@@ -71,12 +71,13 @@ type Failure struct {
 	Code    string `json:"code"`
 }
 type Heartbeat struct {
-	Version string `json:"version"`
-	NodeID  string `json:"node_id"`
-	Profile string `json:"profile"`
-	ModelID string `json:"model_id"`
-	State   string `json:"state"`
-	Bid     int64  `json:"bid"`
+	Version  string `json:"version"`
+	NodeID   string `json:"node_id"`
+	Profile  string `json:"profile"`
+	ModelID  string `json:"model_id"`
+	State    string `json:"state"`
+	Bid      int64  `json:"bid"`
+	Capacity int    `json:"capacity"`
 }
 
 type Challenge struct {

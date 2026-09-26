@@ -19,17 +19,20 @@ const (
 type Config struct {
 	Coordinator string
 	// Executor is "gateway" (reported usage) or "codex-tlsn" (Codex job proven to a verifier).
-	Executor         string
-	Verifier         string
-	Prover           string
-	Gateway          string
-	Model            string
-	Profile          string
-	StateDir         string
-	GatewayKey       string
-	Credential       string
-	NodeID           string
-	Bid              int64
+	Executor   string
+	Verifier   string
+	Prover     string
+	Gateway    string
+	Model      string
+	Profile    string
+	StateDir   string
+	GatewayKey string
+	Credential string
+	NodeID     string
+	Bid        int64
+	// Concurrency is how many leases the node runs at once. The default matches
+	// the local Open Agent API baseline of 20 in-flight requests per account.
+	Concurrency      int
 	LocalFixture     bool
 	InferenceTimeout time.Duration
 	MaxInputBytes    int
@@ -89,6 +92,14 @@ func Load() (Config, error) {
 			return c, errors.New("invalid max output tokens")
 		}
 		c.MaxOutputTokens = v
+	}
+	c.Concurrency = 20
+	if s := os.Getenv("SCARLETT_CONCURRENCY"); s != "" {
+		v, e := strconv.Atoi(s)
+		if e != nil || v < 1 || v > 64 {
+			return c, errors.New("invalid SCARLETT_CONCURRENCY")
+		}
+		c.Concurrency = v
 	}
 	return c, c.Validate()
 }

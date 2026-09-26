@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -151,26 +152,49 @@ func run(c config.Config) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
+	capacity := max(c.Concurrency, 1)
+	slots := make(chan struct{}, capacity)
+	var running sync.WaitGroup
+	defer running.Wait()
+	var mu sync.Mutex
 	var restUntil time.Time
 	for ctx.Err() == nil {
+		mu.Lock()
 		state := "available"
 		if time.Now().Before(restUntil) {
 			state = "exhausted"
 		}
-		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: nodeID, Profile: c.Profile, ModelID: c.Model, State: state, Bid: c.Bid}
+		mu.Unlock()
+		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: nodeID, Profile: c.Profile, ModelID: c.Model, State: state, Bid: c.Bid, Capacity: capacity}
 		reply, err := client.Poll(ctx, h)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "heartbeat:", err)
 		} else if reply.Lease != nil {
-			code, err := submitLease(ctx, client, c, *reply.Lease)
-			if code == "capacity_unavailable" {
-				restUntil = time.Now().Add(capacityRest)
+			// The coordinator counts this node's open leases against its capacity,
+			// so a slot frees up as soon as an earlier result is recorded.
+			select {
+			case slots <- struct{}{}:
+			case <-ctx.Done():
+				return nil
 			}
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "submit:", err)
-			} else if c.LocalFixture {
-				fmt.Printf("fixture job %s: %s\n", reply.Lease.JobID, map[bool]string{true: "failed (" + code + ")", false: "submitted"}[code != ""])
-			}
+			l := *reply.Lease
+			running.Add(1)
+			go func() {
+				defer running.Done()
+				defer func() { <-slots }()
+				code, err := submitLease(ctx, client, c, l)
+				if code == "capacity_unavailable" {
+					mu.Lock()
+					restUntil = time.Now().Add(capacityRest)
+					mu.Unlock()
+				}
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "submit:", err)
+				} else if c.LocalFixture {
+					fmt.Printf("fixture job %s: %s\n", l.JobID, map[bool]string{true: "failed (" + code + ")", false: "submitted"}[code != ""])
+				}
+			}()
+			continue
 		}
 		select {
 		case <-ctx.Done():
