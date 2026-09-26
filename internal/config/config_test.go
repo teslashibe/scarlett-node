@@ -23,13 +23,25 @@ func TestOrigins(t *testing.T) {
 		t.Fatalf("local Docker fixture rejected: %v", err)
 	}
 	local.Gateway = "http://agent2-gateway:8088"
-	if local.Validate() == nil {
-		t.Fatal("accepted agent2 gateway for agent1 model")
+	local.Model = "gpt-5.6-luna"
+	if err := local.Validate(); err != nil {
+		t.Fatalf("luna on agent2 rejected: %v", err)
 	}
+	local.Gateway = "http://agent3-gateway:8088"
+	local.Model = "gpt-5.6-terra"
+	if err := local.Validate(); err != nil {
+		t.Fatalf("terra on agent3 rejected: %v", err)
+	}
+	local.Gateway = "http://agent4-gateway:8088"
 	local.Model = "gpt-5.6-sol"
 	if err := local.Validate(); err != nil {
-		t.Fatalf("agent2 fixture rejected: %v", err)
+		t.Fatalf("sol on agent4 rejected: %v", err)
 	}
+	local.Gateway = "http://agent9-gateway:8088"
+	if local.Validate() == nil {
+		t.Fatal("accepted unknown Docker gateway")
+	}
+	local.Gateway = "http://agent2-gateway:8088"
 	local.Credential = ""
 	if local.Validate() == nil {
 		t.Fatal("accepted local fixture without a node credential")

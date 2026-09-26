@@ -36,6 +36,17 @@ type Config struct {
 	MaxOutputTokens  int
 }
 
+var (
+	fixtureModel   = map[string]bool{"gpt-5.6-luna": true, "gpt-5.6-terra": true, "gpt-5.6-sol": true}
+	fixtureHost    = map[string]bool{"agent1-gateway": true, "agent2-gateway": true, "agent3-gateway": true, "agent4-gateway": true}
+	fixtureGateway = map[string]bool{
+		"http://agent1-gateway:8088": true,
+		"http://agent2-gateway:8088": true,
+		"http://agent3-gateway:8088": true,
+		"http://agent4-gateway:8088": true,
+	}
+)
+
 func Load() (Config, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -95,13 +106,10 @@ func (c Config) Validate() error {
 	if c.Executor != ExecutorGateway && c.Executor != ExecutorCodexTLSN {
 		return errors.New("SCARLETT_EXECUTOR must be gateway or codex-tlsn")
 	}
-	if c.LocalFixture {
-		pinnedGateway := map[string]string{"gpt-5.6-terra": "http://agent1-gateway:8088", "gpt-5.6-sol": "http://agent2-gateway:8088"}[c.Model]
-		if c.Coordinator != "http://host.docker.internal:8091" || pinnedGateway == "" ||
-			c.Executor == ExecutorGateway && c.Gateway != pinnedGateway ||
-			c.Executor == ExecutorCodexTLSN && c.Verifier != "verifier:7047" {
-			return errors.New("local fixture requires pinned Docker services and models")
-		}
+	if c.LocalFixture && (c.Coordinator != "http://host.docker.internal:8091" || !fixtureModel[c.Model] ||
+		c.Executor == ExecutorGateway && !fixtureGateway[c.Gateway] ||
+		c.Executor == ExecutorCodexTLSN && c.Verifier != "verifier:7047") {
+		return errors.New("local fixture requires pinned Docker services and models")
 	}
 	if c.InferenceTimeout < time.Second || c.InferenceTimeout > 300*time.Second || c.MaxInputBytes < 1 || c.MaxInputBytes > 65536 || c.MaxOutputTokens < 1 || c.MaxOutputTokens > 8192 {
 		return errors.New("invalid limits")
@@ -139,7 +147,7 @@ func (c Config) Validate() error {
 			host = g.Host
 		}
 		ip := net.ParseIP(host)
-		if host != "localhost" && (ip == nil || !ip.IsLoopback()) && !(c.LocalFixture && (host == "agent1-gateway" || host == "agent2-gateway")) {
+		if host != "localhost" && (ip == nil || !ip.IsLoopback()) && !(c.LocalFixture && fixtureHost[host]) {
 			return errors.New("HTTP gateway must be loopback or explicit local Docker fixture")
 		}
 	}
