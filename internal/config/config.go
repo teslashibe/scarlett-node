@@ -19,12 +19,10 @@ const (
 type Config struct {
 	Coordinator string
 	// Executor is "gateway" (reported usage) or "codex-tlsn" (Codex job proven to a verifier).
-	Executor string
-	Verifier string
-	Prover   string
-	Gateway  string
-	// Models are the base models this node serves. One slot pool is shared across them.
-	Models     []string
+	Executor   string
+	Verifier   string
+	Prover     string
+	Gateway    string
 	Profile    string
 	StateDir   string
 	GatewayKey string
@@ -41,7 +39,6 @@ type Config struct {
 }
 
 var (
-	fixtureModel   = map[string]bool{"gpt-5.6-luna": true, "gpt-5.6-terra": true, "gpt-5.6-sol": true}
 	fixtureHost    = map[string]bool{"agent1-gateway": true, "agent2-gateway": true, "agent3-gateway": true, "agent4-gateway": true}
 	fixtureGateway = map[string]bool{
 		"http://agent1-gateway:8088": true,
@@ -57,9 +54,6 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	c := Config{Coordinator: os.Getenv("SCARLETT_COORDINATOR"), Executor: os.Getenv("SCARLETT_EXECUTOR"), Verifier: os.Getenv("SCARLETT_VERIFIER"), Prover: os.Getenv("SCARLETT_PROVER"), Gateway: os.Getenv("SCARLETT_GATEWAY"), Profile: os.Getenv("SCARLETT_PROFILE"), StateDir: os.Getenv("SCARLETT_STATE_DIR"), GatewayKey: os.Getenv("SCARLETT_GATEWAY_KEY"), Credential: os.Getenv("SCARLETT_CREDENTIAL"), NodeID: os.Getenv("SCARLETT_NODE_ID"), Bid: 100, LocalFixture: os.Getenv("SCARLETT_LOCAL_FIXTURE") == "1", InferenceTimeout: 45 * time.Second, MaxInputBytes: 32768, MaxOutputTokens: 2048}
-	if s := os.Getenv("SCARLETT_MODELS"); s != "" {
-		c.Models = strings.Split(s, ",")
-	}
 	if s := os.Getenv("SCARLETT_BID"); s != "" {
 		v, e := strconv.ParseInt(s, 10, 64)
 		if e != nil || v < 0 || v > 1_000_000_000 {
@@ -114,10 +108,13 @@ var variants = map[string]bool{
 	"fast": true, "fast-low": true, "fast-medium": true, "fast-high": true, "fast-xhigh": true, "fast-max": true,
 }
 
-// Serves returns the served base model for a lease model: a configured model
-// or its gateway effort/fast alias.
-func (c Config) Serves(id string) (string, bool) {
-	for _, m := range c.Models {
+// Models are the Codex base models every node serves from one slot pool.
+var Models = []string{"gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"}
+
+// Serves returns the base model for a lease model: a base model or its gateway
+// effort/fast alias.
+func Serves(id string) (string, bool) {
+	for _, m := range Models {
 		if id == m || strings.HasPrefix(id, m+"-") && variants[id[len(m)+1:]] {
 			return m, true
 		}
@@ -126,18 +123,8 @@ func (c Config) Serves(id string) (string, bool) {
 }
 
 func (c Config) Validate() error {
-	if len(c.Models) < 1 || len(c.Models) > 16 || c.Profile == "" || strings.ContainsAny(c.Profile, " \n\r\t") || len(c.Profile) > 128 {
-		return errors.New("SCARLETT_MODELS (1–16, comma-separated) and SCARLETT_PROFILE required")
-	}
-	seen := map[string]bool{}
-	for _, m := range c.Models {
-		if m == "" || strings.ContainsAny(m, " \n\r\t") || len(m) > 128 || seen[m] {
-			return errors.New("invalid or duplicate SCARLETT_MODELS entry")
-		}
-		if c.LocalFixture && !fixtureModel[m] {
-			return errors.New("local fixture requires pinned models")
-		}
-		seen[m] = true
+	if c.Profile == "" || strings.ContainsAny(c.Profile, " \n\r\t") || len(c.Profile) > 128 {
+		return errors.New("SCARLETT_PROFILE required")
 	}
 	if c.LocalFixture && c.Profile != "local-fixture" {
 		return errors.New("local fixture requires local-fixture profile")
@@ -151,7 +138,7 @@ func (c Config) Validate() error {
 	if c.LocalFixture && (c.Coordinator != "http://host.docker.internal:8091" ||
 		c.Executor == ExecutorGateway && !fixtureGateway[c.Gateway] ||
 		c.Executor == ExecutorCodexTLSN && c.Verifier != "verifier:7047") {
-		return errors.New("local fixture requires pinned Docker services and models")
+		return errors.New("local fixture requires pinned Docker services")
 	}
 	if c.InferenceTimeout < time.Second || c.InferenceTimeout > 300*time.Second || c.MaxInputBytes < 1 || c.MaxInputBytes > 65536 || c.MaxOutputTokens < 1 || c.MaxOutputTokens > 8192 {
 		return errors.New("invalid limits")

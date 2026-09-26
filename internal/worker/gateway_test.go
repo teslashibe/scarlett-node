@@ -13,18 +13,18 @@ import (
 )
 
 func TestGatewayUsageAndModel(t *testing.T) {
-	c := config.Config{Models: []string{"model-a"}, Profile: "standard", MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: time.Second}
-	lease := coordinator.Lease{Version: coordinator.Version, JobID: "committed", SignedJobID: "signed-committed", Profile: c.Profile, ModelID: c.Models[0], Prompt: "hello", MaxInputTokens: 100, MaxOutputTokens: 20, InputSHA256: SHA("hello"), Attempt: "1", Fence: "f", LeaseDeadline: time.Now().Add(time.Minute), SettlementDeadline: time.Now().Add(time.Minute)}
+	c := config.Config{Profile: "standard", MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: time.Second}
+	lease := coordinator.Lease{Version: coordinator.Version, JobID: "committed", SignedJobID: "signed-committed", Profile: c.Profile, ModelID: "gpt-5.6-luna", Prompt: "hello", MaxInputTokens: 100, MaxOutputTokens: 20, InputSHA256: SHA("hello"), Attempt: "1", Fence: "f", LeaseDeadline: time.Now().Add(time.Minute), SettlementDeadline: time.Now().Add(time.Minute)}
 	cases := []struct{ name, body, code string }{
-		{"good", `{"model":"model-a","choices":[{"message":{"content":"world"},"finish_reason":"stop"}],"usage_source":"upstream","usage":{"prompt_tokens":8,"completion_tokens":4}}`, ""},
-		{"missing source", `{"model":"model-a","choices":[{"message":{"content":"world"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":4}}`, "usage_untrusted"},
-		{"unknown source", `{"model":"model-a","choices":[{"message":{"content":"world"},"finish_reason":"stop"}],"usage_source":"unknown","usage":{"prompt_tokens":8,"completion_tokens":4}}`, "usage_untrusted"},
-		{"estimated source", `{"model":"model-a","choices":[{"message":{"content":"world"},"finish_reason":"stop"}],"usage_source":"estimated","usage":{"prompt_tokens":8,"completion_tokens":4}}`, "usage_untrusted"},
-		{"no usage", `{"model":"model-a","choices":[{"message":{"content":"world"},"finish_reason":"stop"}]}`, "usage_unavailable"},
-		{"missing completion", `{"model":"model-a","choices":[{"message":{"content":"world"},"finish_reason":"stop"}],"usage_source":"upstream","usage":{"prompt_tokens":8}}`, "usage_unavailable"},
-		{"wrong model", `{"model":"model-b","choices":[{"message":{"content":"world"},"finish_reason":"stop"}],"usage_source":"upstream","usage":{"prompt_tokens":8,"completion_tokens":4}}`, "invalid_gateway_response"},
-		{"over budget", `{"model":"model-a","choices":[{"message":{"content":"world"},"finish_reason":"stop"}],"usage_source":"upstream","usage":{"prompt_tokens":8,"completion_tokens":21}}`, "usage_out_of_bounds"},
-		{"truncated", `{"model":"model-a","choices":[{"message":{"content":"world"},"finish_reason":"length"}],"usage_source":"upstream","usage":{"prompt_tokens":8,"completion_tokens":4}}`, "invalid_gateway_response"},
+		{"good", `{"model":"gpt-5.6-luna","choices":[{"message":{"content":"world"},"finish_reason":"stop"}],"usage_source":"upstream","usage":{"prompt_tokens":8,"completion_tokens":4}}`, ""},
+		{"missing source", `{"model":"gpt-5.6-luna","choices":[{"message":{"content":"world"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":4}}`, "usage_untrusted"},
+		{"unknown source", `{"model":"gpt-5.6-luna","choices":[{"message":{"content":"world"},"finish_reason":"stop"}],"usage_source":"unknown","usage":{"prompt_tokens":8,"completion_tokens":4}}`, "usage_untrusted"},
+		{"estimated source", `{"model":"gpt-5.6-luna","choices":[{"message":{"content":"world"},"finish_reason":"stop"}],"usage_source":"estimated","usage":{"prompt_tokens":8,"completion_tokens":4}}`, "usage_untrusted"},
+		{"no usage", `{"model":"gpt-5.6-luna","choices":[{"message":{"content":"world"},"finish_reason":"stop"}]}`, "usage_unavailable"},
+		{"missing completion", `{"model":"gpt-5.6-luna","choices":[{"message":{"content":"world"},"finish_reason":"stop"}],"usage_source":"upstream","usage":{"prompt_tokens":8}}`, "usage_unavailable"},
+		{"wrong model", `{"model":"gpt-5.6-terra","choices":[{"message":{"content":"world"},"finish_reason":"stop"}],"usage_source":"upstream","usage":{"prompt_tokens":8,"completion_tokens":4}}`, "invalid_gateway_response"},
+		{"over budget", `{"model":"gpt-5.6-luna","choices":[{"message":{"content":"world"},"finish_reason":"stop"}],"usage_source":"upstream","usage":{"prompt_tokens":8,"completion_tokens":21}}`, "usage_out_of_bounds"},
+		{"truncated", `{"model":"gpt-5.6-luna","choices":[{"message":{"content":"world"},"finish_reason":"length"}],"usage_source":"upstream","usage":{"prompt_tokens":8,"completion_tokens":4}}`, "invalid_gateway_response"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -37,7 +37,7 @@ func TestGatewayUsageAndModel(t *testing.T) {
 					MaxTokens int    `json:"max_tokens"`
 				}
 				json.NewDecoder(r.Body).Decode(&req)
-				if req.Model != "model-a" || req.MaxTokens != 20 {
+				if req.Model != "gpt-5.6-luna" || req.MaxTokens != 20 {
 					t.Errorf("request %+v", req)
 				}
 				w.Write([]byte(tc.body))
@@ -62,11 +62,11 @@ func TestUnpaidDemoUsage(t *testing.T) {
 	for _, source := range []string{"", "unknown", "estimated", "upstream"} {
 		t.Run(source, func(t *testing.T) {
 			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				json.NewEncoder(w).Encode(map[string]any{"model": "model-a", "choices": []any{map[string]any{"message": map[string]string{"content": "world"}, "finish_reason": "stop"}}, "usage_source": source, "usage": map[string]int{"prompt_tokens": 8, "completion_tokens": 4}})
+				json.NewEncoder(w).Encode(map[string]any{"model": "gpt-5.6-luna", "choices": []any{map[string]any{"message": map[string]string{"content": "world"}, "finish_reason": "stop"}}, "usage_source": source, "usage": map[string]int{"prompt_tokens": 8, "completion_tokens": 4}})
 			}))
 			defer s.Close()
-			g := New(config.Config{Gateway: s.URL, Models: []string{"model-a"}, Profile: "standard", LocalFixture: true, MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: time.Second})
-			got, code := g.Run(context.Background(), coordinator.Lease{Version: coordinator.Version, JobID: "job", SignedJobID: "signed", Attempt: "1", Fence: "f", Profile: "standard", ModelID: "model-a", Prompt: "hello", InputSHA256: SHA("hello"), MaxInputTokens: 100, MaxOutputTokens: 20, LeaseDeadline: time.Now().Add(time.Minute), SettlementDeadline: time.Now().Add(time.Minute)})
+			g := New(config.Config{Gateway: s.URL, Profile: "standard", LocalFixture: true, MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: time.Second})
+			got, code := g.Run(context.Background(), coordinator.Lease{Version: coordinator.Version, JobID: "job", SignedJobID: "signed", Attempt: "1", Fence: "f", Profile: "standard", ModelID: "gpt-5.6-luna", Prompt: "hello", InputSHA256: SHA("hello"), MaxInputTokens: 100, MaxOutputTokens: 20, LeaseDeadline: time.Now().Add(time.Minute), SettlementDeadline: time.Now().Add(time.Minute)})
 			if code != "" || !got.UsageAvailable || got.ExecutionMode != "unpaid_local_demo" {
 				t.Fatalf("demo result: %+v, %s", got, code)
 			}
@@ -82,7 +82,7 @@ func TestUnpaidDemoUsage(t *testing.T) {
 }
 
 func TestRejectLeaseBeforeGateway(t *testing.T) {
-	c := config.Config{Gateway: "http://127.0.0.1:1", Models: []string{"a"}, Profile: "p", MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: time.Second}
+	c := config.Config{Gateway: "http://127.0.0.1:1", Profile: "p", MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: time.Second}
 	l := coordinator.Lease{Version: coordinator.Version, JobID: "j", SignedJobID: "signed-j", Profile: "p", ModelID: "b", Prompt: "x", InputSHA256: SHA("x"), MaxInputTokens: 10, MaxOutputTokens: 10, Attempt: "1", Fence: "f", LeaseDeadline: time.Now().Add(time.Minute), SettlementDeadline: time.Now().Add(time.Minute)}
 	_, code := New(c).Run(context.Background(), l)
 	if code != "invalid_lease" {
@@ -91,17 +91,17 @@ func TestRejectLeaseBeforeGateway(t *testing.T) {
 }
 
 func TestGatewayVariantLease(t *testing.T) {
-	c := config.Config{Models: []string{"a", "b"}, Profile: "p", MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: time.Second}
-	l := coordinator.Lease{Version: coordinator.Version, JobID: "j", SignedJobID: "signed-j", Profile: "p", ModelID: "b-fast-high", Prompt: "x", InputSHA256: SHA("x"), MaxInputTokens: 10, MaxOutputTokens: 10, Attempt: "1", Fence: "f", LeaseDeadline: time.Now().Add(time.Minute), SettlementDeadline: time.Now().Add(time.Minute)}
+	c := config.Config{Profile: "p", MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: time.Second}
+	l := coordinator.Lease{Version: coordinator.Version, JobID: "j", SignedJobID: "signed-j", Profile: "p", ModelID: "gpt-5.6-terra-fast-high", Prompt: "x", InputSHA256: SHA("x"), MaxInputTokens: 10, MaxOutputTokens: 10, Attempt: "1", Fence: "f", LeaseDeadline: time.Now().Add(time.Minute), SettlementDeadline: time.Now().Add(time.Minute)}
 	six := 6
 	cases := []struct {
 		name, body, code string
 		cached           *int
 	}{
-		{"base resolved", `{"model":"b","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage_source":"upstream","usage":{"prompt_tokens":8,"completion_tokens":4}}`, "", nil},
-		{"cached reported", `{"model":"b-fast-high","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage_source":"upstream","usage":{"prompt_tokens":8,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":6}}}`, "", &six},
-		{"cached over input", `{"model":"b","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage_source":"upstream","usage":{"prompt_tokens":8,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":9}}}`, "usage_out_of_bounds", nil},
-		{"other base", `{"model":"a","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage_source":"upstream","usage":{"prompt_tokens":8,"completion_tokens":4}}`, "invalid_gateway_response", nil},
+		{"base resolved", `{"model":"gpt-5.6-terra","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage_source":"upstream","usage":{"prompt_tokens":8,"completion_tokens":4}}`, "", nil},
+		{"cached reported", `{"model":"gpt-5.6-terra-fast-high","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage_source":"upstream","usage":{"prompt_tokens":8,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":6}}}`, "", &six},
+		{"cached over input", `{"model":"gpt-5.6-terra","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage_source":"upstream","usage":{"prompt_tokens":8,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":9}}}`, "usage_out_of_bounds", nil},
+		{"other base", `{"model":"gpt-5.6-luna","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage_source":"upstream","usage":{"prompt_tokens":8,"completion_tokens":4}}`, "invalid_gateway_response", nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -110,7 +110,7 @@ func TestGatewayVariantLease(t *testing.T) {
 					Model string `json:"model"`
 				}
 				json.NewDecoder(r.Body).Decode(&req)
-				if req.Model != "b-fast-high" {
+				if req.Model != "gpt-5.6-terra-fast-high" {
 					t.Errorf("sent model %q", req.Model)
 				}
 				w.Write([]byte(tc.body))
@@ -126,7 +126,7 @@ func TestGatewayVariantLease(t *testing.T) {
 			}
 		})
 	}
-	for _, id := range []string{"b-turbo", "c-high", "b-high-fast", "bb"} {
+	for _, id := range []string{"gpt-5.6-terra-turbo", "gpt-5.5-high", "gpt-5.6-terra-high-fast", "gpt-5.6-terrax"} {
 		l.ModelID = id
 		if _, code := New(c).Run(context.Background(), l); code != "invalid_lease" {
 			t.Errorf("%s: code %q", id, code)
@@ -135,8 +135,8 @@ func TestGatewayVariantLease(t *testing.T) {
 }
 
 func TestGatewayWithoutCapacity(t *testing.T) {
-	c := config.Config{Models: []string{"a"}, Profile: "p", MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: time.Second}
-	l := coordinator.Lease{Version: coordinator.Version, JobID: "j", SignedJobID: "signed-j", Profile: "p", ModelID: "a", Prompt: "x", InputSHA256: SHA("x"), MaxInputTokens: 10, MaxOutputTokens: 10, Attempt: "1", Fence: "f", LeaseDeadline: time.Now().Add(time.Minute), SettlementDeadline: time.Now().Add(time.Minute)}
+	c := config.Config{Profile: "p", MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: time.Second}
+	l := coordinator.Lease{Version: coordinator.Version, JobID: "j", SignedJobID: "signed-j", Profile: "p", ModelID: "gpt-5.6-luna", Prompt: "x", InputSHA256: SHA("x"), MaxInputTokens: 10, MaxOutputTokens: 10, Attempt: "1", Fence: "f", LeaseDeadline: time.Now().Add(time.Minute), SettlementDeadline: time.Now().Add(time.Minute)}
 	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) }))
 		c.Gateway = srv.URL

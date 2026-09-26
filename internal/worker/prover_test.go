@@ -43,12 +43,12 @@ func TestMain(m *testing.M) {
 }
 
 func TestProverRun(t *testing.T) {
-	c := config.Config{Executor: config.ExecutorCodexTLSN, Verifier: "verifier:7047", Prover: os.Args[0], Models: []string{"model-a"}, Profile: "standard", MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: 5 * time.Second}
+	c := config.Config{Executor: config.ExecutorCodexTLSN, Verifier: "verifier:7047", Prover: os.Args[0], Profile: "standard", MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: 5 * time.Second}
 	payload := func(model, prompt string) json.RawMessage {
 		return json.RawMessage(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":%q}]}]}`, model, prompt))
 	}
 	lease := func() coordinator.Lease {
-		return coordinator.Lease{Version: coordinator.Version, JobID: "job", SignedJobID: "job", Profile: c.Profile, ModelID: c.Models[0], Prompt: "hello", MaxInputTokens: 100, MaxOutputTokens: 20, InputSHA256: SHA("hello"), Attempt: "1", Fence: "f", LeaseDeadline: time.Now().Add(time.Minute), SettlementDeadline: time.Now().Add(time.Minute), CodexPayload: payload("model-a", "hello"), VerifierToken: strings.Repeat("ab", 32)}
+		return coordinator.Lease{Version: coordinator.Version, JobID: "job", SignedJobID: "job", Profile: c.Profile, ModelID: "gpt-5.6-luna", Prompt: "hello", MaxInputTokens: 100, MaxOutputTokens: 20, InputSHA256: SHA("hello"), Attempt: "1", Fence: "f", LeaseDeadline: time.Now().Add(time.Minute), SettlementDeadline: time.Now().Add(time.Minute), CodexPayload: payload("gpt-5.6-luna", "hello"), VerifierToken: strings.Repeat("ab", 32)}
 	}
 	cases := []struct {
 		name, mode string
@@ -58,8 +58,8 @@ func TestProverRun(t *testing.T) {
 		{"proof sent", "ok", func(*coordinator.Lease) {}, ""},
 		{"prover failure", "fail", func(*coordinator.Lease) {}, "prover_error"},
 		{"unexpected output", "garbage", func(*coordinator.Lease) {}, "prover_error"},
-		{"payload for another model", "ok", func(l *coordinator.Lease) { l.CodexPayload = payload("model-b", "hello") }, "invalid_lease"},
-		{"payload with another prompt", "ok", func(l *coordinator.Lease) { l.CodexPayload = payload("model-a", "spend more") }, "invalid_lease"},
+		{"payload for another model", "ok", func(l *coordinator.Lease) { l.CodexPayload = payload("gpt-5.6-terra", "hello") }, "invalid_lease"},
+		{"payload with another prompt", "ok", func(l *coordinator.Lease) { l.CodexPayload = payload("gpt-5.6-luna", "spend more") }, "invalid_lease"},
 		{"effort variant", "ok", func(l *coordinator.Lease) {
 			l.ModelID = "model-a-high"
 			l.CodexPayload = payload("model-a-high", "hello")

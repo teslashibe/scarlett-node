@@ -18,12 +18,11 @@ paths:
           application/json:
             schema:
               type: object
-              required: [version, code, profile, model_id]
+              required: [version, code, profile]
               properties:
                 version: {type: string, enum: [node-v1]}
                 code: {type: string}
                 profile: {type: string}
-                model_id: {type: string}
       responses:
         '200':
           description: Paired; credential is shown once
@@ -137,17 +136,12 @@ components:
         credential: {type: string}
     Heartbeat:
       type: object
-      required: [version, node_id, profile, models, state]
+      required: [version, node_id, profile, state]
+      description: Every node serves every catalog model (gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol) and their gateway aliases from one shared capacity.
       properties:
         version: {type: string, enum: [node-v1]}
         node_id: {type: string}
         profile: {type: string}
-        models:
-          type: array
-          minItems: 1
-          maxItems: 16
-          items: {type: string}
-          description: Base models this node serves, sharing one capacity. A lease may name a base model or its gateway alias with a reasoning effort (-low, -medium, -high, -xhigh, -max) and/or the fast tier (-fast, -fast-<effort>).
         state: {type: string, enum: [available, exhausted], description: exhausted means the node's gateway recently had no capacity; the coordinator offers it no lease until it reports available again.}
         bid: {type: integer, minimum: 0, maximum: 1000000000, description: Standing assignment bid. Lower wins, then least assigned work, then node_id. Missing is treated as 100. Not an on-chain quote.}
         capacity: {type: integer, minimum: 1, maximum: 64, description: Leases the node runs at once. The coordinator keeps open leases at or below this. Missing is treated as 1.}
@@ -179,7 +173,7 @@ components:
         job_id: {type: string}
         signed_job_id: {type: string, description: Coordinator-issued signed job commitment; not cryptographically verified by v1 node.}
         profile: {type: string}
-        model_id: {type: string, description: A served base model or its effort/fast alias. Proven Codex leases must name a base model.}
+        model_id: {type: string, description: 'A catalog base model or its gateway alias with a reasoning effort (-low, -medium, -high, -xhigh, -max) and/or the fast tier (-fast, -fast-<effort>). Proven Codex leases must name a base model.'}
         prompt: {type: string}
         max_input_tokens: {type: integer, minimum: 1}
         max_output_tokens: {type: integer, minimum: 1}
