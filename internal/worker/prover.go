@@ -28,7 +28,9 @@ func (p Prover) Run(ctx context.Context, l coordinator.Lease) (code, detail stri
 	if code != "" {
 		return code, ""
 	}
-	if !validPayload(l) || len(l.VerifierToken) != 64 || !isHex(l.VerifierToken) {
+	// The proof policy does not yet bind reasoning effort or service tier,
+	// so only base-model leases are proven.
+	if base, _ := c.Serves(l.ModelID); base != l.ModelID || !validPayload(l) || len(l.VerifierToken) != 64 || !isHex(l.VerifierToken) {
 		return "invalid_lease", ""
 	}
 	input, err := json.Marshal(struct {

@@ -19,11 +19,12 @@ const (
 type Config struct {
 	Coordinator string
 	// Executor is "gateway" (reported usage) or "codex-tlsn" (Codex job proven to a verifier).
-	Executor   string
-	Verifier   string
-	Prover     string
-	Gateway    string
-	Model      string
+	Executor string
+	Verifier string
+	Prover   string
+	Gateway  string
+	// Models are the base models this node serves. One slot pool is shared across them.
+	Models     []string
 	Profile    string
 	StateDir   string
 	GatewayKey string
@@ -55,7 +56,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	c := Config{Coordinator: os.Getenv("SCARLETT_COORDINATOR"), Executor: os.Getenv("SCARLETT_EXECUTOR"), Verifier: os.Getenv("SCARLETT_VERIFIER"), Prover: os.Getenv("SCARLETT_PROVER"), Gateway: os.Getenv("SCARLETT_GATEWAY"), Model: os.Getenv("SCARLETT_MODEL"), Profile: os.Getenv("SCARLETT_PROFILE"), StateDir: os.Getenv("SCARLETT_STATE_DIR"), GatewayKey: os.Getenv("SCARLETT_GATEWAY_KEY"), Credential: os.Getenv("SCARLETT_CREDENTIAL"), NodeID: os.Getenv("SCARLETT_NODE_ID"), Bid: 100, LocalFixture: os.Getenv("SCARLETT_LOCAL_FIXTURE") == "1", InferenceTimeout: 45 * time.Second, MaxInputBytes: 32768, MaxOutputTokens: 2048}
+	c := Config{Coordinator: os.Getenv("SCARLETT_COORDINATOR"), Executor: os.Getenv("SCARLETT_EXECUTOR"), Verifier: os.Getenv("SCARLETT_VERIFIER"), Prover: os.Getenv("SCARLETT_PROVER"), Gateway: os.Getenv("SCARLETT_GATEWAY"), Profile: os.Getenv("SCARLETT_PROFILE"), StateDir: os.Getenv("SCARLETT_STATE_DIR"), GatewayKey: os.Getenv("SCARLETT_GATEWAY_KEY"), Credential: os.Getenv("SCARLETT_CREDENTIAL"), NodeID: os.Getenv("SCARLETT_NODE_ID"), Bid: 100, LocalFixture: os.Getenv("SCARLETT_LOCAL_FIXTURE") == "1", InferenceTimeout: 45 * time.Second, MaxInputBytes: 32768, MaxOutputTokens: 2048}
+	if s := os.Getenv("SCARLETT_MODELS"); s != "" {
+		c.Models = strings.Split(s, ",")
+	}
 	if s := os.Getenv("SCARLETT_BID"); s != "" {
 		v, e := strconv.ParseInt(s, 10, 64)
 		if e != nil || v < 0 || v > 1_000_000_000 {
@@ -104,9 +108,36 @@ func Load() (Config, error) {
 	return c, c.Validate()
 }
 
+// variants are the gateway alias suffixes that select reasoning effort and the fast tier.
+var variants = map[string]bool{
+	"low": true, "medium": true, "high": true, "xhigh": true, "max": true,
+	"fast": true, "fast-low": true, "fast-medium": true, "fast-high": true, "fast-xhigh": true, "fast-max": true,
+}
+
+// Serves returns the served base model for a lease model: a configured model
+// or its gateway effort/fast alias.
+func (c Config) Serves(id string) (string, bool) {
+	for _, m := range c.Models {
+		if id == m || strings.HasPrefix(id, m+"-") && variants[id[len(m)+1:]] {
+			return m, true
+		}
+	}
+	return "", false
+}
+
 func (c Config) Validate() error {
-	if c.Model == "" || c.Profile == "" || strings.ContainsAny(c.Model+c.Profile, " \n\r\t") || len(c.Model) > 128 || len(c.Profile) > 128 {
-		return errors.New("SCARLETT_MODEL and SCARLETT_PROFILE required")
+	if len(c.Models) < 1 || len(c.Models) > 16 || c.Profile == "" || strings.ContainsAny(c.Profile, " \n\r\t") || len(c.Profile) > 128 {
+		return errors.New("SCARLETT_MODELS (1–16, comma-separated) and SCARLETT_PROFILE required")
+	}
+	seen := map[string]bool{}
+	for _, m := range c.Models {
+		if m == "" || strings.ContainsAny(m, " \n\r\t") || len(m) > 128 || seen[m] {
+			return errors.New("invalid or duplicate SCARLETT_MODELS entry")
+		}
+		if c.LocalFixture && !fixtureModel[m] {
+			return errors.New("local fixture requires pinned models")
+		}
+		seen[m] = true
 	}
 	if c.LocalFixture && c.Profile != "local-fixture" {
 		return errors.New("local fixture requires local-fixture profile")
@@ -117,7 +148,7 @@ func (c Config) Validate() error {
 	if c.Executor != ExecutorGateway && c.Executor != ExecutorCodexTLSN {
 		return errors.New("SCARLETT_EXECUTOR must be gateway or codex-tlsn")
 	}
-	if c.LocalFixture && (c.Coordinator != "http://host.docker.internal:8091" || !fixtureModel[c.Model] ||
+	if c.LocalFixture && (c.Coordinator != "http://host.docker.internal:8091" ||
 		c.Executor == ExecutorGateway && !fixtureGateway[c.Gateway] ||
 		c.Executor == ExecutorCodexTLSN && c.Verifier != "verifier:7047") {
 		return errors.New("local fixture requires pinned Docker services and models")

@@ -7,7 +7,7 @@ import (
 )
 
 func TestOrigins(t *testing.T) {
-	c := Config{Coordinator: "https://example.org", Executor: ExecutorGateway, Gateway: "http://127.0.0.1:8080", Model: "a", Profile: "p", StateDir: filepath.Join(t.TempDir(), "state"), InferenceTimeout: time.Second, MaxInputBytes: 1, MaxOutputTokens: 1}
+	c := Config{Coordinator: "https://example.org", Executor: ExecutorGateway, Gateway: "http://127.0.0.1:8080", Models: []string{"a"}, Profile: "p", StateDir: filepath.Join(t.TempDir(), "state"), InferenceTimeout: time.Second, MaxInputBytes: 1, MaxOutputTokens: 1}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -18,22 +18,22 @@ func TestOrigins(t *testing.T) {
 			t.Fatalf("accepted coordinator %s", bad)
 		}
 	}
-	local := Config{Coordinator: "http://host.docker.internal:8091", Executor: ExecutorGateway, Gateway: "http://agent1-gateway:8088", Model: "gpt-5.6-terra", Profile: "local-fixture", StateDir: filepath.Join(t.TempDir(), "state"), NodeID: "terra", Credential: "local-sim-terra-credential-not-a-wallet", LocalFixture: true, InferenceTimeout: time.Second, MaxInputBytes: 32, MaxOutputTokens: 128}
+	local := Config{Coordinator: "http://host.docker.internal:8091", Executor: ExecutorGateway, Gateway: "http://agent1-gateway:8088", Models: []string{"gpt-5.6-terra"}, Profile: "local-fixture", StateDir: filepath.Join(t.TempDir(), "state"), NodeID: "terra", Credential: "local-sim-terra-credential-not-a-wallet", LocalFixture: true, InferenceTimeout: time.Second, MaxInputBytes: 32, MaxOutputTokens: 128}
 	if err := local.Validate(); err != nil {
 		t.Fatalf("local Docker fixture rejected: %v", err)
 	}
 	local.Gateway = "http://agent2-gateway:8088"
-	local.Model = "gpt-5.6-luna"
+	local.Models = []string{"gpt-5.6-luna"}
 	if err := local.Validate(); err != nil {
 		t.Fatalf("luna on agent2 rejected: %v", err)
 	}
 	local.Gateway = "http://agent3-gateway:8088"
-	local.Model = "gpt-5.6-terra"
+	local.Models = []string{"gpt-5.6-terra"}
 	if err := local.Validate(); err != nil {
 		t.Fatalf("terra on agent3 rejected: %v", err)
 	}
 	local.Gateway = "http://agent4-gateway:8088"
-	local.Model = "gpt-5.6-sol"
+	local.Models = []string{"gpt-5.6-sol"}
 	if err := local.Validate(); err != nil {
 		t.Fatalf("sol on agent4 rejected: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestOrigins(t *testing.T) {
 }
 
 func TestCodexTLSN(t *testing.T) {
-	c := Config{Coordinator: "https://example.org", Executor: ExecutorCodexTLSN, Verifier: "127.0.0.1:7047", Prover: "scarlett-prover", Model: "a", Profile: "p", StateDir: filepath.Join(t.TempDir(), "state"), InferenceTimeout: time.Second, MaxInputBytes: 1, MaxOutputTokens: 1}
+	c := Config{Coordinator: "https://example.org", Executor: ExecutorCodexTLSN, Verifier: "127.0.0.1:7047", Prover: "scarlett-prover", Models: []string{"a"}, Profile: "p", StateDir: filepath.Join(t.TempDir(), "state"), InferenceTimeout: time.Second, MaxInputBytes: 1, MaxOutputTokens: 1}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestCodexTLSN(t *testing.T) {
 	if c.Validate() == nil {
 		t.Fatal("accepted unknown executor")
 	}
-	local := Config{Coordinator: "http://host.docker.internal:8091", Executor: ExecutorCodexTLSN, Verifier: "verifier:7047", Prover: "scarlett-prover", Model: "gpt-5.6-terra", Profile: "local-fixture", StateDir: filepath.Join(t.TempDir(), "state"), NodeID: "terra", Credential: "local-sim-terra-credential-not-a-wallet", LocalFixture: true, InferenceTimeout: time.Second, MaxInputBytes: 32, MaxOutputTokens: 128}
+	local := Config{Coordinator: "http://host.docker.internal:8091", Executor: ExecutorCodexTLSN, Verifier: "verifier:7047", Prover: "scarlett-prover", Models: []string{"gpt-5.6-terra"}, Profile: "local-fixture", StateDir: filepath.Join(t.TempDir(), "state"), NodeID: "terra", Credential: "local-sim-terra-credential-not-a-wallet", LocalFixture: true, InferenceTimeout: time.Second, MaxInputBytes: 32, MaxOutputTokens: 128}
 	if err := local.Validate(); err != nil {
 		t.Fatalf("local TLSN fixture rejected: %v", err)
 	}

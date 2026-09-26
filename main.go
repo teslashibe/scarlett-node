@@ -71,7 +71,7 @@ func pair(c config.Config) error {
 	}
 	client := coordinator.New(c.Coordinator, "")
 	var reply coordinator.PairReply
-	_, err = client.Post(context.Background(), "/api/node/v1/pair", map[string]string{"version": coordinator.Version, "code": code, "profile": c.Profile, "model_id": c.Model}, &reply)
+	_, err = client.Post(context.Background(), "/api/node/v1/pair", map[string]string{"version": coordinator.Version, "code": code, "profile": c.Profile, "model_id": c.Models[0]}, &reply)
 	if err != nil {
 		return err
 	}
@@ -165,7 +165,7 @@ func run(c config.Config) error {
 			state = "exhausted"
 		}
 		mu.Unlock()
-		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: nodeID, Profile: c.Profile, ModelID: c.Model, State: state, Bid: c.Bid, Capacity: capacity}
+		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: nodeID, Profile: c.Profile, Models: c.Models, State: state, Bid: c.Bid, Capacity: capacity}
 		reply, err := client.Poll(ctx, h)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "heartbeat:", err)

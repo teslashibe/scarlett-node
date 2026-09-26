@@ -27,7 +27,10 @@ func SHA(s string) string { h := sha256.Sum256([]byte(s)); return hex.EncodeToSt
 
 // checkLease validates untrusted lease fields and returns the inference deadline or a failure code.
 func checkLease(c config.Config, l coordinator.Lease) (time.Time, string) {
-	if l.Version != coordinator.Version || l.JobID == "" || l.SignedJobID == "" || l.Attempt == "" || l.Fence == "" || l.InputSHA256 == "" || l.ModelID != c.Model || l.Profile != c.Profile || l.MaxInputTokens < 1 || l.MaxOutputTokens < 1 || l.MaxOutputTokens > c.MaxOutputTokens || !utf8.ValidString(l.Prompt) || len(l.Prompt) > c.MaxInputBytes || SHA(l.Prompt) != l.InputSHA256 {
+	if l.Version != coordinator.Version || l.JobID == "" || l.SignedJobID == "" || l.Attempt == "" || l.Fence == "" || l.InputSHA256 == "" || l.Profile != c.Profile || l.MaxInputTokens < 1 || l.MaxOutputTokens < 1 || l.MaxOutputTokens > c.MaxOutputTokens || !utf8.ValidString(l.Prompt) || len(l.Prompt) > c.MaxInputBytes || SHA(l.Prompt) != l.InputSHA256 {
+		return time.Time{}, "invalid_lease"
+	}
+	if _, ok := c.Serves(l.ModelID); !ok {
 		return time.Time{}, "invalid_lease"
 	}
 	// The local gateway ignores max_tokens: the local fixture is for
@@ -71,7 +74,7 @@ func (g *Gateway) Run(ctx context.Context, l coordinator.Lease) (coordinator.Res
 		} `json:"messages"`
 		MaxTokens int  `json:"max_tokens"`
 		Stream    bool `json:"stream"`
-	}{Model: c.Model, Messages: []struct {
+	}{Model: l.ModelID, Messages: []struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`
 	}{{Role: "user", Content: l.Prompt}}, MaxTokens: l.MaxOutputTokens})
@@ -114,9 +117,14 @@ func (g *Gateway) Run(ctx context.Context, l coordinator.Lease) (coordinator.Res
 		Usage       *struct {
 			PromptTokens     *int `json:"prompt_tokens"`
 			CompletionTokens *int `json:"completion_tokens"`
+			PromptDetails    *struct {
+				CachedTokens *int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
-	if json.Unmarshal(data, &answer) != nil || answer.Model != l.ModelID || len(answer.Choices) != 1 || answer.Choices[0].FinishReason != "stop" || answer.Choices[0].Message.Content == "" || !utf8.ValidString(answer.Choices[0].Message.Content) {
+	// An effort/fast alias resolves to its base model upstream.
+	base, _ := c.Serves(l.ModelID)
+	if json.Unmarshal(data, &answer) != nil || answer.Model != l.ModelID && answer.Model != base || len(answer.Choices) != 1 || answer.Choices[0].FinishReason != "stop" || answer.Choices[0].Message.Content == "" || !utf8.ValidString(answer.Choices[0].Message.Content) {
 		return fail("invalid_gateway_response")
 	}
 	if answer.Usage == nil || answer.Usage.PromptTokens == nil || answer.Usage.CompletionTokens == nil {
@@ -128,6 +136,12 @@ func (g *Gateway) Run(ctx context.Context, l coordinator.Lease) (coordinator.Res
 	in, out := *answer.Usage.PromptTokens, *answer.Usage.CompletionTokens
 	if in < 1 || out < 1 || in > l.MaxInputTokens || out > l.MaxOutputTokens {
 		return fail("usage_out_of_bounds")
+	}
+	if d := answer.Usage.PromptDetails; d != nil && d.CachedTokens != nil {
+		if *d.CachedTokens < 0 || *d.CachedTokens > in {
+			return fail("usage_out_of_bounds")
+		}
+		r.CachedInputTokens = d.CachedTokens
 	}
 	if ctx.Err() != nil || !time.Now().Before(l.LeaseDeadline) || !time.Now().Before(l.SettlementDeadline) {
 		return fail("expired")
