@@ -143,7 +143,7 @@ components:
         node_id: {type: string}
         profile: {type: string}
         model_id: {type: string}
-        state: {type: string, enum: [available]}
+        state: {type: string, enum: [available, exhausted], description: exhausted means the node's gateway recently had no capacity; the coordinator offers it no lease until it reports available again.}
         bid: {type: integer, minimum: 0, maximum: 1000000000, description: Standing assignment bid. Lower wins, then least assigned work, then node_id. Missing is treated as 100. Not an on-chain quote.}
     Challenge:
       type: object
@@ -228,4 +228,4 @@ components:
         version: {type: string, enum: [node-v1]}
         attempt: {type: string}
         fence: {type: string}
-        code: {type: string, enum: [invalid_lease, expired, gateway_error, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds, prover_error]}
+        code: {type: string, enum: [invalid_lease, expired, gateway_error, capacity_unavailable, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds, prover_error], description: capacity_unavailable means the gateway was unreachable or returned 429/503 before inference; the coordinator may requeue the job for another node.}

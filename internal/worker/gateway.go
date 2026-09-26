@@ -86,9 +86,15 @@ func (g *Gateway) Run(ctx context.Context, l coordinator.Lease) (coordinator.Res
 	start := time.Now()
 	resp, err := g.HTTP.Do(req)
 	if err != nil {
-		return fail("gateway_error")
+		if ctx.Err() != nil {
+			return fail("gateway_error")
+		}
+		return fail("capacity_unavailable")
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+		return fail("capacity_unavailable")
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fail("gateway_error")
 	}

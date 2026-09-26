@@ -89,3 +89,20 @@ func TestRejectLeaseBeforeGateway(t *testing.T) {
 		t.Fatal(code)
 	}
 }
+
+func TestGatewayWithoutCapacity(t *testing.T) {
+	c := config.Config{Model: "a", Profile: "p", MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: time.Second}
+	l := coordinator.Lease{Version: coordinator.Version, JobID: "j", SignedJobID: "signed-j", Profile: "p", ModelID: "a", Prompt: "x", InputSHA256: SHA("x"), MaxInputTokens: 10, MaxOutputTokens: 10, Attempt: "1", Fence: "f", LeaseDeadline: time.Now().Add(time.Minute), SettlementDeadline: time.Now().Add(time.Minute)}
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) }))
+		c.Gateway = srv.URL
+		if _, code := New(c).Run(context.Background(), l); code != "capacity_unavailable" {
+			t.Errorf("status %d: code %q", status, code)
+		}
+		srv.Close()
+	}
+	c.Gateway = "http://127.0.0.1:1"
+	if _, code := New(c).Run(context.Background(), l); code != "capacity_unavailable" {
+		t.Errorf("unreachable gateway: code %q", code)
+	}
+}

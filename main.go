@@ -126,6 +126,10 @@ func loadIdentity(c config.Config) (identity, error) {
 	}
 	return id, nil
 }
+
+// capacityRest is how long a node reports "exhausted" after its gateway had no capacity.
+const capacityRest = 30 * time.Second
+
 func run(c config.Config) error {
 	cred, nodeID := c.Credential, c.NodeID
 	if cred == "" {
@@ -147,13 +151,21 @@ func run(c config.Config) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
+	var restUntil time.Time
 	for ctx.Err() == nil {
-		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: nodeID, Profile: c.Profile, ModelID: c.Model, State: "available", Bid: c.Bid}
+		state := "available"
+		if time.Now().Before(restUntil) {
+			state = "exhausted"
+		}
+		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: nodeID, Profile: c.Profile, ModelID: c.Model, State: state, Bid: c.Bid}
 		reply, err := client.Poll(ctx, h)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "heartbeat:", err)
 		} else if reply.Lease != nil {
 			code, err := submitLease(ctx, client, c, *reply.Lease)
+			if code == "capacity_unavailable" {
+				restUntil = time.Now().Add(capacityRest)
+			}
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "submit:", err)
 			} else if c.LocalFixture {
