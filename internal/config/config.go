@@ -27,6 +27,9 @@ type Config struct {
 	Profile          string
 	StateDir         string
 	GatewayKey       string
+	Credential       string
+	NodeID           string
+	Bid              int64
 	LocalFixture     bool
 	InferenceTimeout time.Duration
 	MaxInputBytes    int
@@ -38,7 +41,14 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	c := Config{Coordinator: os.Getenv("SCARLETT_COORDINATOR"), Executor: os.Getenv("SCARLETT_EXECUTOR"), Verifier: os.Getenv("SCARLETT_VERIFIER"), Prover: os.Getenv("SCARLETT_PROVER"), Gateway: os.Getenv("SCARLETT_GATEWAY"), Model: os.Getenv("SCARLETT_MODEL"), Profile: os.Getenv("SCARLETT_PROFILE"), StateDir: os.Getenv("SCARLETT_STATE_DIR"), GatewayKey: os.Getenv("SCARLETT_GATEWAY_KEY"), LocalFixture: os.Getenv("SCARLETT_LOCAL_FIXTURE") == "1", InferenceTimeout: 45 * time.Second, MaxInputBytes: 32768, MaxOutputTokens: 2048}
+	c := Config{Coordinator: os.Getenv("SCARLETT_COORDINATOR"), Executor: os.Getenv("SCARLETT_EXECUTOR"), Verifier: os.Getenv("SCARLETT_VERIFIER"), Prover: os.Getenv("SCARLETT_PROVER"), Gateway: os.Getenv("SCARLETT_GATEWAY"), Model: os.Getenv("SCARLETT_MODEL"), Profile: os.Getenv("SCARLETT_PROFILE"), StateDir: os.Getenv("SCARLETT_STATE_DIR"), GatewayKey: os.Getenv("SCARLETT_GATEWAY_KEY"), Credential: os.Getenv("SCARLETT_CREDENTIAL"), NodeID: os.Getenv("SCARLETT_NODE_ID"), Bid: 100, LocalFixture: os.Getenv("SCARLETT_LOCAL_FIXTURE") == "1", InferenceTimeout: 45 * time.Second, MaxInputBytes: 32768, MaxOutputTokens: 2048}
+	if s := os.Getenv("SCARLETT_BID"); s != "" {
+		v, e := strconv.ParseInt(s, 10, 64)
+		if e != nil || v < 0 || v > 1_000_000_000 {
+			return c, errors.New("invalid SCARLETT_BID")
+		}
+		c.Bid = v
+	}
 	if c.StateDir == "" {
 		c.StateDir = filepath.Join(home, ".local", "state", "scarlett-node")
 	}
@@ -79,8 +89,8 @@ func (c Config) Validate() error {
 	if c.LocalFixture && c.Profile != "local-fixture" {
 		return errors.New("local fixture requires local-fixture profile")
 	}
-	if c.LocalFixture && (len(c.GatewayKey) < 32 || strings.Trim(c.GatewayKey, " ") == "") {
-		return errors.New("local fixture requires SCARLETT_GATEWAY_KEY with at least 32 characters")
+	if c.LocalFixture && (c.NodeID == "" || strings.ContainsAny(c.NodeID, " \n\r\t") || len(c.Credential) < 32) {
+		return errors.New("local fixture requires SCARLETT_NODE_ID and SCARLETT_CREDENTIAL (at least 32 characters)")
 	}
 	if c.Executor != ExecutorGateway && c.Executor != ExecutorCodexTLSN {
 		return errors.New("SCARLETT_EXECUTOR must be gateway or codex-tlsn")

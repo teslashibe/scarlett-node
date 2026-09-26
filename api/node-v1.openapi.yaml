@@ -144,6 +144,7 @@ components:
         profile: {type: string}
         model_id: {type: string}
         state: {type: string, enum: [available]}
+        bid: {type: integer, minimum: 0, maximum: 1000000000, description: Standing assignment bid. Lower wins, then least assigned work, then node_id. Missing is treated as 100. Not an on-chain quote.}
     Challenge:
       type: object
       required: [version, nonce, expires_at]

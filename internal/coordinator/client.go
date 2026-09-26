@@ -76,6 +76,7 @@ type Heartbeat struct {
 	Profile string `json:"profile"`
 	ModelID string `json:"model_id"`
 	State   string `json:"state"`
+	Bid     int64  `json:"bid"`
 }
 
 type Challenge struct {

@@ -126,58 +126,44 @@ func loadIdentity(c config.Config) (identity, error) {
 	}
 	return id, nil
 }
-func runFixture(c config.Config) error {
-	client := coordinator.New(c.Coordinator, c.GatewayKey)
-	client.EchoUnqualifiedHTTP = true
+func run(c config.Config) error {
+	cred, nodeID := c.Credential, c.NodeID
+	if cred == "" {
+		id, err := loadIdentity(c)
+		if err != nil {
+			return err
+		}
+		cred, nodeID = id.Credential, id.NodeID
+	} else if nodeID == "" {
+		return errors.New("SCARLETT_NODE_ID required with SCARLETT_CREDENTIAL")
+	}
+	client := coordinator.New(c.Coordinator, cred)
+	if c.LocalFixture {
+		client.EchoUnqualifiedHTTP = true
+	}
+	wait := 5 * time.Second
+	if c.LocalFixture {
+		wait = time.Second
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 	for ctx.Err() == nil {
-		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: "local-fixture", Profile: c.Profile, ModelID: c.Model, State: "available"}
+		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: nodeID, Profile: c.Profile, ModelID: c.Model, State: "available", Bid: c.Bid}
 		reply, err := client.Poll(ctx, h)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "fixture heartbeat:", err)
+			fmt.Fprintln(os.Stderr, "heartbeat:", err)
 		} else if reply.Lease != nil {
 			code, err := submitLease(ctx, client, c, *reply.Lease)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "fixture submit:", err)
-			} else {
+				fmt.Fprintln(os.Stderr, "submit:", err)
+			} else if c.LocalFixture {
 				fmt.Printf("fixture job %s: %s\n", reply.Lease.JobID, map[bool]string{true: "failed (" + code + ")", false: "submitted"}[code != ""])
 			}
 		}
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-time.After(time.Second):
-		}
-	}
-	return nil
-}
-
-func run(c config.Config) error {
-	if c.LocalFixture {
-		return runFixture(c)
-	}
-	id, err := loadIdentity(c)
-	if err != nil {
-		return err
-	}
-	client := coordinator.New(c.Coordinator, id.Credential)
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
-	defer stop()
-	for ctx.Err() == nil {
-		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: id.NodeID, Profile: c.Profile, ModelID: c.Model, State: "available"}
-		reply, err := client.Poll(ctx, h)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "heartbeat:", err)
-		} else if reply.Lease != nil {
-			if _, err := submitLease(ctx, client, c, *reply.Lease); err != nil {
-				fmt.Fprintln(os.Stderr, "submit:", err)
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(5 * time.Second):
+		case <-time.After(wait):
 		}
 	}
 	return nil

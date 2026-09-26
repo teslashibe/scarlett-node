@@ -18,7 +18,7 @@ func TestOrigins(t *testing.T) {
 			t.Fatalf("accepted coordinator %s", bad)
 		}
 	}
-	local := Config{Coordinator: "http://host.docker.internal:8091", Executor: ExecutorGateway, Gateway: "http://agent1-gateway:8088", Model: "gpt-5.6-terra", Profile: "local-fixture", StateDir: filepath.Join(t.TempDir(), "state"), GatewayKey: "local-fixture-key-at-least-32-bytes-long", LocalFixture: true, InferenceTimeout: time.Second, MaxInputBytes: 32, MaxOutputTokens: 128}
+	local := Config{Coordinator: "http://host.docker.internal:8091", Executor: ExecutorGateway, Gateway: "http://agent1-gateway:8088", Model: "gpt-5.6-terra", Profile: "local-fixture", StateDir: filepath.Join(t.TempDir(), "state"), NodeID: "terra", Credential: "local-sim-terra-credential-not-a-wallet", LocalFixture: true, InferenceTimeout: time.Second, MaxInputBytes: 32, MaxOutputTokens: 128}
 	if err := local.Validate(); err != nil {
 		t.Fatalf("local Docker fixture rejected: %v", err)
 	}
@@ -30,6 +30,11 @@ func TestOrigins(t *testing.T) {
 	if err := local.Validate(); err != nil {
 		t.Fatalf("agent2 fixture rejected: %v", err)
 	}
+	local.Credential = ""
+	if local.Validate() == nil {
+		t.Fatal("accepted local fixture without a node credential")
+	}
+	local.Credential = "local-sim-terra-credential-not-a-wallet"
 	local.LocalFixture = false
 	if local.Validate() == nil {
 		t.Fatal("accepted plaintext Docker services outside local fixture")
@@ -59,7 +64,7 @@ func TestCodexTLSN(t *testing.T) {
 	if c.Validate() == nil {
 		t.Fatal("accepted unknown executor")
 	}
-	local := Config{Coordinator: "http://host.docker.internal:8091", Executor: ExecutorCodexTLSN, Verifier: "verifier:7047", Prover: "scarlett-prover", Model: "gpt-5.6-terra", Profile: "local-fixture", StateDir: filepath.Join(t.TempDir(), "state"), GatewayKey: "local-fixture-key-at-least-32-bytes-long", LocalFixture: true, InferenceTimeout: time.Second, MaxInputBytes: 32, MaxOutputTokens: 128}
+	local := Config{Coordinator: "http://host.docker.internal:8091", Executor: ExecutorCodexTLSN, Verifier: "verifier:7047", Prover: "scarlett-prover", Model: "gpt-5.6-terra", Profile: "local-fixture", StateDir: filepath.Join(t.TempDir(), "state"), NodeID: "terra", Credential: "local-sim-terra-credential-not-a-wallet", LocalFixture: true, InferenceTimeout: time.Second, MaxInputBytes: 32, MaxOutputTokens: 128}
 	if err := local.Validate(); err != nil {
 		t.Fatalf("local TLSN fixture rejected: %v", err)
 	}
