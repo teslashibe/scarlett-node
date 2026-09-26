@@ -1,0 +1,149 @@
+openapi: 3.0.3
+info:
+  title: Scarlett supplier node wire API
+  version: node-v1
+  description: >-
+    Portable proposed supplier/coordinator contract. The coordinator must authenticate bearer
+    credentials, atomically fence attempts, validate input and output hashes, and commit signed job IDs
+    before issuing leases; these server behaviors are not implemented in this repository.
+servers:
+  - url: https://coordinator.example
+paths:
+  /api/node/v1/pair:
+    post:
+      summary: Exchange a one-time code for a node-scoped credential
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version, code, profile, model_id]
+              properties:
+                version: {type: string, enum: [node-v1]}
+                code: {type: string}
+                profile: {type: string}
+                model_id: {type: string}
+      responses:
+        '200':
+          description: Paired; credential is shown once
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PairReply'}
+  /api/node/v1/heartbeat:
+    post:
+      security: [{nodeBearer: []}]
+      summary: Report availability and poll for at most one lease
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Heartbeat'}
+      responses:
+        '200':
+          description: Lease or null; no implicit acceptance
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [lease]
+                properties:
+                  lease:
+                    nullable: true
+                    allOf: [{$ref: '#/components/schemas/Lease'}]
+  /api/node/v1/jobs/{job_id}/result:
+    post:
+      security: [{nodeBearer: []}]
+      parameters: [{$ref: '#/components/parameters/JobID'}]
+      summary: Submit result for exact live attempt and fence, once
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Result'}
+      responses:
+        '200': {description: Accepted and committed once}
+        '409': {description: Expired, duplicate or fenced; not rewardable}
+  /api/node/v1/jobs/{job_id}/fail:
+    post:
+      security: [{nodeBearer: []}]
+      parameters: [{$ref: '#/components/parameters/JobID'}]
+      summary: Report nonrewardable attempt failure
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Failure'}
+      responses:
+        '200': {description: Failure recorded}
+        '409': {description: Expired or fenced}
+components:
+  securitySchemes:
+    nodeBearer: {type: http, scheme: bearer}
+  parameters:
+    JobID:
+      name: job_id
+      in: path
+      required: true
+      schema: {type: string, maxLength: 128}
+  schemas:
+    PairReply:
+      type: object
+      required: [version, node_id, supplier_pubkey, credential]
+      properties:
+        version: {type: string, enum: [node-v1]}
+        node_id: {type: string}
+        supplier_pubkey: {type: string}
+        credential: {type: string}
+    Heartbeat:
+      type: object
+      required: [version, node_id, profile, model_id, state]
+      properties:
+        version: {type: string, enum: [node-v1]}
+        node_id: {type: string}
+        profile: {type: string}
+        model_id: {type: string}
+        state: {type: string, enum: [available]}
+    Lease:
+      type: object
+      description: Job ID and signed_job_id are issued/committed server-side before lease; client does not cryptographically verify signed_job_id yet.
+      required: [version, job_id, signed_job_id, profile, model_id, prompt, max_input_tokens, max_output_tokens, input_sha256, attempt, fence, lease_deadline, settlement_deadline]
+      properties:
+        version: {type: string, enum: [node-v1]}
+        job_id: {type: string}
+        signed_job_id: {type: string, description: Coordinator-issued signed job commitment; not cryptographically verified by v1 node.}
+        profile: {type: string}
+        model_id: {type: string}
+        prompt: {type: string}
+        max_input_tokens: {type: integer, minimum: 1}
+        max_output_tokens: {type: integer, minimum: 1}
+        input_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        attempt: {type: string}
+        fence: {type: string}
+        lease_deadline: {type: string, format: date-time}
+        settlement_deadline: {type: string, format: date-time}
+    Result:
+      type: object
+      description: Rewardable only when usage_available is true and server independently validates the attempt, model, usage and hashes.
+      required: [version, job_id, attempt, fence, input_sha256, output_sha256, output, resolved_model_id, input_tokens, output_tokens, duration_ms, usage_available]
+      properties:
+        version: {type: string, enum: [node-v1]}
+        job_id: {type: string}
+        attempt: {type: string}
+        fence: {type: string}
+        input_sha256: {type: string}
+        output_sha256: {type: string}
+        output: {type: string}
+        resolved_model_id: {type: string}
+        input_tokens: {type: integer, minimum: 1}
+        output_tokens: {type: integer, minimum: 1}
+        duration_ms: {type: integer, minimum: 0}
+        usage_available: {type: boolean, enum: [true]}
+    Failure:
+      type: object
+      required: [version, attempt, fence, code]
+      properties:
+        version: {type: string, enum: [node-v1]}
+        attempt: {type: string}
+        fence: {type: string}
+        code: {type: string, enum: [invalid_lease, expired, gateway_error, invalid_gateway_response, usage_unavailable, usage_out_of_bounds]}

@@ -1,0 +1,121 @@
+package worker
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"io"
+	"net/http"
+	"time"
+	"unicode/utf8"
+
+	"github.com/teslashibe/scarlett-node/internal/config"
+	"github.com/teslashibe/scarlett-node/internal/coordinator"
+)
+
+type Gateway struct {
+	Config config.Config
+	HTTP   *http.Client
+}
+
+func New(c config.Config) *Gateway {
+	return &Gateway{Config: c, HTTP: &http.Client{Timeout: c.InferenceTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+}
+func SHA(s string) string { h := sha256.Sum256([]byte(s)); return hex.EncodeToString(h[:]) }
+func (g *Gateway) Run(ctx context.Context, l coordinator.Lease) (coordinator.Result, string) {
+	r := coordinator.Result{Version: coordinator.Version, JobID: l.JobID, Attempt: l.Attempt, Fence: l.Fence, InputSHA256: l.InputSHA256}
+	fail := func(code string) (coordinator.Result, string) { return r, code }
+	c := g.Config
+	if l.Version != coordinator.Version || l.JobID == "" || l.SignedJobID == "" || l.Attempt == "" || l.Fence == "" || l.InputSHA256 == "" || l.ModelID != c.Model || l.Profile != c.Profile || l.MaxInputTokens < 1 || l.MaxOutputTokens < 1 || l.MaxOutputTokens > c.MaxOutputTokens || !utf8.ValidString(l.Prompt) || len(l.Prompt) > c.MaxInputBytes || SHA(l.Prompt) != l.InputSHA256 {
+		return fail("invalid_lease")
+	}
+	// The local gateway ignores max_tokens: the local fixture is for
+	// observing usage, not for enforcing a pre-execution supplier cost cap.
+	if c.LocalFixture && (len(l.Prompt) > 32 || l.MaxInputTokens > 32000) {
+		return fail("invalid_lease")
+	}
+	// A byte cap is not a tokenizer: require the coordinator's explicit token cap,
+	// and reject oversized bytes. Exact input tokens must come from the gateway.
+	now := time.Now()
+	if !l.LeaseDeadline.After(now) || !l.SettlementDeadline.After(now) {
+		return fail("expired")
+	}
+	deadline := l.LeaseDeadline
+	if l.SettlementDeadline.Before(deadline) {
+		deadline = l.SettlementDeadline
+	}
+	if c.InferenceTimeout < time.Until(deadline) {
+		deadline = now.Add(c.InferenceTimeout)
+	}
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	payload, _ := json.Marshal(struct {
+		Model    string `json:"model"`
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+		MaxTokens int  `json:"max_tokens"`
+		Stream    bool `json:"stream"`
+	}{Model: c.Model, Messages: []struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}{{Role: "user", Content: l.Prompt}}, MaxTokens: l.MaxOutputTokens})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Gateway+"/v1/chat/completions", bytes.NewReader(payload))
+	if err != nil {
+		return fail("gateway_error")
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.GatewayKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.GatewayKey)
+	}
+	start := time.Now()
+	resp, err := g.HTTP.Do(req)
+	if err != nil {
+		return fail("gateway_error")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fail("gateway_error")
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 131073))
+	if err != nil || len(data) > 131072 {
+		return fail("gateway_error")
+	}
+	var answer struct {
+		Model   string `json:"model"`
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage *struct {
+			PromptTokens     *int `json:"prompt_tokens"`
+			CompletionTokens *int `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(data, &answer) != nil || answer.Model != l.ModelID || len(answer.Choices) != 1 || answer.Choices[0].FinishReason != "stop" || answer.Choices[0].Message.Content == "" || !utf8.ValidString(answer.Choices[0].Message.Content) {
+		return fail("invalid_gateway_response")
+	}
+	if answer.Usage == nil || answer.Usage.PromptTokens == nil || answer.Usage.CompletionTokens == nil {
+		return fail("usage_unavailable")
+	}
+	in, out := *answer.Usage.PromptTokens, *answer.Usage.CompletionTokens
+	if in < 1 || out < 1 || in > l.MaxInputTokens || out > l.MaxOutputTokens {
+		return fail("usage_out_of_bounds")
+	}
+	if ctx.Err() != nil || !time.Now().Before(l.LeaseDeadline) || !time.Now().Before(l.SettlementDeadline) {
+		return fail("expired")
+	}
+	r.Output = answer.Choices[0].Message.Content
+	r.OutputSHA256 = SHA(r.Output)
+	r.ResolvedModelID = answer.Model
+	r.InputTokens = in
+	r.OutputTokens = out
+	r.DurationMS = time.Since(start).Milliseconds()
+	r.UsageAvailable = true
+	return r, ""
+}
