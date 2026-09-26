@@ -3,6 +3,7 @@ package coordinator
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,8 +48,10 @@ type Result struct {
 	ResolvedModelID string `json:"resolved_model_id"`
 	InputTokens     int    `json:"input_tokens"`
 	OutputTokens    int    `json:"output_tokens"`
-	DurationMS      int64  `json:"duration_ms"`
+	DurationMS      int64  `json:"duration_ms"` // Diagnostic only; never reward latency.
 	UsageAvailable  bool   `json:"usage_available"`
+	UsageSource     string `json:"usage_source"`
+	ExecutionMode   string `json:"execution_mode"`
 }
 type Failure struct {
 	Version string `json:"version"`
@@ -64,10 +67,80 @@ type Heartbeat struct {
 	State   string `json:"state"`
 }
 
+type Challenge struct {
+	Version   string    `json:"version"`
+	Nonce     string    `json:"nonce"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+type ChallengeEcho struct {
+	Version string `json:"version"`
+	NodeID  string `json:"node_id"`
+	Nonce   string `json:"nonce"`
+}
+
+type HeartbeatReply struct {
+	Lease     *Lease     `json:"lease"`
+	Challenge *Challenge `json:"challenge,omitempty"`
+}
+
+// Poll echoes an app-issued challenge before returning any lease to inference.
+// The app owns single-use validation and RTT timing; the node supplies no duration.
+func (c *Client) Poll(ctx context.Context, h Heartbeat) (HeartbeatReply, error) {
+	var reply HeartbeatReply
+	status, err := c.Post(ctx, "/api/node/v1/heartbeat", h, &reply)
+	if err != nil {
+		return HeartbeatReply{}, err
+	}
+	if status != http.StatusOK {
+		return HeartbeatReply{}, errors.New("unexpected heartbeat status")
+	}
+	if reply.Challenge == nil {
+		return reply, nil
+	}
+	challenge := reply.Challenge
+	origin, err := url.Parse(c.Origin)
+	if err != nil || !c.allowEcho(origin) || h.NodeID == "" || h.Version != Version {
+		return HeartbeatReply{}, errors.New("challenge echo is not allowed for this coordinator")
+	}
+	nonce, err := hex.DecodeString(challenge.Nonce)
+	if err != nil || len(nonce) != 32 || hex.EncodeToString(nonce) != challenge.Nonce || challenge.Version != Version || !challenge.ExpiresAt.After(time.Now()) {
+		return HeartbeatReply{}, errors.New("invalid or expired challenge")
+	}
+	echoCtx, cancel := context.WithDeadline(ctx, challenge.ExpiresAt)
+	defer cancel()
+	status, err = c.Post(echoCtx, "/api/node/v1/challenge/echo", ChallengeEcho{Version: Version, NodeID: h.NodeID, Nonce: challenge.Nonce}, nil)
+	if err != nil {
+		return HeartbeatReply{}, err
+	}
+	if status != http.StatusNoContent {
+		return HeartbeatReply{}, errors.New("unexpected challenge echo status")
+	}
+	return reply, nil
+}
+
 type Client struct {
-	Origin     string
-	Credential string
-	HTTP       *http.Client
+	Origin              string
+	Credential          string
+	EchoUnqualifiedHTTP bool
+	HTTP                *http.Client
+}
+
+func (c *Client) allowEcho(origin *url.URL) bool {
+	if c == nil || origin == nil || c.Credential == "" {
+		return false
+	}
+	host := origin.Hostname()
+	switch {
+	case origin.Scheme == "https":
+		return true
+	case origin.Scheme == "http" && c.EchoUnqualifiedHTTP:
+		return true
+	case origin.Scheme == "http" && (host == "127.0.0.1" || host == "localhost" || host == "::1"):
+		return true
+	default:
+		return false
+	}
 }
 
 func New(origin, credential string) *Client {

@@ -128,15 +128,13 @@ func loadIdentity(c config.Config) (identity, error) {
 }
 func runFixture(c config.Config) error {
 	client := coordinator.New(c.Coordinator, c.GatewayKey)
+	client.EchoUnqualifiedHTTP = true
 	gateway := worker.New(c)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 	for ctx.Err() == nil {
 		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: "local-fixture", Profile: c.Profile, ModelID: c.Model, State: "available"}
-		var reply struct {
-			Lease *coordinator.Lease `json:"lease"`
-		}
-		_, err := client.Post(ctx, "/api/node/v1/heartbeat", h, &reply)
+		reply, err := client.Poll(ctx, h)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "fixture heartbeat:", err)
 		} else if reply.Lease != nil {
@@ -182,10 +180,7 @@ func run(c config.Config) error {
 	defer stop()
 	for ctx.Err() == nil {
 		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: id.NodeID, Profile: c.Profile, ModelID: c.Model, State: "available"}
-		var reply struct {
-			Lease *coordinator.Lease `json:"lease"`
-		}
-		_, err := client.Post(ctx, "/api/node/v1/heartbeat", h, &reply)
+		reply, err := client.Poll(ctx, h)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "heartbeat:", err)
 		} else if reply.Lease != nil {

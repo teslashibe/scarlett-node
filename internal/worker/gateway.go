@@ -25,7 +25,10 @@ func New(c config.Config) *Gateway {
 }
 func SHA(s string) string { h := sha256.Sum256([]byte(s)); return hex.EncodeToString(h[:]) }
 func (g *Gateway) Run(ctx context.Context, l coordinator.Lease) (coordinator.Result, string) {
-	r := coordinator.Result{Version: coordinator.Version, JobID: l.JobID, Attempt: l.Attempt, Fence: l.Fence, InputSHA256: l.InputSHA256}
+	r := coordinator.Result{Version: coordinator.Version, JobID: l.JobID, Attempt: l.Attempt, Fence: l.Fence, InputSHA256: l.InputSHA256, UsageSource: "unknown", ExecutionMode: "paid"}
+	if g.Config.LocalFixture {
+		r.ExecutionMode = "unpaid_local_demo"
+	}
 	fail := func(code string) (coordinator.Result, string) { return r, code }
 	c := g.Config
 	if l.Version != coordinator.Version || l.JobID == "" || l.SignedJobID == "" || l.Attempt == "" || l.Fence == "" || l.InputSHA256 == "" || l.ModelID != c.Model || l.Profile != c.Profile || l.MaxInputTokens < 1 || l.MaxOutputTokens < 1 || l.MaxOutputTokens > c.MaxOutputTokens || !utf8.ValidString(l.Prompt) || len(l.Prompt) > c.MaxInputBytes || SHA(l.Prompt) != l.InputSHA256 {
@@ -92,7 +95,8 @@ func (g *Gateway) Run(ctx context.Context, l coordinator.Lease) (coordinator.Res
 			} `json:"message"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
-		Usage *struct {
+		UsageSource string `json:"usage_source"`
+		Usage       *struct {
 			PromptTokens     *int `json:"prompt_tokens"`
 			CompletionTokens *int `json:"completion_tokens"`
 		} `json:"usage"`
@@ -102,6 +106,9 @@ func (g *Gateway) Run(ctx context.Context, l coordinator.Lease) (coordinator.Res
 	}
 	if answer.Usage == nil || answer.Usage.PromptTokens == nil || answer.Usage.CompletionTokens == nil {
 		return fail("usage_unavailable")
+	}
+	if answer.UsageSource != "upstream" && !c.LocalFixture {
+		return fail("usage_untrusted")
 	}
 	in, out := *answer.Usage.PromptTokens, *answer.Usage.CompletionTokens
 	if in < 1 || out < 1 || in > l.MaxInputTokens || out > l.MaxOutputTokens {
@@ -117,5 +124,8 @@ func (g *Gateway) Run(ctx context.Context, l coordinator.Lease) (coordinator.Res
 	r.OutputTokens = out
 	r.DurationMS = time.Since(start).Milliseconds()
 	r.UsageAvailable = true
+	if answer.UsageSource == "upstream" {
+		r.UsageSource = "upstream"
+	}
 	return r, ""
 }

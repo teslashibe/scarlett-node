@@ -48,9 +48,33 @@ paths:
                 type: object
                 required: [lease]
                 properties:
+                  challenge:
+                    $ref: '#/components/schemas/Challenge'
                   lease:
                     nullable: true
                     allOf: [{$ref: '#/components/schemas/Lease'}]
+  /api/node/v1/challenge/echo:
+    post:
+      security: [{nodeBearer: []}]
+      summary: Immediately echo the heartbeat challenge before inference
+      description: >-
+        No provider call or node-reported time. App starts a monotonic timer when sending the
+        challenge in the heartbeat response and stops at authenticated echo receipt. App must
+        bind a cryptographically random 32-byte nonce to the authenticated node and credential,
+        enforce expiry and atomic single use, and reject cross-node, replayed or unknown nonces.
+        No automatic echo retry after an ambiguous response. Use a small rolling median of fresh
+        successful samples; expire stale scores and award no bonus without a fresh valid sample.
+        RTT includes HTTP handling, not inference, and does not prove co-location or resist relays.
+        Disable bonuses unless proxy/relay gaming is acceptable. Local HTTP demos cannot qualify.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ChallengeEcho'}
+      responses:
+        '204': {description: Authenticated single-use echo recorded}
+        '401': {description: Invalid or revoked node credential}
+        '409': {description: Unknown, expired, replayed or wrong-node nonce}
   /api/node/v1/jobs/{job_id}/result:
     post:
       security: [{nodeBearer: []}]
@@ -104,6 +128,21 @@ components:
         profile: {type: string}
         model_id: {type: string}
         state: {type: string, enum: [available]}
+    Challenge:
+      type: object
+      required: [version, nonce, expires_at]
+      properties:
+        version: {type: string, enum: [node-v1]}
+        nonce: {type: string, pattern: '^[0-9a-f]{64}$', description: App-generated random 32-byte nonce; never supplied by a job.}
+        expires_at: {type: string, format: date-time, description: App-enforced freshness deadline; node rejects locally expired challenges.}
+    ChallengeEcho:
+      type: object
+      required: [version, node_id, nonce]
+      additionalProperties: false
+      properties:
+        version: {type: string, enum: [node-v1]}
+        node_id: {type: string, description: Must match the authenticated credential owner.}
+        nonce: {type: string, pattern: '^[0-9a-f]{64}$'}
     Lease:
       type: object
       description: Job ID and signed_job_id are issued/committed server-side before lease; client does not cryptographically verify signed_job_id yet.
@@ -124,8 +163,12 @@ components:
         settlement_deadline: {type: string, format: date-time}
     Result:
       type: object
-      description: Rewardable only when usage_available is true and server independently validates the attempt, model, usage and hashes.
-      required: [version, job_id, attempt, fence, input_sha256, output_sha256, output, resolved_model_id, input_tokens, output_tokens, duration_ms, usage_available]
+      description: >-
+        Paid mode requires usage_source upstream. unpaid_local_demo is a local fixture marker.
+        The current app may record it as simulated Scarlett SCT and must not treat that as an
+        on-chain mint. Source is forwarded from the gateway, not authenticated provider evidence.
+        duration_ms is never reward latency.
+      required: [version, job_id, attempt, fence, input_sha256, output_sha256, output, resolved_model_id, input_tokens, output_tokens, duration_ms, usage_available, usage_source, execution_mode]
       properties:
         version: {type: string, enum: [node-v1]}
         job_id: {type: string}
@@ -137,8 +180,10 @@ components:
         resolved_model_id: {type: string}
         input_tokens: {type: integer, minimum: 1}
         output_tokens: {type: integer, minimum: 1}
-        duration_ms: {type: integer, minimum: 0}
+        duration_ms: {type: integer, minimum: 0, description: Node-observed gateway request duration; diagnostic only, never reward latency.}
         usage_available: {type: boolean, enum: [true]}
+        usage_source: {type: string, enum: [upstream, unknown], description: Only upstream can qualify in paid mode; missing or other gateway sources normalize to unknown in unpaid demos.}
+        execution_mode: {type: string, enum: [paid, unpaid_local_demo], description: Paid mode requires upstream usage. unpaid_local_demo may be recorded only as simulated Scarlett SCT.}
     Failure:
       type: object
       required: [version, attempt, fence, code]
@@ -146,4 +191,4 @@ components:
         version: {type: string, enum: [node-v1]}
         attempt: {type: string}
         fence: {type: string}
-        code: {type: string, enum: [invalid_lease, expired, gateway_error, invalid_gateway_response, usage_unavailable, usage_out_of_bounds]}
+        code: {type: string, enum: [invalid_lease, expired, gateway_error, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds]}
