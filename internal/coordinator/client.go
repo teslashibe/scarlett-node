@@ -36,6 +36,17 @@ type Lease struct {
 	Fence              string    `json:"fence"`
 	LeaseDeadline      time.Time `json:"lease_deadline"`
 	SettlementDeadline time.Time `json:"settlement_deadline"`
+	// Set for proven Codex jobs: the exact request to send and a single-use
+	// token for the verifier configured locally in SCARLETT_VERIFIER.
+	CodexPayload  json.RawMessage `json:"codex_payload,omitempty"`
+	VerifierToken string          `json:"verifier_token,omitempty"`
+}
+
+// Proven tells the coordinator a proof was sent; it reads the answer from the verifier.
+type Proven struct {
+	Version string `json:"version"`
+	Attempt string `json:"attempt"`
+	Fence   string `json:"fence"`
 }
 type Result struct {
 	Version         string `json:"version"`

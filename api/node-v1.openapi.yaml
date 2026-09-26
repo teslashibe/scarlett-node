@@ -88,6 +88,22 @@ paths:
       responses:
         '200': {description: Accepted and committed once}
         '409': {description: Expired, duplicate or fenced; not rewardable}
+  /api/node/v1/jobs/{job_id}/proven:
+    post:
+      security: [{nodeBearer: []}]
+      parameters: [{$ref: '#/components/parameters/JobID'}]
+      summary: Report that a Codex proof was sent to the assigned verifier
+      description: >-
+        The node does not submit the answer. The coordinator reads model, output, and usage
+        from the verifier after this call. A supplier copy of the output is not accepted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Proven'}
+      responses:
+        '200': {description: Verifier result accepted and committed once}
+        '409': {description: Expired, duplicate, fenced, rejected, or proof not ready}
   /api/node/v1/jobs/{job_id}/fail:
     post:
       security: [{nodeBearer: []}]
@@ -145,7 +161,11 @@ components:
         nonce: {type: string, pattern: '^[0-9a-f]{64}$'}
     Lease:
       type: object
-      description: Job ID and signed_job_id are issued/committed server-side before lease; client does not cryptographically verify signed_job_id yet.
+      description: >-
+        Job ID and signed_job_id are issued/committed server-side before lease; client does not
+        cryptographically verify signed_job_id yet. codex_payload and verifier_token are set only
+        for proven Codex jobs. The node proves that request to the locally configured verifier;
+        the coordinator reads the answer from the verifier, not from this node.
       required: [version, job_id, signed_job_id, profile, model_id, prompt, max_input_tokens, max_output_tokens, input_sha256, attempt, fence, lease_deadline, settlement_deadline]
       properties:
         version: {type: string, enum: [node-v1]}
@@ -161,6 +181,13 @@ components:
         fence: {type: string}
         lease_deadline: {type: string, format: date-time}
         settlement_deadline: {type: string, format: date-time}
+        codex_payload:
+          type: object
+          description: Exact Codex response.create the node must send. Required with verifier_token for proven jobs.
+        verifier_token:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Single-use token for the verifier configured in SCARLETT_VERIFIER. Not a login secret.
     Result:
       type: object
       description: >-
@@ -184,6 +211,15 @@ components:
         usage_available: {type: boolean, enum: [true]}
         usage_source: {type: string, enum: [upstream, unknown], description: Only upstream can qualify in paid mode; missing or other gateway sources normalize to unknown in unpaid demos.}
         execution_mode: {type: string, enum: [paid, unpaid_local_demo], description: Paid mode requires upstream usage. unpaid_local_demo may be recorded only as simulated Scarlett SCT.}
+    Proven:
+      type: object
+      description: Proof was sent. The coordinator reads the answer from the verifier.
+      required: [version, attempt, fence]
+      additionalProperties: false
+      properties:
+        version: {type: string, enum: [node-v1]}
+        attempt: {type: string}
+        fence: {type: string}
     Failure:
       type: object
       required: [version, attempt, fence, code]
@@ -191,4 +227,4 @@ components:
         version: {type: string, enum: [node-v1]}
         attempt: {type: string}
         fence: {type: string}
-        code: {type: string, enum: [invalid_lease, expired, gateway_error, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds]}
+        code: {type: string, enum: [invalid_lease, expired, gateway_error, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds, prover_error]}

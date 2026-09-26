@@ -11,8 +11,17 @@ import (
 	"time"
 )
 
+const (
+	ExecutorGateway   = "gateway"
+	ExecutorCodexTLSN = "codex-tlsn"
+)
+
 type Config struct {
-	Coordinator      string
+	Coordinator string
+	// Executor is "gateway" (reported usage) or "codex-tlsn" (Codex job proven to a verifier).
+	Executor         string
+	Verifier         string
+	Prover           string
 	Gateway          string
 	Model            string
 	Profile          string
@@ -29,9 +38,15 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	c := Config{Coordinator: os.Getenv("SCARLETT_COORDINATOR"), Gateway: os.Getenv("SCARLETT_GATEWAY"), Model: os.Getenv("SCARLETT_MODEL"), Profile: os.Getenv("SCARLETT_PROFILE"), StateDir: os.Getenv("SCARLETT_STATE_DIR"), GatewayKey: os.Getenv("SCARLETT_GATEWAY_KEY"), LocalFixture: os.Getenv("SCARLETT_LOCAL_FIXTURE") == "1", InferenceTimeout: 45 * time.Second, MaxInputBytes: 32768, MaxOutputTokens: 2048}
+	c := Config{Coordinator: os.Getenv("SCARLETT_COORDINATOR"), Executor: os.Getenv("SCARLETT_EXECUTOR"), Verifier: os.Getenv("SCARLETT_VERIFIER"), Prover: os.Getenv("SCARLETT_PROVER"), Gateway: os.Getenv("SCARLETT_GATEWAY"), Model: os.Getenv("SCARLETT_MODEL"), Profile: os.Getenv("SCARLETT_PROFILE"), StateDir: os.Getenv("SCARLETT_STATE_DIR"), GatewayKey: os.Getenv("SCARLETT_GATEWAY_KEY"), LocalFixture: os.Getenv("SCARLETT_LOCAL_FIXTURE") == "1", InferenceTimeout: 45 * time.Second, MaxInputBytes: 32768, MaxOutputTokens: 2048}
 	if c.StateDir == "" {
 		c.StateDir = filepath.Join(home, ".local", "state", "scarlett-node")
+	}
+	if c.Executor == "" {
+		c.Executor = ExecutorGateway
+	}
+	if c.Prover == "" {
+		c.Prover = "scarlett-prover"
 	}
 	if s := os.Getenv("SCARLETT_INFERENCE_TIMEOUT_SECONDS"); s != "" {
 		v, e := strconv.Atoi(s)
@@ -67,8 +82,16 @@ func (c Config) Validate() error {
 	if c.LocalFixture && (len(c.GatewayKey) < 32 || strings.Trim(c.GatewayKey, " ") == "") {
 		return errors.New("local fixture requires SCARLETT_GATEWAY_KEY with at least 32 characters")
 	}
-	if c.LocalFixture && (c.Coordinator != "http://host.docker.internal:8091" || c.Gateway != "http://agent1-gateway:8088" && c.Gateway != "http://agent2-gateway:8088" || c.Model != "gpt-5.6-terra" && c.Model != "gpt-5.6-sol" || c.Model == "gpt-5.6-terra" && c.Gateway != "http://agent1-gateway:8088" || c.Model == "gpt-5.6-sol" && c.Gateway != "http://agent2-gateway:8088") {
-		return errors.New("local fixture requires pinned Docker services and models")
+	if c.Executor != ExecutorGateway && c.Executor != ExecutorCodexTLSN {
+		return errors.New("SCARLETT_EXECUTOR must be gateway or codex-tlsn")
+	}
+	if c.LocalFixture {
+		pinnedGateway := map[string]string{"gpt-5.6-terra": "http://agent1-gateway:8088", "gpt-5.6-sol": "http://agent2-gateway:8088"}[c.Model]
+		if c.Coordinator != "http://host.docker.internal:8091" || pinnedGateway == "" ||
+			c.Executor == ExecutorGateway && c.Gateway != pinnedGateway ||
+			c.Executor == ExecutorCodexTLSN && c.Verifier != "verifier:7047" {
+			return errors.New("local fixture requires pinned Docker services and models")
+		}
 	}
 	if c.InferenceTimeout < time.Second || c.InferenceTimeout > 300*time.Second || c.MaxInputBytes < 1 || c.MaxInputBytes > 65536 || c.MaxOutputTokens < 1 || c.MaxOutputTokens > 8192 {
 		return errors.New("invalid limits")
@@ -79,6 +102,19 @@ func (c Config) Validate() error {
 	}
 	if u.Scheme != "https" && !(c.LocalFixture && u.Scheme == "http" && (u.Hostname() == "localhost" || u.Hostname() == "host.docker.internal" || net.ParseIP(u.Hostname()) != nil && net.ParseIP(u.Hostname()).IsLoopback())) {
 		return errors.New("SCARLETT_COORDINATOR must be HTTPS or explicit local fixture HTTP")
+	}
+	if c.StateDir == "" || !filepath.IsAbs(c.StateDir) {
+		return errors.New("state directory must be absolute")
+	}
+	if c.Executor == ExecutorCodexTLSN {
+		host, port, e := net.SplitHostPort(c.Verifier)
+		if e != nil || host == "" || port == "" {
+			return errors.New("SCARLETT_VERIFIER must be host:port")
+		}
+		if c.Prover == "" {
+			return errors.New("SCARLETT_PROVER required")
+		}
+		return nil
 	}
 	g, e := url.Parse(c.Gateway)
 	if e != nil || g.Host == "" || g.User != nil || g.RawQuery != "" || g.Fragment != "" || g.Path != "" {
@@ -96,9 +132,6 @@ func (c Config) Validate() error {
 		if host != "localhost" && (ip == nil || !ip.IsLoopback()) && !(c.LocalFixture && (host == "agent1-gateway" || host == "agent2-gateway")) {
 			return errors.New("HTTP gateway must be loopback or explicit local Docker fixture")
 		}
-	}
-	if c.StateDir == "" || !filepath.IsAbs(c.StateDir) {
-		return errors.New("state directory must be absolute")
 	}
 	return nil
 }

@@ -24,26 +24,22 @@ func New(c config.Config) *Gateway {
 	return &Gateway{Config: c, HTTP: &http.Client{Timeout: c.InferenceTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 }
 func SHA(s string) string { h := sha256.Sum256([]byte(s)); return hex.EncodeToString(h[:]) }
-func (g *Gateway) Run(ctx context.Context, l coordinator.Lease) (coordinator.Result, string) {
-	r := coordinator.Result{Version: coordinator.Version, JobID: l.JobID, Attempt: l.Attempt, Fence: l.Fence, InputSHA256: l.InputSHA256, UsageSource: "unknown", ExecutionMode: "paid"}
-	if g.Config.LocalFixture {
-		r.ExecutionMode = "unpaid_local_demo"
-	}
-	fail := func(code string) (coordinator.Result, string) { return r, code }
-	c := g.Config
+
+// checkLease validates untrusted lease fields and returns the inference deadline or a failure code.
+func checkLease(c config.Config, l coordinator.Lease) (time.Time, string) {
 	if l.Version != coordinator.Version || l.JobID == "" || l.SignedJobID == "" || l.Attempt == "" || l.Fence == "" || l.InputSHA256 == "" || l.ModelID != c.Model || l.Profile != c.Profile || l.MaxInputTokens < 1 || l.MaxOutputTokens < 1 || l.MaxOutputTokens > c.MaxOutputTokens || !utf8.ValidString(l.Prompt) || len(l.Prompt) > c.MaxInputBytes || SHA(l.Prompt) != l.InputSHA256 {
-		return fail("invalid_lease")
+		return time.Time{}, "invalid_lease"
 	}
 	// The local gateway ignores max_tokens: the local fixture is for
 	// observing usage, not for enforcing a pre-execution supplier cost cap.
 	if c.LocalFixture && (len(l.Prompt) > 32 || l.MaxInputTokens > 32000) {
-		return fail("invalid_lease")
+		return time.Time{}, "invalid_lease"
 	}
 	// A byte cap is not a tokenizer: require the coordinator's explicit token cap,
-	// and reject oversized bytes. Exact input tokens must come from the gateway.
+	// and reject oversized bytes. Exact input tokens must come from upstream.
 	now := time.Now()
 	if !l.LeaseDeadline.After(now) || !l.SettlementDeadline.After(now) {
-		return fail("expired")
+		return time.Time{}, "expired"
 	}
 	deadline := l.LeaseDeadline
 	if l.SettlementDeadline.Before(deadline) {
@@ -51,6 +47,19 @@ func (g *Gateway) Run(ctx context.Context, l coordinator.Lease) (coordinator.Res
 	}
 	if c.InferenceTimeout < time.Until(deadline) {
 		deadline = now.Add(c.InferenceTimeout)
+	}
+	return deadline, ""
+}
+func (g *Gateway) Run(ctx context.Context, l coordinator.Lease) (coordinator.Result, string) {
+	r := coordinator.Result{Version: coordinator.Version, JobID: l.JobID, Attempt: l.Attempt, Fence: l.Fence, InputSHA256: l.InputSHA256, UsageSource: "unknown", ExecutionMode: "paid"}
+	if g.Config.LocalFixture {
+		r.ExecutionMode = "unpaid_local_demo"
+	}
+	fail := func(code string) (coordinator.Result, string) { return r, code }
+	c := g.Config
+	deadline, code := checkLease(c, l)
+	if code != "" {
+		return fail(code)
 	}
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
