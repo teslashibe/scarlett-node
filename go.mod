@@ -1,8 +1,11 @@
 module github.com/teslashibe/scarlett-node
 
-go 1.24
+go 1.25.5
 
-require github.com/teslashibe/open-agent-api v0.1.27
+require (
+	github.com/teslashibe/open-agent-api v0.1.27
+	github.com/teslashibe/x-go v1.13.0
+)
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
