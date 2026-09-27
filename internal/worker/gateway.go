@@ -53,11 +53,48 @@ func checkLease(c config.Config, l coordinator.Lease) (time.Time, string) {
 	}
 	return deadline, ""
 }
-func (g *Gateway) Run(ctx context.Context, l coordinator.Lease) (coordinator.Result, string) {
+func newResult(c config.Config, l coordinator.Lease) coordinator.Result {
 	r := coordinator.Result{Version: coordinator.Version, JobID: l.JobID, Attempt: l.Attempt, Fence: l.Fence, InputSHA256: l.InputSHA256, UsageSource: "unknown", ExecutionMode: "paid"}
-	if g.Config.LocalFixture {
+	if c.LocalFixture {
 		r.ExecutionMode = "unpaid_local_demo"
 	}
+	return r
+}
+
+// finish validates an untrusted completion against the lease and records it on r.
+func finish(ctx context.Context, r coordinator.Result, l coordinator.Lease, start time.Time, model, text string, in, out int, cached *int, upstream bool) (coordinator.Result, string) {
+	// An effort/fast alias resolves to its base model upstream.
+	base, _ := config.Serves(l.ModelID)
+	if model != l.ModelID && model != base || text == "" || !utf8.ValidString(text) {
+		return r, "invalid_gateway_response"
+	}
+	if in < 1 || out < 1 || in > l.MaxInputTokens || out > l.MaxOutputTokens {
+		return r, "usage_out_of_bounds"
+	}
+	if cached != nil {
+		if *cached < 0 || *cached > in {
+			return r, "usage_out_of_bounds"
+		}
+		r.CachedInputTokens = cached
+	}
+	if ctx.Err() != nil || !time.Now().Before(l.LeaseDeadline) || !time.Now().Before(l.SettlementDeadline) {
+		return r, "expired"
+	}
+	r.Output = text
+	r.OutputSHA256 = SHA(text)
+	r.ResolvedModelID = model
+	r.InputTokens = in
+	r.OutputTokens = out
+	r.DurationMS = time.Since(start).Milliseconds()
+	r.UsageAvailable = true
+	if upstream {
+		r.UsageSource = "upstream"
+	}
+	return r, ""
+}
+
+func (g *Gateway) Run(ctx context.Context, l coordinator.Lease) (coordinator.Result, string) {
+	r := newResult(g.Config, l)
 	fail := func(code string) (coordinator.Result, string) { return r, code }
 	c := g.Config
 	deadline, code := checkLease(c, l)
@@ -122,9 +159,7 @@ func (g *Gateway) Run(ctx context.Context, l coordinator.Lease) (coordinator.Res
 			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
-	// An effort/fast alias resolves to its base model upstream.
-	base, _ := config.Serves(l.ModelID)
-	if json.Unmarshal(data, &answer) != nil || answer.Model != l.ModelID && answer.Model != base || len(answer.Choices) != 1 || answer.Choices[0].FinishReason != "stop" || answer.Choices[0].Message.Content == "" || !utf8.ValidString(answer.Choices[0].Message.Content) {
+	if json.Unmarshal(data, &answer) != nil || len(answer.Choices) != 1 || answer.Choices[0].FinishReason != "stop" {
 		return fail("invalid_gateway_response")
 	}
 	if answer.Usage == nil || answer.Usage.PromptTokens == nil || answer.Usage.CompletionTokens == nil {
@@ -133,28 +168,9 @@ func (g *Gateway) Run(ctx context.Context, l coordinator.Lease) (coordinator.Res
 	if answer.UsageSource != "upstream" && !c.LocalFixture {
 		return fail("usage_untrusted")
 	}
-	in, out := *answer.Usage.PromptTokens, *answer.Usage.CompletionTokens
-	if in < 1 || out < 1 || in > l.MaxInputTokens || out > l.MaxOutputTokens {
-		return fail("usage_out_of_bounds")
+	var cached *int
+	if d := answer.Usage.PromptDetails; d != nil {
+		cached = d.CachedTokens
 	}
-	if d := answer.Usage.PromptDetails; d != nil && d.CachedTokens != nil {
-		if *d.CachedTokens < 0 || *d.CachedTokens > in {
-			return fail("usage_out_of_bounds")
-		}
-		r.CachedInputTokens = d.CachedTokens
-	}
-	if ctx.Err() != nil || !time.Now().Before(l.LeaseDeadline) || !time.Now().Before(l.SettlementDeadline) {
-		return fail("expired")
-	}
-	r.Output = answer.Choices[0].Message.Content
-	r.OutputSHA256 = SHA(r.Output)
-	r.ResolvedModelID = answer.Model
-	r.InputTokens = in
-	r.OutputTokens = out
-	r.DurationMS = time.Since(start).Milliseconds()
-	r.UsageAvailable = true
-	if answer.UsageSource == "upstream" {
-		r.UsageSource = "upstream"
-	}
-	return r, ""
+	return finish(ctx, r, l, start, answer.Model, answer.Choices[0].Message.Content, *answer.Usage.PromptTokens, *answer.Usage.CompletionTokens, cached, answer.UsageSource == "upstream")
 }
