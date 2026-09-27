@@ -3,9 +3,10 @@
 //! Suppliers connect to the session port, send `<token>\n`, then run TLSNotary.
 //! Codex jobs use proxy mode: the verifier opens the connection to OpenAI
 //! itself and the token is single use. X reads (`x.read`) use MPC-TLS so the
-//! supplier's own connection reaches X; the token allows `max_exchanges`
-//! proven requests. The verifier records only what it verified; the
-//! coordinator reads that result, never the supplier's copy.
+//! supplier's own connection reaches X; the job pins every read it pays for,
+//! and the token allows `max_attempts` proofs until every pinned read is
+//! fulfilled. The verifier records only what it verified; the coordinator
+//! reads that result, never the supplier's copy.
 //!
 //! Environment: SCARLETT_VERIFIER_KEY (required, 32+ chars),
 //! SCARLETT_VERIFIER_LISTEN (default 0.0.0.0:7047), SCARLETT_VERIFIER_API
@@ -44,7 +45,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::{
     policy::{self, Verified},
-    xpolicy::{self, Exchange},
+    xpolicy::{self, Exchange, Spec},
     xprove::{MAX_RECV, MAX_SENT},
 };
 
@@ -71,7 +72,11 @@ enum Status {
     },
     Expired,
     XRead {
-        remaining: usize,
+        remaining_attempts: usize,
+        /// Every pinned exchange is fulfilled.
+        complete: bool,
+        /// Indexes of pinned exchanges not yet fulfilled.
+        pending: Vec<usize>,
         exchanges: Vec<XRecord>,
         rejections: Vec<String>,
     },
@@ -79,8 +84,15 @@ enum Status {
 
 #[derive(Clone, Serialize)]
 struct XRecord {
+    /// The pinned exchange this proof matched.
+    index: usize,
+    /// Whether this proof fulfilled it, which takes HTTP 200 with data.
+    fulfilled: bool,
     #[serde(flatten)]
     exchange: Exchange,
+    /// Next-page cursors in a fulfilling response, for exchanges that page on from it.
+    #[serde(skip)]
+    cursors: Vec<String>,
     sent_bytes: usize,
     received_bytes: usize,
     duration_ms: u64,
@@ -88,7 +100,7 @@ struct XRecord {
 
 enum Kind {
     Codex,
-    X(Vec<String>),
+    X(Arc<Vec<Spec>>),
 }
 
 struct Entry {
@@ -169,8 +181,10 @@ async fn create(State(shared): State<Shared>, headers: HeaderMap, Json(request):
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid job or attempt"})));
     }
     let validated = if request.payload["type"] == "x.read" {
-        xpolicy::validate_job(&request.payload).map(|(ops, max)| {
-            (Kind::X(ops), Status::XRead { remaining: max, exchanges: Vec::new(), rejections: Vec::new() })
+        xpolicy::validate_job(&request.payload).map(|(specs, max)| {
+            let pending = (0..specs.len()).collect();
+            let initial = Status::XRead { remaining_attempts: max, complete: false, pending, exchanges: Vec::new(), rejections: Vec::new() };
+            (Kind::X(Arc::new(specs)), initial)
         })
     } else {
         policy::validate_job(&request.payload).map(|_| (Kind::Codex, Status::Pending))
@@ -220,7 +234,7 @@ async fn status(
 
 enum Job {
     Codex(Value),
-    X(Vec<String>),
+    X(Arc<Vec<Spec>>),
 }
 
 async fn handle(shared: Shared, mut socket: TcpStream) -> Result<()> {
@@ -250,14 +264,20 @@ async fn handle(shared: Shared, mut socket: TcpStream) -> Result<()> {
                 entry.status = Status::Running;
                 Job::Codex(entry.payload.clone())
             }
-            Kind::X(ops) => {
-                let Status::XRead { remaining, .. } = &mut entry.status else { bail!("session is in an unexpected state") };
-                // Each connection spends one exchange; the token dies with the last one.
-                *remaining -= 1;
-                if *remaining == 0 {
+            Kind::X(specs) => {
+                let Status::XRead { remaining_attempts, complete, .. } = &mut entry.status else {
+                    bail!("session is in an unexpected state")
+                };
+                if *remaining_attempts == 0 || *complete {
+                    s.by_token.remove(token);
+                    bail!("x.read session has no attempts left");
+                }
+                // Each connection spends one attempt; the token dies with the last one.
+                *remaining_attempts -= 1;
+                if *remaining_attempts == 0 {
                     s.by_token.remove(token);
                 }
-                Job::X(ops.clone())
+                Job::X(specs.clone())
             }
         };
         (key, job)
@@ -282,25 +302,52 @@ async fn handle(shared: Shared, mut socket: TcpStream) -> Result<()> {
                 entry.status = status;
             }
         }
-        Job::X(ops) => {
-            let outcome = match tokio::time::timeout(config.session_limit, verify_x(socket, &ops)).await {
-                Ok(Ok(proven)) => Ok(proven),
+        Job::X(specs) => {
+            let outcome = match tokio::time::timeout(config.session_limit, verify_x(socket)).await {
+                // Parse the response before taking the lock that every session shares.
+                Ok(Ok((exchange, sent_bytes, received_bytes))) => Ok((xpolicy::outcome(&exchange), exchange, sent_bytes, received_bytes)),
                 Ok(Err(e)) => Err(format!("{e:#}")),
                 Err(_) => Err(timed_out()),
             };
-            match &outcome {
-                Ok((e, ..)) => println!("verifier: job {job_id} proved X {} (HTTP {})", e.operation, e.http_status),
-                Err(reason) => println!("verifier: job {job_id} rejected an X exchange: {reason}"),
-            }
-            if let Some(Entry { status: Status::XRead { exchanges, rejections, .. }, .. }) = sessions.lock().unwrap().by_job.get_mut(&key) {
-                match outcome {
-                    Ok((exchange, sent_bytes, received_bytes)) => exchanges.push(XRecord {
+            let mut guard = sessions.lock().unwrap();
+            let s = &mut *guard;
+            let Some(Entry { status: Status::XRead { complete, pending, exchanges, rejections, .. }, .. }) = s.by_job.get_mut(&key) else {
+                return Ok(());
+            };
+            // Match under the lock, so concurrent proofs of one exchange cannot both fulfil it.
+            let matched = outcome.and_then(|((fulfilled, cursors), exchange, sent_bytes, received_bytes)| {
+                let done: Vec<(usize, &[String])> = exchanges.iter().filter(|r| r.fulfilled).map(|r| (r.index, r.cursors.as_slice())).collect();
+                match xpolicy::assign(&specs, &done, &exchange) {
+                    Ok(index) => Ok(XRecord {
+                        index,
+                        fulfilled,
                         exchange,
+                        cursors,
                         sent_bytes,
                         received_bytes,
                         duration_ms: started.elapsed().as_millis() as u64,
                     }),
-                    Err(reason) => rejections.push(reason),
+                    Err(e) => Err(format!("{e:#}")),
+                }
+            });
+            match matched {
+                Ok(record) => {
+                    println!(
+                        "verifier: job {job_id} proved X {} for exchange {} (HTTP {})",
+                        record.exchange.operation, record.index, record.exchange.http_status
+                    );
+                    if record.fulfilled {
+                        pending.retain(|&i| i != record.index);
+                    }
+                    exchanges.push(record);
+                    if pending.is_empty() {
+                        *complete = true;
+                        s.by_token.retain(|_, k| *k != key);
+                    }
+                }
+                Err(reason) => {
+                    println!("verifier: job {job_id} rejected an X exchange: {reason}");
+                    rejections.push(reason);
                 }
             }
         }
@@ -316,12 +363,12 @@ async fn verify(socket: TcpStream, job: &Value, upstream: &str) -> Result<Verifi
 }
 
 /// Returns the verified exchange and the transcript's sent and received sizes.
-async fn verify_x(socket: TcpStream, operations: &[String]) -> Result<(Exchange, usize, usize)> {
+async fn verify_x(socket: TcpStream) -> Result<(Exchange, usize, usize)> {
     let (server_name, transcript) = prove_session(socket, None).await?;
     let sent_hidden: Vec<_> = transcript.sent_unauthed().iter().collect();
     let received_hidden: Vec<_> = transcript.received_unauthed().iter().collect();
     let (sent, received) = (transcript.sent_unsafe(), transcript.received_unsafe());
-    let exchange = xpolicy::check(&server_name, sent, &sent_hidden, received, &received_hidden, operations)?;
+    let exchange = xpolicy::check(&server_name, sent, &sent_hidden, received, &received_hidden)?;
     Ok((exchange, sent.len(), received.len()))
 }
 
