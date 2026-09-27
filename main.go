@@ -152,6 +152,14 @@ func run(c config.Config) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
+	var local worker.Completer
+	if c.Executor == config.ExecutorCodex {
+		cx, err := worker.NewCodex(c)
+		if err != nil {
+			return err
+		}
+		local = cx
+	}
 	capacity := max(c.Concurrency, 1)
 	slots := make(chan struct{}, capacity)
 	var running sync.WaitGroup
@@ -182,7 +190,7 @@ func run(c config.Config) error {
 			go func() {
 				defer running.Done()
 				defer func() { <-slots }()
-				code, err := submitLease(ctx, client, c, l)
+				code, err := submitLease(ctx, client, c, l, local)
 				if code == "capacity_unavailable" {
 					mu.Lock()
 					restUntil = time.Now().Add(capacityRest)
@@ -205,7 +213,7 @@ func run(c config.Config) error {
 	return nil
 }
 
-func submitLease(ctx context.Context, client *coordinator.Client, c config.Config, l coordinator.Lease) (string, error) {
+func submitLease(ctx context.Context, client *coordinator.Client, c config.Config, l coordinator.Lease, local worker.Completer) (string, error) {
 	var body any
 	path, err := coordinator.JobPath(l.JobID, "result")
 	code := ""
@@ -224,7 +232,11 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 		}
 	} else {
 		var result coordinator.Result
-		result, code = worker.New(c).Run(ctx, l)
+		if c.Executor == config.ExecutorCodex {
+			result, code = worker.Codex{Config: c, Client: local}.Run(ctx, l)
+		} else {
+			result, code = worker.New(c).Run(ctx, l)
+		}
 		body = result
 		if code != "" {
 			path, err = coordinator.JobPath(l.JobID, "fail")

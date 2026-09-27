@@ -14,21 +14,27 @@ import (
 const (
 	ExecutorGateway   = "gateway"
 	ExecutorCodexTLSN = "codex-tlsn"
+	ExecutorCodex     = "codex"
 )
 
 type Config struct {
 	Coordinator string
-	// Executor is "gateway" (reported usage) or "codex-tlsn" (Codex job proven to a verifier).
-	Executor   string
-	Verifier   string
-	Prover     string
-	Gateway    string
-	Profile    string
-	StateDir   string
-	GatewayKey string
-	Credential string
-	NodeID     string
-	Bid        int64
+	// Executor is "gateway" (reported usage from an HTTP gateway), "codex" (the same
+	// Codex client run in-process from this node's own login) or "codex-tlsn"
+	// (Codex job proven to a verifier).
+	Executor string
+	// CodexHome holds this node's `codex login` auth.json; CodexProfile and
+	// CodexScaffold are open-agent-api's codex_profile.json and codex_scaffold.json.
+	CodexHome, CodexProfile, CodexScaffold string
+	Verifier                               string
+	Prover                                 string
+	Gateway                                string
+	Profile                                string
+	StateDir                               string
+	GatewayKey                             string
+	Credential                             string
+	NodeID                                 string
+	Bid                                    int64
 	// Concurrency is how many leases the node runs at once. The default matches
 	// the local Open Agent API baseline of 20 in-flight requests per account.
 	Concurrency      int
@@ -53,7 +59,7 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	c := Config{Coordinator: os.Getenv("SCARLETT_COORDINATOR"), Executor: os.Getenv("SCARLETT_EXECUTOR"), Verifier: os.Getenv("SCARLETT_VERIFIER"), Prover: os.Getenv("SCARLETT_PROVER"), Gateway: os.Getenv("SCARLETT_GATEWAY"), Profile: os.Getenv("SCARLETT_PROFILE"), StateDir: os.Getenv("SCARLETT_STATE_DIR"), GatewayKey: os.Getenv("SCARLETT_GATEWAY_KEY"), Credential: os.Getenv("SCARLETT_CREDENTIAL"), NodeID: os.Getenv("SCARLETT_NODE_ID"), Bid: 100, LocalFixture: os.Getenv("SCARLETT_LOCAL_FIXTURE") == "1", InferenceTimeout: 45 * time.Second, MaxInputBytes: 32768, MaxOutputTokens: 2048}
+	c := Config{Coordinator: os.Getenv("SCARLETT_COORDINATOR"), Executor: os.Getenv("SCARLETT_EXECUTOR"), Verifier: os.Getenv("SCARLETT_VERIFIER"), Prover: os.Getenv("SCARLETT_PROVER"), Gateway: os.Getenv("SCARLETT_GATEWAY"), Profile: os.Getenv("SCARLETT_PROFILE"), StateDir: os.Getenv("SCARLETT_STATE_DIR"), GatewayKey: os.Getenv("SCARLETT_GATEWAY_KEY"), Credential: os.Getenv("SCARLETT_CREDENTIAL"), NodeID: os.Getenv("SCARLETT_NODE_ID"), CodexHome: os.Getenv("SCARLETT_CODEX_HOME"), CodexProfile: os.Getenv("SCARLETT_CODEX_PROFILE"), CodexScaffold: os.Getenv("SCARLETT_CODEX_SCAFFOLD"), Bid: 100, LocalFixture: os.Getenv("SCARLETT_LOCAL_FIXTURE") == "1", InferenceTimeout: 45 * time.Second, MaxInputBytes: 32768, MaxOutputTokens: 2048}
 	if s := os.Getenv("SCARLETT_BID"); s != "" {
 		v, e := strconv.ParseInt(s, 10, 64)
 		if e != nil || v < 0 || v > 1_000_000_000 {
@@ -69,6 +75,9 @@ func Load() (Config, error) {
 	}
 	if c.Prover == "" {
 		c.Prover = "scarlett-prover"
+	}
+	if c.CodexHome == "" {
+		c.CodexHome = filepath.Join(home, ".codex")
 	}
 	if s := os.Getenv("SCARLETT_INFERENCE_TIMEOUT_SECONDS"); s != "" {
 		v, e := strconv.Atoi(s)
@@ -132,8 +141,8 @@ func (c Config) Validate() error {
 	if c.LocalFixture && (c.NodeID == "" || strings.ContainsAny(c.NodeID, " \n\r\t") || len(c.Credential) < 32) {
 		return errors.New("local fixture requires SCARLETT_NODE_ID and SCARLETT_CREDENTIAL (at least 32 characters)")
 	}
-	if c.Executor != ExecutorGateway && c.Executor != ExecutorCodexTLSN {
-		return errors.New("SCARLETT_EXECUTOR must be gateway or codex-tlsn")
+	if c.Executor != ExecutorGateway && c.Executor != ExecutorCodex && c.Executor != ExecutorCodexTLSN {
+		return errors.New("SCARLETT_EXECUTOR must be gateway, codex or codex-tlsn")
 	}
 	if c.LocalFixture && (c.Coordinator != "http://host.docker.internal:8091" ||
 		c.Executor == ExecutorGateway && !fixtureGateway[c.Gateway] ||
@@ -152,6 +161,12 @@ func (c Config) Validate() error {
 	}
 	if c.StateDir == "" || !filepath.IsAbs(c.StateDir) {
 		return errors.New("state directory must be absolute")
+	}
+	if c.Executor == ExecutorCodex {
+		if !filepath.IsAbs(c.CodexHome) || !filepath.IsAbs(c.CodexProfile) || !filepath.IsAbs(c.CodexScaffold) {
+			return errors.New("codex executor requires absolute SCARLETT_CODEX_HOME, SCARLETT_CODEX_PROFILE and SCARLETT_CODEX_SCAFFOLD")
+		}
+		return nil
 	}
 	if c.Executor == ExecutorCodexTLSN {
 		host, port, e := net.SplitHostPort(c.Verifier)
