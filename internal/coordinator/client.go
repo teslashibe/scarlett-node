@@ -36,6 +36,17 @@ type Lease struct {
 	Fence              string    `json:"fence"`
 	LeaseDeadline      time.Time `json:"lease_deadline"`
 	SettlementDeadline time.Time `json:"settlement_deadline"`
+	// Set for proven Codex jobs: the exact request to send and a single-use
+	// token for the verifier configured locally in SCARLETT_VERIFIER.
+	CodexPayload  json.RawMessage `json:"codex_payload,omitempty"`
+	VerifierToken string          `json:"verifier_token,omitempty"`
+}
+
+// Proven tells the coordinator a proof was sent; it reads the answer from the verifier.
+type Proven struct {
+	Version string `json:"version"`
+	Attempt string `json:"attempt"`
+	Fence   string `json:"fence"`
 }
 type Result struct {
 	Version         string `json:"version"`
@@ -47,11 +58,13 @@ type Result struct {
 	Output          string `json:"output"`
 	ResolvedModelID string `json:"resolved_model_id"`
 	InputTokens     int    `json:"input_tokens"`
-	OutputTokens    int    `json:"output_tokens"`
-	DurationMS      int64  `json:"duration_ms"` // Diagnostic only; never reward latency.
-	UsageAvailable  bool   `json:"usage_available"`
-	UsageSource     string `json:"usage_source"`
-	ExecutionMode   string `json:"execution_mode"`
+	// CachedInputTokens is the reported cached subset of InputTokens; nil when not reported.
+	CachedInputTokens *int   `json:"cached_input_tokens,omitempty"`
+	OutputTokens      int    `json:"output_tokens"`
+	DurationMS        int64  `json:"duration_ms"` // Diagnostic only; never reward latency.
+	UsageAvailable    bool   `json:"usage_available"`
+	UsageSource       string `json:"usage_source"`
+	ExecutionMode     string `json:"execution_mode"`
 }
 type Failure struct {
 	Version string `json:"version"`
@@ -60,11 +73,12 @@ type Failure struct {
 	Code    string `json:"code"`
 }
 type Heartbeat struct {
-	Version string `json:"version"`
-	NodeID  string `json:"node_id"`
-	Profile string `json:"profile"`
-	ModelID string `json:"model_id"`
-	State   string `json:"state"`
+	Version  string `json:"version"`
+	NodeID   string `json:"node_id"`
+	Profile  string `json:"profile"`
+	State    string `json:"state"`
+	Bid      int64  `json:"bid"`
+	Capacity int    `json:"capacity"`
 }
 
 type Challenge struct {

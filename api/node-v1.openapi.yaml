@@ -18,12 +18,11 @@ paths:
           application/json:
             schema:
               type: object
-              required: [version, code, profile, model_id]
+              required: [version, code, profile]
               properties:
                 version: {type: string, enum: [node-v1]}
                 code: {type: string}
                 profile: {type: string}
-                model_id: {type: string}
       responses:
         '200':
           description: Paired; credential is shown once
@@ -88,6 +87,22 @@ paths:
       responses:
         '200': {description: Accepted and committed once}
         '409': {description: Expired, duplicate or fenced; not rewardable}
+  /api/node/v1/jobs/{job_id}/proven:
+    post:
+      security: [{nodeBearer: []}]
+      parameters: [{$ref: '#/components/parameters/JobID'}]
+      summary: Report that a Codex proof was sent to the assigned verifier
+      description: >-
+        The node does not submit the answer. The coordinator reads model, output, and usage
+        from the verifier after this call. A supplier copy of the output is not accepted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Proven'}
+      responses:
+        '200': {description: Verifier result accepted and committed once}
+        '409': {description: Expired, duplicate, fenced, rejected, or proof not ready}
   /api/node/v1/jobs/{job_id}/fail:
     post:
       security: [{nodeBearer: []}]
@@ -121,13 +136,15 @@ components:
         credential: {type: string}
     Heartbeat:
       type: object
-      required: [version, node_id, profile, model_id, state]
+      required: [version, node_id, profile, state]
+      description: Every node serves every catalog model (gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol) and their gateway aliases from one shared capacity.
       properties:
         version: {type: string, enum: [node-v1]}
         node_id: {type: string}
         profile: {type: string}
-        model_id: {type: string}
-        state: {type: string, enum: [available]}
+        state: {type: string, enum: [available, exhausted], description: exhausted means the node's gateway recently had no capacity; the coordinator offers it no lease until it reports available again.}
+        bid: {type: integer, minimum: 0, maximum: 1000000000, description: Standing assignment bid. Lower wins, then least assigned work, then node_id. Missing is treated as 100. Not an on-chain quote.}
+        capacity: {type: integer, minimum: 1, maximum: 64, description: Leases the node runs at once. The coordinator keeps open leases at or below this. Missing is treated as 1.}
     Challenge:
       type: object
       required: [version, nonce, expires_at]
@@ -145,14 +162,18 @@ components:
         nonce: {type: string, pattern: '^[0-9a-f]{64}$'}
     Lease:
       type: object
-      description: Job ID and signed_job_id are issued/committed server-side before lease; client does not cryptographically verify signed_job_id yet.
+      description: >-
+        Job ID and signed_job_id are issued/committed server-side before lease; client does not
+        cryptographically verify signed_job_id yet. codex_payload and verifier_token are set only
+        for proven Codex jobs. The node proves that request to the locally configured verifier;
+        the coordinator reads the answer from the verifier, not from this node.
       required: [version, job_id, signed_job_id, profile, model_id, prompt, max_input_tokens, max_output_tokens, input_sha256, attempt, fence, lease_deadline, settlement_deadline]
       properties:
         version: {type: string, enum: [node-v1]}
         job_id: {type: string}
         signed_job_id: {type: string, description: Coordinator-issued signed job commitment; not cryptographically verified by v1 node.}
         profile: {type: string}
-        model_id: {type: string}
+        model_id: {type: string, description: 'A catalog base model or its gateway alias with a reasoning effort (-low, -medium, -high, -xhigh, -max) and/or the fast tier (-fast, -fast-<effort>). Proven Codex leases must name a base model.'}
         prompt: {type: string}
         max_input_tokens: {type: integer, minimum: 1}
         max_output_tokens: {type: integer, minimum: 1}
@@ -161,6 +182,13 @@ components:
         fence: {type: string}
         lease_deadline: {type: string, format: date-time}
         settlement_deadline: {type: string, format: date-time}
+        codex_payload:
+          type: object
+          description: Exact Codex response.create the node must send. Required with verifier_token for proven jobs.
+        verifier_token:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Single-use token for the verifier configured in SCARLETT_VERIFIER. Not a login secret.
     Result:
       type: object
       description: >-
@@ -177,13 +205,23 @@ components:
         input_sha256: {type: string}
         output_sha256: {type: string}
         output: {type: string}
-        resolved_model_id: {type: string}
+        resolved_model_id: {type: string, description: The lease model or, for an alias, its base model.}
         input_tokens: {type: integer, minimum: 1}
+        cached_input_tokens: {type: integer, minimum: 0, description: Cached subset of input_tokens as reported by the gateway. Omitted when not reported; never inferred.}
         output_tokens: {type: integer, minimum: 1}
         duration_ms: {type: integer, minimum: 0, description: Node-observed gateway request duration; diagnostic only, never reward latency.}
         usage_available: {type: boolean, enum: [true]}
         usage_source: {type: string, enum: [upstream, unknown], description: Only upstream can qualify in paid mode; missing or other gateway sources normalize to unknown in unpaid demos.}
         execution_mode: {type: string, enum: [paid, unpaid_local_demo], description: Paid mode requires upstream usage. unpaid_local_demo may be recorded only as simulated Scarlett SCT.}
+    Proven:
+      type: object
+      description: Proof was sent. The coordinator reads the answer from the verifier.
+      required: [version, attempt, fence]
+      additionalProperties: false
+      properties:
+        version: {type: string, enum: [node-v1]}
+        attempt: {type: string}
+        fence: {type: string}
     Failure:
       type: object
       required: [version, attempt, fence, code]
@@ -191,4 +229,4 @@ components:
         version: {type: string, enum: [node-v1]}
         attempt: {type: string}
         fence: {type: string}
-        code: {type: string, enum: [invalid_lease, expired, gateway_error, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds]}
+        code: {type: string, enum: [invalid_lease, expired, gateway_error, capacity_unavailable, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds, prover_error], description: capacity_unavailable means the gateway was unreachable or returned 429/503 before inference; the coordinator may requeue the job for another node.}

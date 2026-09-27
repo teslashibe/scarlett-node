@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -70,7 +71,7 @@ func pair(c config.Config) error {
 	}
 	client := coordinator.New(c.Coordinator, "")
 	var reply coordinator.PairReply
-	_, err = client.Post(context.Background(), "/api/node/v1/pair", map[string]string{"version": coordinator.Version, "code": code, "profile": c.Profile, "model_id": c.Model}, &reply)
+	_, err = client.Post(context.Background(), "/api/node/v1/pair", map[string]string{"version": coordinator.Version, "code": code, "profile": c.Profile}, &reply)
 	if err != nil {
 		return err
 	}
@@ -126,91 +127,120 @@ func loadIdentity(c config.Config) (identity, error) {
 	}
 	return id, nil
 }
-func runFixture(c config.Config) error {
-	client := coordinator.New(c.Coordinator, c.GatewayKey)
-	client.EchoUnqualifiedHTTP = true
-	gateway := worker.New(c)
+
+// capacityRest is how long a node reports "exhausted" after its gateway had no capacity.
+const capacityRest = 30 * time.Second
+
+func run(c config.Config) error {
+	cred, nodeID := c.Credential, c.NodeID
+	if cred == "" {
+		id, err := loadIdentity(c)
+		if err != nil {
+			return err
+		}
+		cred, nodeID = id.Credential, id.NodeID
+	} else if nodeID == "" {
+		return errors.New("SCARLETT_NODE_ID required with SCARLETT_CREDENTIAL")
+	}
+	client := coordinator.New(c.Coordinator, cred)
+	if c.LocalFixture {
+		client.EchoUnqualifiedHTTP = true
+	}
+	wait := 5 * time.Second
+	if c.LocalFixture {
+		wait = time.Second
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
+	capacity := max(c.Concurrency, 1)
+	slots := make(chan struct{}, capacity)
+	var running sync.WaitGroup
+	defer running.Wait()
+	var mu sync.Mutex
+	var restUntil time.Time
 	for ctx.Err() == nil {
-		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: "local-fixture", Profile: c.Profile, ModelID: c.Model, State: "available"}
+		mu.Lock()
+		state := "available"
+		if time.Now().Before(restUntil) {
+			state = "exhausted"
+		}
+		mu.Unlock()
+		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: nodeID, Profile: c.Profile, State: state, Bid: c.Bid, Capacity: capacity}
 		reply, err := client.Poll(ctx, h)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "fixture heartbeat:", err)
+			fmt.Fprintln(os.Stderr, "heartbeat:", err)
 		} else if reply.Lease != nil {
+			// The coordinator counts this node's open leases against its capacity,
+			// so a slot frees up as soon as an earlier result is recorded.
+			select {
+			case slots <- struct{}{}:
+			case <-ctx.Done():
+				return nil
+			}
 			l := *reply.Lease
-			result, code := gateway.Run(ctx, l)
-			path, pathErr := coordinator.JobPath(l.JobID, "result")
-			var body any = result
-			if code != "" {
-				path, pathErr = coordinator.JobPath(l.JobID, "fail")
-				body = coordinator.Failure{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence, Code: code}
-			}
-			if pathErr != nil {
-				fmt.Fprintln(os.Stderr, "fixture lease:", pathErr)
-			} else {
-				// The coordinator may have committed an ambiguous response; never retry.
-				if _, err := client.Post(ctx, path, body, nil); err != nil {
-					fmt.Fprintln(os.Stderr, "fixture submit:", err)
-				} else {
-					fmt.Printf("fixture job %s: %s\n", l.JobID, map[bool]string{true: "failed (" + code + ")", false: "result submitted"}[code != ""])
+			running.Add(1)
+			go func() {
+				defer running.Done()
+				defer func() { <-slots }()
+				code, err := submitLease(ctx, client, c, l)
+				if code == "capacity_unavailable" {
+					mu.Lock()
+					restUntil = time.Now().Add(capacityRest)
+					mu.Unlock()
 				}
-			}
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "submit:", err)
+				} else if c.LocalFixture {
+					fmt.Printf("fixture job %s: %s\n", l.JobID, map[bool]string{true: "failed (" + code + ")", false: "submitted"}[code != ""])
+				}
+			}()
+			continue
 		}
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-time.After(time.Second):
+		case <-time.After(wait):
 		}
 	}
 	return nil
 }
 
-func run(c config.Config) error {
-	if c.LocalFixture {
-		return runFixture(c)
+func submitLease(ctx context.Context, client *coordinator.Client, c config.Config, l coordinator.Lease) (string, error) {
+	var body any
+	path, err := coordinator.JobPath(l.JobID, "result")
+	code := ""
+	if c.Executor == config.ExecutorCodexTLSN {
+		var detail string
+		code, detail = worker.Prover{Config: c}.Run(ctx, l)
+		if detail != "" {
+			fmt.Fprintln(os.Stderr, detail)
+		}
+		if code != "" {
+			path, err = coordinator.JobPath(l.JobID, "fail")
+			body = coordinator.Failure{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence, Code: code}
+		} else {
+			path, err = coordinator.JobPath(l.JobID, "proven")
+			body = coordinator.Proven{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence}
+		}
+	} else {
+		var result coordinator.Result
+		result, code = worker.New(c).Run(ctx, l)
+		body = result
+		if code != "" {
+			path, err = coordinator.JobPath(l.JobID, "fail")
+			body = coordinator.Failure{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence, Code: code}
+		}
 	}
-	id, err := loadIdentity(c)
 	if err != nil {
-		return err
+		return code, err
 	}
-	client := coordinator.New(c.Coordinator, id.Credential)
-	gateway := worker.New(c)
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
-	defer stop()
-	for ctx.Err() == nil {
-		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: id.NodeID, Profile: c.Profile, ModelID: c.Model, State: "available"}
-		reply, err := client.Poll(ctx, h)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "heartbeat:", err)
-		} else if reply.Lease != nil {
-			l := *reply.Lease
-			result, code := gateway.Run(ctx, l)
-			path, pathErr := coordinator.JobPath(l.JobID, "result")
-			if code != "" {
-				path, pathErr = coordinator.JobPath(l.JobID, "fail")
-			}
-			if pathErr != nil {
-				fmt.Fprintln(os.Stderr, "lease:", pathErr)
-			} else {
-				var body any = result
-				if code != "" {
-					body = coordinator.Failure{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence, Code: code}
-				}
-				// Never retry an ambiguous submit: only the coordinator can know whether it committed.
-				status, e := client.Post(ctx, path, body, nil)
-				if e != nil {
-					fmt.Fprintln(os.Stderr, "submit:", e)
-				} else if status != 200 && status != 201 && status != 204 {
-					fmt.Fprintln(os.Stderr, "unexpected submit status:", status)
-				}
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(5 * time.Second):
-		}
+	// Never retry an ambiguous submit: only the coordinator can know whether it committed.
+	status, err := client.Post(ctx, path, body, nil)
+	if err != nil {
+		return code, err
 	}
-	return nil
+	if status != 200 && status != 201 && status != 204 {
+		return code, fmt.Errorf("unexpected submit status: %d", status)
+	}
+	return code, nil
 }
