@@ -64,6 +64,7 @@ pub async fn run(request: Request) -> Result<Summary> {
     let creds = load_creds()?;
 
     let mut socket = TcpStream::connect(&request.verifier).await.context("verifier unreachable")?;
+    socket.set_nodelay(true)?;
     socket.write_all(format!("{}\n", request.token).as_bytes()).await?;
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();

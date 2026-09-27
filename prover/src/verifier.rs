@@ -1,8 +1,11 @@
 //! Validator side. The coordinator registers the exact job payload over a
-//! bearer-protected HTTP API and receives a single-use token for the supplier.
+//! bearer-protected HTTP API and receives a token for the supplier.
 //! Suppliers connect to the session port, send `<token>\n`, then run TLSNotary.
-//! The verifier opens the connection to OpenAI itself and records only what it
-//! verified; the coordinator reads that result, never the supplier's copy.
+//! Codex jobs use proxy mode: the verifier opens the connection to OpenAI
+//! itself and the token is single use. X reads (`x.read`) use MPC-TLS so the
+//! supplier's own connection reaches X; the token allows `max_exchanges`
+//! proven requests. The verifier records only what it verified; the
+//! coordinator reads that result, never the supplier's copy.
 //!
 //! Environment: SCARLETT_VERIFIER_KEY (required, 32+ chars),
 //! SCARLETT_VERIFIER_LISTEN (default 0.0.0.0:7047), SCARLETT_VERIFIER_API
@@ -29,6 +32,7 @@ use tlsn::{
     Session,
     config::verifier::VerifierConfig,
     connection::ServerName,
+    transcript::PartialTranscript,
     verifier::{VerifierCommitStart, VerifierOutput},
     webpki::RootCertStore,
 };
@@ -38,7 +42,11 @@ use tokio::{
 };
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-use crate::policy::{self, Verified};
+use crate::{
+    policy::{self, Verified},
+    xpolicy::{self, Exchange},
+    xprove::{MAX_RECV, MAX_SENT},
+};
 
 const MAX_TTL: Duration = Duration::from_secs(600);
 
@@ -62,10 +70,30 @@ enum Status {
         reason: String,
     },
     Expired,
+    XRead {
+        remaining: usize,
+        exchanges: Vec<XRecord>,
+        rejections: Vec<String>,
+    },
+}
+
+#[derive(Clone, Serialize)]
+struct XRecord {
+    #[serde(flatten)]
+    exchange: Exchange,
+    sent_bytes: usize,
+    received_bytes: usize,
+    duration_ms: u64,
+}
+
+enum Kind {
+    Codex,
+    X(Vec<String>),
 }
 
 struct Entry {
     payload: Value,
+    kind: Kind,
     expires: Instant,
     status: Status,
 }
@@ -105,6 +133,7 @@ pub async fn run() -> Result<()> {
     println!("verifier: sessions on {listen}, API on {api}, upstream {}", shared.0.upstream);
     loop {
         let (socket, peer) = listener.accept().await?;
+        let _ = socket.set_nodelay(true);
         let shared = shared.clone();
         tokio::spawn(async move {
             if let Err(e) = handle(shared, socket).await {
@@ -139,9 +168,17 @@ async fn create(State(shared): State<Shared>, headers: HeaderMap, Json(request):
     if request.job_id.is_empty() || request.job_id.len() > 128 || request.attempt.is_empty() || request.attempt.len() > 128 {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid job or attempt"})));
     }
-    if let Err(e) = policy::validate_job(&request.payload) {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()})));
-    }
+    let validated = if request.payload["type"] == "x.read" {
+        xpolicy::validate_job(&request.payload).map(|(ops, max)| {
+            (Kind::X(ops), Status::XRead { remaining: max, exchanges: Vec::new(), rejections: Vec::new() })
+        })
+    } else {
+        policy::validate_job(&request.payload).map(|_| (Kind::Codex, Status::Pending))
+    };
+    let (kind, initial) = match validated {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))),
+    };
     let ttl = Duration::from_secs(request.ttl_seconds.unwrap_or(300)).min(MAX_TTL);
     let token: String = rand::random::<[u8; 32]>().iter().map(|b| format!("{b:02x}")).collect();
     let key = job_key(&request.job_id, &request.attempt);
@@ -156,7 +193,7 @@ async fn create(State(shared): State<Shared>, headers: HeaderMap, Json(request):
     if sessions.by_job.contains_key(&key) {
         return (StatusCode::CONFLICT, Json(serde_json::json!({"error": "session already exists for this attempt"})));
     }
-    sessions.by_job.insert(key.clone(), Entry { payload: request.payload, expires: now + ttl, status: Status::Pending });
+    sessions.by_job.insert(key.clone(), Entry { payload: request.payload, kind, expires: now + ttl, status: initial });
     sessions.by_token.insert(token.clone(), key);
     (StatusCode::CREATED, Json(serde_json::json!({"token": token})))
 }
@@ -181,6 +218,11 @@ async fn status(
     (StatusCode::OK, Json(serde_json::to_value(status).unwrap_or_default()))
 }
 
+enum Job {
+    Codex(Value),
+    X(Vec<String>),
+}
+
 async fn handle(shared: Shared, mut socket: TcpStream) -> Result<()> {
     let (config, sessions) = &*shared;
     let mut line = [0u8; 65];
@@ -189,51 +231,131 @@ async fn handle(shared: Shared, mut socket: TcpStream) -> Result<()> {
         bail!("malformed session token");
     }
     let token = std::str::from_utf8(&line[..64])?;
-    let (key, payload) = {
-        let mut sessions = sessions.lock().unwrap();
-        // Tokens are single use: removing it here blocks replays and parallel attempts.
-        let key = sessions.by_token.remove(token).context("unknown or used session token")?;
-        let entry = sessions.by_job.get_mut(&key).context("session expired")?;
+    let (key, job) = {
+        let mut guard = sessions.lock().unwrap();
+        let s = &mut *guard;
+        let key = s.by_token.get(token).cloned().context("unknown or used session token")?;
+        let entry = s.by_job.get_mut(&key).context("session expired")?;
         if Instant::now() >= entry.expires {
-            entry.status = Status::Expired;
+            s.by_token.remove(token);
+            if let Kind::Codex = entry.kind {
+                entry.status = Status::Expired;
+            }
             bail!("session expired");
         }
-        entry.status = Status::Running;
-        (key, entry.payload.clone())
+        let job = match &entry.kind {
+            Kind::Codex => {
+                // Codex tokens are single use: removing it here blocks replays and parallel attempts.
+                s.by_token.remove(token);
+                entry.status = Status::Running;
+                Job::Codex(entry.payload.clone())
+            }
+            Kind::X(ops) => {
+                let Status::XRead { remaining, .. } = &mut entry.status else { bail!("session is in an unexpected state") };
+                // Each connection spends one exchange; the token dies with the last one.
+                *remaining -= 1;
+                if *remaining == 0 {
+                    s.by_token.remove(token);
+                }
+                Job::X(ops.clone())
+            }
+        };
+        (key, job)
     };
 
     let started = Instant::now();
-    let result = tokio::time::timeout(config.session_limit, verify(socket, &payload, &config.upstream)).await;
-    let status = match result {
-        Ok(Ok(verified)) => Status::Accepted { verified, duration_ms: started.elapsed().as_millis() as u64 },
-        Ok(Err(e)) => Status::Rejected { reason: format!("{e:#}") },
-        Err(_) => Status::Rejected { reason: format!("session exceeded {}s", config.session_limit.as_secs()) },
-    };
-    let job_id = key.split('\n').next().unwrap_or_default();
-    match &status {
-        Status::Accepted { verified, .. } => println!("verifier: job {job_id} accepted, model {}", verified.model),
-        Status::Rejected { reason } => println!("verifier: job {job_id} rejected: {reason}"),
-        _ => {}
-    }
-    if let Some(entry) = sessions.lock().unwrap().by_job.get_mut(&key) {
-        entry.status = status;
+    let job_id = key.split('\n').next().unwrap_or_default().to_owned();
+    let timed_out = || format!("session exceeded {}s", config.session_limit.as_secs());
+    match job {
+        Job::Codex(payload) => {
+            let status = match tokio::time::timeout(config.session_limit, verify(socket, &payload, &config.upstream)).await {
+                Ok(Ok(verified)) => Status::Accepted { verified, duration_ms: started.elapsed().as_millis() as u64 },
+                Ok(Err(e)) => Status::Rejected { reason: format!("{e:#}") },
+                Err(_) => Status::Rejected { reason: timed_out() },
+            };
+            match &status {
+                Status::Accepted { verified, .. } => println!("verifier: job {job_id} accepted, model {}", verified.model),
+                Status::Rejected { reason } => println!("verifier: job {job_id} rejected: {reason}"),
+                _ => {}
+            }
+            if let Some(entry) = sessions.lock().unwrap().by_job.get_mut(&key) {
+                entry.status = status;
+            }
+        }
+        Job::X(ops) => {
+            let outcome = match tokio::time::timeout(config.session_limit, verify_x(socket, &ops)).await {
+                Ok(Ok(proven)) => Ok(proven),
+                Ok(Err(e)) => Err(format!("{e:#}")),
+                Err(_) => Err(timed_out()),
+            };
+            match &outcome {
+                Ok((e, ..)) => println!("verifier: job {job_id} proved X {} (HTTP {})", e.operation, e.http_status),
+                Err(reason) => println!("verifier: job {job_id} rejected an X exchange: {reason}"),
+            }
+            if let Some(Entry { status: Status::XRead { exchanges, rejections, .. }, .. }) = sessions.lock().unwrap().by_job.get_mut(&key) {
+                match outcome {
+                    Ok((exchange, sent_bytes, received_bytes)) => exchanges.push(XRecord {
+                        exchange,
+                        sent_bytes,
+                        received_bytes,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                    }),
+                    Err(reason) => rejections.push(reason),
+                }
+            }
+        }
     }
     Ok(())
 }
 
 async fn verify(socket: TcpStream, job: &Value, upstream: &str) -> Result<Verified> {
+    let (server_name, transcript) = prove_session(socket, Some(upstream)).await?;
+    let sent_hidden: Vec<_> = transcript.sent_unauthed().iter().collect();
+    let received_hidden: Vec<_> = transcript.received_unauthed().iter().collect();
+    policy::check(&server_name, transcript.sent_unsafe(), &sent_hidden, transcript.received_unsafe(), &received_hidden, job)
+}
+
+/// Returns the verified exchange and the transcript's sent and received sizes.
+async fn verify_x(socket: TcpStream, operations: &[String]) -> Result<(Exchange, usize, usize)> {
+    let (server_name, transcript) = prove_session(socket, None).await?;
+    let sent_hidden: Vec<_> = transcript.sent_unauthed().iter().collect();
+    let received_hidden: Vec<_> = transcript.received_unauthed().iter().collect();
+    let (sent, received) = (transcript.sent_unsafe(), transcript.received_unsafe());
+    let exchange = xpolicy::check(&server_name, sent, &sent_hidden, received, &received_hidden, operations)?;
+    Ok((exchange, sent.len(), received.len()))
+}
+
+/// Runs one TLSNotary session: proxy mode through `upstream` when given, else
+/// MPC-TLS within the X size limits. Returns the proven server name and transcript.
+async fn prove_session(socket: TcpStream, upstream: Option<&str>) -> Result<(String, PartialTranscript)> {
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();
     let driver_task = tokio::spawn(driver);
 
     let verifier = handle.new_verifier(VerifierConfig::builder().root_store(RootCertStore::mozilla()).build()?)?;
-    let verifier = match verifier.commit().await? {
-        VerifierCommitStart::Proxy(verifier) => {
+    let verifier = match (verifier.commit().await?, upstream) {
+        (VerifierCommitStart::Proxy(verifier), Some(upstream)) => {
             // The verifier, not the supplier, opens the connection to OpenAI.
             let server = TcpStream::connect(upstream).await?;
+            server.set_nodelay(true)?;
             verifier.accept().await?.run(server.compat()).await?
         }
-        VerifierCommitStart::Mpc(_) => bail!("only proxy mode is accepted"),
+        (VerifierCommitStart::Mpc(verifier), None) => {
+            let cfg = verifier.config();
+            if cfg.max_sent_data() > MAX_SENT || cfg.max_recv_data() > MAX_RECV {
+                verifier.reject(Some("MPC-TLS limits are too large")).await?;
+                bail!("supplier asked for MPC-TLS limits above {MAX_SENT} sent / {MAX_RECV} received bytes");
+            }
+            verifier.accept().await?.run().await?
+        }
+        (VerifierCommitStart::Proxy(verifier), None) => {
+            verifier.reject(Some("X reads must use MPC-TLS")).await?;
+            bail!("X reads must use MPC-TLS");
+        }
+        (VerifierCommitStart::Mpc(verifier), Some(_)) => {
+            verifier.reject(Some("only proxy mode is accepted")).await?;
+            bail!("only proxy mode is accepted");
+        }
     };
     let verifier = verifier.verify().await?;
     if !verifier.request().server_identity() {
@@ -247,15 +369,5 @@ async fn verify(socket: TcpStream, job: &Value, upstream: &str) -> Result<Verifi
     driver_task.await??;
 
     let ServerName::Dns(server_name) = server_name.context("server name missing")?;
-    let transcript = transcript.context("transcript missing")?;
-    let sent_hidden: Vec<_> = transcript.sent_unauthed().iter().collect();
-    let received_hidden: Vec<_> = transcript.received_unauthed().iter().collect();
-    policy::check(
-        server_name.as_str(),
-        transcript.sent_unsafe(),
-        &sent_hidden,
-        transcript.received_unsafe(),
-        &received_hidden,
-        job,
-    )
+    Ok((server_name.as_str().to_owned(), transcript.context("transcript missing")?))
 }

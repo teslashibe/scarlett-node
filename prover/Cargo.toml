@@ -5,8 +5,13 @@ edition = "2024"
 publish = false
 
 [dependencies]
-tlsn = { git = "https://github.com/tlsnotary/tlsn", tag = "v0.1.0-alpha.15", features = ["mozilla-certs"] }
+# v0.1.0-alpha.15 with the session mux stream limit raised from 512 to 4096,
+# which MPC-TLS otherwise exceeds intermittently.
+tlsn = { git = "https://github.com/teslashibe/tlsn", rev = "bb4cdc32ae2e80296a27143a348d4bc1769fd09e", features = ["mozilla-certs"] }
 anyhow = "1"
+base64 = "0.22"
+flate2 = "1"
+percent-encoding = "2"
 axum = "0.8"
 futures = "0.3"
 rand = "0.9"

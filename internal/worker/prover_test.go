@@ -20,6 +20,9 @@ func TestMain(m *testing.M) {
 	if mode == "" {
 		os.Exit(m.Run())
 	}
+	if strings.HasPrefix(mode, "x") {
+		fakeXProver(mode)
+	}
 	var in struct {
 		Verifier string          `json:"verifier"`
 		Token    string          `json:"token"`
