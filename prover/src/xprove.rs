@@ -3,7 +3,18 @@
 //! verifier jointly holds the session keys. Only the session cookie and CSRF
 //! token values are hidden.
 
-use std::{future::IntoFuture, ops::Range, time::Instant};
+use std::{
+    future::IntoFuture,
+    io,
+    ops::Range,
+    pin::Pin,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{self, Poll, Waker},
+    time::Instant,
+};
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -15,7 +26,10 @@ use tlsn::{
     connection::ServerName,
     webpki::RootCertStore,
 };
-use tokio::{io::AsyncWriteExt as _, net::TcpStream};
+use tokio::{
+    io::{AsyncWriteExt as _, ReadBuf},
+    net::TcpStream,
+};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::{
@@ -67,11 +81,12 @@ pub async fn run(request: Request) -> Result<Summary> {
         .new_prover(ProverConfig::builder().build()?)?
         .commit(MpcTlsConfig::builder().max_sent_data(raw.len()).max_recv_data(max_recv).build()?)
         .await?;
-    let server = TcpStream::connect((HOST, 443)).await.context("x.com unreachable")?;
-    server.set_nodelay(true)?;
+    let tcp = TcpStream::connect((HOST, 443)).await.context("x.com unreachable")?;
+    tcp.set_nodelay(true)?;
+    let end = Arc::new(End::default());
     let (mut tls, prover) = prover.connect(
         TlsClientConfig::builder().server_name(ServerName::Dns(HOST.try_into()?)).root_store(RootCertStore::mozilla()).build()?,
-        server.compat(),
+        Server { tcp, end: end.clone() }.compat(),
     )?;
     let prover_task = tokio::spawn(prover.into_future());
     tls.write_all(&raw).await?;
@@ -92,7 +107,9 @@ pub async fn run(request: Request) -> Result<Summary> {
     })
     .await
     .context("timed out waiting for X")??;
-    tls.close().await?;
+    // tlsn finalizes only once the server stream ends, and X may hold the
+    // connection open indefinitely, so end it here.
+    end.finish();
     drop(tls);
 
     let mut prover = prover_task.await??;
@@ -116,6 +133,51 @@ pub async fn run(request: Request) -> Result<Summary> {
         received_bytes,
         duration_ms: started.elapsed().as_millis(),
     })
+}
+
+/// The x.com connection, whose reads report end of stream once `End::finish` is called.
+struct Server {
+    tcp: TcpStream,
+    end: Arc<End>,
+}
+
+#[derive(Default)]
+struct End {
+    finished: AtomicBool,
+    waker: Mutex<Option<Waker>>,
+}
+
+impl End {
+    fn finish(&self) {
+        self.finished.store(true, Ordering::SeqCst);
+        if let Some(waker) = self.waker.lock().unwrap().take() {
+            waker.wake();
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for Server {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        *self.end.waker.lock().unwrap() = Some(cx.waker().clone());
+        if self.end.finished.load(Ordering::SeqCst) {
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.tcp).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for Server {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.tcp).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.tcp).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.tcp).poll_shutdown(cx)
+    }
 }
 
 /// Everything in the request except the Cookie and X-Csrf-Token values.

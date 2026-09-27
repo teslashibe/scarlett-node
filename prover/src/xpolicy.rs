@@ -178,7 +178,7 @@ fn parse_head(received: &[u8]) -> Result<Head> {
 }
 
 /// Whether `received` already holds a whole response by its own framing. A
-/// response without chunking or a length ends only when the connection does.
+/// response without chunking or a length is never complete.
 pub fn response_complete(received: &[u8]) -> bool {
     let Ok(h) = parse_head(received) else { return false };
     let rest = &received[h.body_start..];
@@ -198,7 +198,8 @@ pub fn response_body(received: &[u8]) -> Result<(u16, String)> {
     } else if let Some(n) = h.length {
         rest.get(..n).context("response body is truncated")?.to_vec()
     } else {
-        rest.to_vec()
+        // The prover ends the server stream itself, so an unframed body could be cut short.
+        bail!("response has neither Content-Length nor chunked framing");
     };
     if h.gzip {
         let mut plain = Vec::new();
@@ -332,6 +333,7 @@ mod tests {
     fn decodes_plain_content_length_bodies() {
         let r = b"HTTP/1.1 403 Forbidden\r\ncontent-length: 2\r\n\r\n{}".to_vec();
         assert_eq!(response_body(&r).unwrap(), (403, "{}".into()));
+        assert!(response_body(b"HTTP/1.1 200 OK\r\n\r\n{}").is_err());
     }
 
     #[test]
