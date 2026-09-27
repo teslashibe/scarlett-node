@@ -1,0 +1,61 @@
+# Run the node and prover checks on every pull request and on everything that
+# can ship (main, v* tags).
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2046 # splitting is the point: one arg per package dir
+          files=$(gofmt -l $(go list -f '{{.Dir}}' ./...))
+          if [ -n "$files" ]; then
+            echo "gofmt needed on:" >&2
+            echo "$files" >&2
+            exit 1
+          fi
+
+      - run: go build ./...
+
+      - run: go vet ./...
+
+      - run: go test -race ./...
+
+  prover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: prover
+    steps:
+      - uses: actions/checkout@v7
+
+      # rustup installs the channel pinned in prover/rust-toolchain.toml.
+      - run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: prover
+
+      - run: cargo test --locked
