@@ -19,7 +19,7 @@ use tlsn::{
     connection::{DnsName, ServerName},
     webpki::{CertificateDer, RootCertStore},
 };
-use tokio::{io::AsyncWriteExt, net::TcpStream};
+use tokio::io::AsyncWriteExt;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest, http::HeaderValue};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
@@ -28,6 +28,9 @@ use crate::policy::{HOST, PATH, find, validate_job};
 #[derive(Deserialize)]
 pub struct Request {
     pub verifier: String,
+    pub verifier_ca_file: Option<String>,
+    #[serde(default)]
+    pub plaintext_fixture: bool,
     pub token: String,
     pub payload: Value,
 }
@@ -63,8 +66,7 @@ pub async fn run(request: Request) -> Result<Summary> {
     };
     let creds = load_creds()?;
 
-    let mut socket = TcpStream::connect(&request.verifier).await.context("verifier unreachable")?;
-    socket.set_nodelay(true)?;
+    let mut socket = crate::control::connect(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture).await?;
     socket.write_all(format!("{}\n", request.token).as_bytes()).await?;
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();

@@ -45,6 +45,9 @@ pub const MAX_SENT: usize = 16 << 10;
 #[derive(Deserialize)]
 pub struct Request {
     pub verifier: String,
+    pub verifier_ca_file: Option<String>,
+    #[serde(default)]
+    pub plaintext_fixture: bool,
     pub token: String,
     /// Base64 of the complete HTTP/1.1 request, which must ask X to close the connection.
     pub request: String,
@@ -72,8 +75,7 @@ pub async fn run(request: Request) -> Result<Summary> {
     let max_recv = request.max_recv.unwrap_or(MAX_RECV).min(MAX_RECV);
     let started = Instant::now();
 
-    let mut socket = TcpStream::connect(&request.verifier).await.context("verifier unreachable")?;
-    socket.set_nodelay(true)?;
+    let mut socket = crate::control::connect(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture).await?;
     socket.write_all(format!("{}\n", request.token).as_bytes()).await?;
     let (driver, mut handle) = Session::new(socket.compat()).split();
     let mut session = Driver::new(tokio::spawn(driver));

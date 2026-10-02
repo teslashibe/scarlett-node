@@ -20,10 +20,12 @@ import (
 // x.com API calls, including writes, are refused. Everything else, such as
 // transaction-ID bootstrap pages, goes through Base unproven.
 type XTransport struct {
-	Prover   string
-	Verifier string
-	Token    string
-	Base     http.RoundTripper
+	Prover           string
+	Verifier         string
+	VerifierCA       string
+	PlaintextFixture bool
+	Token            string
+	Base             http.RoundTripper
 }
 
 var errUnprovenXCall = errors.New("only X GraphQL reads can be proven")
@@ -47,10 +49,12 @@ func (t XTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	input, err := json.Marshal(struct {
-		Verifier string `json:"verifier"`
-		Token    string `json:"token"`
-		Request  string `json:"request"`
-	}{t.Verifier, t.Token, base64.StdEncoding.EncodeToString(raw.Bytes())})
+		Verifier         string `json:"verifier"`
+		VerifierCA       string `json:"verifier_ca_file,omitempty"`
+		PlaintextFixture bool   `json:"plaintext_fixture,omitempty"`
+		Token            string `json:"token"`
+		Request          string `json:"request"`
+	}{t.Verifier, t.VerifierCA, t.PlaintextFixture, t.Token, base64.StdEncoding.EncodeToString(raw.Bytes())})
 	if err != nil {
 		return nil, err
 	}

@@ -330,7 +330,7 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 	}
 	proof := w.Proof
 	if proof == nil {
-		proof = XTransport{Prover: w.Config.Prover, Verifier: w.Config.Verifier, Token: l.VerifierToken}
+		proof = XTransport{Prover: w.Config.Prover, Verifier: w.Config.Verifier, VerifierCA: w.Config.VerifierCA, PlaintextFixture: w.Config.VerifierPlaintextFixture, Token: l.VerifierToken}
 	}
 	transport := &xBoundTransport{base: base, proof: proof, bootstrap: true, specs: plan.Exchanges}
 	ids := map[string]string{}

@@ -549,9 +549,17 @@ pub async fn run() -> Result<()> {
     } else {
         Sessions::default()
     };
-    if sessions.store.is_some() && !api.parse::<std::net::SocketAddr>().is_ok_and(|a| a.ip().is_loopback()) {
-        bail!("durable verifier API must bind loopback");
+    if !api.parse::<std::net::SocketAddr>().is_ok_and(|a| a.ip().is_loopback()) {
+        bail!("verifier API must bind loopback");
     }
+    let cert = env::var("SCARLETT_VERIFIER_TLS_CERT").ok();
+    let private_key = env::var("SCARLETT_VERIFIER_TLS_KEY").ok();
+    let plaintext = env::var("SCARLETT_VERIFIER_PLAINTEXT_FIXTURE").as_deref() == Ok("1");
+    let acceptor = match (cert, private_key) {
+        (Some(cert), Some(key)) if !plaintext => Some(crate::control::acceptor(&cert, &key)?),
+        (None, None) if plaintext && listen.parse::<std::net::SocketAddr>().is_ok_and(|a| a.ip().is_loopback()) => None,
+        _ => bail!("verifier needs a TLS certificate/key or an explicit loopback plaintext fixture"),
+    };
     let shared: Shared = Arc::new((Config { key, upstream, session_limit: Duration::from_secs(limit) }, Mutex::new(sessions)));
     let cleanup = shared.clone();
     tokio::spawn(async move {
@@ -574,11 +582,23 @@ pub async fn run() -> Result<()> {
 
     let listener = TcpListener::bind(&listen).await.with_context(|| format!("binding {listen}"))?;
     println!("verifier: sessions on {listen}, API on {api}, upstream {}", shared.0.upstream);
+    let slots = Arc::new(tokio::sync::Semaphore::new(64));
     loop {
         let (socket, peer) = listener.accept().await?;
+        let Ok(slot) = slots.clone().try_acquire_owned() else { continue };
         let _ = socket.set_nodelay(true);
         let shared = shared.clone();
+        let acceptor = acceptor.clone();
         tokio::spawn(async move {
+            let _slot = slot;
+            let socket: crate::control::Socket = if let Some(acceptor) = acceptor {
+                match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(socket)).await {
+                    Ok(Ok(socket)) => Box::new(socket),
+                    _ => return,
+                }
+            } else {
+                Box::new(socket)
+            };
             if handle(shared, socket).await.is_err() {
                 println!("verifier: session from {peer} ended without a result");
             }
@@ -708,7 +728,7 @@ enum Job {
     X(Arc<Vec<Spec>>),
 }
 
-async fn handle(shared: Shared, mut socket: TcpStream) -> Result<()> {
+async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()> {
     let (config, sessions) = &*shared;
     let mut line = [0u8; 65];
     tokio::time::timeout(Duration::from_secs(10), socket.read_exact(&mut line)).await.context("no session token")??;
@@ -856,7 +876,7 @@ async fn handle(shared: Shared, mut socket: TcpStream) -> Result<()> {
     Ok(())
 }
 
-async fn verify(socket: TcpStream, job: &Value, upstream: &str) -> Result<Verified> {
+async fn verify(socket: crate::control::Socket, job: &Value, upstream: &str) -> Result<Verified> {
     let (server_name, transcript) = prove_session(socket, Some(upstream)).await?;
     let sent_hidden: Vec<_> = transcript.sent_unauthed().iter().collect();
     let received_hidden: Vec<_> = transcript.received_unauthed().iter().collect();
@@ -864,7 +884,7 @@ async fn verify(socket: TcpStream, job: &Value, upstream: &str) -> Result<Verifi
 }
 
 /// Returns the verified exchange and the transcript's sent and received sizes.
-async fn verify_x(socket: TcpStream) -> Result<(Exchange, usize, usize)> {
+async fn verify_x(socket: crate::control::Socket) -> Result<(Exchange, usize, usize)> {
     let (server_name, transcript) = prove_session(socket, None).await?;
     let sent_hidden: Vec<_> = transcript.sent_unauthed().iter().collect();
     let received_hidden: Vec<_> = transcript.received_unauthed().iter().collect();
@@ -882,7 +902,7 @@ impl Drop for CancelDriver {
     }
 }
 
-async fn prove_session(socket: TcpStream, upstream: Option<&str>) -> Result<(String, PartialTranscript)> {
+async fn prove_session(socket: crate::control::Socket, upstream: Option<&str>) -> Result<(String, PartialTranscript)> {
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();
     let driver_task = tokio::spawn(driver);
