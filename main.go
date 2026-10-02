@@ -171,6 +171,11 @@ func run(c config.Config) error {
 		local = cx
 	}
 	capacity := max(c.Concurrency, 1)
+	var services *servicePool
+	if c.Executor == config.ExecutorServices {
+		services = newServicePool(c)
+		capacity = services.capacity()
+	}
 	slots := make(chan struct{}, capacity)
 	var running sync.WaitGroup
 	defer func() { stop(); running.Wait() }()
@@ -202,6 +207,15 @@ func run(c config.Config) error {
 		}
 		mu.Unlock()
 		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: nodeID, Profile: c.Profile, State: state, Bid: c.Bid, Capacity: capacity}
+		if services != nil {
+			h.Services = services.health()
+			h.State = "exhausted"
+			for _, s := range h.Services {
+				if (s.State == "configured" || s.State == "ready") && s.InFlight < s.Capacity {
+					h.State = "available"
+				}
+			}
+		}
 		reply, err := client.Poll(ctx, h)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "heartbeat:", err)
@@ -214,11 +228,26 @@ func run(c config.Config) error {
 				return nil
 			}
 			l := *reply.Lease
+			serviceAvailable := services == nil || services.acquire(l.ServiceType)
 			running.Add(1)
 			go func() {
 				defer running.Done()
 				defer func() { <-slots }()
-				code, err := submitLease(ctx, client, c, l, local, journal)
+				var code string
+				var err error
+				if !serviceAvailable {
+					code = "service_unavailable"
+					err = rejectLease(ctx, client, journal, l, code)
+				} else {
+					code, err = submitLease(ctx, client, c, l, local, journal)
+					if services != nil {
+						if err != nil && code == "" {
+							services.finish(l.ServiceType, "report_pending")
+						} else {
+							services.finish(l.ServiceType, code)
+						}
+					}
+				}
 				if code == "capacity_unavailable" {
 					mu.Lock()
 					restUntil = time.Now().Add(capacityRest)
@@ -254,10 +283,16 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	}
 	var body any
 	code := ""
-	if c.Executor == config.ExecutorCodexTLSN {
+	if c.Executor == config.ExecutorCodexTLSN || c.Executor == config.ExecutorServices {
 		var detail string
-		code, detail = worker.Prover{Config: c}.Run(ctx, l)
-		if detail != "" {
+		if c.Executor == config.ExecutorServices && !c.Enabled(l.ServiceType) {
+			code = "service_unavailable"
+		} else if c.Executor == config.ExecutorServices && l.ServiceType == "x_read" {
+			code = worker.X{Config: c}.Run(ctx, l)
+		} else {
+			code, detail = worker.Prover{Config: c}.Run(ctx, l)
+		}
+		if detail != "" && c.Executor != config.ExecutorServices {
 			fmt.Fprintln(os.Stderr, detail)
 		}
 		if code != "" {
@@ -286,7 +321,7 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	kind := "result"
 	if code != "" {
 		kind = "fail"
-	} else if c.Executor == config.ExecutorCodexTLSN {
+	} else if c.Executor == config.ExecutorCodexTLSN || c.Executor == config.ExecutorServices {
 		kind = "proven"
 	}
 	record, err = journal.Ready(record, kind, raw)

@@ -24,6 +24,7 @@ type PairReply struct {
 }
 type Lease struct {
 	Version            string    `json:"version"`
+	ServiceType        string    `json:"service_type,omitempty"`
 	JobID              string    `json:"job_id"`
 	SignedJobID        string    `json:"signed_job_id"`
 	Profile            string    `json:"profile"`
@@ -40,6 +41,27 @@ type Lease struct {
 	// token for the verifier configured locally in SCARLETT_VERIFIER.
 	CodexPayload  json.RawMessage `json:"codex_payload,omitempty"`
 	VerifierToken string          `json:"verifier_token,omitempty"`
+	XRequest      *XRequest       `json:"x_request,omitempty"`
+	XPayload      json.RawMessage `json:"x_payload,omitempty"`
+}
+
+// XRequest is bounded public read work; no URLs, headers or credentials come
+// from the coordinator. Pagination must be pinned separately in XPayload.
+type XRequest struct {
+	Operation string `json:"operation"`
+	Query     string `json:"query,omitempty"`
+	Username  string `json:"username,omitempty"`
+	PostID    string `json:"post_id,omitempty"`
+	Count     int    `json:"count,omitempty"`
+	Pages     int    `json:"pages,omitempty"`
+}
+
+type ServiceHealth struct {
+	Kind          string `json:"kind"`
+	State         string `json:"state"`
+	Capacity      int    `json:"capacity"`
+	InFlight      int    `json:"in_flight"`
+	LastErrorCode string `json:"last_error_code,omitempty"`
 }
 
 // Proven tells the coordinator a proof was sent; it reads the answer from the verifier.
@@ -73,12 +95,13 @@ type Failure struct {
 	Code    string `json:"code"`
 }
 type Heartbeat struct {
-	Version  string `json:"version"`
-	NodeID   string `json:"node_id"`
-	Profile  string `json:"profile"`
-	State    string `json:"state"`
-	Bid      int64  `json:"bid"`
-	Capacity int    `json:"capacity"`
+	Version  string          `json:"version"`
+	NodeID   string          `json:"node_id"`
+	Profile  string          `json:"profile"`
+	State    string          `json:"state"`
+	Bid      int64           `json:"bid"`
+	Capacity int             `json:"capacity"`
+	Services []ServiceHealth `json:"services,omitempty"`
 }
 
 type Challenge struct {

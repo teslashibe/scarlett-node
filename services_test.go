@@ -1,0 +1,117 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/teslashibe/scarlett-node/internal/config"
+	"github.com/teslashibe/scarlett-node/internal/coordinator"
+)
+
+func poolFixture(t *testing.T, selected ...string) *servicePool {
+	t.Helper()
+	dir := t.TempDir()
+	home := filepath.Join(dir, "codex")
+	os.Mkdir(home, 0700)
+	os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"synthetic_fixture":true}`), 0600)
+	session := filepath.Join(dir, "session.json")
+	os.WriteFile(session, []byte(`{"auth_token":"synthetic-auth","ct0":"synthetic-csrf"}`), 0600)
+	return newServicePool(config.Config{Services: selected, CodexHome: home, XSession: session, CodexConcurrency: 2, XConcurrency: 1})
+}
+func healthKind(t *testing.T, p *servicePool, kind string) coordinator.ServiceHealth {
+	t.Helper()
+	for _, s := range p.health() {
+		if s.Kind == kind {
+			return s
+		}
+	}
+	t.Fatal("missing service")
+	return coordinator.ServiceHealth{}
+}
+func TestServicesIndependentCapacityQuotaAndAuthentication(t *testing.T) {
+	p := poolFixture(t, "codex", "x_read")
+	if p.capacity() != 3 || !p.acquire("x_read") || p.acquire("x_read") {
+		t.Fatal("X capacity not bounded")
+	}
+	p.finish("x_read", "x_rate_limited")
+	if healthKind(t, p, "x_read").State != "exhausted" || !p.acquire("codex") {
+		t.Fatal("X quota disabled Codex")
+	}
+	p.finish("codex", "")
+	if healthKind(t, p, "codex").State != "ready" {
+		t.Fatal("successful local proof status missing")
+	}
+	p.mu.Lock()
+	p.entries["x_read"].restUntil = time.Now().Add(-time.Second)
+	p.mu.Unlock()
+	if !p.acquire("x_read") {
+		t.Fatal("quota cooldown never recovered")
+	}
+	p.finish("x_read", "auth_required")
+	if p.acquire("x_read") || !p.acquire("codex") {
+		t.Fatal("authentication blocked wrong service")
+	}
+	p.finish("codex", "")
+	if e := os.WriteFile(p.config.XSession, []byte(`{"auth_token":"new-synthetic-session","ct0":"synthetic-csrf"}`), 0600); e != nil {
+		t.Fatal(e)
+	}
+	if !p.acquire("x_read") {
+		t.Fatal("changed local session did not recover")
+	}
+	p.finish("x_read", "")
+	raw, _ := json.Marshal(p.health())
+	if string(raw) == "" {
+		t.Fatal("missing health")
+	}
+	for _, secret := range []string{"synthetic-auth", "synthetic-csrf", "new-synthetic-session"} {
+		if bytes.Contains(raw, []byte(secret)) {
+			t.Fatal("credential leaked in health")
+		}
+	}
+}
+func TestServiceSelectionAndConcurrentSlotClaims(t *testing.T) {
+	p := poolFixture(t, "codex")
+	if p.acquire("x_read") || healthKind(t, p, "x_read").State != "not_added" || p.capacity() != 2 {
+		t.Fatal("disabled X served")
+	}
+	var wins atomic.Int32
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if p.acquire("codex") {
+				wins.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if wins.Load() != 2 || healthKind(t, p, "codex").InFlight != 2 {
+		t.Fatal("shared slot race exceeded quota")
+	}
+	p.finish("codex", "")
+	p.finish("codex", "report_pending")
+	if healthKind(t, p, "codex").InFlight != 0 {
+		t.Fatal("slots not released")
+	}
+}
+func TestServiceMetadataDoesNotClaimAuthenticatedReadiness(t *testing.T) {
+	p := poolFixture(t, "codex", "x_read")
+	if healthKind(t, p, "codex").State != "configured" || healthKind(t, p, "x_read").State != "configured" {
+		t.Fatal("configuration invented provider readiness")
+	}
+	os.Chmod(p.config.XSession, 0644)
+	if healthKind(t, p, "x_read").State != "auth_required" || healthKind(t, p, "codex").State != "configured" {
+		t.Fatal("unsafe session affected wrong service")
+	}
+	os.Remove(filepath.Join(p.config.CodexHome, "auth.json"))
+	if healthKind(t, p, "codex").State != "auth_required" {
+		t.Fatal("missing login appears configured")
+	}
+}

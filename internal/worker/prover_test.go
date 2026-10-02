@@ -83,3 +83,28 @@ func TestProverRun(t *testing.T) {
 		})
 	}
 }
+
+func TestTypedCodexPayloadRejectsToolsOverridesAndAmbiguousJSON(t *testing.T) {
+	l := coordinator.Lease{ServiceType: "codex", ModelID: "gpt-5.6-luna", Prompt: "synthetic"}
+	good := map[string]any{"type": "response.create", "model": l.ModelID, "instructions": "You are a helpful assistant.", "input": []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": l.Prompt}}}}, "stream": true, "store": false, "reasoning": map[string]any{"effort": "low"}, "text": map[string]any{"verbosity": "low"}}
+	l.CodexPayload, _ = json.Marshal(good)
+	if !validPayload(l) {
+		t.Fatal("canonical payload rejected")
+	}
+	for name, edit := range map[string]func(map[string]any){"tools": func(p map[string]any) { p["tools"] = []any{map[string]any{"type": "web_search"}} }, "instructions": func(p map[string]any) { p["instructions"] = "other work" }, "tier": func(p map[string]any) { p["service_tier"] = "priority" }, "retention": func(p map[string]any) { p["store"] = true }, "role": func(p map[string]any) { p["input"].([]any)[0].(map[string]any)["role"] = "system" }, "effort": func(p map[string]any) { p["reasoning"] = map[string]any{"effort": "high"} }} {
+		t.Run(name, func(t *testing.T) {
+			raw, _ := json.Marshal(good)
+			var p map[string]any
+			json.Unmarshal(raw, &p)
+			edit(p)
+			l.CodexPayload, _ = json.Marshal(p)
+			if validPayload(l) {
+				t.Fatal("unsafe typed payload accepted")
+			}
+		})
+	}
+	l.CodexPayload = json.RawMessage(`{"type":"response.create","type":"response.create"}`)
+	if validPayload(l) {
+		t.Fatal("ambiguous payload accepted")
+	}
+}

@@ -15,6 +15,7 @@ const (
 	ExecutorGateway   = "gateway"
 	ExecutorCodexTLSN = "codex-tlsn"
 	ExecutorCodex     = "codex"
+	ExecutorServices  = "services"
 )
 
 type Config struct {
@@ -39,6 +40,10 @@ type Config struct {
 	// Concurrency is how many leases the node runs at once. The default matches
 	// the local Open Agent API baseline of 20 in-flight requests per account.
 	Concurrency      int
+	Services         []string
+	XSession         string
+	CodexConcurrency int
+	XConcurrency     int
 	LocalFixture     bool
 	InferenceTimeout time.Duration
 	MaxInputBytes    int
@@ -79,6 +84,22 @@ func Load() (Config, error) {
 	}
 	if c.CodexHome == "" {
 		c.CodexHome = filepath.Join(home, ".codex")
+	}
+	if c.Executor == ExecutorServices {
+		c.XSession = os.Getenv("SCARLETT_X_SESSION")
+		c.Services = strings.Split(os.Getenv("SCARLETT_SERVICES"), ",")
+		c.CodexConcurrency, c.XConcurrency = 1, 1
+		for name, destination := range map[string]*int{"SCARLETT_CODEX_CONCURRENCY": &c.CodexConcurrency, "SCARLETT_X_CONCURRENCY": &c.XConcurrency} {
+			if value := os.Getenv(name); value != "" {
+				n, e := strconv.Atoi(value)
+				if e != nil || n < 1 || n > 32 {
+					return c, errors.New("invalid service concurrency")
+				}
+				*destination = n
+			}
+		}
+	} else if os.Getenv("SCARLETT_SERVICES") != "" {
+		return c, errors.New("SCARLETT_SERVICES requires services executor")
 	}
 	if s := os.Getenv("SCARLETT_INFERENCE_TIMEOUT_SECONDS"); s != "" {
 		v, e := strconv.Atoi(s)
@@ -142,8 +163,8 @@ func (c Config) Validate() error {
 	if c.LocalFixture && (c.NodeID == "" || strings.ContainsAny(c.NodeID, " \n\r\t") || len(c.Credential) < 32) {
 		return errors.New("local fixture requires SCARLETT_NODE_ID and SCARLETT_CREDENTIAL (at least 32 characters)")
 	}
-	if c.Executor != ExecutorGateway && c.Executor != ExecutorCodex && c.Executor != ExecutorCodexTLSN {
-		return errors.New("SCARLETT_EXECUTOR must be gateway, codex or codex-tlsn")
+	if c.Executor != ExecutorGateway && c.Executor != ExecutorCodex && c.Executor != ExecutorCodexTLSN && c.Executor != ExecutorServices {
+		return errors.New("SCARLETT_EXECUTOR must be gateway, codex, codex-tlsn or services")
 	}
 	if c.LocalFixture && (c.Coordinator != "http://host.docker.internal:8091" ||
 		c.Executor == ExecutorGateway && !fixtureGateway[c.Gateway] ||
@@ -172,9 +193,33 @@ func (c Config) Validate() error {
 		}
 		return nil
 	}
-	if c.Executor == ExecutorCodexTLSN {
+	if c.Executor == ExecutorServices {
+		if c.LocalFixture || len(c.Services) < 1 || len(c.Services) > 2 || c.CodexConcurrency < 1 || c.CodexConcurrency > 32 || c.XConcurrency < 1 || c.XConcurrency > 32 {
+			return errors.New("invalid independent service configuration")
+		}
+		seen := map[string]bool{}
+		for _, kind := range c.Services {
+			if (kind != "codex" && kind != "x_read") || seen[kind] {
+				return errors.New("SCARLETT_SERVICES must select codex, x_read or both")
+			}
+			seen[kind] = true
+		}
+		if seen["codex"] && !filepath.IsAbs(c.CodexHome) || seen["x_read"] && !filepath.IsAbs(c.XSession) {
+			return errors.New("services need absolute local credential paths")
+		}
+	}
+	if c.Executor == ExecutorCodexTLSN || c.Executor == ExecutorServices {
 		host, port, e := net.SplitHostPort(c.Verifier)
-		if e != nil || host == "" || port == "" {
+		number, portErr := strconv.Atoi(port)
+		validHost := host != "" && len(host) <= 253
+		if net.ParseIP(host) == nil {
+			for _, r := range host {
+				if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '.') {
+					validHost = false
+				}
+			}
+		}
+		if e != nil || !validHost || portErr != nil || number < 1 || number > 65535 {
 			return errors.New("SCARLETT_VERIFIER must be host:port")
 		}
 		if c.Prover == "" {
@@ -200,4 +245,13 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+func (c Config) Enabled(kind string) bool {
+	for _, s := range c.Services {
+		if s == kind {
+			return true
+		}
+	}
+	return false
 }

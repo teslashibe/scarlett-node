@@ -5,6 +5,7 @@ go 1.25.5
 require (
 	github.com/teslashibe/open-agent-api v0.1.27
 	github.com/teslashibe/x-go v1.13.0
+	golang.org/x/sys v0.35.0
 	golang.org/x/term v0.34.0
 )
 
@@ -20,6 +21,8 @@ require (
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.17.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
-	golang.org/x/sys v0.35.0 // indirect
 	google.golang.org/protobuf v1.36.8 // indirect
 )
+
+// Private runtime snapshot; source hashes are in third_party/x-go/UPSTREAM.json.
+replace github.com/teslashibe/x-go v1.13.0 => ./third_party/x-go

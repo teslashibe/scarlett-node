@@ -28,8 +28,8 @@ jobs:
       - name: gofmt
         run: |
           set -euo pipefail
-          # shellcheck disable=SC2046 # splitting is the point: one arg per package dir
-          files=$(gofmt -l $(go list -f '{{.Dir}}' ./...))
+          # Keep pinned upstream sources unchanged; check every tracked first-party Go file.
+          files=$(git ls-files -z -- '*.go' ':!:third_party/**' | xargs -0 gofmt -l)
           if [ -n "$files" ]; then
             echo "gofmt needed on:" >&2
             echo "$files" >&2
