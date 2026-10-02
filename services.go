@@ -86,7 +86,15 @@ func (p *servicePool) health() []coordinator.ServiceHealth {
 		if s.enabled {
 			capacity = s.capacity
 		}
-		out = append(out, coordinator.ServiceHealth{Kind: kind, State: s.state, Capacity: capacity, InFlight: s.inFlight, LastErrorCode: s.lastError})
+		h := coordinator.ServiceHealth{Kind: kind, State: s.state, Capacity: capacity, InFlight: s.inFlight, LastErrorCode: s.lastError}
+		if s.enabled {
+			h.MaxInputBytes = p.config.MaxInputBytes
+			if kind == "codex" {
+				h.MaxOutputTokens = p.config.MaxOutputTokens
+				h.Models = append([]string(nil), config.Models...)
+			}
+		}
+		out = append(out, h)
 	}
 	return out
 }

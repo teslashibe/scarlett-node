@@ -24,7 +24,7 @@ func poolFixture(t *testing.T, selected ...string) *servicePool {
 	os.WriteFile(session, []byte(`{"auth_token":"synthetic-auth","ct0":"synthetic-csrf"}`), 0600)
 	helper := filepath.Join(dir, "synthetic-prover")
 	os.WriteFile(helper, []byte("#!/bin/sh\nexit 1\n"), 0700)
-	return newServicePool(config.Config{Services: selected, CodexHome: home, XSession: session, Prover: helper, CodexConcurrency: 2, XConcurrency: 1})
+	return newServicePool(config.Config{Services: selected, CodexHome: home, XSession: session, Prover: helper, CodexConcurrency: 2, XConcurrency: 1, MaxInputBytes: 32768, MaxOutputTokens: 2048})
 }
 
 func TestMissingProofHelperNeverAdvertisesConfiguredCapacity(t *testing.T) {
@@ -144,5 +144,23 @@ func TestServiceMetadataDoesNotClaimAuthenticatedReadiness(t *testing.T) {
 	os.Remove(filepath.Join(p.config.CodexHome, "auth.json"))
 	if healthKind(t, p, "codex").State != "auth_required" {
 		t.Fatal("missing login appears configured")
+	}
+}
+
+func TestServiceLimitsUseLocalConfigWithoutSharedSlices(t *testing.T) {
+	p := poolFixture(t, "codex", "x_read")
+	p.config.MaxInputBytes, p.config.MaxOutputTokens = 123, 456
+	c := healthKind(t, p, "codex")
+	x := healthKind(t, p, "x_read")
+	if c.MaxInputBytes != 123 || c.MaxOutputTokens != 456 || len(c.Models) != 3 || x.MaxInputBytes != 123 || x.MaxOutputTokens != 0 || len(x.Models) != 0 {
+		t.Fatal("local limits not reported")
+	}
+	c.Models[0] = "caller-mutation"
+	if healthKind(t, p, "codex").Models[0] != "gpt-5.6-luna" {
+		t.Fatal("health modified runtime catalog")
+	}
+	disabled := healthKind(t, poolFixture(t, "x_read"), "codex")
+	if disabled.MaxInputBytes != 0 || disabled.MaxOutputTokens != 0 || len(disabled.Models) != 0 {
+		t.Fatal("disabled service advertised capabilities")
 	}
 }

@@ -100,3 +100,17 @@ catalog and coordinator pin together. The artifact is a compatibility snapshot,
 not evidence that its query IDs still work on live X or that an account is
 authorized for paid execution. It contains no session credentials and enables
 no paid demand itself.
+
+## Reported execution limits
+
+Services-mode heartbeats include each enabled service's local `max_input_bytes`.
+For Codex this counts prompt UTF-8 bytes; for X it counts the serialized
+`x_request`, as the worker does. Codex also reports its configured
+`max_output_tokens` and the accepted base-model catalog. X reports neither.
+Disabled services advertise no limits. These reports describe local validation,
+not verified provider access, successful work or payment evidence.
+
+The coordinator must reject incompatible new assignments and check limits again
+before funded acceptance. Legacy heartbeats can still report health, but cannot
+establish compatibility for new paid work. Roll out the coordinator parser before
+nodes publish the added fields. Existing local worker checks remain in force.

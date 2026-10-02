@@ -69,6 +69,10 @@ type ServiceHealth struct {
 	Capacity      int    `json:"capacity"`
 	InFlight      int    `json:"in_flight"`
 	LastErrorCode string `json:"last_error_code,omitempty"`
+	// Local execution limits, not provider authorization or proven readiness.
+	MaxInputBytes   int      `json:"max_input_bytes,omitempty"`
+	MaxOutputTokens int      `json:"max_output_tokens,omitempty"`
+	Models          []string `json:"models,omitempty"`
 }
 
 // Proven tells the coordinator a proof was sent; it reads the answer from the verifier.
