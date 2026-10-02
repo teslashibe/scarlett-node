@@ -4,7 +4,7 @@
 use std::ops::Range;
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const HOST: &str = "chatgpt.com";
@@ -12,7 +12,7 @@ pub const PATH: &str = "/backend-api/codex/responses";
 /// The supplier may hide only this header's credential value.
 const AUTH_PREFIX: &[u8] = b"authorization: Bearer ";
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Verified {
     pub model: String,
     pub output: String,
