@@ -3,6 +3,7 @@ module github.com/teslashibe/scarlett-node
 go 1.25.5
 
 require (
+	filippo.io/edwards25519 v1.1.0
 	github.com/teslashibe/open-agent-api v0.1.27
 	github.com/teslashibe/x-go v1.13.0
 	golang.org/x/sys v0.35.0
