@@ -77,3 +77,9 @@ RPC snapshot behavior follows [Solana’s getMultipleAccounts contract](https://
 The production payment contract, lease request commitment and execution gate still need their coordinator/runtime companions. This package does not enable dispatch, remove the current marketplace blockers or authorize provider work against test funds.
 
 Committed `accepted` and `failed` attempt outcomes require a canonical lowercase 64-character report SHA-256. Missing or malformed receipts leave the local journal unresolved. Unpairing stops new reports; the coordinator may retain status-only recovery for an exact report it committed before unpairing or wallet unbinding, so already accepted buyer work can finish. This recovery does not grant execution or access to prompts, outputs, usage or provider credentials.
+
+### Community funded acceptance
+
+Community Codex/X offers require `acceptance_required` and the exact request/terms commitments, with no verifier token. The native process persists its journal before requesting HTTPS acceptance from its locally configured coordinator. It requires production-receipt authority, the exact unchanged lease and a canonical verifier token before starting the helper/provider. A lost or changed acknowledgement leaves work unstarted and unresolved; recovery never repeats the provider. Services mode and production Codex proof mode reject legacy offers without this handshake. Explicit local fixture mode retains the old fixture contract.
+
+The coordinator's production payment ingester and pricing policy remain separate dependencies. Acceptance refers to normalized payment evidence from that trusted owner; the node does not independently authenticate a checkout or turn the test-USDC prototype reader into real funding. `signed_job_id` carries the immutable community terms digest, including the buyer quote, and is not an on-chain signature. Suppliers earn points only.

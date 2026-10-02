@@ -16,6 +16,10 @@ import (
 
 const Version = "node-v1"
 
+// A lease repeats its bounded prompt in the exact 64 KiB verifier request.
+// Leave room for that duplication and the acceptance/identity envelope.
+const maxReplyBytes = 144 << 10
+
 type PairReply struct {
 	Version        string `json:"version"`
 	NodeID         string `json:"node_id"`
@@ -43,6 +47,9 @@ type Lease struct {
 	VerifierToken string          `json:"verifier_token,omitempty"`
 	XRequest      *XRequest       `json:"x_request,omitempty"`
 	XPayload      json.RawMessage `json:"x_payload,omitempty"`
+	// Community offers grant no provider permission before funded acceptance.
+	AcceptanceRequired bool   `json:"acceptance_required,omitempty"`
+	RequestSHA256      string `json:"request_sha256,omitempty"`
 }
 
 // XRequest is bounded public read work; no URLs, headers or credentials come
@@ -221,8 +228,8 @@ func (c *Client) Post(ctx context.Context, path string, body any, out any) (int,
 		return resp.StatusCode, fmt.Errorf("coordinator HTTP %d", resp.StatusCode)
 	}
 	if out != nil {
-		data, err := io.ReadAll(io.LimitReader(resp.Body, 131073))
-		if err != nil || len(data) > 131072 {
+		data, err := io.ReadAll(io.LimitReader(resp.Body, maxReplyBytes+1))
+		if err != nil || len(data) > maxReplyBytes {
 			return resp.StatusCode, errors.New("coordinator response too large")
 		}
 		if err = json.Unmarshal(data, out); err != nil {
