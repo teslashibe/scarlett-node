@@ -74,6 +74,40 @@ paths:
         '204': {description: Authenticated single-use echo recorded}
         '401': {description: Invalid or revoked node credential}
         '409': {description: Unknown, expired, replayed or wrong-node nonce}
+  /api/node/v1/jobs/{job_id}/accept:
+    post:
+      security: [{nodeBearer: []}]
+      parameters: [{$ref: '#/components/parameters/JobID'}]
+      summary: Accept an exact funded offer before provider execution
+      description: >-
+        Persist the local attempt journal before this request. The coordinator registers the exact
+        immutable request with its locally trusted durable verifier and rechecks production funding,
+        ownership, revocation and exclusive deadline before committing acceptance. Registration may
+        be repeated with identical bindings after uncertainty; provider execution may not be replayed.
+        A lost acceptance reply leaves provider work unstarted and requires attempt reconciliation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [version, attempt, fence, request_sha256, terms_sha256]
+              properties:
+                version: {type: string, enum: [node-v1]}
+                attempt: {type: string}
+                fence: {type: string}
+                request_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+                terms_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+      responses:
+        '200':
+          description: Exact durable funded acceptance, with the verifier token
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LeaseAcceptance'}
+        '401': {description: Invalid or revoked node credential}
+        '409': {description: Funding, ownership, terms, fence or deadline conflict}
+        '503': {description: Verifier unavailable or bounded registration capacity busy}
   /api/node/v1/jobs/{job_id}/result:
     post:
       security: [{nodeBearer: []}]
@@ -209,6 +243,15 @@ components:
         version: {type: string, enum: [node-v1]}
         node_id: {type: string, description: Must match the authenticated credential owner.}
         nonce: {type: string, pattern: '^[0-9a-f]{64}$'}
+    LeaseAcceptance:
+      type: object
+      additionalProperties: false
+      required: [version, state, funding_authority, lease]
+      properties:
+        version: {type: string, enum: [node-v1]}
+        state: {type: string, enum: [leased]}
+        funding_authority: {type: string, enum: [production_receipt], description: Normalized trusted payment-adapter evidence; never prototype funds}
+        lease: {$ref: '#/components/schemas/Lease'}
     Lease:
       type: object
       description: >-
@@ -224,7 +267,7 @@ components:
             model_id: {type: string, minLength: 1}
             max_input_tokens: {type: integer, minimum: 1}
             max_output_tokens: {type: integer, minimum: 1}
-        - required: [service_type, x_request, x_payload, verifier_token]
+        - required: [service_type, x_request, x_payload]
           properties:
             service_type: {type: string, enum: [x_read]}
             model_id: {type: string, maxLength: 0}
@@ -233,8 +276,10 @@ components:
             max_output_tokens: {type: integer, maximum: 0}
       properties:
         version: {type: string, enum: [node-v1]}
+        acceptance_required: {type: boolean, description: Required true for community provider work; token-free offers need funded acceptance before execution}
+        request_sha256: {type: string, pattern: '^[0-9a-f]{64}$', description: Canonical exact verifier request digest}
         job_id: {type: string}
-        signed_job_id: {type: string, description: Coordinator-issued job commitment; not cryptographically verified by v1 node.}
+        signed_job_id: {type: string, description: Legacy commitment field; community offers bind the immutable reviewed terms digest, not an on-chain signature.}
         service_type: {type: string, enum: [codex, x_read], description: Required in services mode; omitted by legacy Codex leases}
         profile: {type: string}
         model_id: {type: string, description: 'A catalog base model or its gateway alias with a reasoning effort (-low, -medium, -high, -xhigh, -max) and/or the fast tier (-fast, -fast-<effort>). Proven Codex leases must name a base model.'}

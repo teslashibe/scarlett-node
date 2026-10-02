@@ -82,6 +82,11 @@ func rejectLease(ctx context.Context, client *coordinator.Client, journal *attem
 	if err = journal.Begin(r); err != nil {
 		return err
 	}
+	if l.AcceptanceRequired {
+		if _, err = client.Accept(ctx, l); err != nil {
+			return err
+		}
+	}
 	raw, err := json.Marshal(coordinator.Failure{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence, Code: code})
 	if err != nil {
 		return err

@@ -333,6 +333,9 @@ func run(c config.Config) error {
 }
 
 func submitLease(ctx context.Context, client *coordinator.Client, c config.Config, l coordinator.Lease, local worker.Completer, journal *attempts.Journal) (string, error) {
+	if !c.LocalFixture && (c.Executor == config.ExecutorServices || c.Executor == config.ExecutorCodexTLSN) && !l.AcceptanceRequired {
+		return "invalid_lease", errors.New("community provider work requires funded acceptance")
+	}
 	if _, err := coordinator.JobPath(l.JobID, "result"); err != nil {
 		return "invalid_lease", err
 	}
@@ -342,6 +345,14 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	}
 	if err := journal.Begin(record); err != nil {
 		return "", err
+	}
+	if l.AcceptanceRequired {
+		// Persist uncertainty before acceptance HTTP. A lost acknowledgement
+		// keeps this journal pending; recovery never re-executes the provider.
+		l, err = client.Accept(ctx, l)
+		if err != nil {
+			return "", err
+		}
 	}
 	var body any
 	code := ""
