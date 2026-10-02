@@ -138,7 +138,7 @@ func TestRecoveryLiveUsesExactBodyAndUncertainCallsNeverRerun(t *testing.T) {
 	}
 }
 func TestRecoveryRejectsWrongIdentityOldContractAndDifferentReceipt(t *testing.T) {
-	for _, failure := range []string{"identity", "old-contract", "wrong-receipt", "pending", "fenced", "unsupported"} {
+	for _, failure := range []string{"identity", "old-contract", "wrong-receipt", "missing-receipt", "malformed-receipt", "pending", "fenced", "unsupported"} {
 		t.Run(failure, func(t *testing.T) {
 			j := testJournal(t, filepath.Join(t.TempDir(), "attempts"))
 			l := testLease()
@@ -158,6 +158,10 @@ func TestRecoveryRejectsWrongIdentityOldContractAndDifferentReceipt(t *testing.T
 				status.ReplaySafe = false
 			case "wrong-receipt":
 				status.SubmissionSHA256 = attempts.Hash([]byte("other"))
+			case "missing-receipt":
+				status.SubmissionSHA256 = ""
+			case "malformed-receipt":
+				status.SubmissionSHA256 = "invalid"
 			case "pending":
 				status.State = "proof_pending"
 			case "fenced":

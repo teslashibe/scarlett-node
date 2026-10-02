@@ -139,7 +139,7 @@ paths:
         Report retries require this explicit contract. Persistence idempotency never
         authorizes repeated provider execution. live means no committed report;
         proof_pending means the verifier owns ingestion; accepted/failed are committed
-        outcomes; expired/fenced are permanent for this attempt. Revocation denies access.
+        outcomes; expired/fenced are permanent for this attempt. Revocation denies new reports and recovery of unreported attempts. A report committed before unpairing or wallet unbinding may finish verification for the buyer; its node may read only that exact attempt status afterward. Recovery does not authorize another provider call.
         A restarted node reports execution_uncertain for a started attempt and must
         not rerun its provider. That failure must not automatically requeue paid work.
       responses:
