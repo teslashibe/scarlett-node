@@ -2,7 +2,10 @@ package coordinator
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -141,5 +144,49 @@ func TestUnboundedOrPrefilledCommunityOfferDoesNotCallCoordinator(t *testing.T) 
 	}
 	if calls != 0 {
 		t.Fatal("unsafe offer contacted coordinator")
+	}
+}
+
+// The node receives the coordinator's stored terms digest, not its private
+// buyer quote. This test checks commitment preservation across denominations;
+// monetary validity and funding evidence belong to the coordinator tests.
+func TestFundedAcceptanceBindsMicroUSDQuoteCommitment(t *testing.T) {
+	termsDigest := func(asset string, atoms int64) string {
+		identity := fmt.Sprintf(`{"terms":{"nodeId":"synthetic-node","service":"codex","policyReference":"synthetic-v1","model":"gpt-5.6-luna","operation":"","maxInput":100,"maxOutput":20,"exchanges":1,"quote":{"asset":%q,"amountAtoms":%d,"pricingReference":"synthetic-price-v1"}},"requestHash":%q}`, asset, atoms, strings.Repeat("b", 64))
+		sum := sha256.Sum256([]byte(identity))
+		return hex.EncodeToString(sum[:])
+	}
+	for _, denomination := range []string{"usd", "usdc", "usd_micros"} {
+		t.Run(denomination, func(t *testing.T) {
+			offer := Lease{Version: Version, ServiceType: "codex", JobID: "synthetic-quote", SignedJobID: termsDigest(denomination, 100), RequestSHA256: strings.Repeat("b", 64), Attempt: "attempt", Fence: "fence", Profile: "p", AcceptanceRequired: true, LeaseDeadline: time.Now().Add(time.Minute)}
+			offer.SettlementDeadline = offer.LeaseDeadline
+			otherDenomination := "usd_micros"
+			if denomination == otherDenomination {
+				otherDenomination = "usd"
+			}
+			for _, responseDigest := range []string{offer.SignedJobID, termsDigest(otherDenomination, 100), termsDigest(denomination, 101)} {
+				server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					var request map[string]string
+					if json.NewDecoder(r.Body).Decode(&request) != nil || request["terms_sha256"] != offer.SignedJobID {
+						t.Error("funded acceptance changed the offered quote commitment")
+					}
+					accepted := offer
+					accepted.SignedJobID = responseDigest
+					accepted.VerifierToken = strings.Repeat("c", 64)
+					json.NewEncoder(w).Encode(LeaseAcceptance{Version: Version, State: "leased", FundingAuthority: "production_receipt", Lease: accepted})
+				}))
+				client := New(server.URL, "synthetic-credential")
+				client.HTTP = server.Client()
+				got, err := client.Accept(context.Background(), offer)
+				server.Close()
+				if responseDigest == offer.SignedJobID {
+					if err != nil || got.SignedJobID != offer.SignedJobID {
+						t.Fatal("exact denomination commitment rejected", err)
+					}
+				} else if err == nil {
+					t.Fatal("changed quote denomination or amount authorized execution")
+				}
+			}
+		})
 	}
 }

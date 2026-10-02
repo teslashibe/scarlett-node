@@ -212,3 +212,91 @@ func TestFullJournalRejectsNewWorkWithoutEvictingUncertainAttempts(t *testing.T)
 		t.Fatal("uncertain history evicted", e)
 	}
 }
+
+func TestByteReservationStopsAdmissionAndKeepsRecovery(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "attempts")
+	limits := Limits{MaxRecords: 4, MaxRecordBytes: maxRecordBytes, MaxTotalBytes: 2 * maxRecordBytes}
+	j, err := OpenWithLimits(dir, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := fixture()
+	if err = j.Begin(r); err != nil {
+		t.Fatal(err)
+	}
+	r2 := r
+	r2.JobID = "second"
+	if err = j.Begin(r2); err != nil {
+		t.Fatal(err)
+	}
+	capacity, err := j.Capacity()
+	if err != nil || capacity.AvailableRecords != 0 || capacity.ReservedBytes != limits.MaxTotalBytes {
+		t.Fatal(capacity, err)
+	}
+	r3 := r
+	r3.JobID = "third"
+	if err = j.Begin(r3); err == nil {
+		t.Fatal("accepted without room for provider report")
+	}
+	if _, err = j.Ready(r, "fail", []byte(`{"code":"synthetic"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err = j.Terminal(r); err != nil {
+		t.Fatal(err)
+	}
+	// One terminal receipt still consumes its actual bytes. The full-size
+	// reservation for the second attempt remains intact.
+	capacity, err = j.Capacity()
+	if err != nil || capacity.ReservedBytes >= limits.MaxTotalBytes {
+		t.Fatal(capacity, err)
+	}
+	if err = j.Purge(time.Now().Add(48 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	j.Close()
+	j, err = OpenWithLimits(dir, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	pending, err := j.Pending()
+	if err != nil || len(pending) != 1 || pending[0].JobID != "second" {
+		t.Fatal(pending, err)
+	}
+	if err = j.Begin(r2); err != ErrExists {
+		t.Fatal("uncertain provider call became replayable", err)
+	}
+}
+
+func TestJournalLimitsFailClosed(t *testing.T) {
+	for _, limits := range []Limits{{}, {1, 1, 1}, {1000001, maxRecordBytes, 256 << 20}, {1, maxRecordBytes, maxRecordBytes - 1}} {
+		if _, err := OpenWithLimits(filepath.Join(t.TempDir(), "attempts"), limits); err == nil {
+			t.Fatal("invalid limits accepted", limits)
+		}
+	}
+}
+
+func BenchmarkJournalSyntheticCommit(b *testing.B) {
+	// Includes JSON serialization, private atomic writes and file/directory
+	// fsync on this machine. It does not measure proof or provider throughput.
+	j, err := OpenWithLimits(filepath.Join(b.TempDir(), "attempts"), Limits{1000000, maxRecordBytes, 16 << 30})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer j.Close()
+	body := []byte(`{"code":"synthetic"}`)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r := fixture()
+		r.JobID = fmt.Sprintf("synthetic-%d", i)
+		if err := j.Begin(r); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := j.Ready(r, "fail", body); err != nil {
+			b.Fatal(err)
+		}
+		if err := j.Terminal(r); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

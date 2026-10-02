@@ -27,6 +27,31 @@ var (
 	ErrConflict = errors.New("attempt journal identity conflict")
 )
 
+// Limits bound private receipt retention. Pending records reserve their full
+// encoded record size so committing the provider report cannot consume another
+// accepted attempt's space.
+type Limits struct {
+	MaxRecords     int   `json:"max_records"`
+	MaxRecordBytes int   `json:"max_record_bytes"`
+	MaxTotalBytes  int64 `json:"max_total_bytes"`
+}
+
+func DefaultLimits() Limits { return Limits{maxRecords, maxRecordBytes, 256 << 20} }
+func (l Limits) Validate() error {
+	if l.MaxRecords < 1 || l.MaxRecords > 1000000 || l.MaxRecordBytes < maxRecordBytes || l.MaxRecordBytes > 1<<20 || l.MaxTotalBytes < int64(l.MaxRecordBytes) || l.MaxTotalBytes > 16<<30 {
+		return errors.New("invalid attempt journal limits")
+	}
+	return nil
+}
+
+type Capacity struct {
+	Limits           Limits `json:"limits"`
+	Records          int    `json:"records"`
+	Bytes            int64  `json:"bytes"`
+	ReservedBytes    int64  `json:"reserved_bytes"`
+	AvailableRecords int    `json:"available_records"`
+}
+
 type Record struct {
 	JobID            string    `json:"job_id"`
 	Attempt          string    `json:"attempt"`
@@ -41,14 +66,19 @@ type Record struct {
 }
 
 type Journal struct {
-	mu   sync.Mutex
-	dir  string
-	lock *os.File
+	mu     sync.Mutex
+	dir    string
+	lock   *os.File
+	limits Limits
 }
 
 // Open holds an OS lock until Close, including across worker goroutines. A
 // crash releases the lock; starting a second process never claims live work.
-func Open(dir string) (*Journal, error) {
+func Open(dir string) (*Journal, error) { return OpenWithLimits(dir, DefaultLimits()) }
+func OpenWithLimits(dir string, limits Limits) (*Journal, error) {
+	if err := limits.Validate(); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
@@ -73,7 +103,7 @@ func Open(dir string) (*Journal, error) {
 		f.Close()
 		return nil, errors.New("another node process owns the attempt journal")
 	}
-	j := &Journal{dir: dir, lock: f}
+	j := &Journal{dir: dir, lock: f, limits: limits}
 	// The exclusive lock makes abandoned atomic-write files safe to remove.
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -142,7 +172,7 @@ func (j *Journal) read(name string) (Record, error) {
 	if err != nil {
 		return r, err
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > maxRecordBytes {
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > int64(j.limits.MaxRecordBytes) {
 		return r, errors.New("invalid attempt record file")
 	}
 	f, err := os.OpenFile(name, os.O_RDONLY|unix.O_NOFOLLOW, 0)
@@ -150,11 +180,11 @@ func (j *Journal) read(name string) (Record, error) {
 		return r, err
 	}
 	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, maxRecordBytes+1))
+	data, err := io.ReadAll(io.LimitReader(f, int64(j.limits.MaxRecordBytes)+1))
 	if err != nil {
 		return r, err
 	}
-	if len(data) > maxRecordBytes || json.Unmarshal(data, &r) != nil || !valid(r) || filepath.Base(name) != key(r)+".json" {
+	if len(data) > j.limits.MaxRecordBytes || json.Unmarshal(data, &r) != nil || !valid(r) || filepath.Base(name) != key(r)+".json" {
 		return r, errors.New("invalid attempt record")
 	}
 	return r, nil
@@ -167,8 +197,35 @@ func (j *Journal) write(r Record) error {
 		return errors.New("invalid attempt record")
 	}
 	data, err := json.Marshal(r)
-	if err != nil || len(data) > maxRecordBytes {
+	if err != nil || len(data) > j.limits.MaxRecordBytes {
 		return errors.New("attempt record too large")
+	}
+	records, err := j.records()
+	if err != nil {
+		return err
+	}
+	var reserved int64
+	for _, existing := range records {
+		if key(existing) == key(r) {
+			continue
+		}
+		if existing.State != "terminal" {
+			reserved += int64(j.limits.MaxRecordBytes)
+		} else {
+			info, err := os.Stat(filepath.Join(j.dir, key(existing)+".json"))
+			if err != nil {
+				return err
+			}
+			reserved += info.Size()
+		}
+	}
+	if r.State != "terminal" {
+		reserved += int64(j.limits.MaxRecordBytes)
+	} else {
+		reserved += int64(len(data))
+	}
+	if reserved > j.limits.MaxTotalBytes {
+		return errors.New("attempt journal storage full")
 	}
 	f, err := os.CreateTemp(j.dir, ".write-")
 	if err != nil {
@@ -205,6 +262,7 @@ func (j *Journal) records() ([]Record, error) {
 		return nil, err
 	}
 	result := []Record{}
+	var total int64
 	for _, entry := range entries {
 		if entry.Name() == ".lock" {
 			continue
@@ -219,13 +277,48 @@ func (j *Journal) records() ([]Record, error) {
 		if err != nil {
 			return nil, err
 		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		total += info.Size()
+		if total > j.limits.MaxTotalBytes {
+			return nil, errors.New("attempt journal storage capacity exceeded")
+		}
 		result = append(result, r)
-		if len(result) > maxRecords {
+		if len(result) > j.limits.MaxRecords {
 			return nil, errors.New("attempt journal capacity exceeded")
 		}
 	}
 	return result, nil
 }
+func (j *Journal) capacity(records []Record) (Capacity, error) {
+	c := Capacity{Limits: j.limits, Records: len(records)}
+	for _, r := range records {
+		info, err := os.Stat(filepath.Join(j.dir, key(r)+".json"))
+		if err != nil {
+			return c, err
+		}
+		c.Bytes += info.Size()
+		if r.State != "terminal" {
+			c.ReservedBytes += int64(j.limits.MaxRecordBytes)
+		} else {
+			c.ReservedBytes += info.Size()
+		}
+	}
+	c.AvailableRecords = min(j.limits.MaxRecords-c.Records, int(max(int64(0), j.limits.MaxTotalBytes-c.ReservedBytes)/int64(j.limits.MaxRecordBytes)))
+	return c, nil
+}
+func (j *Journal) Capacity() (Capacity, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	records, err := j.records()
+	if err != nil {
+		return Capacity{}, err
+	}
+	return j.capacity(records)
+}
+
 func (j *Journal) Begin(r Record) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -251,7 +344,11 @@ func (j *Journal) Begin(r Record) error {
 	if err != nil {
 		return err
 	}
-	if len(records) >= maxRecords {
+	capacity, err := j.capacity(records)
+	if err != nil {
+		return err
+	}
+	if capacity.AvailableRecords < 1 {
 		return errors.New("attempt journal full; reconcile before accepting work")
 	}
 	return j.write(r)
