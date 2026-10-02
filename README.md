@@ -59,3 +59,15 @@ SIGTERM and Ctrl-C stop polling and give accepted workers up to two minutes to f
 Current gaps against [issue #1](https://github.com/teslashibe/scarlett-node/issues/1): committed job identities are not cryptographically verified against the Solana program. Dynamic capacity and independent tokenization remain incomplete. The node emits no rewardable report for missing usage, model mismatch, invalid finish reason or expired lease. Usage constraints are checked after inference, rather than imposing an upstream spending ceiling. TLSNotary still needs an authorized provider login and coordinator-run verifier. The coordinator has not enabled paid dispatch or the reconciliation contract; typed services await the production coordinator companion. The unpaid Docker fixture remains separate from the points-only community product.
 
 Builds use the pinned private x-go runtime snapshot in `third_party/x-go`, with source hashes recorded in `UPSTREAM.json`. Hosted CI and Docker builds need no GitHub credential for it. The command and MCP adapters are outside this snapshot. The gateway remains the public pinned module in go.mod.
+
+## Prototype funding evidence
+
+`internal/funding` checks the v2 test-USDC protocol independently of coordinator assertions. It verifies the domain-separated Ed25519 quote, exact owner/request/service/work/deadline bindings, canonical configuration/job/escrow addresses and a finalized account snapshot from a reviewed local RPC endpoint. Configuration pins cover program, publisher, cluster genesis, mint and treasury. A missing account, changed job, closed escrow, wrong policy or insufficient balance fails. Unsolicited excess escrow does not block otherwise valid funding.
+
+The reader has a combined three-second deadline, bounded responses and no redirects or automatic retries. HTTPS is required except for a literal loopback prototype validator. Mainnet genesis is rejected. It queries public account addresses only, never signs or submits a transaction, and always marks evidence as prototype test-USDC. This cannot establish real revenue or points eligibility.
+
+The account and quote fixtures are generated using the companion protocol’s Anchor 0.31.1 and Solana libraries, without a chain call or payment. Regenerate with `node internal/funding/testdata/generate.cjs /path/to/isolated/scarlett-protocol` after that checkout’s local harness and v2 IDL are prepared. They contain synthetic public keys and a synthetic signature, with no provider credentials.
+
+RPC snapshot behavior follows [Solana’s getMultipleAccounts contract](https://solana.com/docs/rpc/http/getmultipleaccounts); canonical addresses follow [Solana’s PDA derivation](https://solana.com/docs/core/pda). The curve decoder is pinned in `go.mod`.
+
+The production payment contract, lease request commitment and execution gate still need their coordinator/runtime companions. This package does not enable dispatch, remove the current marketplace blockers or authorize provider work against test funds.
