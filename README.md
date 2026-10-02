@@ -83,3 +83,20 @@ Committed `accepted` and `failed` attempt outcomes require a canonical lowercase
 Community Codex/X offers require `acceptance_required` and the exact request/terms commitments, with no verifier token. The native process persists its journal before requesting HTTPS acceptance from its locally configured coordinator. It requires production-receipt authority, the exact unchanged lease and a canonical verifier token before starting the helper/provider. A lost or changed acknowledgement leaves work unstarted and unresolved; recovery never repeats the provider. Services mode and production Codex proof mode reject legacy offers without this handshake. Explicit local fixture mode retains the old fixture contract.
 
 The coordinator's production payment ingester and pricing policy remain separate dependencies. Acceptance refers to normalized payment evidence from that trusted owner; the node does not independently authenticate a checkout or turn the test-USDC prototype reader into real funding. `signed_job_id` carries the immutable community terms digest, including the buyer quote, and is not an on-chain signature. Suppliers earn points only.
+## Public X request catalog
+
+[`api/x-request-catalog.json`](api/x-request-catalog.json) publishes the exact
+query IDs, shared feature flags and fixed variables emitted by the pinned
+`x-go` v1.13.0 runtime for search, profile, post and thread reads. Its example
+query, handle and post IDs are placeholders for bounded buyer input. The
+coordinator constructs the plan; buyers cannot supply provider URLs, query IDs,
+feature flags, extra variables or an initial cursor. Search pages follow the
+previous verified response cursor and remain limited to three exchanges.
+
+`TestPublicXRequestCatalogMatchesRuntime` captures each operation through a
+synthetic transport with no upstream dial path and compares it to this public
+artifact. Changes to the pinned client or request policy must update the
+catalog and coordinator pin together. The artifact is a compatibility snapshot,
+not evidence that its query IDs still work on live X or that an account is
+authorized for paid execution. It contains no session credentials and enables
+no paid demand itself.
