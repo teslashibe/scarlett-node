@@ -86,6 +86,10 @@ Committed `accepted` and `failed` attempt outcomes require a canonical lowercase
 
 Community Codex/X offers require `acceptance_required` and the exact request/terms commitments, with no verifier token. The native process persists its journal before requesting HTTPS acceptance from its locally configured coordinator. It requires production-receipt authority, the exact unchanged lease and a canonical verifier token before starting the helper/provider. A lost or changed acknowledgement leaves work unstarted and unresolved; recovery never repeats the provider. Services mode and production Codex proof mode reject legacy offers without this handshake. Explicit local fixture mode retains the old fixture contract.
 
+Buyer quote denominations are owned by the coordinator: legacy `usd` uses cents, `usdc` uses millionths of USDC, and prepaid `usd_micros` uses millionths of a US dollar. They are distinct units with no implicit conversion. The node receives the stored terms digest through `signed_job_id`, echoes it as `terms_sha256`, and requires the accepted lease to match that offer exactly. It receives no quote amount or buyer balance and cannot independently validate monetary precision, reserve credit or authenticate checkout evidence. Those checks belong to the coordinator's authoritative funding adapter. The Rust verifier checks provider proofs independently of buyer monetary units.
+
+The `usd_micros` denomination leaves the public `node-v1` lease shape unchanged. The separate `internal/funding` Borsh reader retains its devnet test-USDC contract and provides no prepaid funding authority.
+
 The coordinator's production payment ingester and pricing policy remain separate dependencies. Acceptance refers to normalized payment evidence from that trusted owner; the node does not independently authenticate a checkout or turn the test-USDC prototype reader into real funding. `signed_job_id` carries the immutable community terms digest, including the buyer quote, and is not an on-chain signature. Suppliers earn points only.
 ## Public X request catalog
 
