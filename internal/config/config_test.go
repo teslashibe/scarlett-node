@@ -18,6 +18,14 @@ func TestOrigins(t *testing.T) {
 			t.Fatalf("accepted coordinator %s", bad)
 		}
 	}
+
+	for _, ca := range []string{"relative.pem", "/tmp/synthetic-ca.pem"} {
+		copy := c
+		copy.CoordinatorCA = ca
+		if (copy.Validate() == nil) != (ca == "/tmp/synthetic-ca.pem") {
+			t.Fatal("coordinator CA path validation wrong")
+		}
+	}
 	local := Config{Coordinator: "http://host.docker.internal:8091", Executor: ExecutorGateway, Gateway: "http://agent1-gateway:8088", Profile: "local-fixture", StateDir: filepath.Join(t.TempDir(), "state"), NodeID: "terra", Credential: "local-sim-terra-credential-not-a-wallet", LocalFixture: true, InferenceTimeout: time.Second, MaxInputBytes: 32, MaxOutputTokens: 128}
 	if err := local.Validate(); err != nil {
 		t.Fatalf("local Docker fixture rejected: %v", err)

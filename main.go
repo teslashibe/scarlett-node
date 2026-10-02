@@ -59,7 +59,10 @@ func pair(c config.Config) error {
 	if err != nil {
 		return err
 	}
-	client := coordinator.New(c.Coordinator, "")
+	client, err := coordinator.NewWithCA(c.Coordinator, "", c.CoordinatorCA)
+	if err != nil {
+		return err
+	}
 	var reply coordinator.PairReply
 	_, err = client.Post(context.Background(), "/api/node/v1/pair", map[string]string{"version": coordinator.Version, "code": code, "profile": c.Profile}, &reply)
 	if err != nil {
@@ -125,7 +128,10 @@ func run(c config.Config) error {
 	} else if nodeID == "" {
 		return errors.New("SCARLETT_NODE_ID required with SCARLETT_CREDENTIAL")
 	}
-	client := coordinator.New(c.Coordinator, cred)
+	client, err := coordinator.NewWithCA(c.Coordinator, cred, c.CoordinatorCA)
+	if err != nil {
+		return err
+	}
 	if c.LocalFixture {
 		client.EchoUnqualifiedHTTP = true
 	}
