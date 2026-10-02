@@ -1,0 +1,18 @@
+[Unit]
+Description=Scarlett community node
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/scarlett-node/node.env
+ExecStart=%h/.local/bin/scarlett-node run
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+# Give the main process time to finish workers before stopping prover children
+KillMode=mixed
+TimeoutStopSec=150
+
+[Install]
+WantedBy=default.target

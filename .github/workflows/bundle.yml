@@ -1,0 +1,43 @@
+name: bundle
+on:
+  pull_request:
+    paths:
+      - '**.go'
+      - 'go.*'
+      - 'prover/**'
+      - 'third_party/**'
+      - 'scripts/**'
+      - 'packaging/**'
+      - 'Dockerfile'
+      - '.github/workflows/bundle.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: rustup toolchain install
+        working-directory: prover
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: prover
+      - name: Build native bundle
+        run: scripts/package.sh "dev-${GITHUB_SHA}" "$RUNNER_TEMP/bundles"
+      - name: Install and test bundle
+        run: scripts/test-install.sh "$RUNNER_TEMP/bundles"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-bundle-${{ matrix.runner }}
+          path: ${{ runner.temp }}/bundles/*.tar.gz*
+          if-no-files-found: error

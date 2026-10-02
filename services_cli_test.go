@@ -54,6 +54,10 @@ func TestActualServicesCLIHeartbeatOnly(t *testing.T) {
 	ca := filepath.Join(dir, "ca.pem")
 	os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600)
 	state := filepath.Join(dir, "state")
+	helper := filepath.Join(dir, "synthetic-prover")
+	if e := os.WriteFile(helper, []byte("#!/bin/sh\nexit 1\n"), 0700); e != nil {
+		t.Fatal(e)
+	}
 	cmd := exec.Command(binary, "run")
 	for _, e := range os.Environ() {
 		if !strings.HasPrefix(e, "SCARLETT_") && !strings.HasPrefix(e, "CODEX_HOME=") {
@@ -61,6 +65,9 @@ func TestActualServicesCLIHeartbeatOnly(t *testing.T) {
 		}
 	}
 	cmd.Env = append(cmd.Env, "SCARLETT_EXECUTOR=services", "SCARLETT_VERIFIER=127.0.0.1:17047", "SCARLETT_SERVICES=codex,x_read", "SCARLETT_COORDINATOR="+server.URL, "SCARLETT_COORDINATOR_CA_FILE="+ca, "SCARLETT_CODEX_HOME="+home, "SCARLETT_X_SESSION="+session, "SCARLETT_PROFILE=standard", "SCARLETT_STATE_DIR="+state, "SCARLETT_CREDENTIAL="+credential, "SCARLETT_NODE_ID=synthetic-node")
+	if os.Getenv("SCARLETT_TEST_BUNDLE") != "1" {
+		cmd.Env = append(cmd.Env, "SCARLETT_PROVER="+helper)
+	}
 	var stderr bytes.Buffer
 	cmd.Stdout = io.Discard
 	cmd.Stderr = &stderr
