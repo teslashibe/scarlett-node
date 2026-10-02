@@ -18,7 +18,8 @@ const (
 )
 
 type Config struct {
-	Coordinator string
+	Coordinator   string
+	CoordinatorCA string
 	// Executor is "gateway" (reported usage from an HTTP gateway), "codex" (the same
 	// Codex client run in-process from this node's own login) or "codex-tlsn"
 	// (Codex job proven to a verifier).
@@ -59,7 +60,7 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	c := Config{Coordinator: os.Getenv("SCARLETT_COORDINATOR"), Executor: os.Getenv("SCARLETT_EXECUTOR"), Verifier: os.Getenv("SCARLETT_VERIFIER"), Prover: os.Getenv("SCARLETT_PROVER"), Gateway: os.Getenv("SCARLETT_GATEWAY"), Profile: os.Getenv("SCARLETT_PROFILE"), StateDir: os.Getenv("SCARLETT_STATE_DIR"), GatewayKey: os.Getenv("SCARLETT_GATEWAY_KEY"), Credential: os.Getenv("SCARLETT_CREDENTIAL"), NodeID: os.Getenv("SCARLETT_NODE_ID"), CodexHome: os.Getenv("SCARLETT_CODEX_HOME"), CodexProfile: os.Getenv("SCARLETT_CODEX_PROFILE"), CodexScaffold: os.Getenv("SCARLETT_CODEX_SCAFFOLD"), Bid: 100, LocalFixture: os.Getenv("SCARLETT_LOCAL_FIXTURE") == "1", InferenceTimeout: 45 * time.Second, MaxInputBytes: 32768, MaxOutputTokens: 2048}
+	c := Config{Coordinator: os.Getenv("SCARLETT_COORDINATOR"), CoordinatorCA: os.Getenv("SCARLETT_COORDINATOR_CA_FILE"), Executor: os.Getenv("SCARLETT_EXECUTOR"), Verifier: os.Getenv("SCARLETT_VERIFIER"), Prover: os.Getenv("SCARLETT_PROVER"), Gateway: os.Getenv("SCARLETT_GATEWAY"), Profile: os.Getenv("SCARLETT_PROFILE"), StateDir: os.Getenv("SCARLETT_STATE_DIR"), GatewayKey: os.Getenv("SCARLETT_GATEWAY_KEY"), Credential: os.Getenv("SCARLETT_CREDENTIAL"), NodeID: os.Getenv("SCARLETT_NODE_ID"), CodexHome: os.Getenv("SCARLETT_CODEX_HOME"), CodexProfile: os.Getenv("SCARLETT_CODEX_PROFILE"), CodexScaffold: os.Getenv("SCARLETT_CODEX_SCAFFOLD"), Bid: 100, LocalFixture: os.Getenv("SCARLETT_LOCAL_FIXTURE") == "1", InferenceTimeout: 45 * time.Second, MaxInputBytes: 32768, MaxOutputTokens: 2048}
 	if s := os.Getenv("SCARLETT_BID"); s != "" {
 		v, e := strconv.ParseInt(s, 10, 64)
 		if e != nil || v < 0 || v > 1_000_000_000 {
@@ -158,6 +159,9 @@ func (c Config) Validate() error {
 	}
 	if u.Scheme != "https" && !(c.LocalFixture && u.Scheme == "http" && (u.Hostname() == "localhost" || u.Hostname() == "host.docker.internal" || net.ParseIP(u.Hostname()) != nil && net.ParseIP(u.Hostname()).IsLoopback())) {
 		return errors.New("SCARLETT_COORDINATOR must be HTTPS or explicit local fixture HTTP")
+	}
+	if c.CoordinatorCA != "" && (!filepath.IsAbs(c.CoordinatorCA) || u.Scheme != "https") {
+		return errors.New("SCARLETT_COORDINATOR_CA_FILE requires an absolute path and HTTPS")
 	}
 	if c.StateDir == "" || !filepath.IsAbs(c.StateDir) {
 		return errors.New("state directory must be absolute")
