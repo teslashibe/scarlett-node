@@ -17,6 +17,9 @@ pub struct Verified {
     pub model: String,
     pub output: String,
     pub input_tokens: u64,
+    /// Reported cached subset; missing details are unknown, never zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
     pub output_tokens: u64,
 }
 
@@ -77,12 +80,23 @@ pub fn check(
     let (Some(input_tokens), Some(output_tokens)) = (usage["input_tokens"].as_u64(), usage["output_tokens"].as_u64()) else {
         bail!("completed response has no token usage");
     };
+    let cached_input_tokens = match usage.get("input_tokens_details") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(details)) => match details.get("cached_tokens") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(value.as_u64().context("completed response has invalid cached input usage")?),
+        },
+        Some(_) => bail!("completed response has invalid input usage details"),
+    };
+    if cached_input_tokens.is_some_and(|cached| cached > input_tokens) {
+        bail!("cached input usage exceeds total input usage");
+    }
     let output = events
         .iter()
         .filter(|v| v["type"] == "response.output_text.delta")
         .filter_map(|v| v["delta"].as_str())
         .collect();
-    Ok(Verified { model: model.to_owned(), output, input_tokens, output_tokens })
+    Ok(Verified { model: model.to_owned(), output, input_tokens, cached_input_tokens, output_tokens })
 }
 
 /// Byte range of the bearer credential in the request header, if present.
@@ -201,7 +215,44 @@ mod tests {
     fn accepts_honest_transcript_hiding_only_the_token() {
         let sent = sent_with(&job());
         let got = check(HOST, &sent, &[token_range(&sent)], &received_with("gpt-5.5"), &[], &job()).unwrap();
-        assert_eq!(got, Verified { model: "gpt-5.5".into(), output: "hello".into(), input_tokens: 12, output_tokens: 3 });
+        assert_eq!(got, Verified { model: "gpt-5.5".into(), output: "hello".into(), input_tokens: 12, cached_input_tokens: None, output_tokens: 3 });
+    }
+
+    fn received_usage(usage: Value) -> Vec<u8> {
+        let mut r = b"HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n\r\n".to_vec();
+        r.extend(frame(json!({"type": "response.output_text.delta", "delta": "synthetic output"}).to_string().as_bytes(), None, true, 1));
+        let done = json!({"type": "response.completed", "response": {"model": "gpt-5.5", "usage": usage}});
+        r.extend(frame(done.to_string().as_bytes(), None, true, 1));
+        r
+    }
+    #[test]
+    fn cached_usage_preserves_unknown_zero_and_verified_subset() {
+        let sent = sent_with(&job());
+        for cached in [None, Some(0), Some(5), Some(12)] {
+            let mut usage = json!({"input_tokens":12,"output_tokens":3});
+            if let Some(n) = cached { usage["input_tokens_details"] = json!({"cached_tokens":n}); }
+            let verified = check(HOST, &sent, &[token_range(&sent)], &received_usage(usage), &[], &job()).unwrap();
+            assert_eq!(verified.cached_input_tokens, cached);
+            let stored = serde_json::to_value(&verified).unwrap();
+            assert_eq!(stored.get("cached_input_tokens"), cached.map(|n| json!(n)).as_ref());
+            assert_eq!(serde_json::from_value::<Verified>(stored).unwrap(), verified);
+        }
+        for details in [Value::Null, json!({}), json!({"cached_tokens":null})] {
+            let usage = json!({"input_tokens":12,"output_tokens":3,"input_tokens_details":details});
+            assert_eq!(check(HOST, &sent, &[token_range(&sent)], &received_usage(usage), &[], &job()).unwrap().cached_input_tokens, None);
+        }
+    }
+    #[test]
+    fn rejects_malformed_and_oversize_cached_usage_in_proven_transcript() {
+        let sent = sent_with(&job());
+        for cached in [json!(-1), json!(13), json!(u64::MAX), json!(1.5), json!(0.0), json!("0"), json!(true), json!({})] {
+            let usage = json!({"input_tokens":12,"output_tokens":3,"input_tokens_details":{"cached_tokens":cached}});
+            assert!(check(HOST, &sent, &[token_range(&sent)], &received_usage(usage), &[], &job()).is_err());
+        }
+        for details in [json!(12), json!("cache"), json!([]), json!(true)] {
+            let usage = json!({"input_tokens":12,"output_tokens":3,"input_tokens_details":details});
+            assert!(check(HOST, &sent, &[token_range(&sent)], &received_usage(usage), &[], &job()).is_err());
+        }
     }
 
     #[test]

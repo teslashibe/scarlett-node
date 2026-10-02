@@ -146,7 +146,8 @@ fn kind(payload: &Value, durable: bool) -> Result<(Kind, Status)> {
 // local receipt must stop startup, never become an authoritative success.
 fn validate_receipt(kind: &Kind, status: &Status, in_flight: usize) -> Result<()> {
     match (kind, status) {
-        (Kind::Codex, Status::Pending | Status::Accepted { .. }) if in_flight == 0 => Ok(()),
+        (Kind::Codex, Status::Pending) if in_flight == 0 => Ok(()),
+        (Kind::Codex, Status::Accepted { verified, .. }) if in_flight == 0 && verified.cached_input_tokens.is_none_or(|cached| cached <= verified.input_tokens) => Ok(()),
         (Kind::Codex, Status::Running) if in_flight == 1 => Ok(()),
         (_, Status::Rejected { .. } | Status::Expired) if in_flight == 0 => Ok(()),
         (Kind::X(specs), Status::XRead { remaining_attempts, complete, pending, exchanges, rejections }) => {
@@ -355,7 +356,7 @@ mod durable_tests {
     }
     #[tokio::test]
     async fn accepted_receipt_survives_restart_but_interrupted_proof_is_uncertain() {
-        for complete in [true, false] {
+        for (complete, cached) in [(true, None), (true, Some(0)), (true, Some(3)), (false, None)] {
             let dir = Temp::new();
             let s = shared(&dir.0);
             let expires = now_ms() + 30_000;
@@ -371,6 +372,7 @@ mod durable_tests {
                             model: "synthetic-model".into(),
                             output: "synthetic accepted result".into(),
                             input_tokens: 8,
+                            cached_input_tokens: cached,
                             output_tokens: 4,
                         },
                         duration_ms: 1,
@@ -387,6 +389,7 @@ mod durable_tests {
             if complete {
                 assert_eq!(view["status"], "accepted");
                 assert_eq!(view["output"], "synthetic accepted result");
+                assert_eq!(view.get("cached_input_tokens"), cached.map(|n| json!(n)).as_ref());
             } else {
                 assert_eq!(view["status"], "rejected");
                 assert_eq!(view["reason"], "execution_uncertain");
@@ -394,6 +397,29 @@ mod durable_tests {
             assert!(s.1.lock().unwrap().by_token.is_empty());
             assert_eq!(create(State(s), headers(), Json(request(expires))).await.0, StatusCode::CONFLICT);
         }
+    }
+    #[tokio::test]
+    async fn invalid_cached_usage_stops_durable_restore() {
+        let dir = Temp::new();
+        let s = shared(&dir.0);
+        let expires = now_ms() + 30_000;
+        assert_eq!(create(State(s.clone()), headers(), Json(request(expires))).await.0, StatusCode::CREATED);
+        {
+            let mut sessions = s.1.lock().unwrap();
+            let key = job_key("synthetic", "1");
+            let e = sessions.by_job.get_mut(&key).unwrap();
+            e.status = Status::Accepted {
+                verified: Verified {
+                    model: "synthetic-model".into(), output: "synthetic result".into(),
+                    input_tokens: 8, cached_input_tokens: Some(9), output_tokens: 4,
+                },
+                duration_ms: 1,
+            };
+            sessions.commit(&key).unwrap();
+        }
+        drop(s);
+        let (store, records) = Store::open(&dir.0).unwrap();
+        assert!(Sessions::restore(store, records).is_err());
     }
     #[tokio::test]
     async fn incomplete_x_exchange_crash_revokes_token_and_storage_failure_hides_success() {
