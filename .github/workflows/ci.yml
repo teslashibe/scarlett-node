@@ -36,11 +36,15 @@ jobs:
             exit 1
           fi
 
-      - run: go build ./...
+      - run: |
+          go build ./...
+          go build -o "$RUNNER_TEMP/scarlett-node" .
 
       - run: go vet ./...
 
       - run: go test -race ./...
+        env:
+          SCARLETT_TEST_NODE_BINARY: ${{ runner.temp }}/scarlett-node
 
   prover:
     runs-on: ubuntu-latest

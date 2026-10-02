@@ -1,0 +1,175 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/teslashibe/scarlett-node/internal/coordinator"
+	"golang.org/x/sys/unix"
+)
+
+// Local observations contain no credentials, prompts, outputs or proof tokens.
+// A fresh observation is not independent provider or coordinator evidence.
+type runtimeStatus struct {
+	Version            string                      `json:"version"`
+	State              string                      `json:"state"`
+	NodeID             string                      `json:"node_id,omitempty"`
+	UpdatedAt          time.Time                   `json:"updated_at"`
+	LastHeartbeatAt    time.Time                   `json:"last_heartbeat_at"`
+	InFlight           int                         `json:"in_flight"`
+	UnresolvedAttempts int                         `json:"unresolved_attempts"`
+	Services           []coordinator.ServiceHealth `json:"services"`
+	DrainRequested     bool                        `json:"drain_requested"`
+}
+
+func localCommand(command string, output io.Writer) error {
+	dir := os.Getenv("SCARLETT_STATE_DIR")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		dir = filepath.Join(home, ".local", "state", "scarlett-node")
+	}
+	if !filepath.IsAbs(dir) {
+		return errors.New("state directory must be absolute")
+	}
+	if err := prepareStateDir(dir); err != nil {
+		return err
+	}
+	switch command {
+	case "drain":
+		if err := writeLocalFile(dir, "drain", []byte("drained\n")); err != nil {
+			return err
+		}
+	case "resume":
+		if _, err := drainRequested(dir); err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(dir, "drain")); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if err := syncDirectory(dir); err != nil {
+			return err
+		}
+	}
+	status := runtimeStatus{Version: coordinator.Version, State: "offline", Services: []coordinator.ServiceHealth{}}
+	raw, err := readLocalFile(filepath.Join(dir, "status.json"), 16384)
+	if err == nil {
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&status) != nil || decoder.Decode(new(any)) != io.EOF || status.Version != coordinator.Version || len(status.Services) > 2 || status.InFlight < 0 || status.InFlight > 64 || status.UnresolvedAttempts < 0 || status.UnresolvedAttempts > 1024 || !validIdentityField(status.NodeID, 128) || (status.State != "running" && status.State != "draining" && status.State != "stopped") {
+			return errors.New("invalid local status")
+		}
+		if time.Since(status.UpdatedAt) > 30*time.Second || status.UpdatedAt.After(time.Now().Add(time.Second)) {
+			status.State = "offline"
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	status.DrainRequested, err = drainRequested(dir)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(output).Encode(status)
+}
+
+func readLocalFile(name string, limit int64) ([]byte, error) {
+	f, err := os.OpenFile(name, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > limit {
+		return nil, errors.New("local state file must be regular, private and bounded")
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if len(raw) > int(limit) {
+		return nil, errors.New("local state file too large")
+	}
+	return raw, err
+}
+
+func drainRequested(dir string) (bool, error) {
+	raw, err := readLocalFile(filepath.Join(dir, "drain"), 8)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if string(raw) != "drained\n" {
+		return false, errors.New("invalid drain request")
+	}
+	return true, nil
+}
+
+func saveRuntimeStatus(dir string, status runtimeStatus) error {
+	status.UpdatedAt = time.Now().UTC()
+	raw, err := json.Marshal(status)
+	if err != nil {
+		return err
+	}
+	return writeLocalFile(dir, "status.json", raw)
+}
+
+func writeLocalFile(dir, name string, raw []byte) error {
+	path := filepath.Join(dir, name)
+	if info, err := os.Lstat(path); err == nil {
+		if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
+			return errors.New("invalid local state destination")
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".control-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err = f.Write(raw); err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	if err = os.Rename(f.Name(), path); err != nil {
+		return err
+	}
+	return syncDirectory(dir)
+}
+
+func syncDirectory(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
+func waitForWorkers(workers *sync.WaitGroup, cancel func(), grace time.Duration) {
+	done := make(chan struct{})
+	go func() { workers.Wait(); close(done) }()
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		cancel()
+		<-done
+	}
+}
