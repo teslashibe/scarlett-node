@@ -171,14 +171,15 @@ var variants = map[string]bool{
 	"fast": true, "fast-low": true, "fast-medium": true, "fast-high": true, "fast-xhigh": true, "fast-max": true,
 }
 
-// Models are the Codex base models every node serves from one slot pool.
-var Models = []string{"gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"}
+// Models are reviewed Codex base models retained for historical result validation.
+// AvailableModelsAt applies provider retirement dates to new execution and advertising.
+var Models = modelIDs()
 
 // Serves returns the base model for a lease model: a base model or its gateway
 // effort/fast alias.
 func Serves(id string) (string, bool) {
 	for _, m := range Models {
-		if id == m || strings.HasPrefix(id, m+"-") && variants[id[len(m)+1:]] {
+		if id == m || legacyGatewayAliases[m] && strings.HasPrefix(id, m+"-") && variants[id[len(m)+1:]] {
 			return m, true
 		}
 	}

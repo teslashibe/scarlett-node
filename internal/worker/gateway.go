@@ -33,7 +33,7 @@ func checkLease(c config.Config, l coordinator.Lease) (time.Time, string) {
 	if l.Version != coordinator.Version || l.JobID == "" || l.SignedJobID == "" || l.Attempt == "" || l.Fence == "" || l.InputSHA256 == "" || l.Profile != c.Profile || l.MaxInputTokens < 1 || l.MaxOutputTokens < 1 || l.MaxOutputTokens > c.MaxOutputTokens || !utf8.ValidString(l.Prompt) || len(l.Prompt) > c.MaxInputBytes || SHA(l.Prompt) != l.InputSHA256 {
 		return time.Time{}, "invalid_lease"
 	}
-	if _, ok := config.Serves(l.ModelID); !ok {
+	if !config.ExecutableAt(l.ModelID, time.Now()) {
 		return time.Time{}, "invalid_lease"
 	}
 	// The local gateway ignores max_tokens: the local fixture is for

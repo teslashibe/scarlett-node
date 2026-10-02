@@ -152,11 +152,11 @@ func TestServiceLimitsUseLocalConfigWithoutSharedSlices(t *testing.T) {
 	p.config.MaxInputBytes, p.config.MaxOutputTokens = 123, 456
 	c := healthKind(t, p, "codex")
 	x := healthKind(t, p, "x_read")
-	if c.MaxInputBytes != 123 || c.MaxOutputTokens != 456 || len(c.Models) != 3 || x.MaxInputBytes != 123 || x.MaxOutputTokens != 0 || len(x.Models) != 0 {
+	if c.MaxInputBytes != 123 || c.MaxOutputTokens != 456 || len(c.Models) != len(config.AvailableModelsAt(time.Now())) || x.MaxInputBytes != 123 || x.MaxOutputTokens != 0 || len(x.Models) != 0 {
 		t.Fatal("local limits not reported")
 	}
 	c.Models[0] = "caller-mutation"
-	if healthKind(t, p, "codex").Models[0] != "gpt-5.6-luna" {
+	if healthKind(t, p, "codex").Models[0] != "gpt-6.1-sol" {
 		t.Fatal("health modified runtime catalog")
 	}
 	disabled := healthKind(t, poolFixture(t, "x_read"), "codex")

@@ -91,7 +91,7 @@ func (p *servicePool) health() []coordinator.ServiceHealth {
 			h.MaxInputBytes = p.config.MaxInputBytes
 			if kind == "codex" {
 				h.MaxOutputTokens = p.config.MaxOutputTokens
-				h.Models = append([]string(nil), config.Models...)
+				h.Models = config.AvailableModelsAt(time.Now())
 			}
 		}
 		out = append(out, h)

@@ -108,3 +108,32 @@ func TestTypedCodexPayloadRejectsToolsOverridesAndAmbiguousJSON(t *testing.T) {
 		t.Fatal("ambiguous payload accepted")
 	}
 }
+
+func TestCurrentCodexBaseLeasesBindExactPayloadBeforeProof(t *testing.T) {
+	c := config.Config{Executor: config.ExecutorCodexTLSN, Verifier: "verifier:7047", Prover: os.Args[0], Profile: "standard", MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: 5 * time.Second}
+	t.Setenv("SCARLETT_FAKE_PROVER", "ok")
+	for _, model := range config.AvailableModelsAt(time.Now()) {
+		t.Run(model, func(t *testing.T) {
+			l := coordinator.Lease{Version: coordinator.Version, ServiceType: "codex", JobID: "synthetic-job", SignedJobID: "synthetic-job", Profile: c.Profile, ModelID: model, Prompt: "synthetic", MaxInputTokens: 100, MaxOutputTokens: 20, InputSHA256: SHA("synthetic"), Attempt: "1", Fence: "synthetic-fence", LeaseDeadline: time.Now().Add(time.Minute), SettlementDeadline: time.Now().Add(time.Minute), VerifierToken: strings.Repeat("ab", 32)}
+			payload := map[string]any{"type": "response.create", "model": model, "instructions": "You are a helpful assistant.", "input": []any{map[string]any{"type": "message", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": l.Prompt}}}}, "stream": true, "store": false, "reasoning": map[string]any{"effort": "low"}, "text": map[string]any{"verbosity": "low"}}
+			l.CodexPayload, _ = json.Marshal(payload)
+			if code, detail := (Prover{Config: c}).Run(context.Background(), l); code != "" {
+				t.Fatalf("reviewed base rejected: %s %s", code, detail)
+			}
+			payload["model"] = "gpt-6-astra"
+			if model == "gpt-6-astra" {
+				payload["model"] = "gpt-6-sol"
+			}
+			l.CodexPayload, _ = json.Marshal(payload)
+			if code, _ := (Prover{Config: c}).Run(context.Background(), l); code != "invalid_lease" {
+				t.Fatal("another reviewed model escaped the lease binding")
+			}
+			payload["model"] = model
+			payload["reasoning"] = map[string]any{"effort": "ultra"}
+			l.CodexPayload, _ = json.Marshal(payload)
+			if code, _ := (Prover{Config: c}).Run(context.Background(), l); code != "invalid_lease" {
+				t.Fatal("inventory effort metadata enabled unbound execution")
+			}
+		})
+	}
+}
