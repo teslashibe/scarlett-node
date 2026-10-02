@@ -90,3 +90,29 @@ func TestCodexTLSN(t *testing.T) {
 		t.Fatal("accepted unpinned fixture verifier")
 	}
 }
+
+func TestIndependentProvenServices(t *testing.T) {
+	c := Config{Coordinator: "https://example.org", Executor: ExecutorServices, Services: []string{"x_read"}, XSession: "/tmp/synthetic-x.json", Verifier: "127.0.0.1:7047", Prover: "scarlett-prover", Profile: "p", StateDir: filepath.Join(t.TempDir(), "state"), InferenceTimeout: time.Second, MaxInputBytes: 1024, MaxOutputTokens: 128, CodexConcurrency: 1, XConcurrency: 1}
+	if e := c.Validate(); e != nil {
+		t.Fatal("X-only requires unused gateway or Codex", e)
+	}
+	c.Services = []string{"codex", "x_read"}
+	c.CodexHome = "/tmp/synthetic-codex"
+	if e := c.Validate(); e != nil {
+		t.Fatal(e)
+	}
+	for _, services := range [][]string{nil, {"codex", "codex"}, {"x"}, {"unrestricted"}, {"codex", "x_read", "other"}} {
+		bad := c
+		bad.Services = services
+		if bad.Validate() == nil {
+			t.Fatal("accepted invalid services")
+		}
+	}
+	for _, change := range []func(*Config){func(c *Config) { c.XSession = "relative" }, func(c *Config) { c.CodexHome = "" }, func(c *Config) { c.XConcurrency = 33 }, func(c *Config) { c.CodexConcurrency = 0 }, func(c *Config) { c.LocalFixture = true }, func(c *Config) { c.Verifier = "https://arbitrary/path" }} {
+		bad := c
+		change(&bad)
+		if bad.Validate() == nil {
+			t.Fatal("accepted unsafe service configuration")
+		}
+	}
+}

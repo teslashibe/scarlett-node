@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -44,6 +45,9 @@ func (p Prover) Run(ctx context.Context, l coordinator.Lease) (code, detail stri
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, c.Prover, "prove")
+	if c.CodexHome != "" {
+		cmd.Env = append(os.Environ(), "CODEX_HOME="+c.CodexHome)
+	}
 	cmd.Stdin = bytes.NewReader(input)
 	var stdout, stderr limitedBuffer
 	stdout.max, stderr.max = 4096, 4096
@@ -69,6 +73,40 @@ func (p Prover) Run(ctx context.Context, l coordinator.Lease) (code, detail stri
 func validPayload(l coordinator.Lease) bool {
 	if len(l.CodexPayload) == 0 || len(l.CodexPayload) > 65536 {
 		return false
+	}
+	if l.ServiceType == "codex" {
+		value, err := uniqueJSON(l.CodexPayload)
+		if err != nil {
+			return false
+		}
+		p, ok := value.(map[string]any)
+		if !ok || len(p) != 8 || p["instructions"] != "You are a helpful assistant." || p["stream"] != true || p["store"] != false {
+			return false
+		}
+		reasoning, ok := p["reasoning"].(map[string]any)
+		if !ok || len(reasoning) != 1 || reasoning["effort"] != "low" {
+			return false
+		}
+		text, ok := p["text"].(map[string]any)
+		if !ok || len(text) != 1 || text["verbosity"] != "low" {
+			return false
+		}
+		input, ok := p["input"].([]any)
+		if !ok || len(input) != 1 {
+			return false
+		}
+		message, ok := input[0].(map[string]any)
+		if !ok || len(message) != 3 || message["type"] != "message" || message["role"] != "user" {
+			return false
+		}
+		content, ok := message["content"].([]any)
+		if !ok || len(content) != 1 {
+			return false
+		}
+		item, ok := content[0].(map[string]any)
+		if !ok || len(item) != 2 || item["type"] != "input_text" || item["text"] != l.Prompt {
+			return false
+		}
 	}
 	var p struct {
 		Type  string `json:"type"`

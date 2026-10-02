@@ -1,0 +1,1 @@
+{"version":"node-v1","node_id":"synthetic-node","profile":"standard","state":"available","bid":100,"capacity":2,"services":[{"kind":"codex","state":"configured","capacity":1,"in_flight":0},{"kind":"x_read","state":"exhausted","capacity":1,"in_flight":0,"last_error_code":"x_rate_limited"}]}

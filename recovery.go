@@ -70,3 +70,25 @@ func submitRecord(ctx context.Context, client *coordinator.Client, journal *atte
 	}
 	return journal.Terminal(r)
 }
+
+func rejectLease(ctx context.Context, client *coordinator.Client, journal *attempts.Journal, l coordinator.Lease, code string) error {
+	if _, err := coordinator.JobPath(l.JobID, "fail"); err != nil {
+		return err
+	}
+	r, err := attemptRecord(l)
+	if err != nil {
+		return err
+	}
+	if err = journal.Begin(r); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(coordinator.Failure{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence, Code: code})
+	if err != nil {
+		return err
+	}
+	r, err = journal.Ready(r, "fail", raw)
+	if err != nil {
+		return err
+	}
+	return submitRecord(ctx, client, journal, r)
+}

@@ -93,8 +93,8 @@ paths:
       parameters: [{$ref: '#/components/parameters/JobID'}]
       summary: Report that a proof was sent to the assigned verifier
       description: >-
-        The node does not submit the answer. The coordinator reads model, output, and usage
-        from the verifier after this call. A supplier copy of the output is not accepted.
+        The node does not submit the answer. The coordinator reads Codex model/output/usage or X fulfilment/response copies
+        from the assigned verifier after this call. A supplier copy of the output is not accepted. X bootstrap authentication reads are unproven and do not count as paid exchanges. An empty first search page may fulfil one pinned exchange; missing cursors cannot fulfil later requested pages.
       requestBody:
         required: true
         content:
@@ -171,7 +171,7 @@ components:
     Heartbeat:
       type: object
       required: [version, node_id, profile, state]
-      description: Every node serves every catalog model (gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol) and their gateway aliases from one shared capacity.
+      description: Legacy nodes share catalog capacity. Services-mode nodes report independently enabled Codex/X capacities and states; all health is node-reported, not verifier acceptance or payment evidence.
       properties:
         version: {type: string, enum: [node-v1]}
         node_id: {type: string}
@@ -179,6 +179,21 @@ components:
         state: {type: string, enum: [available, exhausted], description: exhausted means the node's gateway recently had no capacity; the coordinator offers it no lease until it reports available again.}
         bid: {type: integer, minimum: 0, maximum: 1000000000, description: Standing assignment bid. Lower wins, then least assigned work, then node_id. Missing is treated as 100. Not an on-chain quote.}
         capacity: {type: integer, minimum: 1, maximum: 64, description: Leases the node runs at once. The coordinator keeps open leases at or below this. Missing is treated as 1.}
+        services:
+          type: array
+          maxItems: 2
+          description: Each kind is unique; disabled kinds have zero capacity and in-flight count
+          items: {$ref: '#/components/schemas/ServiceHealth'}
+    ServiceHealth:
+      type: object
+      additionalProperties: false
+      required: [kind, state, capacity, in_flight]
+      properties:
+        kind: {type: string, enum: [codex, x_read]}
+        state: {type: string, enum: [not_added, configured, ready, exhausted, auth_required, unreachable], description: configured means a local credential file is usable; ready means local execution reported proof sent, not verifier acceptance}
+        capacity: {type: integer, minimum: 0, maximum: 32}
+        in_flight: {type: integer, minimum: 0, maximum: 32}
+        last_error_code: {type: string, description: Bounded failure code only, never raw provider errors or credentials}
     Challenge:
       type: object
       required: [version, nonce, expires_at]
@@ -201,16 +216,31 @@ components:
         cryptographically verify signed_job_id yet. codex_payload and verifier_token are set only
         for proven Codex jobs. The node proves that request to the locally configured verifier;
         the coordinator reads the answer from the verifier, not from this node.
-      required: [version, job_id, signed_job_id, profile, model_id, prompt, max_input_tokens, max_output_tokens, input_sha256, attempt, fence, lease_deadline, settlement_deadline]
+      required: [version, job_id, signed_job_id, profile, input_sha256, attempt, fence, lease_deadline, settlement_deadline]
+      oneOf:
+        - required: [model_id, prompt, max_input_tokens, max_output_tokens]
+          properties:
+            service_type: {type: string, enum: [codex]}
+            model_id: {type: string, minLength: 1}
+            max_input_tokens: {type: integer, minimum: 1}
+            max_output_tokens: {type: integer, minimum: 1}
+        - required: [service_type, x_request, x_payload, verifier_token]
+          properties:
+            service_type: {type: string, enum: [x_read]}
+            model_id: {type: string, maxLength: 0}
+            prompt: {type: string, maxLength: 0}
+            max_input_tokens: {type: integer, maximum: 0}
+            max_output_tokens: {type: integer, maximum: 0}
       properties:
         version: {type: string, enum: [node-v1]}
         job_id: {type: string}
-        signed_job_id: {type: string, description: Coordinator-issued signed job commitment; not cryptographically verified by v1 node.}
+        signed_job_id: {type: string, description: Coordinator-issued job commitment; not cryptographically verified by v1 node.}
+        service_type: {type: string, enum: [codex, x_read], description: Required in services mode; omitted by legacy Codex leases}
         profile: {type: string}
         model_id: {type: string, description: 'A catalog base model or its gateway alias with a reasoning effort (-low, -medium, -high, -xhigh, -max) and/or the fast tier (-fast, -fast-<effort>). Proven Codex leases must name a base model.'}
         prompt: {type: string}
-        max_input_tokens: {type: integer, minimum: 1}
-        max_output_tokens: {type: integer, minimum: 1}
+        max_input_tokens: {type: integer, minimum: 0}
+        max_output_tokens: {type: integer, minimum: 0}
         input_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
         attempt: {type: string}
         fence: {type: string}
@@ -223,6 +253,43 @@ components:
           type: string
           pattern: '^[0-9a-f]{64}$'
           description: Single-use token for the verifier configured in SCARLETT_VERIFIER. Not a login secret.
+        x_request: {$ref: '#/components/schemas/XRequest'}
+        x_payload: {$ref: '#/components/schemas/XPayload'}
+    XRequest:
+      type: object
+      additionalProperties: false
+      required: [operation]
+      description: search uses a trimmed query, 1-20 items per page and 1-3 exact pages, Latest order; profile uses username; post/thread use post_id and one exchange; unrelated fields must be absent or zero
+      properties:
+        operation: {type: string, enum: [search, profile, post, thread]}
+        query: {type: string, minLength: 1, maxLength: 256}
+        username: {type: string, pattern: '^[A-Za-z0-9_]{1,15}$'}
+        post_id: {type: string, pattern: '^[0-9]{1,20}$'}
+        count: {type: integer, minimum: 1, maximum: 20}
+        pages: {type: integer, minimum: 1, maximum: 3}
+    XPayload:
+      type: object
+      additionalProperties: false
+      required: [type, exchanges, max_attempts]
+      description: Exact verifier x.read policy, with one attempt per requested exchange, no automatic retries, unique JSON keys and integer numbers; pagination uses the same operation/variables and cursor_from immediately preceding it
+      properties:
+        type: {type: string, enum: [x.read]}
+        max_attempts: {type: integer, minimum: 1, maximum: 3}
+        exchanges:
+          type: array
+          minItems: 1
+          maxItems: 3
+          items:
+            type: object
+            additionalProperties: false
+            required: [operation, query_id, variables, features]
+            properties:
+              operation: {type: string, enum: [SearchTimeline, UserByScreenName, TweetResultByRestId, TweetDetail]}
+              query_id: {type: string, pattern: '^[A-Za-z0-9_-]{1,64}$'}
+              variables: {type: object}
+              features: {type: object}
+              field_toggles: {type: object}
+              cursor_from: {type: integer, minimum: 0, maximum: 1}
     Result:
       type: object
       description: >-
@@ -275,4 +342,4 @@ components:
         version: {type: string, enum: [node-v1]}
         attempt: {type: string}
         fence: {type: string}
-        code: {type: string, enum: [invalid_lease, expired, gateway_error, capacity_unavailable, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds, prover_error, execution_uncertain], description: execution_uncertain means a provider call might have occurred before interruption and must not automatically requeue paid work. Transport failure alone does not prove a call never ran; capacity_unavailable must not authorize an ambiguous provider retry.}
+        code: {type: string, enum: [invalid_lease, expired, gateway_error, capacity_unavailable, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds, prover_error, execution_uncertain, auth_required, service_unavailable, x_rate_limited, x_incomplete, x_request_failed], description: execution_uncertain means a provider call might have occurred before interruption and must not automatically requeue paid work. Transport failure alone does not prove a call never ran; capacity_unavailable must not authorize an ambiguous provider retry.}
