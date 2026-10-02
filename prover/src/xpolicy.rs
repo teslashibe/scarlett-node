@@ -109,6 +109,9 @@ pub fn validate_job(job: &Value) -> Result<(Vec<Spec>, usize)> {
     }
     for (i, spec) in job.exchanges.iter().enumerate() {
         let at = |what: &str| format!("exchange {i}: {what}");
+        if job.exchanges[..i].contains(spec) {
+            bail!(at("duplicate requested read"));
+        }
         if !READ_OPERATIONS.contains(&spec.operation.as_str()) {
             bail!(at("operation is not an allowed read"));
         }
@@ -173,11 +176,20 @@ pub fn outcome(e: &Exchange) -> (bool, Vec<String>) {
 }
 
 /// Which exchange of `job` a proven read fulfils or retries, given the
-/// exchanges already fulfilled as `(index, cursors in its response)`. An
+/// exchanges already fulfilled as `(index, proven request, response cursors)`. An
 /// exchange is pending until a matching read fulfils it, and a paged exchange
 /// only once its source is fulfilled.
-pub fn assign(job: &[Spec], fulfilled: &[(usize, &[String])], got: &Exchange) -> Result<usize> {
-    let cursors_of = |i: usize| fulfilled.iter().find(|(k, _)| *k == i).map(|(_, c)| *c);
+pub fn assign(job: &[Spec], fulfilled: &[(usize, &Exchange, &[String])], got: &Exchange) -> Result<usize> {
+    // A looping pagination cursor or repeated requested read must not turn the
+    // same proven request into another unit of useful work. Response bytes are
+    // not identity: distinct pages may legitimately have identical bodies.
+    if fulfilled.iter().any(|(_, e, _)| {
+        e.operation == got.operation && e.query_id == got.query_id && e.variables == got.variables
+            && e.features == got.features && e.field_toggles == got.field_toggles
+    }) {
+        bail!("request already fulfilled");
+    }
+    let cursors_of = |i: usize| fulfilled.iter().find(|(k, _, _)| *k == i).map(|(_, _, c)| *c);
     for (i, spec) in job.iter().enumerate() {
         if cursors_of(i).is_some() {
             continue;
@@ -687,8 +699,8 @@ mod tests {
 
     /// `assign` against exchanges already fulfilled by these responses.
     fn assign_after(specs: &[Spec], done: &[(usize, &Exchange)], got: &Exchange) -> Result<usize> {
-        let cursors: Vec<(usize, Vec<String>)> = done.iter().filter(|(_, e)| outcome(e).0).map(|(i, e)| (*i, outcome(e).1)).collect();
-        let fulfilled: Vec<(usize, &[String])> = cursors.iter().map(|(i, c)| (*i, c.as_slice())).collect();
+        let cursors: Vec<(usize, &Exchange, Vec<String>)> = done.iter().filter(|(_, e)| outcome(e).0).map(|(i, e)| (*i, *e, outcome(e).1)).collect();
+        let fulfilled: Vec<(usize, &Exchange, &[String])> = cursors.iter().map(|(i, e, c)| (*i, *e, c.as_slice())).collect();
         assign(specs, &fulfilled, got)
     }
 
@@ -819,14 +831,14 @@ mod tests {
         let mut toggles = spec("Viewer", json!({"withCommunity": true}));
         toggles["field_toggles"] = json!({"t": false});
         assert_eq!(validate_job(&json!({"type": "x.read", "exchanges": [toggles], "max_attempts": 1})).unwrap().1, 1);
-        let many: Vec<Value> = (0..100).map(|_| s.clone()).collect();
+        let many: Vec<Value> = (0..100).map(|i| spec("SearchTimeline", search(&format!("synthetic-{i}")))).collect();
         assert_eq!(validate_job(&json!({"type": "x.read", "exchanges": many})).unwrap().1, 200);
         // A resumed first page may carry its own cursor; its next page drops it.
         let mut resumed = search("bitcoin");
         resumed["cursor"] = json!("C0");
         assert!(validate_job(&json!({"type": "x.read", "exchanges": [spec("SearchTimeline", resumed), paged("SearchTimeline", search("bitcoin"), 0)]})).is_ok());
 
-        let too_many: Vec<Value> = (0..101).map(|_| s.clone()).collect();
+        let too_many: Vec<Value> = (0..101).map(|i| spec("SearchTimeline", search(&format!("synthetic-{i}")))).collect();
         let with = |key: &str, value: Value| {
             let mut e = s.clone();
             e[key] = value;
@@ -925,10 +937,9 @@ mod tests {
         }
         assert!(outcome(&Exchange { body: r#"{"data":{"x":1},"errors":[{"message":"partial"}]}"#.into(), ..ok.clone() }).0, "partial data must fulfil");
         assert!(assign_after(&specs, &[(0, &ok)], &ok).is_err(), "a duplicate of a fulfilled exchange was accepted");
-        // Two identical exchanges are fulfilled one after the other.
-        let twice = job(vec![spec("Viewer", json!({})), spec("Viewer", json!({}))]);
-        let viewer = exchange("Viewer", json!({}));
-        assert_eq!(assign_after(&twice, &[(0, &viewer)], &viewer).unwrap(), 1);
+        // A second request for the same page cannot earn another fulfilled unit.
+        let twice = json!({"type":"x.read","exchanges":[spec("Viewer", json!({})),spec("Viewer", json!({}))]});
+        assert!(validate_job(&twice).is_err());
     }
 
     #[test]
@@ -972,6 +983,27 @@ mod tests {
         let done = [(0, &p1), (1, &page_2)];
         assert_eq!(assign_after(&specs, &done, &exchange("SearchTimeline", with_cursor("bitcoin", "C2"))).unwrap(), 2);
         assert!(assign_after(&specs, &done, &exchange("SearchTimeline", with_cursor("bitcoin", "C1"))).is_err(), "page 2 again was accepted");
+    }
+
+    #[test]
+    fn looping_cursor_cannot_fulfil_another_page() {
+        let specs = job(vec![
+            spec("SearchTimeline", search("bitcoin")),
+            paged("SearchTimeline", search("bitcoin"), 0),
+            paged("SearchTimeline", search("bitcoin"), 1),
+        ]);
+        let first = Exchange { body: page("C1"), ..exchange("SearchTimeline", search("bitcoin")) };
+        let mut variables = search("bitcoin");
+        variables["cursor"] = json!("C1");
+        let second = Exchange { body: first.body.clone(), ..exchange("SearchTimeline", variables) };
+        // Different request cursors are distinct work even if response bytes match.
+        assert_eq!(assign_after(&specs, &[(0, &first)], &second).unwrap(), 1);
+        let failed = Exchange { http_status: 429, ..second.clone() };
+        assert_eq!(assign_after(&specs, &[(0, &first), (1, &failed)], &second).unwrap(), 1);
+        let done = [(0, &first), (1, &second)];
+        assert!(assign_after(&specs, &done, &second).is_err());
+        // A new response body cannot make the repeated request a new page.
+        assert!(assign_after(&specs, &done, &Exchange { body: page("C2"), ..second.clone() }).is_err());
     }
 
     #[test]
