@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/teslashibe/scarlett-node/internal/attempts"
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
 	"github.com/teslashibe/scarlett-node/internal/worker"
@@ -118,6 +119,14 @@ func loadIdentity(c config.Config) (identity, error) {
 const capacityRest = 30 * time.Second
 
 func run(c config.Config) error {
+	if err := prepareStateDir(c.StateDir); err != nil {
+		return err
+	}
+	journal, err := attempts.Open(filepath.Join(c.StateDir, "attempts"))
+	if err != nil {
+		return err
+	}
+	defer journal.Close()
 	cred, nodeID := c.Credential, c.NodeID
 	if cred == "" {
 		id, err := loadIdentity(c)
@@ -141,6 +150,18 @@ func run(c config.Config) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
+	if err := journal.Purge(time.Now()); err != nil {
+		return err
+	}
+	pending, err := journal.Pending()
+	if err != nil {
+		return err
+	}
+	for _, record := range pending {
+		if err := recoverAttempt(ctx, client, journal, record); err != nil {
+			fmt.Fprintln(os.Stderr, "reconcile:", err)
+		}
+	}
 	var local worker.Completer
 	if c.Executor == config.ExecutorCodex {
 		cx, err := worker.NewCodex(c)
@@ -152,10 +173,28 @@ func run(c config.Config) error {
 	capacity := max(c.Concurrency, 1)
 	slots := make(chan struct{}, capacity)
 	var running sync.WaitGroup
-	defer running.Wait()
+	defer func() { stop(); running.Wait() }()
 	var mu sync.Mutex
 	var restUntil time.Time
+	lastRecovery := time.Now()
 	for ctx.Err() == nil {
+		if time.Since(lastRecovery) >= 30*time.Second {
+			if err := journal.Purge(time.Now()); err != nil {
+				return err
+			}
+			if records, err := journal.Pending(); err == nil {
+				for _, record := range records {
+					if record.State == "ready" {
+						if err := recoverAttempt(ctx, client, journal, record); err != nil {
+							fmt.Fprintln(os.Stderr, "reconcile:", err)
+						}
+					}
+				}
+			} else {
+				return err
+			}
+			lastRecovery = time.Now()
+		}
 		mu.Lock()
 		state := "available"
 		if time.Now().Before(restUntil) {
@@ -179,7 +218,7 @@ func run(c config.Config) error {
 			go func() {
 				defer running.Done()
 				defer func() { <-slots }()
-				code, err := submitLease(ctx, client, c, l, local)
+				code, err := submitLease(ctx, client, c, l, local, journal)
 				if code == "capacity_unavailable" {
 					mu.Lock()
 					restUntil = time.Now().Add(capacityRest)
@@ -202,9 +241,18 @@ func run(c config.Config) error {
 	return nil
 }
 
-func submitLease(ctx context.Context, client *coordinator.Client, c config.Config, l coordinator.Lease, local worker.Completer) (string, error) {
+func submitLease(ctx context.Context, client *coordinator.Client, c config.Config, l coordinator.Lease, local worker.Completer, journal *attempts.Journal) (string, error) {
+	if _, err := coordinator.JobPath(l.JobID, "result"); err != nil {
+		return "invalid_lease", err
+	}
+	record, err := attemptRecord(l)
+	if err != nil {
+		return "invalid_lease", err
+	}
+	if err := journal.Begin(record); err != nil {
+		return "", err
+	}
 	var body any
-	path, err := coordinator.JobPath(l.JobID, "result")
 	code := ""
 	if c.Executor == config.ExecutorCodexTLSN {
 		var detail string
@@ -213,10 +261,8 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 			fmt.Fprintln(os.Stderr, detail)
 		}
 		if code != "" {
-			path, err = coordinator.JobPath(l.JobID, "fail")
 			body = coordinator.Failure{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence, Code: code}
 		} else {
-			path, err = coordinator.JobPath(l.JobID, "proven")
 			body = coordinator.Proven{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence}
 		}
 	} else {
@@ -228,20 +274,24 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 		}
 		body = result
 		if code != "" {
-			path, err = coordinator.JobPath(l.JobID, "fail")
 			body = coordinator.Failure{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence, Code: code}
 		}
 	}
+	// Persist the exact report before touching the coordinator. Recovery may
+	// retry only after the authenticated replay-safe contract is confirmed.
+	raw, err := json.Marshal(body)
 	if err != nil {
 		return code, err
 	}
-	// Never retry an ambiguous submit: only the coordinator can know whether it committed.
-	status, err := client.Post(ctx, path, body, nil)
+	kind := "result"
+	if code != "" {
+		kind = "fail"
+	} else if c.Executor == config.ExecutorCodexTLSN {
+		kind = "proven"
+	}
+	record, err = journal.Ready(record, kind, raw)
 	if err != nil {
 		return code, err
 	}
-	if status != 200 && status != 201 && status != 204 {
-		return code, fmt.Errorf("unexpected submit status: %d", status)
-	}
-	return code, nil
+	return code, submitRecord(ctx, client, journal, record)
 }
