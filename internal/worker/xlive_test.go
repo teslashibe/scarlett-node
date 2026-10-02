@@ -35,6 +35,7 @@ var readOperations = []string{
 // rejected. It spends the session's X quota and never calls a write method.
 // SCARLETT_X_LIST_ID picks the public list to read.
 //
+//	SCARLETT_VERIFIER_TLS_CERT=/absolute/server.pem SCARLETT_VERIFIER_TLS_KEY=/absolute/private-key.pem \
 //	SCARLETT_VERIFIER_KEY=... scarlett-prover verifier
 //	SCARLETT_X_SESSION=path/to/session.json SCARLETT_PROVER=path/to/scarlett-prover \
 //	SCARLETT_VERIFIER=127.0.0.1:7047 SCARLETT_VERIFIER_API=http://127.0.0.1:7070 SCARLETT_VERIFIER_KEY=... \
@@ -147,7 +148,7 @@ func TestXLive(t *testing.T) {
 		"payload": map[string]any{"type": "x.read", "exchanges": p.specs, "max_attempts": len(p.specs) + 10},
 	}, &created)
 
-	rec := &recorder{t: t, next: XTransport{Prover: prover, Verifier: verifierAddr, Token: created.Token}}
+	rec := &recorder{t: t, next: XTransport{Prover: prover, Verifier: verifierAddr, VerifierCA: os.Getenv("SCARLETT_VERIFIER_CA_FILE"), Token: created.Token}}
 	c, err := session.NewClient(ctx, x.WithHTTPClient(&http.Client{Timeout: 5 * time.Minute, Transport: rec}))
 	if err != nil {
 		t.Fatalf("x-go client: %v", err)
@@ -231,7 +232,7 @@ func TestXLive(t *testing.T) {
 		}, &created)
 		// The same client now proves its reads under the cheat job's token.
 		base, before := len(rec.bodies), rec.attempts
-		rec.t, rec.next = t, XTransport{Prover: prover, Verifier: verifierAddr, Token: created.Token}
+		rec.t, rec.next = t, XTransport{Prover: prover, Verifier: verifierAddr, VerifierCA: os.Getenv("SCARLETT_VERIFIER_CA_FILE"), Token: created.Token}
 
 		eth, err := c.SearchTweets(ctx, "ethereum", 20, latest)
 		if err != nil || eth.NextCursor == "" {

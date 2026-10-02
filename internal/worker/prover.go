@@ -35,10 +35,12 @@ func (p Prover) Run(ctx context.Context, l coordinator.Lease) (code, detail stri
 		return "invalid_lease", ""
 	}
 	input, err := json.Marshal(struct {
-		Verifier string          `json:"verifier"`
-		Token    string          `json:"token"`
-		Payload  json.RawMessage `json:"payload"`
-	}{c.Verifier, l.VerifierToken, l.CodexPayload})
+		Verifier         string          `json:"verifier"`
+		VerifierCA       string          `json:"verifier_ca_file,omitempty"`
+		PlaintextFixture bool            `json:"plaintext_fixture,omitempty"`
+		Token            string          `json:"token"`
+		Payload          json.RawMessage `json:"payload"`
+	}{c.Verifier, c.VerifierCA, c.VerifierPlaintextFixture, l.VerifierToken, l.CodexPayload})
 	if err != nil {
 		return "invalid_lease", ""
 	}

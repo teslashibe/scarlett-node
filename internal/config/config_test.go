@@ -116,3 +116,33 @@ func TestIndependentProvenServices(t *testing.T) {
 		}
 	}
 }
+
+func TestVerifierTLSConfiguration(t *testing.T) {
+	c := Config{Coordinator: "https://example.org", Executor: ExecutorCodexTLSN, Verifier: "verifier.example.org:7047", Prover: "scarlett-prover", Profile: "standard", StateDir: filepath.Join(t.TempDir(), "state"), InferenceTimeout: time.Second, MaxInputBytes: 1024, MaxOutputTokens: 20}
+	c.VerifierCA = "/absolute/private-test-ca.pem"
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	c.VerifierCA = "relative.pem"
+	if c.Validate() == nil {
+		t.Fatal("relative verifier CA accepted")
+	}
+	c.VerifierCA = ""
+	c.VerifierPlaintextFixture = true
+	if c.Validate() == nil {
+		t.Fatal("community plaintext verifier accepted")
+	}
+	c.LocalFixture = true
+	c.Profile = "local-fixture"
+	c.Coordinator = "http://host.docker.internal:8091"
+	c.NodeID = "synthetic-node"
+	c.Credential = "synthetic-local-credential-never-used-remotely"
+	c.Verifier = "verifier:7047"
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	c.VerifierCA = "/absolute/ca.pem"
+	if c.Validate() == nil {
+		t.Fatal("mixed fixture plaintext and CA accepted")
+	}
+}

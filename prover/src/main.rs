@@ -5,6 +5,7 @@
 //! `scarlett-prover verifier` runs the validator service (see verifier.rs).
 //! `scarlett-prover fake-openai <addr> <ca-out>` is for impersonation tests.
 
+mod control;
 mod fake;
 mod policy;
 mod prove;
