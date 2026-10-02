@@ -211,10 +211,10 @@ impl Sessions {
                 token = None;
             }
             let key = job_key(&r.job_id, &r.attempt);
-            if let Some(token) = token {
-                if s.by_token.insert(token, key.clone()).is_some() {
-                    bail!("duplicate persisted verifier token");
-                }
+            if let Some(token) = token
+                && s.by_token.insert(token, key.clone()).is_some()
+            {
+                bail!("duplicate persisted verifier token");
             }
             s.by_job.insert(
                 key.clone(),
