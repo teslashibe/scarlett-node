@@ -32,8 +32,14 @@ func main() {
 	}
 }
 func start(args []string) error {
-	if len(args) != 1 || (args[0] != "pair" && args[0] != "run") {
-		return errors.New("usage: scarlett-node pair|run")
+	if len(args) != 1 {
+		return errors.New("usage: scarlett-node pair|run|status|drain|resume")
+	}
+	if args[0] == "status" || args[0] == "drain" || args[0] == "resume" {
+		return localCommand(args[0], os.Stdout)
+	}
+	if args[0] != "pair" && args[0] != "run" {
+		return errors.New("usage: scarlett-node pair|run|status|drain|resume")
 	}
 	c, err := config.Load()
 	if err != nil {
@@ -150,6 +156,8 @@ func run(c config.Config) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
+	workCtx, cancelWork := context.WithCancel(context.Background())
+	defer cancelWork()
 	if err := journal.Purge(time.Now()); err != nil {
 		return err
 	}
@@ -178,11 +186,30 @@ func run(c config.Config) error {
 	}
 	slots := make(chan struct{}, capacity)
 	var running sync.WaitGroup
-	defer func() { stop(); running.Wait() }()
+	status := runtimeStatus{Version: coordinator.Version, State: "running", NodeID: nodeID, Services: []coordinator.ServiceHealth{}}
+	defer func() {
+		status.State = "draining"
+		status.InFlight = len(slots)
+		_ = saveRuntimeStatus(c.StateDir, status)
+		waitForWorkers(&running, cancelWork, 2*time.Minute)
+		status.State = "stopped"
+		status.InFlight = 0
+		if records, err := journal.Pending(); err == nil {
+			status.UnresolvedAttempts = len(records)
+		}
+		if services != nil {
+			status.Services = services.health()
+		}
+		_ = saveRuntimeStatus(c.StateDir, status)
+	}()
 	var mu sync.Mutex
 	var restUntil time.Time
 	lastRecovery := time.Now()
 	for ctx.Err() == nil {
+		drained, err := drainRequested(c.StateDir)
+		if err != nil {
+			return err
+		}
 		if time.Since(lastRecovery) >= 30*time.Second {
 			if err := journal.Purge(time.Now()); err != nil {
 				return err
@@ -216,10 +243,43 @@ func run(c config.Config) error {
 				}
 			}
 		}
+		status.State = "running"
+		if drained {
+			h.State = "exhausted"
+			status.State = "draining"
+		}
+		status.Services = h.Services
+		status.InFlight = len(slots)
+		if records, err := journal.Pending(); err != nil {
+			return err
+		} else {
+			status.UnresolvedAttempts = len(records)
+		}
+		if err := saveRuntimeStatus(c.StateDir, status); err != nil {
+			return err
+		}
 		reply, err := client.Poll(ctx, h)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "heartbeat:", err)
 		} else if reply.Lease != nil {
+			status.LastHeartbeatAt = time.Now().UTC()
+			// Read again after polling: drain may have arrived while the request
+			// was in flight. Never start newly delivered work while draining.
+			drained, err = drainRequested(c.StateDir)
+			if err != nil {
+				return err
+			}
+			if drained || ctx.Err() != nil {
+				if err := rejectLease(workCtx, client, journal, *reply.Lease, "service_unavailable"); err != nil {
+					fmt.Fprintln(os.Stderr, "drain rejection:", err)
+				}
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(wait):
+				}
+				continue
+			}
 			// The coordinator counts this node's open leases against its capacity,
 			// so a slot frees up as soon as an earlier result is recorded.
 			select {
@@ -237,9 +297,9 @@ func run(c config.Config) error {
 				var err error
 				if !serviceAvailable {
 					code = "service_unavailable"
-					err = rejectLease(ctx, client, journal, l, code)
+					err = rejectLease(workCtx, client, journal, l, code)
 				} else {
-					code, err = submitLease(ctx, client, c, l, local, journal)
+					code, err = submitLease(workCtx, client, c, l, local, journal)
 					if services != nil {
 						if err != nil && code == "" {
 							services.finish(l.ServiceType, "report_pending")
@@ -260,6 +320,8 @@ func run(c config.Config) error {
 				}
 			}()
 			continue
+		} else {
+			status.LastHeartbeatAt = time.Now().UTC()
 		}
 		select {
 		case <-ctx.Done():
