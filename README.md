@@ -75,3 +75,5 @@ The account and quote fixtures are generated using the companion protocol’s An
 RPC snapshot behavior follows [Solana’s getMultipleAccounts contract](https://solana.com/docs/rpc/http/getmultipleaccounts); canonical addresses follow [Solana’s PDA derivation](https://solana.com/docs/core/pda). The curve decoder is pinned in `go.mod`.
 
 The production payment contract, lease request commitment and execution gate still need their coordinator/runtime companions. This package does not enable dispatch, remove the current marketplace blockers or authorize provider work against test funds.
+
+Committed `accepted` and `failed` attempt outcomes require a canonical lowercase 64-character report SHA-256. Missing or malformed receipts leave the local journal unresolved. Unpairing stops new reports; the coordinator may retain status-only recovery for an exact report it committed before unpairing or wallet unbinding, so already accepted buyer work can finish. This recovery does not grant execution or access to prompts, outputs, usage or provider credentials.

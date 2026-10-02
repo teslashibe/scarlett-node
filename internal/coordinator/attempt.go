@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -49,6 +50,15 @@ func (c *Client) AttemptStatus(ctx context.Context, job, attempt, fence string) 
 	}
 	if result.Version != Version || result.JobID != job || result.Attempt != attempt || result.Fence != fence || !result.ReplaySafe {
 		return result, errors.New("attempt reconciliation identity or replay contract mismatch")
+	}
+	if result.SubmissionSHA256 != "" {
+		hash, e := hex.DecodeString(result.SubmissionSHA256)
+		if e != nil || len(hash) != 32 || hex.EncodeToString(hash) != result.SubmissionSHA256 {
+			return result, errors.New("invalid attempt report receipt")
+		}
+	}
+	if (result.State == "accepted" || result.State == "failed") && result.SubmissionSHA256 == "" {
+		return result, errors.New("committed attempt report receipt is missing")
 	}
 	switch result.State {
 	case "live", "proof_pending", "accepted", "failed", "expired", "fenced":
