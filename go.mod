@@ -5,6 +5,7 @@ go 1.25.5
 require (
 	github.com/teslashibe/open-agent-api v0.1.27
 	github.com/teslashibe/x-go v1.13.0
+	golang.org/x/term v0.34.0
 )
 
 require (
