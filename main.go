@@ -45,10 +45,7 @@ func start(args []string) error {
 }
 func identityPath(c config.Config) string { return filepath.Join(c.StateDir, "identity.json") }
 func pair(c config.Config) error {
-	if err := os.MkdirAll(c.StateDir, 0700); err != nil {
-		return err
-	}
-	if err := os.Chmod(c.StateDir, 0700); err != nil {
+	if err := prepareStateDir(c.StateDir); err != nil {
 		return err
 	}
 	if _, err := os.Lstat(identityPath(c)); err == nil {
@@ -57,17 +54,10 @@ func pair(c config.Config) error {
 		return err
 	}
 	fmt.Fprintln(os.Stderr, "Enter one-time pairing code:")
-	// Read from stdin rather than flags/env so it does not appear in process arguments.
-	b, err := io.ReadAll(io.LimitReader(os.Stdin, 257))
+	code, err := readProtectedPairCode(os.Stdin)
+	fmt.Fprintln(os.Stderr)
 	if err != nil {
 		return err
-	}
-	code := string(b)
-	for len(code) > 0 && (code[len(code)-1] == '\n' || code[len(code)-1] == '\r') {
-		code = code[:len(code)-1]
-	}
-	if code == "" || len(code) > 256 {
-		return errors.New("invalid pairing code")
 	}
 	client := coordinator.New(c.Coordinator, "")
 	var reply coordinator.PairReply
@@ -75,23 +65,11 @@ func pair(c config.Config) error {
 	if err != nil {
 		return err
 	}
-	if reply.Version != coordinator.Version || reply.NodeID == "" || reply.SupplierPubkey == "" || reply.Credential == "" {
+	if reply.Version != coordinator.Version || !validIdentityField(reply.NodeID, 128) || !validIdentityField(reply.SupplierPubkey, 128) || !validIdentityField(reply.Credential, 4096) {
 		return errors.New("invalid pairing response")
 	}
-	f, err := os.OpenFile(identityPath(c), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
+	if err = saveIdentity(c, identity{reply.NodeID, reply.SupplierPubkey, reply.Credential}); err != nil {
 		return err
-	}
-	data, e := json.Marshal(identity{reply.NodeID, reply.SupplierPubkey, reply.Credential})
-	if e == nil {
-		_, e = f.Write(data)
-	}
-	if closeErr := f.Close(); e == nil {
-		e = closeErr
-	}
-	if e != nil {
-		os.Remove(identityPath(c))
-		return e
 	}
 	fmt.Printf("Paired node %s (supplier %s)\n", reply.NodeID, reply.SupplierPubkey)
 	return nil
@@ -112,7 +90,12 @@ func loadIdentity(c config.Config) (identity, error) {
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
 		return id, errors.New("identity file must be regular and private (0600)")
 	}
-	data, err := os.ReadFile(identityPath(c))
+	f, err := os.Open(identityPath(c))
+	if err != nil {
+		return id, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, 8193))
 	if err != nil {
 		return id, err
 	}
