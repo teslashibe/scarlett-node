@@ -161,9 +161,18 @@ func New(origin, credential string) *Client {
 	return &Client{Origin: origin, Credential: credential, HTTP: &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 }
 func (c *Client) Post(ctx context.Context, path string, body any, out any) (int, error) {
-	raw, err := json.Marshal(body)
-	if err != nil {
-		return 0, err
+	var raw []byte
+	var err error
+	if exact, ok := body.(json.RawMessage); ok {
+		if !json.Valid(exact) {
+			return 0, errors.New("invalid coordinator report")
+		}
+		raw = exact // preserve the journal's submission hash, including whitespace
+	} else {
+		raw, err = json.Marshal(body)
+		if err != nil {
+			return 0, err
+		}
 	}
 	if len(raw) > 131072 {
 		return 0, errors.New("request too large")

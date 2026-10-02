@@ -78,7 +78,7 @@ paths:
     post:
       security: [{nodeBearer: []}]
       parameters: [{$ref: '#/components/parameters/JobID'}]
-      summary: Submit result for exact live attempt and fence, once
+      summary: Submit the immutable result for an exact live attempt and fence
       requestBody:
         required: true
         content:
@@ -86,12 +86,12 @@ paths:
             schema: {$ref: '#/components/schemas/Result'}
       responses:
         '200': {description: Accepted and committed once}
-        '409': {description: Expired, duplicate or fenced; not rewardable}
+        '409': {description: Expired, conflicting body or fenced; not rewardable}
   /api/node/v1/jobs/{job_id}/proven:
     post:
       security: [{nodeBearer: []}]
       parameters: [{$ref: '#/components/parameters/JobID'}]
-      summary: Report that a Codex proof was sent to the assigned verifier
+      summary: Report that a proof was sent to the assigned verifier
       description: >-
         The node does not submit the answer. The coordinator reads model, output, and usage
         from the verifier after this call. A supplier copy of the output is not accepted.
@@ -101,8 +101,9 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/Proven'}
       responses:
-        '200': {description: Verifier result accepted and committed once}
-        '409': {description: Expired, duplicate, fenced, rejected, or proof not ready}
+        '200': {description: Verifier result accepted and committed once, including an identical report replay}
+        '202': {description: Report persisted; verifier ingestion remains pending}
+        '409': {description: Expired, conflicting report, fenced or rejected}
   /api/node/v1/jobs/{job_id}/fail:
     post:
       security: [{nodeBearer: []}]
@@ -116,6 +117,39 @@ paths:
       responses:
         '200': {description: Failure recorded}
         '409': {description: Expired or fenced}
+  /api/node/v1/jobs/{job_id}/attempt:
+    get:
+      security: [{nodeBearer: []}]
+      parameters:
+        - {$ref: '#/components/parameters/JobID'}
+        - name: attempt
+          in: query
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+        - name: fence
+          in: query
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+      summary: Reconcile an authenticated node's exact attempt after interruption
+      description: >-
+        Only the assigned node may read this outcome. replay_safe true promises
+        that result/proven/fail persist one immutable submission body per attempt
+        and fence, with identical retries returning the original outcome and changed
+        bodies rejected. submission_sha256 hashes the exact HTTP report body bytes.
+        Report retries require this explicit contract. Persistence idempotency never
+        authorizes repeated provider execution. live means no committed report;
+        proof_pending means the verifier owns ingestion; accepted/failed are committed
+        outcomes; expired/fenced are permanent for this attempt. Revocation denies access.
+        A restarted node reports execution_uncertain for a started attempt and must
+        not rerun its provider. That failure must not automatically requeue paid work.
+      responses:
+        '200':
+          description: Durable attempt state, not a payment or points receipt
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AttemptStatus'}
+        '401': {description: Invalid or revoked node credential}
+        '404': {description: Attempt unavailable to this node or reconciliation unsupported}
 components:
   securitySchemes:
     nodeBearer: {type: http, scheme: bearer}
@@ -222,6 +256,18 @@ components:
         version: {type: string, enum: [node-v1]}
         attempt: {type: string}
         fence: {type: string}
+    AttemptStatus:
+      type: object
+      additionalProperties: false
+      required: [version, job_id, attempt, fence, state, replay_safe]
+      properties:
+        version: {type: string, enum: [node-v1]}
+        job_id: {type: string}
+        attempt: {type: string}
+        fence: {type: string}
+        state: {type: string, enum: [live, proof_pending, accepted, failed, expired, fenced]}
+        replay_safe: {type: boolean, enum: [true]}
+        submission_sha256: {type: string, pattern: '^[0-9a-f]{64}$', description: Required for accepted/failed reports; exact report bytes committed by the coordinator}
     Failure:
       type: object
       required: [version, attempt, fence, code]
@@ -229,4 +275,4 @@ components:
         version: {type: string, enum: [node-v1]}
         attempt: {type: string}
         fence: {type: string}
-        code: {type: string, enum: [invalid_lease, expired, gateway_error, capacity_unavailable, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds, prover_error], description: capacity_unavailable means the gateway was unreachable or returned 429/503 before inference; the coordinator may requeue the job for another node.}
+        code: {type: string, enum: [invalid_lease, expired, gateway_error, capacity_unavailable, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds, prover_error, execution_uncertain], description: execution_uncertain means a provider call might have occurred before interruption and must not automatically requeue paid work. Transport failure alone does not prove a call never ran; capacity_unavailable must not authorize an ambiguous provider retry.}
