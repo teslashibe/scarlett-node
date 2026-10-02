@@ -146,3 +146,22 @@ func TestVerifierTLSConfiguration(t *testing.T) {
 		t.Fatal("mixed fixture plaintext and CA accepted")
 	}
 }
+
+func TestJournalCapacityEnvironment(t *testing.T) {
+	t.Setenv("SCARLETT_COORDINATOR", "https://example.org")
+	t.Setenv("SCARLETT_PROFILE", "synthetic")
+	t.Setenv("SCARLETT_GATEWAY", "http://127.0.0.1:8080")
+	t.Setenv("SCARLETT_JOURNAL_MAX_RECORDS", "4096")
+	t.Setenv("SCARLETT_JOURNAL_MAX_RECORD_BYTES", "192000")
+	t.Setenv("SCARLETT_JOURNAL_MAX_TOTAL_BYTES", "268435456")
+	c, err := Load()
+	if err != nil || c.JournalLimits.MaxRecords != 4096 {
+		t.Fatal(c.JournalLimits, err)
+	}
+	for _, bad := range []string{"0", "1000001", "garbage", "-1"} {
+		t.Setenv("SCARLETT_JOURNAL_MAX_RECORDS", bad)
+		if _, err := Load(); err == nil {
+			t.Fatal("invalid limit accepted", bad)
+		}
+	}
+}

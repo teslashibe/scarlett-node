@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"github.com/teslashibe/scarlett-node/internal/attempts"
 	"net"
 	"net/url"
 	"os"
@@ -19,6 +20,7 @@ const (
 )
 
 type Config struct {
+	JournalLimits attempts.Limits
 	Coordinator   string
 	CoordinatorCA string
 	// Executor is "gateway" (reported usage from an HTTP gateway), "codex" (the same
@@ -68,6 +70,26 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	c := Config{Coordinator: os.Getenv("SCARLETT_COORDINATOR"), CoordinatorCA: os.Getenv("SCARLETT_COORDINATOR_CA_FILE"), Executor: os.Getenv("SCARLETT_EXECUTOR"), Verifier: os.Getenv("SCARLETT_VERIFIER"), VerifierCA: os.Getenv("SCARLETT_VERIFIER_CA_FILE"), VerifierPlaintextFixture: os.Getenv("SCARLETT_VERIFIER_PLAINTEXT_FIXTURE") == "1", Prover: os.Getenv("SCARLETT_PROVER"), Gateway: os.Getenv("SCARLETT_GATEWAY"), Profile: os.Getenv("SCARLETT_PROFILE"), StateDir: os.Getenv("SCARLETT_STATE_DIR"), GatewayKey: os.Getenv("SCARLETT_GATEWAY_KEY"), Credential: os.Getenv("SCARLETT_CREDENTIAL"), NodeID: os.Getenv("SCARLETT_NODE_ID"), CodexHome: os.Getenv("SCARLETT_CODEX_HOME"), CodexProfile: os.Getenv("SCARLETT_CODEX_PROFILE"), CodexScaffold: os.Getenv("SCARLETT_CODEX_SCAFFOLD"), Bid: 100, LocalFixture: os.Getenv("SCARLETT_LOCAL_FIXTURE") == "1", InferenceTimeout: 45 * time.Second, MaxInputBytes: 32768, MaxOutputTokens: 2048}
+	c.JournalLimits = attempts.DefaultLimits()
+	for name, destination := range map[string]*int{"SCARLETT_JOURNAL_MAX_RECORDS": &c.JournalLimits.MaxRecords, "SCARLETT_JOURNAL_MAX_RECORD_BYTES": &c.JournalLimits.MaxRecordBytes} {
+		if raw := os.Getenv(name); raw != "" {
+			value, err := strconv.Atoi(raw)
+			if err != nil {
+				return c, errors.New("invalid " + name)
+			}
+			*destination = value
+		}
+	}
+	if raw := os.Getenv("SCARLETT_JOURNAL_MAX_TOTAL_BYTES"); raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return c, errors.New("invalid SCARLETT_JOURNAL_MAX_TOTAL_BYTES")
+		}
+		c.JournalLimits.MaxTotalBytes = value
+	}
+	if err := c.JournalLimits.Validate(); err != nil {
+		return c, err
+	}
 	if s := os.Getenv("SCARLETT_BID"); s != "" {
 		v, e := strconv.ParseInt(s, 10, 64)
 		if e != nil || v < 0 || v > 1_000_000_000 {
@@ -164,6 +186,11 @@ func Serves(id string) (string, bool) {
 }
 
 func (c Config) Validate() error {
+	if c.JournalLimits != (attempts.Limits{}) {
+		if err := c.JournalLimits.Validate(); err != nil {
+			return err
+		}
+	}
 	if c.Profile == "" || strings.ContainsAny(c.Profile, " \n\r\t") || len(c.Profile) > 128 {
 		return errors.New("SCARLETT_PROFILE required")
 	}

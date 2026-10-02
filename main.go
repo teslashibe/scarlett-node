@@ -128,7 +128,7 @@ func run(c config.Config) error {
 	if err := prepareStateDir(c.StateDir); err != nil {
 		return err
 	}
-	journal, err := attempts.Open(filepath.Join(c.StateDir, "attempts"))
+	journal, err := attempts.OpenWithLimits(filepath.Join(c.StateDir, "attempts"), c.JournalLimits)
 	if err != nil {
 		return err
 	}
@@ -247,6 +247,19 @@ func run(c config.Config) error {
 		if drained {
 			h.State = "exhausted"
 			status.State = "draining"
+		}
+		journalCapacity, err := journal.Capacity()
+		if err != nil {
+			return err
+		}
+		status.JournalCapacity = &journalCapacity
+		// In-flight goroutines may not have called Begin yet. Reserve one
+		// additional slot for each before advertising new admission capacity.
+		if journalCapacity.AvailableRecords <= len(slots) {
+			h.State = "exhausted"
+			for i := range h.Services {
+				h.Services[i].State = "exhausted"
+			}
 		}
 		status.Services = h.Services
 		status.InFlight = len(slots)

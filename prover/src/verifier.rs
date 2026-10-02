@@ -57,6 +57,9 @@ struct Config {
     key: String,
     upstream: String,
     session_limit: Duration,
+    limits: verifier_store::Limits,
+    concurrency: usize,
+    slots: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -190,7 +193,7 @@ impl Sessions {
             if r.expires_ms > now.saturating_add(MAX_TTL.as_millis() as u64) {
                 bail!("verifier receipt expiry exceeds the session bound");
             }
-            if now > r.expires_ms.saturating_add(verifier_store::RETENTION_MS) {
+            if r.in_flight == 0 && r.status["reason"] != "execution_uncertain" && now > r.expires_ms.saturating_add(verifier_store::RETENTION_MS) {
                 s.store.as_mut().unwrap().remove(&r.job_id, &r.attempt)?;
                 continue;
             }
@@ -258,11 +261,18 @@ impl Sessions {
     }
     fn purge(&mut self) -> Result<()> {
         let now = now_ms();
+        // Expiry revokes unspent tokens and releases reserved result space.
+        // In-flight proofs keep their reservation until their outcome commits.
+        let expired: Vec<_> = self.by_token.values().filter(|key| self.by_job.get(*key).is_some_and(|e| e.in_flight == 0 && e.expires_ms <= now)).cloned().collect();
+        for key in expired {
+            self.by_token.retain(|_, value| value != &key);
+            self.commit(&key)?;
+        }
         let retention = if self.store.is_some() { verifier_store::RETENTION_MS } else { MAX_TTL.as_millis() as u64 };
         let stale: Vec<_> = self
             .by_job
             .iter()
-            .filter(|(_, e)| e.in_flight == 0 && now > e.expires_ms.saturating_add(retention))
+            .filter(|(_, e)| e.in_flight == 0 && !matches!(&e.status, Status::Rejected { reason } if reason == "execution_uncertain") && now > e.expires_ms.saturating_add(retention))
             .map(|(k, _)| k.clone())
             .collect();
         for key in stale {
@@ -306,6 +316,9 @@ mod durable_tests {
                 key: "synthetic-fixture-key-never-used-remotely".into(),
                 upstream: "127.0.0.1:1".into(),
                 session_limit: Duration::from_secs(30),
+                limits: verifier_store::Limits::default(),
+                concurrency: 64,
+                slots: Arc::new(tokio::sync::Semaphore::new(64)),
             },
             Mutex::new(Sessions::restore(store, records).unwrap()),
         ))
@@ -600,10 +613,58 @@ mod durable_tests {
             panic!("lost partial X receipt");
         }
     }
+    #[tokio::test]
+    async fn capacity_requires_authority_and_reports_storage_health() {
+        let dir = Temp::new(); let s = shared(&dir.0);
+        assert_eq!(capacity(State(s.clone()), HeaderMap::new()).await.0, StatusCode::UNAUTHORIZED);
+        let (code, Json(body)) = capacity(State(s.clone()), headers()).await;
+        assert_eq!(code, StatusCode::OK); assert_eq!(body["healthy"], true); assert_eq!(body["durable"], true);
+        s.1.lock().unwrap().failed = true;
+        assert_eq!(capacity(State(s), headers()).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+    #[tokio::test]
+    async fn expiry_releases_reservation_without_losing_receipt() {
+        let dir = Temp::new(); let s = shared(&dir.0);
+        assert_eq!(create(State(s.clone()), headers(), Json(request(now_ms() + 10_000))).await.0, StatusCode::CREATED);
+        let key = job_key("synthetic", "1");
+        let mut sessions = s.1.lock().unwrap();
+        assert_eq!(sessions.store.as_ref().unwrap().capacity().reserved_bytes, verifier_store::MAX_RECORD_BYTES);
+        sessions.by_job.get_mut(&key).unwrap().expires_ms = now_ms() - 1;
+        sessions.purge().unwrap();
+        assert!(sessions.by_token.is_empty());
+        assert!(sessions.by_job.contains_key(&key));
+        let capacity = sessions.store.as_ref().unwrap().capacity();
+        assert_eq!(capacity.reserved_bytes, capacity.bytes);
+    }
+    #[tokio::test]
+    async fn old_interrupted_receipt_is_retained_as_uncertain() {
+        let dir = Temp::new(); let s = shared(&dir.0);
+        assert_eq!(create(State(s.clone()), headers(), Json(request(now_ms() + 1000))).await.0, StatusCode::CREATED);
+        let key = job_key("synthetic", "1");
+        {
+            let mut sessions = s.1.lock().unwrap();
+            sessions.by_token.clear();
+            let e = sessions.by_job.get_mut(&key).unwrap();
+            e.status = Status::Running; e.in_flight = 1;
+            e.expires_ms = now_ms() - verifier_store::RETENTION_MS - 1000;
+            sessions.commit(&key).unwrap();
+        }
+        drop(s);
+        let s = shared(&dir.0);
+        let mut sessions = s.1.lock().unwrap(); sessions.purge().unwrap();
+        assert!(matches!(&sessions.by_job[&key].status, Status::Rejected { reason } if reason == "execution_uncertain"));
+        assert!(sessions.by_token.is_empty());
+    }
+
 }
 
 type Shared = Arc<(Config, Mutex<Sessions>)>;
 
+fn bounded_env(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
+    let value = match env::var(name) { Ok(raw) => raw.parse::<u64>().with_context(|| format!("invalid {name}"))?, Err(env::VarError::NotPresent) => default, Err(_) => bail!("invalid {name}") };
+    if !(min..=max).contains(&value) { bail!("invalid {name}"); }
+    Ok(value)
+}
 pub async fn run() -> Result<()> {
     let key = env::var("SCARLETT_VERIFIER_KEY").unwrap_or_default();
     if key.len() < 32 {
@@ -613,8 +674,14 @@ pub async fn run() -> Result<()> {
     let api = env::var("SCARLETT_VERIFIER_API").unwrap_or_else(|_| "127.0.0.1:7070".into());
     let upstream = env::var("UPSTREAM").unwrap_or_else(|_| format!("{}:443", policy::HOST));
     let limit = env::var("SESSION_TIMEOUT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+    let limits = verifier_store::Limits {
+        max_records: bounded_env("SCARLETT_VERIFIER_MAX_RECORDS", 1024, 1, 1_000_000)? as usize,
+        max_record_bytes: bounded_env("SCARLETT_VERIFIER_MAX_RECORD_BYTES", 64 << 20, 1 << 20, 64 << 20)?,
+        max_total_bytes: bounded_env("SCARLETT_VERIFIER_MAX_TOTAL_BYTES", 256 << 20, 1 << 20, 1 << 40)?,
+    }.validate()?;
+    let concurrency = bounded_env("SCARLETT_VERIFIER_CONCURRENCY", 64, 1, 256)? as usize;
     let sessions = if let Ok(dir) = env::var("SCARLETT_VERIFIER_STATE_DIR") {
-        let (store, records) = Store::open(std::path::Path::new(&dir))?;
+        let (store, records) = Store::open_with_limits(std::path::Path::new(&dir), limits)?;
         Sessions::restore(store, records)?
     } else {
         Sessions::default()
@@ -630,7 +697,7 @@ pub async fn run() -> Result<()> {
         (None, None) if plaintext && listen.parse::<std::net::SocketAddr>().is_ok_and(|a| a.ip().is_loopback()) => None,
         _ => bail!("verifier needs a TLS certificate/key or an explicit loopback plaintext fixture"),
     };
-    let shared: Shared = Arc::new((Config { key, upstream, session_limit: Duration::from_secs(limit) }, Mutex::new(sessions)));
+    let shared: Shared = Arc::new((Config { key, upstream, session_limit: Duration::from_secs(limit), limits, concurrency, slots: Arc::new(tokio::sync::Semaphore::new(concurrency)) }, Mutex::new(sessions)));
     let cleanup = shared.clone();
     tokio::spawn(async move {
         loop {
@@ -642,7 +709,7 @@ pub async fn run() -> Result<()> {
     });
 
     let router =
-        Router::new().route("/v1/sessions", post(create)).route("/v1/sessions/{job_id}/{attempt}", get(status)).with_state(shared.clone());
+        Router::new().route("/v1/sessions", post(create)).route("/v1/sessions/{job_id}/{attempt}", get(status)).route("/v1/capacity", get(capacity)).with_state(shared.clone());
     let api_listener = TcpListener::bind(&api).await.with_context(|| format!("binding {api}"))?;
     tokio::spawn(async move {
         if let Err(e) = axum::serve(api_listener, router).await {
@@ -652,7 +719,7 @@ pub async fn run() -> Result<()> {
 
     let listener = TcpListener::bind(&listen).await.with_context(|| format!("binding {listen}"))?;
     println!("verifier: sessions on {listen}, API on {api}, upstream {}", shared.0.upstream);
-    let slots = Arc::new(tokio::sync::Semaphore::new(64));
+    let slots = shared.0.slots.clone();
     loop {
         let (socket, peer) = listener.accept().await?;
         let Ok(slot) = slots.clone().try_acquire_owned() else { continue };
@@ -741,7 +808,7 @@ async fn create(State(shared): State<Shared>, headers: HeaderMap, Json(request):
         }
         return (StatusCode::CONFLICT, Json(serde_json::json!({"error": "session already exists for this attempt"})));
     }
-    if sessions.by_job.len() >= verifier_store::MAX_RECORDS {
+    if sessions.by_job.len() >= config.limits.max_records || sessions.store.as_ref().is_some_and(|store| !store.capacity().can_register) {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"verifier session capacity reached"})));
     }
     sessions.by_job.insert(
@@ -761,6 +828,21 @@ async fn create(State(shared): State<Shared>, headers: HeaderMap, Json(request):
         return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"verifier state unavailable"})));
     }
     (StatusCode::CREATED, Json(serde_json::json!({"token": token,"durable":durable})))
+}
+
+async fn capacity(State(shared): State<Shared>, headers: HeaderMap) -> (StatusCode, Json<Value>) {
+    if !authorized(&shared.0, &headers) {
+        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"verifier key required"})));
+    }
+    let sessions = shared.1.lock().unwrap();
+    let storage = sessions.store.as_ref().map(Store::capacity);
+    (if sessions.failed { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK }, Json(serde_json::json!({
+        "healthy": !sessions.failed, "durable": sessions.store.is_some(), "concurrency":shared.0.concurrency,
+        "records":sessions.by_job.len(), "storage":storage, "limits":shared.0.limits,
+        "active_connections":shared.0.concurrency - shared.0.slots.available_permits(),
+        "in_flight_proofs":sessions.by_job.values().map(|entry| entry.in_flight).sum::<usize>(),
+        "pending_sessions":sessions.by_token.values().filter(|key| sessions.by_job.get(*key).is_some_and(|entry| entry.expires_ms > now_ms())).count()
+    })))
 }
 
 async fn status(

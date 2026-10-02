@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/teslashibe/scarlett-node/internal/attempts"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
 	"golang.org/x/sys/unix"
 )
@@ -17,6 +18,7 @@ import (
 // Local observations contain no credentials, prompts, outputs or proof tokens.
 // A fresh observation is not independent provider or coordinator evidence.
 type runtimeStatus struct {
+	JournalCapacity    *attempts.Capacity          `json:"journal_capacity,omitempty"`
 	Version            string                      `json:"version"`
 	State              string                      `json:"state"`
 	NodeID             string                      `json:"node_id,omitempty"`
@@ -64,8 +66,11 @@ func localCommand(command string, output io.Writer) error {
 	if err == nil {
 		decoder := json.NewDecoder(bytes.NewReader(raw))
 		decoder.DisallowUnknownFields()
-		if decoder.Decode(&status) != nil || decoder.Decode(new(any)) != io.EOF || status.Version != coordinator.Version || len(status.Services) > 2 || status.InFlight < 0 || status.InFlight > 64 || status.UnresolvedAttempts < 0 || status.UnresolvedAttempts > 1024 || !validIdentityField(status.NodeID, 128) || (status.State != "running" && status.State != "draining" && status.State != "stopped") {
+		if decoder.Decode(&status) != nil || decoder.Decode(new(any)) != io.EOF || status.Version != coordinator.Version || len(status.Services) > 2 || status.InFlight < 0 || status.InFlight > 64 || status.UnresolvedAttempts < 0 || status.UnresolvedAttempts > 1000000 || !validIdentityField(status.NodeID, 128) || (status.State != "running" && status.State != "draining" && status.State != "stopped") {
 			return errors.New("invalid local status")
+		}
+		if c := status.JournalCapacity; c != nil && (c.Limits.Validate() != nil || c.Records < 0 || c.Records > c.Limits.MaxRecords || c.Bytes < 0 || c.Bytes > c.Limits.MaxTotalBytes || c.ReservedBytes < c.Bytes || c.AvailableRecords < 0 || c.AvailableRecords > c.Limits.MaxRecords-c.Records) {
+			return errors.New("invalid journal capacity status")
 		}
 		if time.Since(status.UpdatedAt) > 30*time.Second || status.UpdatedAt.After(time.Now().Add(time.Second)) {
 			status.State = "offline"
