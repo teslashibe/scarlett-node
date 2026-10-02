@@ -9,6 +9,7 @@ mod fake;
 mod policy;
 mod prove;
 mod verifier;
+mod verifier_store;
 mod xpolicy;
 mod xprove;
 

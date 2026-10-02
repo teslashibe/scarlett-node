@@ -85,7 +85,7 @@ struct Job {
 }
 
 /// A proven X read as the verifier parsed it from the transcript.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Exchange {
     pub operation: String,
     pub query_id: String,

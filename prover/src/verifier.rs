@@ -11,13 +11,14 @@
 //! Environment: SCARLETT_VERIFIER_KEY (required, 32+ chars),
 //! SCARLETT_VERIFIER_LISTEN (default 0.0.0.0:7047), SCARLETT_VERIFIER_API
 //! (default 127.0.0.1:7070), UPSTREAM (default chatgpt.com:443),
-//! SESSION_TIMEOUT_SECS (default 300).
+//! SESSION_TIMEOUT_SECS (default 300). Optional SCARLETT_VERIFIER_STATE_DIR
+//! enables private durable receipts and requires absolute expiry/fence bindings.
 
 use std::{
     collections::HashMap,
     env,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -45,6 +46,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::{
     policy::{self, Verified},
+    verifier_store::{self, Record, Store},
     xpolicy::{self, Exchange, Spec},
     xprove::{MAX_RECV, MAX_SENT},
 };
@@ -57,7 +59,7 @@ struct Config {
     session_limit: Duration,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum Status {
     Pending,
@@ -82,7 +84,7 @@ enum Status {
     },
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct XRecord {
     /// The pinned exchange this proof matched.
     index: usize,
@@ -108,12 +110,426 @@ struct Entry {
     kind: Kind,
     expires: Instant,
     status: Status,
+    expires_ms: u64,
+    fence: String,
+    in_flight: usize,
 }
 
 #[derive(Default)]
 struct Sessions {
     by_job: HashMap<String, Entry>,
     by_token: HashMap<String, String>,
+    store: Option<Store>,
+    failed: bool,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+fn kind(payload: &Value, durable: bool) -> Result<(Kind, Status)> {
+    if payload["type"] == "x.read" {
+        let (specs, max) = xpolicy::validate_job(payload)?;
+        if durable && (specs.len() > 3 || max != specs.len()) {
+            bail!("durable X jobs require 1-3 exchanges with one attempt each");
+        }
+        let pending = (0..specs.len()).collect();
+        Ok((
+            Kind::X(Arc::new(specs)),
+            Status::XRead { remaining_attempts: max, complete: false, pending, exchanges: Vec::new(), rejections: Vec::new() },
+        ))
+    } else {
+        policy::validate_job(payload)?;
+        Ok((Kind::Codex, Status::Pending))
+    }
+}
+// Persisted status must describe the same job and spent attempts. A malformed
+// local receipt must stop startup, never become an authoritative success.
+fn validate_receipt(kind: &Kind, status: &Status, in_flight: usize) -> Result<()> {
+    match (kind, status) {
+        (Kind::Codex, Status::Pending | Status::Accepted { .. }) if in_flight == 0 => Ok(()),
+        (Kind::Codex, Status::Running) if in_flight == 1 => Ok(()),
+        (_, Status::Rejected { .. } | Status::Expired) if in_flight == 0 => Ok(()),
+        (Kind::X(specs), Status::XRead { remaining_attempts, complete, pending, exchanges, rejections }) => {
+            if remaining_attempts
+                .checked_add(exchanges.len())
+                .and_then(|n| n.checked_add(rejections.len()))
+                .and_then(|n| n.checked_add(in_flight))
+                != Some(specs.len())
+            {
+                bail!("invalid X receipt attempt count");
+            }
+            let mut done: Vec<(usize, &[String])> = Vec::new();
+            let cursors: Vec<Vec<String>> = exchanges.iter().map(|r| xpolicy::outcome(&r.exchange).1).collect();
+            for (record, cursors) in exchanges.iter().zip(&cursors) {
+                if record.index != xpolicy::assign(specs, &done, &record.exchange)?
+                    || record.fulfilled != xpolicy::outcome(&record.exchange).0
+                    || record.sent_bytes > MAX_SENT
+                    || record.received_bytes > MAX_RECV
+                {
+                    bail!("invalid X receipt exchange");
+                }
+                if record.fulfilled {
+                    done.push((record.index, cursors));
+                }
+            }
+            let expected: Vec<_> = (0..specs.len()).filter(|i| !done.iter().any(|(k, _)| k == i)).collect();
+            if pending != &expected || *complete != expected.is_empty() {
+                bail!("invalid X receipt completion");
+            }
+            Ok(())
+        }
+        _ => bail!("receipt status does not match the job"),
+    }
+}
+impl Sessions {
+    fn restore(store: Store, records: Vec<Record>) -> Result<Self> {
+        let mut s = Self { store: Some(store), ..Self::default() };
+        let now = now_ms();
+        for r in records {
+            if r.expires_ms > now.saturating_add(MAX_TTL.as_millis() as u64) {
+                bail!("verifier receipt expiry exceeds the session bound");
+            }
+            if now > r.expires_ms.saturating_add(verifier_store::RETENTION_MS) {
+                s.store.as_mut().unwrap().remove(&r.job_id, &r.attempt)?;
+                continue;
+            }
+            let (kind, _) = kind(&r.payload, true)?;
+            let mut status: Status = serde_json::from_value(r.status)?;
+            validate_receipt(&kind, &status, r.in_flight)?;
+            let mut token = r.token;
+            if r.in_flight > 0 || matches!(status, Status::Running) {
+                status = Status::Rejected { reason: "execution_uncertain".into() };
+                token = None;
+            }
+            if let Status::XRead { exchanges, .. } = &mut status {
+                for record in exchanges.iter_mut().filter(|r| r.fulfilled) {
+                    record.cursors = xpolicy::outcome(&record.exchange).1;
+                }
+            }
+            let reusable = matches!(&status, Status::Pending | Status::XRead { remaining_attempts: 1.., complete: false, .. });
+            if r.expires_ms <= now || !reusable {
+                token = None;
+            }
+            let key = job_key(&r.job_id, &r.attempt);
+            if let Some(token) = token {
+                if s.by_token.insert(token, key.clone()).is_some() {
+                    bail!("duplicate persisted verifier token");
+                }
+            }
+            s.by_job.insert(
+                key.clone(),
+                Entry {
+                    payload: r.payload,
+                    kind,
+                    status,
+                    expires: Instant::now() + Duration::from_millis(r.expires_ms.saturating_sub(now)),
+                    expires_ms: r.expires_ms,
+                    fence: r.fence,
+                    in_flight: 0,
+                },
+            );
+            s.commit(&key)?;
+        }
+        Ok(s)
+    }
+    fn commit(&mut self, key: &str) -> Result<()> {
+        let Some(store) = self.store.as_mut() else {
+            return Ok(());
+        };
+        let entry = self.by_job.get(key).context("unknown receipt")?;
+        let (job_id, attempt) = key.split_once('\n').context("invalid receipt key")?;
+        let record = Record {
+            schema: 1,
+            job_id: job_id.into(),
+            attempt: attempt.into(),
+            fence: entry.fence.clone(),
+            payload: entry.payload.clone(),
+            status: serde_json::to_value(&entry.status)?,
+            expires_ms: entry.expires_ms,
+            in_flight: entry.in_flight,
+            token: self.by_token.iter().find(|(_, k)| k.as_str() == key).map(|(t, _)| t.clone()),
+        };
+        let result = store.save(&record);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+    fn purge(&mut self) -> Result<()> {
+        let now = now_ms();
+        let retention = if self.store.is_some() { verifier_store::RETENTION_MS } else { MAX_TTL.as_millis() as u64 };
+        let stale: Vec<_> = self
+            .by_job
+            .iter()
+            .filter(|(_, e)| e.in_flight == 0 && now > e.expires_ms.saturating_add(retention))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in stale {
+            if let Some(store) = self.store.as_mut() {
+                let (job, attempt) = key.split_once('\n').context("invalid receipt key")?;
+                if let Err(e) = store.remove(job, attempt) {
+                    self.failed = true;
+                    return Err(e);
+                }
+            }
+            self.by_job.remove(&key);
+            self.by_token.retain(|_, k| k != &key);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod durable_tests {
+    use super::*;
+    use serde_json::json;
+    use std::{fs, os::unix::fs::DirBuilderExt, path::PathBuf};
+
+    struct Temp(PathBuf);
+    impl Temp {
+        fn new() -> Self {
+            let p = env::temp_dir().join(format!("scarlett-verifier-api-{}", rand::random::<u128>()));
+            fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+            Self(p)
+        }
+    }
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    fn shared(dir: &std::path::Path) -> Shared {
+        let (store, records) = Store::open(dir).unwrap();
+        Arc::new((
+            Config {
+                key: "synthetic-fixture-key-never-used-remotely".into(),
+                upstream: "127.0.0.1:1".into(),
+                session_limit: Duration::from_secs(30),
+            },
+            Mutex::new(Sessions::restore(store, records).unwrap()),
+        ))
+    }
+    fn headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer synthetic-fixture-key-never-used-remotely".parse().unwrap());
+        h
+    }
+    fn request(expires: u64) -> CreateRequest {
+        CreateRequest {
+            job_id: "synthetic".into(),
+            attempt: "1".into(),
+            fence: Some("f1".into()),
+            expires_at_ms: Some(expires),
+            ttl_seconds: None,
+            payload: json!({"type":"response.create","model":"synthetic-model"}),
+        }
+    }
+    #[tokio::test]
+    async fn registration_acknowledgement_is_idempotent_and_binds_fence_payload_expiry() {
+        let dir = Temp::new();
+        let expires = now_ms() + 30_000;
+        let s = shared(&dir.0);
+        let (code, Json(first)) = create(State(s.clone()), headers(), Json(request(expires))).await;
+        assert_eq!(code, StatusCode::CREATED);
+        assert_eq!(first["durable"], true);
+        drop(s);
+        let s = shared(&dir.0);
+        let (code, Json(retry)) = create(State(s.clone()), headers(), Json(request(expires))).await;
+        assert_eq!(code, StatusCode::CREATED);
+        assert_eq!(first["token"], retry["token"]);
+        for change in ["fence", "payload", "expiry"] {
+            let mut r = request(expires);
+            match change {
+                "fence" => r.fence = Some("wrong".into()),
+                "payload" => r.payload["model"] = "changed".into(),
+                _ => r.expires_at_ms = Some(expires + 1),
+            }
+            assert_eq!(create(State(s.clone()), headers(), Json(r)).await.0, StatusCode::CONFLICT);
+        }
+        let (code, Json(view)) = status(State(s), headers(), Path(("synthetic".into(), "1".into()))).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(view["fence"], "f1");
+        assert_eq!(view["expires_at_ms"], expires);
+        assert_eq!(view["request_sha256"], verifier_store::hash(&serde_json::to_vec(&request(expires).payload).unwrap()));
+        assert!(view.get("token").is_none());
+    }
+    #[tokio::test]
+    async fn accepted_receipt_survives_restart_but_interrupted_proof_is_uncertain() {
+        for complete in [true, false] {
+            let dir = Temp::new();
+            let s = shared(&dir.0);
+            let expires = now_ms() + 30_000;
+            assert_eq!(create(State(s.clone()), headers(), Json(request(expires))).await.0, StatusCode::CREATED);
+            {
+                let mut sessions = s.1.lock().unwrap();
+                let key = job_key("synthetic", "1");
+                sessions.by_token.clear();
+                let e = sessions.by_job.get_mut(&key).unwrap();
+                e.status = if complete {
+                    Status::Accepted {
+                        verified: Verified {
+                            model: "synthetic-model".into(),
+                            output: "synthetic accepted result".into(),
+                            input_tokens: 8,
+                            output_tokens: 4,
+                        },
+                        duration_ms: 1,
+                    }
+                } else {
+                    Status::Running
+                };
+                e.in_flight = usize::from(!complete);
+                sessions.commit(&key).unwrap();
+            }
+            drop(s);
+            let s = shared(&dir.0);
+            let (_, Json(view)) = status(State(s.clone()), headers(), Path(("synthetic".into(), "1".into()))).await;
+            if complete {
+                assert_eq!(view["status"], "accepted");
+                assert_eq!(view["output"], "synthetic accepted result");
+            } else {
+                assert_eq!(view["status"], "rejected");
+                assert_eq!(view["reason"], "execution_uncertain");
+            }
+            assert!(s.1.lock().unwrap().by_token.is_empty());
+            assert_eq!(create(State(s), headers(), Json(request(expires))).await.0, StatusCode::CONFLICT);
+        }
+    }
+    #[tokio::test]
+    async fn incomplete_x_exchange_crash_revokes_token_and_storage_failure_hides_success() {
+        let dir = Temp::new();
+        let s = shared(&dir.0);
+        let expires = now_ms() + 30_000;
+        let lease: Value = serde_json::from_str(include_str!("../../api/fixtures/lease-x.json")).unwrap();
+        let mut r = request(expires);
+        r.payload = lease["x_payload"].clone();
+        assert_eq!(create(State(s.clone()), headers(), Json(r)).await.0, StatusCode::CREATED);
+        {
+            let mut sessions = s.1.lock().unwrap();
+            let key = job_key("synthetic", "1");
+            let e = sessions.by_job.get_mut(&key).unwrap();
+            e.in_flight = 1;
+            if let Status::XRead { remaining_attempts, .. } = &mut e.status {
+                *remaining_attempts -= 1;
+            }
+            sessions.commit(&key).unwrap();
+        }
+        drop(s);
+        let s = shared(&dir.0);
+        let (_, Json(view)) = status(State(s.clone()), headers(), Path(("synthetic".into(), "1".into()))).await;
+        assert_eq!(view["reason"], "execution_uncertain");
+        assert!(s.1.lock().unwrap().by_token.is_empty());
+        // Losing the destination directory simulates a failed durable commit.
+        fs::rename(&dir.0, dir.0.with_extension("moved")).unwrap();
+        let mut r = request(expires);
+        r.attempt = "2".into();
+        assert_eq!(create(State(s.clone()), headers(), Json(r)).await.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(status(State(s), headers(), Path(("synthetic".into(), "1".into()))).await.0, StatusCode::SERVICE_UNAVAILABLE);
+        fs::rename(dir.0.with_extension("moved"), &dir.0).unwrap();
+    }
+    #[tokio::test]
+    async fn durable_session_requires_fence_absolute_expiry_and_authorization() {
+        let dir = Temp::new();
+        let s = shared(&dir.0);
+        let expires = now_ms() + 30_000;
+        assert_eq!(create(State(s.clone()), HeaderMap::new(), Json(request(expires))).await.0, StatusCode::UNAUTHORIZED);
+        let mut missing = request(expires);
+        missing.fence = None;
+        assert_eq!(create(State(s.clone()), headers(), Json(missing)).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(create(State(s.clone()), headers(), Json(request(now_ms() + 601_000))).await.0, StatusCode::BAD_REQUEST);
+        let mut invalid = request(expires);
+        invalid.job_id = "job\nother-attempt".into();
+        assert_eq!(create(State(s), headers(), Json(invalid)).await.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn malformed_receipt_cannot_turn_partial_x_work_into_success() {
+        let lease: Value = serde_json::from_str(include_str!("../../api/fixtures/lease-x.json")).unwrap();
+        let (kind, mut status) = kind(&lease["x_payload"], true).unwrap();
+        assert!(validate_receipt(&kind, &status, 0).is_ok());
+        if let Status::XRead { complete, .. } = &mut status {
+            *complete = true;
+        }
+        assert!(validate_receipt(&kind, &status, 0).is_err());
+        assert!(validate_receipt(&kind, &Status::Pending, 0).is_err());
+        assert!(validate_receipt(&Kind::Codex, &status, 0).is_err());
+    }
+
+    #[tokio::test]
+    async fn expired_incomplete_work_is_not_success_and_retention_removes_private_payloads() {
+        let dir = Temp::new();
+        let s = shared(&dir.0);
+        let expiry = now_ms() + 30_000;
+        assert_eq!(create(State(s.clone()), headers(), Json(request(expiry))).await.0, StatusCode::CREATED);
+        {
+            let mut sessions = s.1.lock().unwrap();
+            let key = job_key("synthetic", "1");
+            let e = sessions.by_job.get_mut(&key).unwrap();
+            e.expires = Instant::now();
+            e.expires_ms = now_ms().saturating_sub(1);
+            sessions.commit(&key).unwrap();
+        }
+        let (_, Json(view)) = status(State(s.clone()), headers(), Path(("synthetic".into(), "1".into()))).await;
+        assert_eq!(view["status"], "expired");
+        {
+            let mut sessions = s.1.lock().unwrap();
+            let key = job_key("synthetic", "1");
+            sessions.by_job.get_mut(&key).unwrap().expires_ms = now_ms() - verifier_store::RETENTION_MS - 1;
+            sessions.commit(&key).unwrap();
+            sessions.purge().unwrap();
+            assert!(sessions.by_job.is_empty());
+            assert!(sessions.by_token.is_empty());
+        }
+        drop(s);
+        let s = shared(&dir.0);
+        assert!(s.1.lock().unwrap().by_job.is_empty());
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1); // Only the process lock remains.
+    }
+
+    #[tokio::test]
+    async fn persisted_x_response_restores_cursor_binding_without_counting_partial_work_complete() {
+        let dir = Temp::new();
+        let s = shared(&dir.0);
+        let expiry = now_ms() + 30_000;
+        let lease: Value = serde_json::from_str(include_str!("../../api/fixtures/lease-x.json")).unwrap();
+        let mut payload = lease["x_payload"].clone();
+        let first = payload["exchanges"][0].clone();
+        let mut second = first.clone();
+        second["cursor_from"] = 0.into();
+        let mut third = first.clone();
+        third["cursor_from"] = 1.into();
+        payload["exchanges"] = json!([first, second, third]);
+        payload["max_attempts"] = 3.into();
+        let mut r = request(expiry);
+        r.payload = payload.clone();
+        assert_eq!(create(State(s.clone()), headers(), Json(r)).await.0, StatusCode::CREATED);
+        let spec = &payload["exchanges"][0];
+        let exchange = Exchange { operation: spec["operation"].as_str().unwrap().into(), query_id: spec["query_id"].as_str().unwrap().into(), variables: spec["variables"].clone(), features: Some(spec["features"].clone()), field_toggles: None, http_status: 200, body: json!({"data":{"timeline":{"instructions":[{"type":"TimelineAddEntries","entries":[{"entryId":"cursor-bottom-0","content":{"entryType":"TimelineTimelineCursor","cursorType":"Bottom","value":"synthetic-next"}}]}]}}}).to_string() };
+        let (fulfilled, cursors) = xpolicy::outcome(&exchange);
+        assert!(fulfilled);
+        assert_eq!(cursors, vec!["synthetic-next"]);
+        {
+            let mut sessions = s.1.lock().unwrap();
+            let key = job_key("synthetic", "1");
+            let e = sessions.by_job.get_mut(&key).unwrap();
+            if let Status::XRead { remaining_attempts, pending, exchanges, .. } = &mut e.status {
+                *remaining_attempts -= 1;
+                pending.retain(|&i| i != 0);
+                exchanges.push(XRecord { index: 0, fulfilled, exchange, cursors, sent_bytes: 100, received_bytes: 100, duration_ms: 1 });
+            }
+            sessions.commit(&key).unwrap();
+        }
+        drop(s);
+        let s = shared(&dir.0);
+        let sessions = s.1.lock().unwrap();
+        if let Status::XRead { complete, remaining_attempts, exchanges, .. } = &sessions.by_job[&job_key("synthetic", "1")].status {
+            assert!(!complete);
+            assert_eq!(*remaining_attempts, 2);
+            assert_eq!(exchanges[0].cursors, vec!["synthetic-next"]);
+        } else {
+            panic!("lost partial X receipt");
+        }
+    }
 }
 
 type Shared = Arc<(Config, Mutex<Sessions>)>;
@@ -127,13 +543,28 @@ pub async fn run() -> Result<()> {
     let api = env::var("SCARLETT_VERIFIER_API").unwrap_or_else(|_| "127.0.0.1:7070".into());
     let upstream = env::var("UPSTREAM").unwrap_or_else(|_| format!("{}:443", policy::HOST));
     let limit = env::var("SESSION_TIMEOUT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
-    let shared: Shared =
-        Arc::new((Config { key, upstream, session_limit: Duration::from_secs(limit) }, Mutex::new(Sessions::default())));
+    let sessions = if let Ok(dir) = env::var("SCARLETT_VERIFIER_STATE_DIR") {
+        let (store, records) = Store::open(std::path::Path::new(&dir))?;
+        Sessions::restore(store, records)?
+    } else {
+        Sessions::default()
+    };
+    if sessions.store.is_some() && !api.parse::<std::net::SocketAddr>().is_ok_and(|a| a.ip().is_loopback()) {
+        bail!("durable verifier API must bind loopback");
+    }
+    let shared: Shared = Arc::new((Config { key, upstream, session_limit: Duration::from_secs(limit) }, Mutex::new(sessions)));
+    let cleanup = shared.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            if cleanup.1.lock().unwrap().purge().is_err() {
+                eprintln!("verifier state unavailable");
+            }
+        }
+    });
 
-    let router = Router::new()
-        .route("/v1/sessions", post(create))
-        .route("/v1/sessions/{job_id}/{attempt}", get(status))
-        .with_state(shared.clone());
+    let router =
+        Router::new().route("/v1/sessions", post(create)).route("/v1/sessions/{job_id}/{attempt}", get(status)).with_state(shared.clone());
     let api_listener = TcpListener::bind(&api).await.with_context(|| format!("binding {api}"))?;
     tokio::spawn(async move {
         if let Err(e) = axum::serve(api_listener, router).await {
@@ -148,8 +579,8 @@ pub async fn run() -> Result<()> {
         let _ = socket.set_nodelay(true);
         let shared = shared.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(shared, socket).await {
-                println!("verifier: session from {peer} ended without a result: {e:#}");
+            if handle(shared, socket).await.is_err() {
+                println!("verifier: session from {peer} ended without a result");
             }
         });
     }
@@ -170,6 +601,8 @@ struct CreateRequest {
     attempt: String,
     payload: Value,
     ttl_seconds: Option<u64>,
+    fence: Option<String>,
+    expires_at_ms: Option<u64>,
 }
 
 async fn create(State(shared): State<Shared>, headers: HeaderMap, Json(request): Json<CreateRequest>) -> (StatusCode, Json<Value>) {
@@ -177,39 +610,67 @@ async fn create(State(shared): State<Shared>, headers: HeaderMap, Json(request):
     if !authorized(config, &headers) {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "verifier key required"})));
     }
-    if request.job_id.is_empty() || request.job_id.len() > 128 || request.attempt.is_empty() || request.attempt.len() > 128 {
+    if !verifier_store::field(&request.job_id)
+        || !verifier_store::field(&request.attempt)
+        || request.fence.as_ref().is_some_and(|f| !verifier_store::field(f))
+    {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid job or attempt"})));
     }
-    let validated = if request.payload["type"] == "x.read" {
-        xpolicy::validate_job(&request.payload).map(|(specs, max)| {
-            let pending = (0..specs.len()).collect();
-            let initial = Status::XRead { remaining_attempts: max, complete: false, pending, exchanges: Vec::new(), rejections: Vec::new() };
-            (Kind::X(Arc::new(specs)), initial)
-        })
-    } else {
-        policy::validate_job(&request.payload).map(|_| (Kind::Codex, Status::Pending))
-    };
+    let mut sessions = sessions.lock().unwrap();
+    if sessions.failed || sessions.purge().is_err() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"verifier state unavailable"})));
+    }
+    let durable = sessions.store.is_some();
+    if durable && (request.fence.is_none() || request.expires_at_ms.is_none()) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"durable sessions require a fence and absolute expiry"})));
+    }
+    let validated = kind(&request.payload, durable);
     let (kind, initial) = match validated {
         Ok(v) => v,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()}))),
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e.to_string()})));
+        }
     };
-    let ttl = Duration::from_secs(request.ttl_seconds.unwrap_or(300)).min(MAX_TTL);
+    let now = now_ms();
+    let expires_ms = request.expires_at_ms.unwrap_or(now.saturating_add(request.ttl_seconds.unwrap_or(300).min(600) * 1000));
+    if expires_ms <= now || expires_ms > now.saturating_add(MAX_TTL.as_millis() as u64) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"invalid session expiry"})));
+    }
+    let ttl = Duration::from_millis(expires_ms - now);
     let token: String = rand::random::<[u8; 32]>().iter().map(|b| format!("{b:02x}")).collect();
     let key = job_key(&request.job_id, &request.attempt);
-    let mut sessions = sessions.lock().unwrap();
-    let now = Instant::now();
-    sessions.by_job.retain(|_, e| e.expires + MAX_TTL > now);
-    let live: std::collections::HashSet<&String> = sessions.by_job.keys().collect();
-    let stale: Vec<String> = sessions.by_token.iter().filter(|(_, k)| !live.contains(k)).map(|(t, _)| t.clone()).collect();
-    for token in stale {
-        sessions.by_token.remove(&token);
-    }
-    if sessions.by_job.contains_key(&key) {
+    if let Some(existing) = sessions.by_job.get(&key) {
+        if durable
+            && existing.payload == request.payload
+            && existing.fence == request.fence.clone().unwrap_or_default()
+            && existing.expires_ms == expires_ms
+            && existing.in_flight == 0
+            && let Some((token, _)) = sessions.by_token.iter().find(|(_, k)| *k == &key)
+        {
+            return (StatusCode::CREATED, Json(serde_json::json!({"token":token,"durable":true})));
+        }
         return (StatusCode::CONFLICT, Json(serde_json::json!({"error": "session already exists for this attempt"})));
     }
-    sessions.by_job.insert(key.clone(), Entry { payload: request.payload, kind, expires: now + ttl, status: initial });
-    sessions.by_token.insert(token.clone(), key);
-    (StatusCode::CREATED, Json(serde_json::json!({"token": token})))
+    if sessions.by_job.len() >= verifier_store::MAX_RECORDS {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"verifier session capacity reached"})));
+    }
+    sessions.by_job.insert(
+        key.clone(),
+        Entry {
+            payload: request.payload,
+            kind,
+            expires: Instant::now() + ttl,
+            expires_ms,
+            fence: request.fence.unwrap_or_default(),
+            status: initial,
+            in_flight: 0,
+        },
+    );
+    sessions.by_token.insert(token.clone(), key.clone());
+    if sessions.commit(&key).is_err() {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"verifier state unavailable"})));
+    }
+    (StatusCode::CREATED, Json(serde_json::json!({"token": token,"durable":durable})))
 }
 
 async fn status(
@@ -222,14 +683,24 @@ async fn status(
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "verifier key required"})));
     }
     let sessions = sessions.lock().unwrap();
+    if sessions.failed {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"verifier state unavailable"})));
+    }
     let Some(entry) = sessions.by_job.get(&job_key(&job_id, &attempt)) else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown session"})));
     };
     let status = match entry.status {
-        Status::Pending if Instant::now() >= entry.expires => Status::Expired,
+        Status::Pending | Status::XRead { complete: false, .. } if Instant::now() >= entry.expires => Status::Expired,
         ref other => other.clone(),
     };
-    (StatusCode::OK, Json(serde_json::to_value(status).unwrap_or_default()))
+    let mut response = serde_json::to_value(status).unwrap_or_default();
+    response["durable"] = sessions.store.is_some().into();
+    response["job_id"] = job_id.into();
+    response["attempt"] = attempt.into();
+    response["fence"] = entry.fence.clone().into();
+    response["expires_at_ms"] = entry.expires_ms.into();
+    response["request_sha256"] = verifier_store::hash(&serde_json::to_vec(&entry.payload).unwrap_or_default()).into();
+    (StatusCode::OK, Json(response))
 }
 
 enum Job {
@@ -245,16 +716,18 @@ async fn handle(shared: Shared, mut socket: TcpStream) -> Result<()> {
         bail!("malformed session token");
     }
     let token = std::str::from_utf8(&line[..64])?;
-    let (key, job) = {
+    let (key, job, expires) = {
         let mut guard = sessions.lock().unwrap();
         let s = &mut *guard;
+        if s.failed {
+            bail!("verifier state unavailable");
+        }
         let key = s.by_token.get(token).cloned().context("unknown or used session token")?;
         let entry = s.by_job.get_mut(&key).context("session expired")?;
         if Instant::now() >= entry.expires {
             s.by_token.remove(token);
-            if let Kind::Codex = entry.kind {
-                entry.status = Status::Expired;
-            }
+            entry.status = Status::Expired;
+            s.commit(&key)?;
             bail!("session expired");
         }
         let job = match &entry.kind {
@@ -280,43 +753,70 @@ async fn handle(shared: Shared, mut socket: TcpStream) -> Result<()> {
                 Job::X(specs.clone())
             }
         };
-        (key, job)
+        entry.in_flight += 1;
+        let expires = entry.expires;
+        // A durable spent token/attempt must exist before any provider session.
+        s.commit(&key)?;
+        (key, job, expires)
     };
 
     let started = Instant::now();
     let job_id = key.split('\n').next().unwrap_or_default().to_owned();
-    let timed_out = || format!("session exceeded {}s", config.session_limit.as_secs());
+    let limit = config.session_limit.min(expires.saturating_duration_since(Instant::now()));
     match job {
         Job::Codex(payload) => {
-            let status = match tokio::time::timeout(config.session_limit, verify(socket, &payload, &config.upstream)).await {
+            let status = match tokio::time::timeout(limit, verify(socket, &payload, &config.upstream)).await {
                 Ok(Ok(verified)) => Status::Accepted { verified, duration_ms: started.elapsed().as_millis() as u64 },
-                Ok(Err(e)) => Status::Rejected { reason: format!("{e:#}") },
-                Err(_) => Status::Rejected { reason: timed_out() },
+                Ok(Err(_)) => Status::Rejected { reason: "proof_rejected".into() },
+                Err(_) => Status::Rejected { reason: "session_timeout".into() },
             };
             match &status {
-                Status::Accepted { verified, .. } => println!("verifier: job {job_id} accepted, model {}", verified.model),
-                Status::Rejected { reason } => println!("verifier: job {job_id} rejected: {reason}"),
+                Status::Accepted { verified, .. } => {
+                    println!("verifier: job {job_id} accepted, model {}", verified.model)
+                }
+                Status::Rejected { reason } => {
+                    println!("verifier: job {job_id} rejected: {reason}")
+                }
                 _ => {}
             }
-            if let Some(entry) = sessions.lock().unwrap().by_job.get_mut(&key) {
-                entry.status = status;
+            let mut s = sessions.lock().unwrap();
+            if s.failed {
+                bail!("verifier state unavailable");
+            }
+            if let Some(entry) = s.by_job.get_mut(&key) {
+                entry.in_flight = entry.in_flight.saturating_sub(1);
+                entry.status = if Instant::now() >= entry.expires { Status::Expired } else { status };
+                s.commit(&key)?;
             }
         }
         Job::X(specs) => {
-            let outcome = match tokio::time::timeout(config.session_limit, verify_x(socket)).await {
+            let outcome = match tokio::time::timeout(limit, verify_x(socket)).await {
                 // Parse the response before taking the lock that every session shares.
                 Ok(Ok((exchange, sent_bytes, received_bytes))) => Ok((xpolicy::outcome(&exchange), exchange, sent_bytes, received_bytes)),
-                Ok(Err(e)) => Err(format!("{e:#}")),
-                Err(_) => Err(timed_out()),
+                Ok(Err(_)) => Err("proof_rejected".into()),
+                Err(_) => Err("session_timeout".into()),
             };
             let mut guard = sessions.lock().unwrap();
             let s = &mut *guard;
+            if s.failed {
+                bail!("verifier state unavailable");
+            }
+            if let Some(entry) = s.by_job.get_mut(&key) {
+                entry.in_flight = entry.in_flight.saturating_sub(1);
+                if Instant::now() >= entry.expires {
+                    entry.status = Status::Expired;
+                    s.by_token.retain(|_, k| *k != key);
+                    s.commit(&key)?;
+                    return Ok(());
+                }
+            }
             let Some(Entry { status: Status::XRead { complete, pending, exchanges, rejections, .. }, .. }) = s.by_job.get_mut(&key) else {
                 return Ok(());
             };
             // Match under the lock, so concurrent proofs of one exchange cannot both fulfil it.
             let matched = outcome.and_then(|((fulfilled, cursors), exchange, sent_bytes, received_bytes)| {
-                let done: Vec<(usize, &[String])> = exchanges.iter().filter(|r| r.fulfilled).map(|r| (r.index, r.cursors.as_slice())).collect();
+                let done: Vec<(usize, &[String])> =
+                    exchanges.iter().filter(|r| r.fulfilled).map(|r| (r.index, r.cursors.as_slice())).collect();
                 match xpolicy::assign(&specs, &done, &exchange) {
                     Ok(index) => Ok(XRecord {
                         index,
@@ -327,7 +827,7 @@ async fn handle(shared: Shared, mut socket: TcpStream) -> Result<()> {
                         received_bytes,
                         duration_ms: started.elapsed().as_millis() as u64,
                     }),
-                    Err(e) => Err(format!("{e:#}")),
+                    Err(_) => Err("exchange_mismatch".into()),
                 }
             });
             match matched {
@@ -350,6 +850,7 @@ async fn handle(shared: Shared, mut socket: TcpStream) -> Result<()> {
                     rejections.push(reason);
                 }
             }
+            s.commit(&key)?;
         }
     }
     Ok(())
@@ -374,10 +875,19 @@ async fn verify_x(socket: TcpStream) -> Result<(Exchange, usize, usize)> {
 
 /// Runs one TLSNotary session: proxy mode through `upstream` when given, else
 /// MPC-TLS within the X size limits. Returns the proven server name and transcript.
+struct CancelDriver(tokio::task::AbortHandle);
+impl Drop for CancelDriver {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn prove_session(socket: TcpStream, upstream: Option<&str>) -> Result<(String, PartialTranscript)> {
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();
     let driver_task = tokio::spawn(driver);
+    // Cancelling a proof must also drop its session driver and transport.
+    let _driver_guard = CancelDriver(driver_task.abort_handle());
 
     let verifier = handle.new_verifier(VerifierConfig::builder().root_store(RootCertStore::mozilla()).build()?)?;
     let verifier = match (verifier.commit().await?, upstream) {
