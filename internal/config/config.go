@@ -81,6 +81,14 @@ func Load() (Config, error) {
 	}
 	if c.Prover == "" {
 		c.Prover = "scarlett-prover"
+		// Native bundles keep the helper beside the node. Absolute invocation
+		// works even before the installation's bin directory is added to PATH.
+		if exe, e := os.Executable(); e == nil {
+			sibling := filepath.Join(filepath.Dir(exe), "scarlett-prover")
+			if info, e := os.Stat(sibling); e == nil && info.Mode().IsRegular() && info.Mode().Perm()&0111 != 0 {
+				c.Prover = sibling
+			}
+		}
 	}
 	if c.CodexHome == "" {
 		c.CodexHome = filepath.Join(home, ".codex")

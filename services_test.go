@@ -22,7 +22,38 @@ func poolFixture(t *testing.T, selected ...string) *servicePool {
 	os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"synthetic_fixture":true}`), 0600)
 	session := filepath.Join(dir, "session.json")
 	os.WriteFile(session, []byte(`{"auth_token":"synthetic-auth","ct0":"synthetic-csrf"}`), 0600)
-	return newServicePool(config.Config{Services: selected, CodexHome: home, XSession: session, CodexConcurrency: 2, XConcurrency: 1})
+	helper := filepath.Join(dir, "synthetic-prover")
+	os.WriteFile(helper, []byte("#!/bin/sh\nexit 1\n"), 0700)
+	return newServicePool(config.Config{Services: selected, CodexHome: home, XSession: session, Prover: helper, CodexConcurrency: 2, XConcurrency: 1})
+}
+
+func TestMissingProofHelperNeverAdvertisesConfiguredCapacity(t *testing.T) {
+	p := poolFixture(t, "codex", "x_read")
+	if e := os.Remove(p.config.Prover); e != nil {
+		t.Fatal(e)
+	}
+	if p.acquire("codex") || p.acquire("x_read") {
+		t.Fatal("missing helper accepted work")
+	}
+	for _, s := range p.health() {
+		if s.State != "unreachable" || s.LastErrorCode != "prover_error" {
+			t.Fatal("helper unavailable not reported")
+		}
+	}
+	if e := os.WriteFile(p.config.Prover, []byte("#!/bin/sh\nexit 1\n"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	if p.acquire("codex") {
+		t.Fatal("nonexecutable helper accepted")
+	}
+	if e := os.Chmod(p.config.Prover, 0700); e != nil {
+		t.Fatal(e)
+	}
+	if !p.acquire("codex") || !p.acquire("x_read") {
+		t.Fatal("installed helper did not restore configuration")
+	}
+	p.finish("codex", "")
+	p.finish("x_read", "")
 }
 func healthKind(t *testing.T, p *servicePool, kind string) coordinator.ServiceHealth {
 	t.Helper()

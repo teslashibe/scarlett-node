@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ type serviceEntry struct {
 	capacity, inFlight      int
 	state, lastError, stamp string
 	restUntil               time.Time
+	helperMissing           bool
 }
 type servicePool struct {
 	mu      sync.Mutex
@@ -32,6 +34,7 @@ func newServicePool(c config.Config) *servicePool {
 	return p
 }
 func (p *servicePool) refresh(now time.Time) {
+	_, helperError := exec.LookPath(p.config.Prover)
 	for kind, s := range p.entries {
 		if !s.enabled {
 			s.state = "not_added"
@@ -48,18 +51,27 @@ func (p *servicePool) refresh(now time.Time) {
 			stamp = fmt.Sprintf("%d:%d:%d", info.ModTime().UnixNano(), info.Size(), info.Mode().Perm())
 			configured = true
 		}
+		configured = configured && (kind != "x_read" || worker.XConfigured(path))
 		if stamp != s.stamp || s.state == "" {
 			s.stamp = stamp
 			s.lastError = ""
 			s.restUntil = time.Time{}
 			s.state = "configured"
-			if !configured || kind == "x_read" && !worker.XConfigured(path) {
+			if !configured {
 				s.state = "auth_required"
 			}
 		}
 		if !s.restUntil.IsZero() && !now.Before(s.restUntil) {
 			s.restUntil = time.Time{}
 			s.state = "configured"
+		}
+		if configured && helperError != nil {
+			s.helperMissing = true
+			s.state, s.lastError = "unreachable", "prover_error"
+		} else if configured && s.helperMissing {
+			s.helperMissing = false
+			s.state, s.lastError = "configured", ""
+			s.restUntil = time.Time{}
 		}
 	}
 }
