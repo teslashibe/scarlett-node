@@ -1,0 +1,111 @@
+{
+  "version": "codex-signin-models-2026-10-02",
+  "reviewedAt": "2026-10-02",
+  "sources": [
+    "Codex 0.159.2 visible models_cache metadata",
+    "https://learn.chatgpt.com/docs/models"
+  ],
+  "models": [
+    {
+      "id": "gpt-6.1-sol",
+      "codexEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "paidEffort": "low",
+      "paidServiceTier": "default"
+    },
+    {
+      "id": "gpt-6-astra",
+      "codexEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "paidEffort": "low",
+      "paidServiceTier": "default"
+    },
+    {
+      "id": "gpt-6-sol",
+      "codexEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "paidEffort": "low",
+      "paidServiceTier": "default"
+    },
+    {
+      "id": "gpt-6-luna",
+      "codexEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "paidEffort": "low",
+      "paidServiceTier": "default"
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "codexEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "paidEffort": "low",
+      "paidServiceTier": "default"
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "codexEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ],
+      "paidEffort": "low",
+      "paidServiceTier": "default"
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "codexEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "paidEffort": "low",
+      "paidServiceTier": "default"
+    },
+    {
+      "id": "gpt-5.5",
+      "codexEfforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "paidEffort": "low",
+      "paidServiceTier": "default",
+      "signInRetiresAt": "2026-10-14T00:00:00Z"
+    }
+  ]
+}

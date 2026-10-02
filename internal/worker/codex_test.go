@@ -57,3 +57,28 @@ func TestCodexExecutor(t *testing.T) {
 		t.Fatalf("unchecked lease: %q", code)
 	}
 }
+
+func TestCurrentModelsKeepRequestedCompletionAndUsageBounds(t *testing.T) {
+	c := config.Config{Executor: config.ExecutorCodex, Profile: "standard", MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: time.Second}
+	for _, model := range config.AvailableModelsAt(time.Now()) {
+		t.Run(model, func(t *testing.T) {
+			l := coordinator.Lease{Version: coordinator.Version, JobID: "synthetic-job", SignedJobID: "synthetic-job", Profile: c.Profile, ModelID: model, Prompt: "synthetic", MaxInputTokens: 100, MaxOutputTokens: 20, InputSHA256: SHA("synthetic"), Attempt: "1", Fence: "synthetic-fence", LeaseDeadline: time.Now().Add(time.Minute), SettlementDeadline: time.Now().Add(time.Minute)}
+			client := &fakeCodex{res: codex.Result{Text: "synthetic output", Model: model, Usage: true, InputTokens: 8, OutputTokens: 4}}
+			result, code := (Codex{Config: c, Client: client}).Run(context.Background(), l)
+			if code != "" || client.model != model || client.prompt != l.Prompt || result.ResolvedModelID != model {
+				t.Fatal("requested base or completion changed", code)
+			}
+			client.res.Model = "gpt-6-astra"
+			if model == "gpt-6-astra" {
+				client.res.Model = "gpt-6-sol"
+			}
+			if _, code := (Codex{Config: c, Client: client}).Run(context.Background(), l); code != "invalid_gateway_response" {
+				t.Fatal("different reviewed completion model accepted")
+			}
+			client.res.Model, client.res.OutputTokens = model, 21
+			if _, code := (Codex{Config: c, Client: client}).Run(context.Background(), l); code != "usage_out_of_bounds" {
+				t.Fatal("expanded model inventory bypassed the financial token cap")
+			}
+		})
+	}
+}

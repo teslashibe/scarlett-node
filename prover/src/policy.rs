@@ -212,6 +212,30 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_codex_bases_keep_exact_request_and_response_binding() {
+        let catalog: Value = serde_json::from_str(include_str!("../../internal/config/codex-model-catalog.json")).unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        assert_eq!(models.len(), 8);
+        for entry in models {
+            let model = entry["id"].as_str().unwrap();
+            let payload = json!({"type":"response.create", "model":model, "input":"synthetic"});
+            let sent = sent_with(&payload);
+            let hidden = [token_range(&sent)];
+            let honest = check(HOST, &sent, &hidden, &received_with(model), &[], &payload).unwrap();
+            assert_eq!(honest.model, model);
+            assert_eq!(honest.input_tokens, 12);
+            assert_eq!(honest.output_tokens, 3);
+            let other = if model == "gpt-6-astra" { "gpt-6-sol" } else { "gpt-6-astra" };
+            assert!(check(HOST, &sent, &hidden, &received_with(other), &[], &payload).is_err());
+            let mut switched = payload.clone();
+            switched["model"] = json!(other);
+            assert!(check(HOST, &sent, &hidden, &received_with(model), &[], &switched).is_err());
+            // Retirement gates new node execution, never historical receipt proof.
+            assert!(check(HOST, &sent, &hidden, &received_with(model), &[3..9], &payload).is_err());
+        }
+    }
+
+    #[test]
     fn accepts_honest_transcript_hiding_only_the_token() {
         let sent = sent_with(&job());
         let got = check(HOST, &sent, &[token_range(&sent)], &received_with("gpt-5.5"), &[], &job()).unwrap();
