@@ -159,7 +159,7 @@ fn validate_receipt(kind: &Kind, status: &Status, in_flight: usize) -> Result<()
             {
                 bail!("invalid X receipt attempt count");
             }
-            let mut done: Vec<(usize, &[String])> = Vec::new();
+            let mut done: Vec<(usize, &Exchange, &[String])> = Vec::new();
             let cursors: Vec<Vec<String>> = exchanges.iter().map(|r| xpolicy::outcome(&r.exchange).1).collect();
             for (record, cursors) in exchanges.iter().zip(&cursors) {
                 if record.index != xpolicy::assign(specs, &done, &record.exchange)?
@@ -170,10 +170,10 @@ fn validate_receipt(kind: &Kind, status: &Status, in_flight: usize) -> Result<()
                     bail!("invalid X receipt exchange");
                 }
                 if record.fulfilled {
-                    done.push((record.index, cursors));
+                    done.push((record.index, &record.exchange, cursors));
                 }
             }
-            let expected: Vec<_> = (0..specs.len()).filter(|i| !done.iter().any(|(k, _)| k == i)).collect();
+            let expected: Vec<_> = (0..specs.len()).filter(|i| !done.iter().any(|(k, _, _)| k == i)).collect();
             if pending != &expected || *complete != expected.is_empty() {
                 bail!("invalid X receipt completion");
             }
@@ -510,6 +510,50 @@ mod durable_tests {
         let s = shared(&dir.0);
         assert!(s.1.lock().unwrap().by_job.is_empty());
         assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 1); // Only the process lock remains.
+    }
+
+    #[tokio::test]
+    async fn duplicate_x_page_cannot_restore_as_completed_work() {
+        let dir = Temp::new();
+        let s = shared(&dir.0);
+        let lease: Value = serde_json::from_str(include_str!("../../api/fixtures/lease-x.json")).unwrap();
+        let mut payload = lease["x_payload"].clone();
+        let first = payload["exchanges"][0].clone();
+        let mut second = first.clone();
+        second["cursor_from"] = 0.into();
+        let mut third = first.clone();
+        third["cursor_from"] = 1.into();
+        payload["exchanges"] = json!([first, second, third]);
+        payload["max_attempts"] = 3.into();
+        let mut r = request(now_ms() + 30_000);
+        r.payload = payload.clone();
+        assert_eq!(create(State(s.clone()), headers(), Json(r)).await.0, StatusCode::CREATED);
+        let spec = &payload["exchanges"][0];
+        let first = Exchange {
+            operation: spec["operation"].as_str().unwrap().into(), query_id: spec["query_id"].as_str().unwrap().into(),
+            variables: spec["variables"].clone(), features: Some(spec["features"].clone()), field_toggles: None,
+            http_status: 200,
+            body: json!({"data":{"timeline":{"instructions":[{"entries":[{"content":{
+                "entryType":"TimelineTimelineCursor","cursorType":"Bottom","value":"synthetic-loop"
+            }}]}]}}}).to_string(),
+        };
+        let mut second = first.clone();
+        second.variables["cursor"] = json!("synthetic-loop");
+        {
+            let mut sessions = s.1.lock().unwrap();
+            let key = job_key("synthetic", "1");
+            sessions.by_job.get_mut(&key).unwrap().status = Status::XRead {
+                complete: true, remaining_attempts: 0, pending: vec![], rejections: vec![],
+                exchanges: [first, second.clone(), second].into_iter().enumerate().map(|(index, exchange)| XRecord {
+                    index, fulfilled: true, cursors: vec!["synthetic-loop".into()], exchange,
+                    sent_bytes: 100, received_bytes: 100, duration_ms: 1,
+                }).collect(),
+            };
+            sessions.commit(&key).unwrap();
+        }
+        drop(s);
+        let (store, records) = Store::open(&dir.0).unwrap();
+        assert!(Sessions::restore(store, records).is_err());
     }
 
     #[tokio::test]
@@ -861,8 +905,8 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
             };
             // Match under the lock, so concurrent proofs of one exchange cannot both fulfil it.
             let matched = outcome.and_then(|((fulfilled, cursors), exchange, sent_bytes, received_bytes)| {
-                let done: Vec<(usize, &[String])> =
-                    exchanges.iter().filter(|r| r.fulfilled).map(|r| (r.index, r.cursors.as_slice())).collect();
+                let done: Vec<(usize, &Exchange, &[String])> =
+                    exchanges.iter().filter(|r| r.fulfilled).map(|r| (r.index, &r.exchange, r.cursors.as_slice())).collect();
                 match xpolicy::assign(&specs, &done, &exchange) {
                     Ok(index) => Ok(XRecord {
                         index,
