@@ -125,6 +125,10 @@ async fn save_desktop_preferences(
 #[tauri::command]
 fn desktop_autostart(window: WebviewWindow, app: tauri::AppHandle) -> node::Result<bool> {
     local_window(&window)?;
+    #[cfg(windows)]
+    if !windows_autostart::registration_present(&app.package_info().name)? {
+        return Ok(false);
+    }
     app.autolaunch()
         .is_enabled()
         .map_err(|_| Error::AutostartUnavailable)
@@ -139,6 +143,12 @@ async fn set_desktop_autostart(
     local_window(&window)?;
     let _guard = runtime.0.lock().await;
     let manager = app.autolaunch();
+    #[cfg(windows)]
+    if enabled {
+        windows_autostart::prepare_registration()?;
+    } else if !windows_autostart::registration_present(&app.package_info().name)? {
+        return Ok(());
+    }
     if enabled {
         manager.enable()
     } else {
@@ -232,6 +242,29 @@ async fn remove_account(
 async fn cancel_login(window: WebviewWindow, node: State<'_, Arc<Node>>) -> node::Result<()> {
     local_window(&window)?;
     node.cancel_login().await
+}
+#[tauri::command]
+async fn browser_profiles(
+    window: WebviewWindow,
+    node: State<'_, Arc<Node>>,
+) -> node::Result<Vec<node::BrowserProfile>> {
+    local_window(&window)?;
+    node.browser_profiles().await
+}
+#[tauri::command]
+async fn import_x_profile(
+    window: WebviewWindow,
+    node: State<'_, Arc<Node>>,
+    profile: String,
+    id: String,
+    concurrency: u8,
+    consent: bool,
+) -> node::Result<()> {
+    local_window(&window)?;
+    if !consent {
+        return Err(Error::InvalidInput);
+    }
+    node.import_x(profile, id, concurrency).await
 }
 #[tauri::command]
 fn open_network(
@@ -335,6 +368,8 @@ fn main() {
             connect_codex,
             remove_account,
             cancel_login,
+            browser_profiles,
+            import_x_profile,
             control_local_api,
             local_api_key,
             desktop_preferences,

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/teslashibe/scarlett-node/internal/browserx"
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/localfs"
 	"github.com/teslashibe/scarlett-node/internal/worker"
@@ -102,8 +104,15 @@ func accountFilePath(dir string) string {
 // Account mutations are serialized independently of the running node's attempt
 // lock. No CLI operation cancels or reassigns a provider attempt.
 func accountsCommand(args []string, input io.Reader, output io.Writer) error {
+	if len(args) == 1 && args[0] == "browser-profiles" {
+		profiles, err := browserx.Profiles()
+		if err != nil {
+			return errors.New("local browser profiles unavailable")
+		}
+		return json.NewEncoder(output).Encode(profiles)
+	}
 	if len(args) < 1 {
-		return errors.New("usage: scarlett-node accounts list|add|connect|remove")
+		return errors.New("usage: scarlett-node accounts list|add|connect|remove|browser-profiles|import-x")
 	}
 	dir := os.Getenv("SCARLETT_STATE_DIR")
 	if dir == "" {
@@ -162,12 +171,15 @@ func accountsCommand(args []string, input io.Reader, output io.Writer) error {
 			return errors.New("local account not found")
 		}
 		f.Accounts = out
-	} else if (args[0] == "add" && len(args) == 5) || (args[0] == "connect" && len(args) == 4) {
+	} else if (args[0] == "add" && len(args) == 5) || (args[0] == "connect" && len(args) == 4) || (args[0] == "import-x" && len(args) == 4) {
 		n, e := strconv.Atoi(args[len(args)-1])
 		if e != nil {
 			return errors.New("invalid account concurrency")
 		}
 		a := providerAccount{ID: args[2], Service: args[1], Concurrency: n}
+		if args[0] == "import-x" {
+			a.Service = "x_read"
+		}
 		if args[0] == "add" {
 			a.Path = args[3]
 		} else {
@@ -181,7 +193,7 @@ func accountsCommand(args []string, input io.Reader, output io.Writer) error {
 		if !validAccounts(candidate) {
 			return errors.New("invalid or duplicate account; use codex or x_read, a unique lowercase ID, an absolute path and concurrency 1..32")
 		}
-		if args[0] == "connect" {
+		if args[0] == "connect" || args[0] == "import-x" {
 			credentialDir := a.Path
 			name := "auth.json"
 			if a.Service == "x_read" {
@@ -198,7 +210,19 @@ func accountsCommand(args []string, input io.Reader, output io.Writer) error {
 				return errors.New("refusing to overwrite account credentials")
 			}
 			var raw []byte
-			if terminal, ok := input.(*os.File); ok && term.IsTerminal(int(terminal.Fd())) {
+			if args[0] == "import-x" {
+				browser, path, err := browserx.Resolve(args[1])
+				if err == nil {
+					raw, err = browserx.ReadSession(context.Background(), browser, path)
+				}
+				if err != nil {
+					if encodeErr := json.NewEncoder(output).Encode(map[string]string{"status": "error", "code": browserx.Code(err)}); encodeErr != nil {
+						return encodeErr
+					}
+					return err
+				}
+				defer clear(raw)
+			} else if terminal, ok := input.(*os.File); ok && term.IsTerminal(int(terminal.Fd())) {
 				fmt.Fprintln(os.Stderr, "Enter account credential JSON (hidden):")
 				raw, e = term.ReadPassword(int(terminal.Fd()))
 				fmt.Fprintln(os.Stderr)
@@ -224,7 +248,7 @@ func accountsCommand(args []string, input io.Reader, output io.Writer) error {
 		}
 		f = candidate
 	} else {
-		return errors.New("usage: accounts list | add SERVICE ID ABSOLUTE_PATH CONCURRENCY | connect SERVICE ID CONCURRENCY (credential JSON on protected stdin) | remove SERVICE ID")
+		return errors.New("usage: accounts list | browser-profiles | import-x PROFILE_ID ID CONCURRENCY | add SERVICE ID ABSOLUTE_PATH CONCURRENCY | connect SERVICE ID CONCURRENCY (credential JSON on protected stdin) | remove SERVICE ID")
 	}
 	raw, e := json.Marshal(f)
 	if e != nil {

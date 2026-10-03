@@ -2,7 +2,7 @@
 
 Tauri 2 with bundled vanilla TypeScript. The native bridge delegates execution and account scheduling to the independently built Go node and its Rust proof helper. It does not embed the private Scarlett application.
 
-The desktop provides pairing, status, start/drain/resume/stop, a menu-bar/tray supervisor and account controls. Account management requires the native pool release; older node binaries show it as unavailable. Automatic Codex token refresh for the proof-only runtime, browser import, signed public installers, automatic updates and full installed Windows GUI acceptance remain separate release gates. The Mac development app is unsigned and is not a community release.
+The desktop provides pairing, status, start/drain/resume/stop, a menu-bar/tray supervisor and account controls. Account management requires the native pool release; older node binaries show it as unavailable. Automatic Codex token refresh for the proof-only runtime, signed public installers, automatic updates and full installed Windows GUI acceptance remain separate release gates. The Mac development app is unsigned and is not a community release.
 
 ## Build
 
@@ -46,7 +46,7 @@ Only the bundled main webview can invoke the explicit custom commands. Productio
 
 Pairing codes and X cookies are cleared from masked form inputs after submission, never used as process arguments/environment, and not persisted by the webview. Raw command stdout/stderr is not returned to JS or logged. The node receives an allowlisted environment with app-owned paths; unrelated credentials and fixture flags are not inherited. File-based credentials remain private local files, not encrypted vault storage. Optional vault support requires a compatible reader/refresh adapter before it can advertise capacity.
 
-Closing the main window hides it in the tray/menu bar. Explicit Quit requests drain and closes the supervised node's owner pipe, allowing the node's existing two-minute accepted-work window before a bounded forced stop. The journal remains the execution/recovery authority; the shell never retries provider work or reconstructs a receipt. Stop does not unpair/revoke a node. A second instance focuses the existing window and the node retains its journal lock.
+Closing the main window drains and quits by default. Operators can enable background operation to hide it in the tray/menu bar instead. Explicit Quit requests drain and close the supervised node's owner pipe, allowing the node's existing two-minute accepted-work window before a bounded forced stop. The journal remains the execution/recovery authority; the shell never retries provider work or reconstructs a receipt. Stop does not unpair/revoke a node. A second instance focuses the existing window and the node retains its journal lock.
 
 Windows runtime operations require private NTFS storage and the bundled native helpers. Native tests validate ACLs, locking, process trees and owner-pipe shutdown; installed Windows GUI acceptance remains required before publishing its installer.
 
@@ -96,6 +96,22 @@ The local API runs through `scarlett-node desktop api PORT`. That host selects o
 
 The Windows bridge creates or checks private directories before starting the webview and obtains its bearer through fixed `desktop private-dir` and `desktop bearer` helpers. Existing broad ACLs, symlinks/reparse points and unsupported filesystems fail closed. The API bearer stays in the private local file and protected helper output; it is never a process argument or a status field.
 
+## Import an X browser account
+
+Choose a local account ID and concurrency, select a browser profile, tick the X-session consent box, then press **Import X account**. Close the selected browser first so its cookie database has no active journal. Browsers with custom profile locations can use the existing masked cookie-paste form.
+
+Profile discovery reads directory/file metadata only. It returns opaque profile IDs and labels, without cookie-store paths or account credentials. Import reads only `auth_token` and `ct0` for a complete, secure, unexpired root-domain X/Twitter session at `/`. It keeps container/partition sessions separate and refuses conflicting identities. Credentials go directly from the native reader to the private account file; the renderer receives only success or a fixed error code. Existing accounts are never overwritten.
+
+| Browser | Mac | Windows | Limits |
+| --- | --- | --- | --- |
+| Chrome | Standard Google Chrome profiles; plaintext or v10 CBC cookies, with normal Keychain approval | Standard Google Chrome profiles; plaintext or v10 GCM cookies, with current-user DPAPI | App-bound v20 cookies are protected; use cookie paste. No password fallback, elevation or protection bypass |
+| Firefox | Standard Firefox profiles | Standard Firefox profiles | Root-domain session cookies in a closed SQLite store; containers are kept separate |
+| Safari | Standard container or legacy `Cookies.binarycookies` | Unavailable | macOS may deny access; use cookie paste. Scarlett does not grant itself Full Disk Access |
+
+The helper uses a bundled, cgo-free SQLite reader, opens stores read-only and immutable, and refuses populated WAL/journal files. It neither copies nor changes a browser database. Cookie-store changes during import fail with a retry message. Unsupported or inaccessible stores do not add an account. Linux CLI builds support standard Firefox profiles only; the desktop release targets remain Mac and Windows.
+
+Tests use disposable synthetic databases, encrypted cookie fixtures and malformed Safari records. Windows native tests generate their own current-user DPAPI fixture. These checks do not establish compatibility with every installed browser version or prove real X access. Imported accounts remain **Configured · access not verified** until their existing provider execution path verifies access.
+
 ## Device preferences
 
 The This device section saves only a versioned local API port and a window-close choice in the private app directory. New installations default to port 8088 and drain/quit when the window closes. Operators can explicitly choose to keep running in the menu bar or tray. Open Scarlett in the native menu (Cmd/Ctrl-1), the tray, macOS Finder/Dock reopen and Windows duplicate launch restore the existing window without starting a second runtime. Saved ports apply on the next local API start; updating a preference does not interrupt accepted jobs or start a service. Corrupt/private-storage failures are reported rather than silently resetting preferences.
@@ -109,3 +125,5 @@ Go preference persistence tests use disposable private directories, including re
 The native complete-bundle workflow installs its testing NSIS package into a clean disposable runner directory, checks the installed component hashes and versions, then clears the development PATH before launching the installed desktop. Windows UI Automation invokes the real Start and Stop controls. Authenticated and unauthenticated model requests check the private bearer; a forced desktop exit and Ctrl-Q check API cleanup and recovery. All profiles are new, no provider accounts are connected and no inference or X requests run. Evidence records only outcomes, never credentials. The script refuses to run outside a disposable Windows CI runner or against existing app-owned state.
 
 Passing this check establishes the tested installer and UI lifecycle. It does not establish signature trust, remote provider login or verified paid network execution; those remain release requirements.
+
+Installed Windows import acceptance uses new synthetic Chrome/Firefox stores below RUNNER_TEMP and redirects only browser roots for the test app. It exercises profile-specific consent and reset, Firefox import, the protected Chrome paste fallback, masked paste, unchanged stores and native private account persistence. It makes no provider requests. Account ID fields have distinct X/Codex labels for assistive technology. This acceptance is a release gate; test configuration is not a browser import mode for operators.
