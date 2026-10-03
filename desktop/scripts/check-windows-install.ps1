@@ -284,8 +284,8 @@ function Registered-Command {
 function Check-Preferences {
     if ($null -ne (Registered-Command)) { throw 'Clean runner already has a Scarlett login registration' }
     Start-App
-    if (-not (Checkbox-Is 'Keep running when the window closes' $false)) { throw 'Background mode was not opt-in' }
-    if (-not (Checkbox-Is 'Open Scarlett when I log in' $false)) { throw 'Start at login was not opt-in' }
+    Wait-Check { Checkbox-Is 'Keep running when the window closes' $false } 15 'Background mode was not opt-in'
+    Wait-Check { Checkbox-Is 'Open Scarlett when I log in' $false } 15 'Start at login was not opt-in'
     Set-Number 'Saved local API port' 18088
     Click-Button 'Save device preferences'
     Wait-Check { Saved-Preferences 18088 $false } 15 'Device preferences were not saved privately'
