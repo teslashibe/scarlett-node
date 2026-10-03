@@ -38,6 +38,7 @@ The harness initializes x-go once before measuring samples. Its public transacti
 | `SCARLETT_XPERF_MAX_RECV` | Byte ceiling up to 262144; omitted by default | Helper receive allocation candidate; bounded oversize failure is a failed sample |
 | `SCARLETT_XPERF_SENT_RECORDS` | `3`–`32`, omitted by default | MPC sent TLS-record allocation, including protocol records |
 | `SCARLETT_XPERF_RECV_RECORDS` | `3`–`32`, omitted by default | MPC online receive TLS-record allocation, including protocol records |
+| `SCARLETT_XPERF_MPC_NETWORK` | `reduce_bandwidth` default, `reduce_roundtrips` | Use the pinned SDK's existing MPC tradeoff; fewer round trips can require more traffic; Proxy rejects the non-default option |
 | `SCARLETT_XPERF_PREPARE_HOLD_MS` | `0`–`30000`, default `0` | Prepares a known job, holds, then begins logical demand; fresh cryptographic material is used once |
 | `SCARLETT_XPERF_RESPONSE_READY` | `0` default, `1` | Emit a numeric response-ready event to private stderr |
 | `SCARLETT_XPERF_CONCURRENCY` | `1` default, `2`, `4` | Maximum jobs admitted by the host |
@@ -62,6 +63,8 @@ go test -c -tags xperf -o /absolute/private/node-buyer-xperf.test ./internal/wor
 ```
 
 The application's `networkperf` tests supply a newly funded synthetic `node-v1` acceptance through a private `0600` file, then invoke `TestBuyerBoundXPerformance` with `SCARLETT_BUYER_XPERF=1`, `SCARLETT_BUYER_X_LEASE_FILE`, `SCARLETT_BUYER_X_OUTPUT` and the locally configured helper, verifier, CA and X session. The bridge validates the acceptance and runs the existing X worker with minimal headers, a 32 KiB receive ceiling and three sent/online receive records. It keeps the exact accepted request, uses MPC and does not register a replacement job. The application independently reconciles the verifier receipt and tests its REST/MCP result and prepaid settlement. All users and money are synthetic in a fresh disposable database.
+
+The bridge also measures the worker's four initialization reads using fixed phase labels, timings, body sizes and numeric quota headers. It preserves the original headers and bodies. The interval before proof execution is split into HTTP/body time and other time, which includes quota pacing and client processing. It does not identify every non-HTTP millisecond as pacing. The standalone harness initializes a client before its measured jobs, so its helper/sample timings cannot be compared directly with a fresh full-worker run as a client-reuse benchmark.
 
 For the provisional experiment, the application provides a loopback `SCARLETT_BUYER_PROVISIONAL_API` ending in `/experimental/provisional` and a private `SCARLETT_BUYER_PROVISIONAL_KEY_FILE`. The bridge opts into the helper's `provisional_response` field and reads its private stdout pipe. A single decoded response body arrives in a `response_provisional` event marked `state: unverified`, `verified: false` and `settled: false`. HTTP headers are excluded. The normal helper output remains a single final summary when this option is omitted; the option is refused for batched reads.
 

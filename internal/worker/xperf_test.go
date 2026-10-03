@@ -39,6 +39,7 @@ import (
 type xperfConfig struct {
 	session, prover, verifier, ca, api, key, output         string
 	mode, headers, workload, networkProfile, serverName     string
+	mpcNetwork                                              string
 	samples, maxRecv, sentRecords, recvRecords              int
 	prepareHoldMS, batchReads                               int
 	responseReady                                           bool
@@ -47,7 +48,13 @@ type xperfConfig struct {
 }
 
 func xperfConfiguration() (xperfConfig, error) {
-	c := xperfConfig{session: os.Getenv("SCARLETT_X_SESSION"), prover: os.Getenv("SCARLETT_PROVER"), verifier: os.Getenv("SCARLETT_VERIFIER"), ca: os.Getenv("SCARLETT_VERIFIER_CA_FILE"), api: os.Getenv("SCARLETT_VERIFIER_API"), output: os.Getenv("SCARLETT_XPERF_OUTPUT"), mode: os.Getenv("SCARLETT_XPERF_MODE"), headers: os.Getenv("SCARLETT_XPERF_HEADERS"), workload: os.Getenv("SCARLETT_XPERF_WORKLOAD"), networkProfile: os.Getenv("SCARLETT_XPERF_NETWORK_PROFILE"), serverName: os.Getenv("SCARLETT_XPERF_VERIFIER_SERVER_NAME")}
+	c := xperfConfig{session: os.Getenv("SCARLETT_X_SESSION"), prover: os.Getenv("SCARLETT_PROVER"), verifier: os.Getenv("SCARLETT_VERIFIER"), ca: os.Getenv("SCARLETT_VERIFIER_CA_FILE"), api: os.Getenv("SCARLETT_VERIFIER_API"), output: os.Getenv("SCARLETT_XPERF_OUTPUT"), mode: os.Getenv("SCARLETT_XPERF_MODE"), headers: os.Getenv("SCARLETT_XPERF_HEADERS"), workload: os.Getenv("SCARLETT_XPERF_WORKLOAD"), networkProfile: os.Getenv("SCARLETT_XPERF_NETWORK_PROFILE"), serverName: os.Getenv("SCARLETT_XPERF_VERIFIER_SERVER_NAME"), mpcNetwork: os.Getenv("SCARLETT_XPERF_MPC_NETWORK")}
+	if c.mpcNetwork == "" {
+		c.mpcNetwork = "reduce_bandwidth"
+	}
+	if c.mpcNetwork != "reduce_bandwidth" && c.mpcNetwork != "reduce_roundtrips" || c.mode == "proxy" && c.mpcNetwork != "reduce_bandwidth" {
+		return c, errors.New("invalid_mpc_network")
+	}
 	if c.mode == "" {
 		c.mode = "mpc"
 	}
@@ -431,6 +438,9 @@ func xperfRequestsInput(c xperfConfig, token string, requests []*http.Request) (
 	if c.prepareHoldMS != 0 {
 		p["prepare_hold_ms"] = c.prepareHoldMS
 	}
+	if c.mode == "mpc" && c.mpcNetwork != "" {
+		p["mpc_network"] = c.mpcNetwork
+	}
 	if c.responseReady {
 		p["response_ready_event"] = true
 	}
@@ -439,6 +449,7 @@ func xperfRequestsInput(c xperfConfig, token string, requests []*http.Request) (
 }
 
 type xperfSummary struct {
+	MpcNetwork         string            `json:"mpc_network"`
 	Status             string            `json:"status"`
 	Mode               string            `json:"proof_mode"`
 	Response           string            `json:"response"`
@@ -522,6 +533,9 @@ func xperfExecute(ctx context.Context, c xperfConfig, input []byte, diagnostic s
 		return o, errors.New("helper_failed")
 	}
 	if json.Unmarshal(stdout.Bytes(), &o.summary) != nil || o.summary.Status != "proof_sent" || o.summary.Mode != c.mode {
+		return o, errors.New("helper_summary_invalid")
+	}
+	if c.mpcNetwork == "reduce_roundtrips" && o.summary.MpcNetwork != c.mpcNetwork {
 		return o, errors.New("helper_summary_invalid")
 	}
 	return o, nil
@@ -793,6 +807,7 @@ func xperfWait(ctx context.Context, client *http.Client, c xperfConfig, job stri
 // Metrics contain fixed labels and numbers only. Raw provider identifiers,
 // request data, response data, control tokens and diagnostic text cannot enter.
 type xperfMetric struct {
+	MpcNetwork         string            `json:"mpc_network,omitempty"`
 	Schema             int               `json:"schema"`
 	Sample             int               `json:"sample"`
 	Mode               string            `json:"mode"`
@@ -849,6 +864,7 @@ type xperfMetric struct {
 func xperfMeasurement(c xperfConfig, sample int, started time.Time, observations []xperfObserved, receiptMS int64, failure string) xperfMetric {
 	now := time.Now()
 	m := xperfMetric{Schema: 1, Sample: sample, Mode: c.mode, Headers: c.headers, Workload: c.workload, Status: "verified", Verified: failure == "", StartNS: started.UnixNano(), FinishNS: now.UnixNano(), DurationMS: now.Sub(started).Milliseconds(), ReceiptWaitMS: receiptMS, Exchanges: len(observations), MaxRecv: c.maxRecv, SentRecords: c.sentRecords, RecvRecords: c.recvRecords, PrepareHoldMS: c.prepareHoldMS, BatchReads: c.batchReads, TransportComplete: len(observations) > 0, Timings: map[string]uint64{}}
+	m.MpcNetwork = c.mpcNetwork
 	m.Concurrency, m.AccountCapacity, m.ReceiptCapacity = c.concurrency, c.accountCapacity, c.receiptCapacity
 	m.RealAccounts, m.SustainedSeconds = 1, c.sustainedSeconds
 	m.NetworkProfile, m.SimulatedDelayMS, m.Bandwidth = c.networkProfile, c.simulatedDelayMS, c.bandwidth
@@ -1158,14 +1174,14 @@ func TestXPerfCaptureAndVariantInput(t *testing.T) {
 	if !strings.Contains(string(payload), `"proof_policy":"x-proxy-experimental-v1"`) {
 		t.Fatal("proxy policy is not server-bound")
 	}
-	input, _, err := xperfProverInput(xperfConfig{mode: "mpc", headers: "minimal", verifier: "verifier:7047", sentRecords: 3, recvRecords: 3, prepareHoldMS: 10, responseReady: true}, strings.Repeat("ab", 32), r)
+	input, _, err := xperfProverInput(xperfConfig{mode: "mpc", headers: "minimal", verifier: "verifier:7047", sentRecords: 3, recvRecords: 3, prepareHoldMS: 10, responseReady: true, mpcNetwork: "reduce_roundtrips"}, strings.Repeat("ab", 32), r)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var p map[string]any
 	_ = json.Unmarshal(input, &p)
 	raw, _ := base64.StdEncoding.DecodeString(p["request"].(string))
-	if bytes.Contains(raw, []byte("Sec-Fetch-Dest")) || !bytes.Contains(raw, []byte("PRIVATECOOKIE")) || !bytes.Contains(raw, []byte("Connection: close")) || !bytes.Contains(raw, []byte("Accept-Encoding: gzip")) || p["max_sent_records"] != float64(3) || p["max_recv_records_online"] != float64(3) || p["response_ready_event"] != true {
+	if bytes.Contains(raw, []byte("Sec-Fetch-Dest")) || !bytes.Contains(raw, []byte("PRIVATECOOKIE")) || !bytes.Contains(raw, []byte("Connection: close")) || !bytes.Contains(raw, []byte("Accept-Encoding: gzip")) || p["max_sent_records"] != float64(3) || p["max_recv_records_online"] != float64(3) || p["response_ready_event"] != true || p["mpc_network"] != "reduce_roundtrips" {
 		t.Fatal("candidate changed required transport or credentials")
 	}
 	if r.Header.Get("Sec-Fetch-Dest") == "" || r.Close {

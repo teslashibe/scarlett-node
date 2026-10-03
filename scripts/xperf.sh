@@ -55,7 +55,10 @@ if sustained and sustained < 60:
 bandwidth = option("SCARLETT_XPERF_BANDWIDTH_BYTES_SECOND", 0, 0, 1000000000)
 if profile == "direct" and bandwidth:
     raise SystemExit("bandwidth requires a simulated profile")
-manifest = {"schema": 1, "source_revision": revision,
+mpc_network = os.environ.get("SCARLETT_XPERF_MPC_NETWORK", "reduce_bandwidth")
+if mpc_network not in ("reduce_bandwidth", "reduce_roundtrips"):
+    raise SystemExit("invalid MPC network setting")
+manifest = {"mpc_network": mpc_network, "schema": 1, "source_revision": revision,
             "tracked_source_diff_sha256": hashlib.sha256(diff).hexdigest(),
             "source_modified": bool(diff), "helper_sha256": digest.hexdigest(),
             "bootstrap": "unproven_once_outside_samples", "funding": "none",

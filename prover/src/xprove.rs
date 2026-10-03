@@ -22,7 +22,7 @@ use futures::{AsyncReadExt, AsyncWriteExt};
 use serde::{Deserialize, Serialize};
 use tlsn::{
     Session,
-    config::{prove::ProveConfig, prover::ProverConfig, tls::TlsClientConfig, tls_commit::{mpc::MpcTlsConfig, proxy::ProxyTlsConfig}},
+    config::{prove::ProveConfig, prover::ProverConfig, tls::TlsClientConfig, tls_commit::{mpc::{MpcTlsConfig, NetworkSetting}, proxy::ProxyTlsConfig}},
     connection::{DnsName, ServerName},
     webpki::RootCertStore,
 };
@@ -42,6 +42,22 @@ use crate::{
 pub const MAX_RECV: usize = 256 << 10;
 pub const MAX_SENT: usize = 16 << 10;
 
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MpcNetwork {
+    ReduceBandwidth,
+    ReduceRoundtrips,
+}
+
+impl MpcNetwork {
+    fn setting(self) -> NetworkSetting {
+        match self {
+            Self::ReduceBandwidth => NetworkSetting::Latency,
+            Self::ReduceRoundtrips => NetworkSetting::Bandwidth,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct Request {
     pub verifier: String,
@@ -57,6 +73,9 @@ pub struct Request {
     pub proof_mode: ProofMode,
     pub max_sent_records: Option<usize>,
     pub max_recv_records_online: Option<usize>,
+    /// Opt-in use of the pinned SDK's existing network tradeoff. Omission
+    /// preserves its default low-bandwidth configuration.
+    pub mpc_network: Option<MpcNetwork>,
     /// Known-job simulation only: fresh commit is kept alive before logical demand.
     #[serde(default)]
     pub prepare_hold_ms: u64,
@@ -95,6 +114,8 @@ pub struct Summary {
     pub received_bytes: usize,
     pub duration_ms: u128,
     pub proof_mode: ProofMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mpc_network: Option<MpcNetwork>,
     pub timings_ms: Timings,
     pub execution_ms: u128,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -125,7 +146,7 @@ fn validate_experiment(request: &Request) -> Result<()> {
         }
     }
     if request.proof_mode == ProofMode::Proxy
-        && (request.max_sent_records.is_some() || request.max_recv_records_online.is_some() || request.prepare_hold_ms != 0)
+        && (request.max_sent_records.is_some() || request.max_recv_records_online.is_some() || request.prepare_hold_ms != 0 || request.mpc_network.is_some())
     {
         bail!("MPC tuning options are not valid in Proxy mode");
     }
@@ -193,6 +214,7 @@ pub async fn run(request: Request) -> Result<Summary> {
                 let mut config = MpcTlsConfig::builder().max_sent_data(raw.len()).max_recv_data(max_recv);
                 if let Some(n) = request.max_sent_records { config = config.max_sent_records(n); }
                 if let Some(n) = request.max_recv_records_online { config = config.max_recv_records_online(n); }
+                if let Some(network) = request.mpc_network { config = config.network(network.setting()); }
                 let prover = prover.commit(config.build()?).await?;
                 timings.commit = phase.elapsed().as_millis();
                 if request.prepare_hold_ms != 0 { tokio::time::sleep(Duration::from_millis(request.prepare_hold_ms)).await; }
@@ -285,6 +307,7 @@ pub async fn run(request: Request) -> Result<Summary> {
         received_bytes,
         duration_ms: started.elapsed().as_millis(),
         proof_mode: request.proof_mode,
+        mpc_network: request.mpc_network,
         timings_ms: timings,
         execution_ms: execution_started.elapsed().as_millis(),
         batch_exchanges,
@@ -417,6 +440,12 @@ mod tests {
         value.as_object_mut().unwrap().remove("max_sent_records");
         value.as_object_mut().unwrap().remove("max_recv_records_online");
         assert!(validate_experiment(&request(&value)).is_ok());
+        value["mpc_network"] = serde_json::json!("reduce_roundtrips");
+        assert!(validate_experiment(&request(&value)).is_err());
+        value["proof_mode"] = serde_json::json!("mpc");
+        assert!(validate_experiment(&request(&value)).is_ok());
+        value["mpc_network"] = serde_json::json!("unknown");
+        assert!(serde_json::from_value::<Request>(value).is_err());
     }
 
     #[test]

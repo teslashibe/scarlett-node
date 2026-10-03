@@ -68,7 +68,9 @@ func TestBuyerBoundXPerformance(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 	started := time.Now()
-	if failure := (X{Config: local, Base: base, Proof: transport}).Run(ctx, l); failure != "" {
+	bootstrap := &buyerXPerfBootstrap{base: base, started: started}
+	transport.started = started
+	if failure := (X{Config: local, Base: bootstrap, Proof: transport}).Run(ctx, l); failure != "" {
 		t.Fatal("bound X worker failed; uncertain provider work was not retried", failure)
 	}
 	if len(transport.observed) != 1 {
@@ -83,7 +85,7 @@ func TestBuyerBoundXPerformance(t *testing.T) {
 		t.Fatal("report must be new")
 	}
 	defer f.Close()
-	if err := json.NewEncoder(f).Encode(map[string]any{"schema": 1, "service": "x_read", "mode": "mpc", "headers": "minimal", "max_recv": 32768, "max_sent_records": 3, "max_recv_records_online": 3, "proven_exchanges": 1, "worker_ms": time.Since(started).Milliseconds(), "helper_ms": o.helperMS, "response_ready_ms": o.provisionalMS, "provisional_callback": transport.provisionalOrigin != "", "verifier_tcp_payload_bytes": *o.summary.VerifierSent + *o.summary.VerifierReceived, "final_proof_sent": true, "provider_work_not_retried": true}); err != nil {
+	if err := json.NewEncoder(f).Encode(map[string]any{"schema": 1, "service": "x_read", "mode": "mpc", "headers": "minimal", "max_recv": 32768, "max_sent_records": 3, "max_recv_records_online": 3, "proven_exchanges": 1, "worker_ms": time.Since(started).Milliseconds(), "helper_ms": o.helperMS, "response_ready_ms": o.provisionalMS, "provisional_callback": transport.provisionalOrigin != "", "verifier_tcp_payload_bytes": *o.summary.VerifierSent + *o.summary.VerifierReceived, "final_proof_sent": true, "provider_work_not_retried": true, "bootstrap": bootstrap.report(transport.proofStarted)}); err != nil {
 		t.Fatal("report write failed")
 	}
 }
@@ -106,12 +108,15 @@ type buyerXPerfTransport struct {
 	output                            string
 	provisionalOrigin, provisionalKey string
 	observed                          []xperfObserved
+	started                           time.Time
+	proofStarted                      time.Duration
 }
 
 func (t *buyerXPerfTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if len(t.observed) != 0 {
 		return nil, errors.New("experiment provider invocation already consumed")
 	}
+	t.proofStarted = time.Since(t.started)
 	input, _, err := xperfProverInput(t.config, t.lease.VerifierToken, req)
 	if err != nil {
 		return nil, err
