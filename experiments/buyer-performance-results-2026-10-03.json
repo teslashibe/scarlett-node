@@ -1,0 +1,195 @@
+{
+  "schema": 1,
+  "scope": "Local real-provider proof experiments with synthetic prepaid credits; no production readiness claim",
+  "source_pins": {
+    "node_commit": "9912a7fa560715d7f339849bc1f3b780453c78ed",
+    "application_commit": "d61d8d9364f0b39e35cc2feb2da69aac3c386141",
+    "helper_sha256": "6170ba2c3cd6e51ecc88be2bd2fe0721dd14f113ce9dcc63c618af1e359c6703",
+    "sdk_source": "bb4cdc32ae2e80296a27143a348d4bc1769fd09e",
+    "mpz_candidate_source": "a8c6bc94c0192ceea8ded7acc0b2a93b8c1e9f5a",
+    "binary_hashes": {
+      "node-buyer-xperf-final-066.test": "55740e1cdbbab1e2d86a659c63816f5eb0cc41d7767da51b5862afb482d21061",
+      "api-buyer-xperf-receipt-040.test": "eb695f98febc845043203f8ca1db399a0d1fa607184e9a554ff324271e12bcfa"
+    }
+  },
+  "shared_ot_patch_sha256": "28b5cac7bc5095c66882bfcf3647f4f5ce22c0797fd4627b2545a010cc741d3d",
+  "early_search068": {
+    "campaign": "x-buyer-early-search-068",
+    "api_terminal": {
+      "campaign": "x-buyer-early-search-068",
+      "terminal": true,
+      "api_exit_code": 0,
+      "ended_utc": "2026-10-03T12:21:09.535403+00:00",
+      "scope": "API process outcome; provider attempt count requires its report"
+    },
+    "wrapper_terminal": {
+      "campaign": "x-buyer-early-search-068",
+      "terminal": true,
+      "underlying_exit_code": 0,
+      "ended_utc": "2026-10-03T12:21:09.548924+00:00"
+    },
+    "completed_all_cases": true,
+    "planned_cases": 33,
+    "measurements": 33,
+    "search_samples": 30,
+    "retained_failures": 0,
+    "rest_mcp_equal": true,
+    "no_double_charge": true,
+    "receipt_outage_recovered": true,
+    "provider_work_not_retried": true,
+    "nearest_rank_quantiles": {
+      "buyer_total_ms": {
+        "p50": 3946,
+        "p95": 4713
+      },
+      "buyer_provisional_ms": {
+        "p50": 2485,
+        "p95": 3123
+      },
+      "response_ready_ms": {
+        "p50": 2355,
+        "p95": 3006
+      },
+      "queue_wait_ms": {
+        "p50": 18164,
+        "p95": 20269
+      },
+      "receipt_wait_ms": {
+        "p50": 34,
+        "p95": 106
+      },
+      "verifier_tcp_payload_bytes": {
+        "p50": 60437603,
+        "p95": 60448471
+      },
+      "helper_peak_rss_bytes": {
+        "p50": 521781248,
+        "p95": 585465856
+      }
+    },
+    "campaign_elapsed_ms": 713227,
+    "verified_jobs_per_second": 0.04626855929949394,
+    "campaign_clock_scope": "API campaign includes per-job quota admission/queue and drain; excludes separate preflight reset wait",
+    "empty_cases": [
+      {
+        "workload": "empty_reuse",
+        "requested_resources": 0,
+        "actual_charge_usd_micros": 0,
+        "verified_jobs": 1,
+        "proven_exchanges": 1
+      },
+      {
+        "workload": "empty_cold",
+        "requested_resources": 0,
+        "actual_charge_usd_micros": 0,
+        "verified_jobs": 1,
+        "proven_exchanges": 1
+      }
+    ],
+    "source_report_sha256": "3a75919d25b073ced9799b88bd7a0d59e635413bd422b66fd97779bff432fec2",
+    "bootstrap_zero_in_all_30_reused_searches": true,
+    "funding": "Synthetic prepaid administrative credits only, not paid ARR or points",
+    "topology": "Mac API/supplier/nativeSQL15543/verifier17947, one real X account",
+    "actual_first_search_ms": 4809,
+    "current_pins": "Node9912/Appd61/helper066/SDKbb4/MPZa8",
+    "bootstrap_observation_scope": "Existing native schema requests is null or empty for reused clients; no HTTP call count was invented",
+    "actual_early_buyer_http_delivery_all_30": true,
+    "provisional_callback_all_30": true,
+    "all_nonempty_charges_match_50000_usd_micros": true
+  },
+  "pagination069": {
+    "campaign": "x-buyer-pagination-069",
+    "api_terminal": {
+      "campaign": "x-buyer-pagination-069",
+      "terminal": true,
+      "api_exit_code": 0,
+      "ended_utc": "2026-10-03T12:25:13.117249+00:00",
+      "scope": "API process outcome; provider attempt count requires its report"
+    },
+    "wrapper_terminal": {
+      "campaign": "x-buyer-pagination-069",
+      "terminal": true,
+      "underlying_exit_code": 0,
+      "ended_utc": "2026-10-03T12:25:13.131002+00:00"
+    },
+    "complete": true,
+    "planned_cases": 1,
+    "retained_failures": 0,
+    "observation": {
+      "requested_pages": 2,
+      "requested_resources": 40,
+      "proof_connections": 2,
+      "proven_exchanges": 2,
+      "actual_charge_usd_micros": 100000,
+      "verified_jobs": 1,
+      "rest_mcp_equal": true,
+      "receipt_outage_recovered": true,
+      "double_charge": false,
+      "buyer_total_ms": 37706,
+      "worker_ms": 37229,
+      "helper_ms": 7789,
+      "helper_timings_ms": {
+        "commit": 2345,
+        "control_connect": 24,
+        "finalize": 16,
+        "prove": 1447,
+        "request_write": 0,
+        "response_read": 2798,
+        "tls_finish": 801,
+        "total": 7663
+      },
+      "helper_user_cpu_seconds": 2.649419,
+      "helper_system_cpu_seconds": 0.511364,
+      "helper_peak_rss_bytes": 625147904,
+      "helper_resource_metrics_complete": true,
+      "verifier_tcp_payload_bytes": 125850803,
+      "verifier_sent_tcp_payload_bytes": 117733371,
+      "verifier_received_tcp_payload_bytes": 8117432,
+      "receipt_wait_ms": 90,
+      "quota_limit": 50,
+      "quota_remaining": 48,
+      "quota_reset": 1791031188
+    },
+    "funding": "Synthetic credit only; no real deposits, paid ARR or points",
+    "scope": "One corrected two-page job, two fresh proof connections; not a same-connection cursor chain or a tail distribution"
+  },
+  "native067": {
+    "schema": 1,
+    "terminal": true,
+    "underlying_exit_code": 0,
+    "ended_utc": "2026-10-03T11:54:28.637869+00:00",
+    "log_sha256": "f685a64cb496f90ce7e332979897cbb47aa044ae0a896aef324ade9f6737e4e4",
+    "attempts": 2,
+    "verified": 2,
+    "capacity_after": {
+      "healthy": true,
+      "durable": true,
+      "active_connections": 0,
+      "in_flight_proofs": 0,
+      "pending_sessions": 0,
+      "records": 2
+    },
+    "complete": true
+  },
+  "tests_at_measured_pins": {
+    "rust_passed": 78,
+    "rust_failed": 0,
+    "existing_benchmark_ignored": 1,
+    "go_test_exit": 0,
+    "go_build_exit": 0,
+    "synthetic_shared_ot_preparations": 200,
+    "provider_calls_in_preparation_tests": 0
+  },
+  "normal_production_copy010": {
+    "normal_api_ready_http": 200,
+    "homepage_http": 200,
+    "read_only": true,
+    "synthetic_writes": false
+  },
+  "exclusions": [
+    "No raw provider bodies, account identities, session values, verifier tokens or logs",
+    "Single real X account and Mac topology do not establish independent account rotation or fleet capacity",
+    "Pagination uses two fresh proofs, not one cursor-dependent proven connection",
+    "The original interrupted cohorts and overwritten pagination telemetry remain separate"
+  ]
+}

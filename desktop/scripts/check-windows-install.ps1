@@ -19,6 +19,7 @@ public static class ScarlettAcceptanceWindow {
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
+    [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
     [StructLayout(LayoutKind.Sequential)] private struct KeyboardInput {
         public ushort key, scan; public uint flags, time; public UIntPtr extra;
     }
@@ -38,6 +39,11 @@ public static class ScarlettAcceptanceWindow {
         input.value.keyboard.key = key; input.value.keyboard.flags = up ? 2u : 0u;
         return input;
     }
+    private static Input Character(char value, bool up) {
+        Input input = new Input(); input.type = 1;
+        input.value.keyboard.scan = value; input.value.keyboard.flags = 4u | (up ? 2u : 0u);
+        return input;
+    }
     public static bool ModifiersReleased() {
         foreach (int key in new int[] { 0x10, 0x11, 0x12, 0x5B, 0x5C })
             if ((GetAsyncKeyState(key) & 0x8000) != 0) return false;
@@ -54,13 +60,54 @@ public static class ScarlettAcceptanceWindow {
     public static void ControlKey(ushort key) {
         Send(new Input[] { Key(0x11, false), Key(key, false), Key(key, true), Key(0x11, true) });
     }
-    public static void SelectAllAndClear() {
-        Send(new Input[] { Key(0x11, false), Key(0x41, false), Key(0x41, true), Key(0x11, true),
-            Key(0x08, false), Key(0x08, true) });
+    public static void Click(int x, int y) {
+        int left = GetSystemMetrics(76), top = GetSystemMetrics(77);
+        int width = GetSystemMetrics(78), height = GetSystemMetrics(79);
+        if (width < 2 || height < 2 || x < left || y < top ||
+            (long)x >= (long)left + width || (long)y >= (long)top + height)
+            throw new InvalidOperationException("Synthetic click outside desktop bounds");
+        Input move = new Input();
+        move.value.mouse.x = (int)(((long)x - left) * 65535 / (width - 1));
+        move.value.mouse.y = (int)(((long)y - top) * 65535 / (height - 1));
+        move.value.mouse.flags = 0xC001;
+        Input down = new Input(); down.value.mouse.flags = 2;
+        Input up = new Input(); up.value.mouse.flags = 4;
+        Send(new Input[] { move, down, up });
     }
-    public static void SelectAllClearAndTab() {
-        Send(new Input[] { Key(0x11, false), Key(0x41, false), Key(0x41, true), Key(0x11, true),
-            Key(0x08, false), Key(0x08, true), Key(0x09, false), Key(0x09, true) });
+    private static Input[] ClearInputs() {
+        return new Input[] { Key(0x11, false), Key(0x41, false), Key(0x41, true), Key(0x11, true),
+            Key(0x08, false), Key(0x08, true) };
+    }
+    public static void SelectAllAndClear() { Send(ClearInputs()); }
+    public static void SelectOption(int index) {
+        if (index < 1 || index > 2)
+            throw new InvalidOperationException("Synthetic option index outside its bound");
+        Input[] inputs = new Input[6 + index * 2];
+        int offset = 0;
+        inputs[offset++] = Key(0x24, false); inputs[offset++] = Key(0x24, true);
+        for (int step = 0; step < index; step++) {
+            inputs[offset++] = Key(0x28, false); inputs[offset++] = Key(0x28, true);
+        }
+        inputs[offset++] = Key(0x0D, false); inputs[offset++] = Key(0x0D, true);
+        inputs[offset++] = Key(0x09, false); inputs[offset++] = Key(0x09, true);
+        Send(inputs);
+    }
+    public static void ReplaceText(string value) { ReplaceText(value, false); }
+    public static void ReplaceTextAndTab(string value) { ReplaceText(value, true); }
+    private static void ReplaceText(string value, bool tab) {
+        if (String.IsNullOrEmpty(value) || value.Length > 512)
+            throw new InvalidOperationException("Synthetic text length outside its bound");
+        Input[] inputs = new Input[6 + value.Length * 2 + (tab ? 2 : 0)];
+        Array.Copy(ClearInputs(), inputs, 6);
+        for (int index = 0; index < value.Length; index++) {
+            inputs[6 + index * 2] = Character(value[index], false);
+            inputs[7 + index * 2] = Character(value[index], true);
+        }
+        if (tab) {
+            inputs[inputs.Length - 2] = Key(0x09, false);
+            inputs[inputs.Length - 1] = Key(0x09, true);
+        }
+        Send(inputs);
     }
 }
 '@
@@ -116,6 +163,38 @@ function Find-Button([string]$Name) {
     )
     return $script:window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
 }
+function Click-Control([System.Windows.Automation.AutomationElement]$Control) {
+    $handle = $application.MainWindowHandle
+    [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
+    [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
+    $scroll = $null
+    if ($Control.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) {
+        $scroll.ScrollIntoView()
+    }
+    $Control.SetFocus()
+    Wait-Check {
+        return [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+    } 10 'Installed control did not acquire foreground input'
+    $click = @{ point = [System.Windows.Point]::new(0.0, 0.0) }
+    try {
+        Wait-Check {
+            $point = [System.Windows.Point]::new(0.0, 0.0)
+            if (-not $Control.TryGetClickablePoint([ref]$point)) { return $false }
+            $click.point = $point
+            return $true
+        } 10 'Installed control did not become visible for native click'
+    } catch {
+        $originalFailure = $_
+        $diagnostic = @{ controlEnabled = $Control.Current.IsEnabled; controlFocused = $Control.Current.HasKeyboardFocus
+            controlOffscreen = $Control.Current.IsOffscreen; scrollSupported = $null -ne $scroll
+            foregroundOwned = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle; realProviderJobs = 0 }
+        New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+        $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-click-input-failure.json')
+        Write-Output ($diagnostic | ConvertTo-Json -Compress)
+        throw $originalFailure
+    }
+    [ScarlettAcceptanceWindow]::Click([int]$click.point.X, [int]$click.point.Y)
+}
 function Click-Button([string]$Name) {
     Wait-Check {
         $control = Find-Button $Name
@@ -123,15 +202,7 @@ function Click-Button([string]$Name) {
     } 30 "UI control did not become available: $Name"
     $button = Find-Button $Name
     if (-not $button -or -not $button.Current.IsEnabled) { throw "UI control unavailable: $Name" }
-    $scroll = $null
-    if ($button.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) {
-        $scroll.ScrollIntoView()
-    }
-    $invoke = $null
-    if (-not $button.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invoke)) {
-        throw "UI invocation unavailable: $Name"
-    }
-    $invoke.Invoke()
+    Click-Control $button
 }
 function Wait-AppWindow {
     Wait-Check {
@@ -324,18 +395,45 @@ function Check-DefaultCheckbox([string]$Name, [string]$Failure) {
 function Set-Checkbox([string]$Name, [bool]$Enabled) {
     Wait-Check { (Find-Input $Name).Current.IsEnabled } 15 "Checkbox unavailable: $Name"
     if (Checkbox-Is $Name $Enabled) { return }
-    $pattern = $null
-    if (-not (Find-Input $Name).TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
-        throw "Checkbox toggle pattern unavailable: $Name"
+    Click-Control (Find-Input $Name)
+    try { Wait-Check { Checkbox-Is $Name $Enabled } 15 "Checkbox did not update: $Name" }
+    catch {
+        $originalFailure = $_
+        $control = Find-Input $Name
+        $pattern = $null
+        $hasToggle = $null -ne $control -and $control.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)
+        $diagnostic = @{ controlPresent = $null -ne $control; controlEnabled = $null -ne $control -and $control.Current.IsEnabled
+            controlFocused = $null -ne $control -and $control.Current.HasKeyboardFocus
+            toggleSupported = $hasToggle; toggleOn = $hasToggle -and $pattern.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::On
+            expectedOn = $Enabled; foregroundOwned = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $application.MainWindowHandle
+            modifiersReleased = [ScarlettAcceptanceWindow]::ModifiersReleased(); realProviderJobs = 0 }
+        New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+        $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-checkbox-input-failure.json')
+        Write-Output ($diagnostic | ConvertTo-Json -Compress)
+        throw $originalFailure
     }
-    $pattern.Toggle()
-    Wait-Check { Checkbox-Is $Name $Enabled } 15 "Checkbox did not update: $Name"
 }
 function Saved-Preferences([int]$Port, [bool]$Background) {
     $path = Join-Path $state 'preferences.json'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
     $saved = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
     return $saved.schema -eq 1 -and $saved.local_api_port -eq $Port -and $saved.background -eq $Background
+}
+function Check-SavedPreferences([int]$Port, [bool]$Background, [string]$Failure) {
+    try { Wait-Check { Saved-Preferences $Port $Background } 15 $Failure }
+    catch {
+        $originalFailure = $_
+        $path = Join-Path $state 'preferences.json'
+        $saved = $null
+        try { $saved = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json } catch { }
+        $diagnostic = @{ readable = $null -ne $saved; schemaMatches = $saved.schema -eq 1
+            portMatches = $saved.local_api_port -eq $Port; backgroundMatches = $saved.background -eq $Background
+            expectedBackground = $Background; realProviderJobs = 0 }
+        New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+        $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-preferences-save-failure.json')
+        Write-Output ($diagnostic | ConvertTo-Json -Compress)
+        throw $originalFailure
+    }
 }
 function Close-Window {
     $pattern = $null
@@ -356,7 +454,7 @@ function Check-Preferences {
     Check-DefaultCheckbox 'Open Scarlett when I log in' 'Start at login was not opt-in'
     Set-Number 'Saved local API port' 18088
     Click-Button 'Save device preferences'
-    Wait-Check { Saved-Preferences 18088 $false } 15 'Device preferences were not saved privately'
+    Check-SavedPreferences 18088 $false 'Device preferences were not saved privately'
     $script:apiPort = 18088
     if ((Api-Status '/health') -ne 0) { throw 'Preferences test port is already occupied' }
     Click-Button 'Start local API'
@@ -389,7 +487,7 @@ function Check-Preferences {
 
     Set-Checkbox 'Keep running when the window closes' $true
     Click-Button 'Save device preferences'
-    Wait-Check { Saved-Preferences 18088 $true } 15 'Background preference did not save'
+    Check-SavedPreferences 18088 $true 'Background preference did not save'
     Click-Button 'Start local API'
     Wait-Check { (Api-Status '/health') -eq 200 } 30 'Background test API did not start'
     $originalProcess = $application.Id
@@ -403,7 +501,7 @@ function Check-Preferences {
     if ($application.Id -ne $originalProcess -or (Api-Status '/health') -ne 200) { throw 'Reopening did not retain the same background app and API' }
     Set-Checkbox 'Keep running when the window closes' $false
     Click-Button 'Save device preferences'
-    Wait-Check { Saved-Preferences 18088 $false } 15 'Background mode did not restore off'
+    Check-SavedPreferences 18088 $false 'Background mode did not restore off'
     Close-Window
     if (-not $application.WaitForExit(135000)) { throw 'Restored default close did not exit' }
     Wait-Check { (Api-Status '/health') -eq 0 } 30 'Restored default close left API running'
@@ -416,39 +514,26 @@ function Check-Preferences {
 }
 
 function Set-Text([string]$Name, [string]$Value, [string]$NextName = '') {
-    # Use the same text delivery already proved by the per-window probe.
     # WebView2 can advertise ValuePattern while SetValue fails to commit.
     # Only disposable fixtures call this helper, never real credentials.
     if ($Value -notmatch '^[a-z0-9-]+$' -or $Value.Length -gt 512) { throw 'Synthetic input contains unsupported characters' }
     Wait-Check { (Find-Input $Name).Current.IsEnabled } 15 "Text input did not become ready: $Name"
     $control = Find-Input $Name
     if (-not $control -or -not $control.Current.IsEnabled) { throw "Text input unavailable: $Name" }
+    Click-Control $control
     $handle = $application.MainWindowHandle
-    [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
-    [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
-    $scroll = $null
-    if ($control.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) { $scroll.ScrollIntoView() }
-    $control.SetFocus()
     Wait-Check {
         return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
     } 10 'Synthetic input did not acquire keyboard focus'
+    # Queue selection, clearing and Unicode text in one ordered native input
+    # batch. An already-empty field cannot acknowledge queued clearing, and
+    # mixing SendInput with SendKeys can lose text despite successful focus.
     if ($control.Current.IsPassword) {
         if (-not (($Name -eq 'auth_token' -and $NextName -eq 'ct0') -or
             ($Name -eq 'ct0' -and $NextName -eq 'Connect X'))) { throw 'Masked input requires its reviewed successor control' }
-        # SendWait can return before another process handles input. Tab focus
-        # acknowledges the clear and text queues without reading a password.
-        [ScarlettAcceptanceWindow]::SelectAllClearAndTab()
-        Wait-Check {
-            $next = Find-Input $NextName
-            return $null -ne $next -and $next.Current.HasKeyboardFocus -and
-                [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
-        } 10 'Masked clear input was not acknowledged by successor focus'
-        $control = Find-Input $Name
-        $control.SetFocus()
-        Wait-Check {
-            return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
-        } 10 'Masked input did not reacquire keyboard focus'
-        [System.Windows.Forms.SendKeys]::SendWait($Value + '{TAB}')
+        # The successor's focus acknowledges the ordered native clear/text
+        # queue without reading a masked field or racing another input API.
+        [ScarlettAcceptanceWindow]::ReplaceTextAndTab($Value)
         Wait-Check {
             $next = Find-Input $NextName
             return $null -ne $next -and $next.Current.HasKeyboardFocus -and
@@ -457,19 +542,7 @@ function Set-Text([string]$Name, [string]$Value, [string]$NextName = '') {
         return
     }
     if ($NextName) { throw 'Ordinary input cannot use a masked successor' }
-    [ScarlettAcceptanceWindow]::SelectAllAndClear()
-    # Native keyboard events can still be queued when SendInput returns.
-    # Observe the ordinary field's empty value before sending the next text,
-    # as the per-window keyboard probe already does. Never read secret fields.
-    if (-not $control.Current.IsPassword) {
-        Wait-Check {
-            $current = Find-Input $Name
-            $pattern = $null
-            return $null -ne $current -and $current.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern) -and
-                $pattern.Current.Value -ceq ''
-        } 10 'Synthetic input did not clear before typing'
-    }
-    [System.Windows.Forms.SendKeys]::SendWait($Value)
+    [ScarlettAcceptanceWindow]::ReplaceText($Value)
     # Masked cookie fields may refuse value readback. Exact persistence is
     # checked against the synthetic fixture after the Connect action.
     if (-not $control.Current.IsPassword) {
@@ -510,15 +583,10 @@ function Select-Browser([int]$Index, [string]$ExpectedBrowser) {
     Wait-Check {
         return $target.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
     } 10 'Browser chooser did not acquire input focus'
-    [System.Windows.Forms.SendKeys]::SendWait('{HOME}')
-    # PowerShell variable names are case-insensitive; the loop counter must
-    # not overwrite the requested Index before sending its navigation keys.
-    for ($step = 0; $step -lt $Index; $step++) { [System.Windows.Forms.SendKeys]::SendWait('{DOWN}') }
-    # Commit the native select before clicking consent. Keyboard navigation can
-    # leave a preview choice in the popup; consent belongs to the committed
-    # profile and must not race its change event.
-    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-    [System.Windows.Forms.SendKeys]::SendWait('{TAB}')
+    # Open the actual native chooser and queue its navigation/commit keys
+    # together. Separate SendKeys calls can return before WebView2 handles them.
+    Click-Control $target
+    [ScarlettAcceptanceWindow]::SelectOption($Index)
     $readback = @{ controlPresent = $false; valuePattern = $false; valueMatches = $false
         selectionPattern = $false; selectedItemCount = 0; selectedLabelMatches = $false }
     try {

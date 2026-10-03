@@ -29,10 +29,21 @@ use crate::policy::{HOST, PATH, find, validate_job};
 pub struct Request {
     pub verifier: String,
     pub verifier_ca_file: Option<String>,
+    pub verifier_server_name: Option<String>,
     #[serde(default)]
     pub plaintext_fixture: bool,
     pub token: String,
     pub payload: Value,
+    #[serde(default)]
+    pub close_strategy: CloseStrategy,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseStrategy {
+    #[default]
+    Normal,
+    TlsAfterCompleted,
 }
 
 #[derive(Serialize)]
@@ -41,9 +52,26 @@ pub struct Summary {
     #[serde(flatten)]
     pub verifier_transport: crate::control::TrafficSnapshot,
     pub status: &'static str,
+    pub proof_mode: &'static str,
+    pub close_strategy: CloseStrategy,
+    pub duration_ms: u128,
     pub codex_ms: u128,
     pub sent_bytes: usize,
     pub received_bytes: usize,
+    pub timings_ms: Timings,
+}
+
+/// Local monotonic measurements for experiments, never authenticated usage.
+#[derive(Default, Serialize)]
+pub struct Timings {
+    pub control_connect: u128,
+    pub commit: u128,
+    pub websocket_handshake: u128,
+    pub response_read: u128,
+    pub tls_finish: u128,
+    pub prove: u128,
+    pub finalize: u128,
+    pub total: u128,
 }
 
 // Provider errors can contain prompts, authentication headers, and account IDs.
@@ -105,6 +133,17 @@ fn codex_websocket_request() -> Result<tokio_tungstenite::tungstenite::http::Req
     Ok(request)
 }
 
+// Invoke only after a fully assembled, parsed response.completed. The original
+// TLSNotary task still requires authenticated TLS completion and disclosure.
+async fn close_tls_after_completed<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>, limit: Duration) -> Result<()>
+where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
+    tokio::time::timeout(limit, async {
+        ws.close(None).await.context("Codex WebSocket close failed")?;
+        ws.get_mut().shutdown().await.context("Codex TLS write shutdown failed")?;
+        anyhow::Ok(())
+    }).await.context("Codex shutdown timed out")?
+}
+
 pub async fn run(request: Request) -> Result<Summary> {
     validate_job(&request.payload)?;
     if request.token.len() != 64 || !request.token.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -128,16 +167,21 @@ pub async fn run(request: Request) -> Result<Summary> {
     };
     let creds = load_creds()?;
 
-    let (mut socket, traffic) = crate::control::connect(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture).await?;
+    let started_total = Instant::now();
+    let mut timings = Timings::default();
+    let (mut socket, traffic) = crate::control::connect_named(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture, request.verifier_server_name.as_deref()).await?;
     socket.write_all(format!("{}\n", request.token).as_bytes()).await?;
+    timings.control_connect = started_total.elapsed().as_millis();
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();
     let mut session = Driver::new(tokio::spawn(driver));
     let work = async {
+        let phase = Instant::now();
         let prover = handle
             .new_prover(ProverConfig::builder().build()?)?
             .commit(ProxyTlsConfig::builder().server_name(DnsName::try_from(HOST)?).build()?)
             .await?;
+        timings.commit = phase.elapsed().as_millis();
         let (tls, prover) =
             prover.connect(TlsClientConfig::builder().server_name(ServerName::Dns(HOST.try_into()?)).root_store(roots).build()?)?;
         let prover_task = tokio::spawn(prover.into_future());
@@ -151,6 +195,8 @@ pub async fn run(request: Request) -> Result<Summary> {
         let (mut ws, _) = tokio_tungstenite::client_async(ws_request, tls.compat())
             .await
             .context("Codex WebSocket handshake failed")?;
+        timings.websocket_handshake = started.elapsed().as_millis();
+        let phase = Instant::now();
         ws.send(Message::text(payload.to_string())).await?;
         loop {
             let message = tokio::time::timeout(Duration::from_secs(240), ws.next())
@@ -165,13 +211,22 @@ pub async fn run(request: Request) -> Result<Summary> {
                 _ => {}
             }
         }
+        timings.response_read = phase.elapsed().as_millis();
         let codex_ms = started.elapsed().as_millis();
-        let _ = ws.close(None).await;
-        while let Ok(Some(Ok(_))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await {}
+        let phase = Instant::now();
+        match request.close_strategy {
+            CloseStrategy::Normal => {
+                let _ = ws.close(None).await;
+                while let Ok(Some(Ok(_))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await {}
+            }
+            CloseStrategy::TlsAfterCompleted => close_tls_after_completed(&mut ws, Duration::from_secs(5)).await?,
+        }
         drop(ws);
 
         let mut prover =
             tokio::time::timeout(Duration::from_secs(30), prover_task).await.context("TLS connection did not close")???;
+        timings.tls_finish = phase.elapsed().as_millis();
+        let phase = Instant::now();
         let sent = prover.transcript().sent().to_vec();
         let received = prover.transcript().received().to_vec();
         let mut hide_sent = occurrences(&sent, creds.access_token.as_bytes());
@@ -199,17 +254,22 @@ pub async fn run(request: Request) -> Result<Summary> {
         }
         let config = builder.build()?;
         prover.prove(&config).await?;
+        timings.prove = phase.elapsed().as_millis();
         anyhow::Ok((prover, codex_ms, sent.len(), received.len()))
     };
     let (prover, codex_ms, sent_bytes, received_bytes) = session.step(work).await?;
+    let phase = Instant::now();
     session.finish(async { Ok(prover.close().await?) }, || handle.close()).await?;
+    timings.finalize = phase.elapsed().as_millis();
+    timings.total = started_total.elapsed().as_millis();
 
-    Ok(Summary { status: "proof_sent", codex_ms, sent_bytes, received_bytes, verifier_transport: traffic.snapshot() })
+    Ok(Summary { status: "proof_sent", proof_mode: "proxy", close_strategy: request.close_strategy,
+        duration_ms: timings.total, codex_ms, sent_bytes, received_bytes,
+        timings_ms: timings, verifier_transport: traffic.snapshot() })
 }
 
-/// The task driving a prover's TLSNotary session. tlsn's handle waits
-/// forever once the session has ended, such as when the verifier refuses the
-/// token and hangs up, so the prover races each step against it.
+/// The task driving a TLSNotary session. A protocol handle may stay pending
+/// after the transport ends, so both participants race their work against it.
 pub struct Driver<S, E> {
     task: tokio::task::JoinHandle<Result<S, E>>,
     ended: bool,
@@ -228,9 +288,27 @@ impl<S, E: Into<anyhow::Error>> Driver<S, E> {
             ended = &mut self.task => {
                 self.ended = true;
                 match ended {
-                    Ok(Ok(_)) => bail!("verifier closed the session"),
-                    Ok(Err(e)) => Err(e.into().context("verifier session failed")),
-                    Err(e) => Err(anyhow::Error::from(e).context("verifier session failed")),
+                    Ok(Ok(_)) => bail!("TLSNotary session closed"),
+                    Ok(Err(e)) => Err(e.into().context("TLSNotary session failed")),
+                    Err(e) => Err(anyhow::Error::from(e).context("TLSNotary session failed")),
+                }
+            }
+        }
+    }
+
+    /// Final proof verification may finish after the peer has sent its last
+    /// protocol message and closed the transport.
+    pub async fn verify<T>(&mut self, step: impl Future<Output = Result<T>>, drain: Duration) -> Result<T> {
+        let mut step = std::pin::pin!(step);
+        tokio::select! {
+            biased;
+            done = &mut step => done,
+            ended = &mut self.task => {
+                self.ended = true;
+                match ended {
+                    Ok(Ok(_)) => tokio::time::timeout(drain, step).await.context("TLSNotary final verification did not drain")?,
+                    Ok(Err(e)) => Err(e.into().context("TLSNotary session failed")),
+                    Err(e) => Err(anyhow::Error::from(e).context("TLSNotary session failed")),
                 }
             }
         }
@@ -239,6 +317,10 @@ impl<S, E: Into<anyhow::Error>> Driver<S, E> {
     /// Closes the prover and then the session once the proof is sent. The
     /// verifier may hang up as soon as it has the proof, which is not a failure.
     pub async fn finish(mut self, close_prover: impl Future<Output = Result<()>>, close_session: impl FnOnce()) -> Result<()> {
+        if self.ended {
+            close_session();
+            return Ok(());
+        }
         tokio::select! {
             biased;
             closed = close_prover => closed?,
@@ -249,6 +331,78 @@ impl<S, E: Into<anyhow::Error>> Driver<S, E> {
             self.task.await?.map_err(Into::into)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod driver_tests {
+    use super::*;
+
+    async fn closed_driver() -> Driver<(), anyhow::Error> {
+        let task = tokio::spawn(async { Ok(()) });
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        Driver::new(task)
+    }
+
+    #[tokio::test]
+    async fn final_verification_drains_queued_proof_after_clean_eof() {
+        let mut driver = closed_driver().await;
+        let verified = driver.verify(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok("simulated validated output")
+        }, Duration::from_millis(100)).await.unwrap();
+        assert_eq!(verified, "simulated validated output");
+        // Once the driver has been consumed, shutdown must neither await it
+        // again nor wait for an acknowledgement from the closed peer.
+        tokio::time::timeout(Duration::from_millis(100), driver.finish(std::future::pending(), || {})).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn incomplete_final_proof_has_a_bounded_eof_drain() {
+        let mut driver = closed_driver().await;
+        let result = tokio::time::timeout(Duration::from_millis(500), driver.verify(
+            std::future::pending::<Result<()>>(), Duration::from_millis(20)
+        )).await.unwrap();
+        assert!(result.unwrap_err().to_string().contains("final verification did not drain"));
+    }
+
+    #[tokio::test]
+    async fn invalid_final_proof_is_rejected_after_clean_eof() {
+        let mut driver = closed_driver().await;
+        let error = driver.verify(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Err::<(), _>(anyhow!("invalid synthetic proof"))
+        }, Duration::from_millis(100)).await.unwrap_err();
+        assert_eq!(error.to_string(), "invalid synthetic proof");
+    }
+
+    #[tokio::test]
+    async fn eof_before_final_proof_still_fails_immediately() {
+        let mut driver = closed_driver().await;
+        let error = tokio::time::timeout(Duration::from_millis(100), driver.step(std::future::pending::<Result<()>>())).await.unwrap().unwrap_err();
+        assert_eq!(error.to_string(), "TLSNotary session closed");
+    }
+
+    #[tokio::test]
+    async fn failed_driver_does_not_drain_unverified_work() {
+        let task = tokio::spawn(async { Err::<(), _>(anyhow!("synthetic transport failure")) });
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut driver = Driver::new(task);
+        let error = tokio::time::timeout(Duration::from_millis(100), driver.verify(std::future::pending::<Result<()>>(), Duration::from_secs(1))).await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("TLSNotary session failed"));
+    }
+
+    #[tokio::test]
+    async fn outer_deadline_still_preempts_the_final_proof_drain() {
+        let mut driver = closed_driver().await;
+        let result = tokio::time::timeout(Duration::from_millis(20), driver.verify(
+            std::future::pending::<Result<()>>(), Duration::from_secs(1)
+        )).await;
+        assert!(result.is_err());
     }
 }
 
@@ -301,6 +455,32 @@ fn complement(len: usize, mut hidden: Vec<Range<usize>>) -> Vec<Range<usize>> {
 #[cfg(test)]
 mod provider_error_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn explicit_tls_shutdown_flushes_close_then_finishes_without_remote_ws_ack() {
+        use tokio::io::AsyncReadExt;
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        let (client, mut remote) = tokio::io::duplex(4096);
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let peer = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            remote.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        });
+        close_tls_after_completed(&mut ws, Duration::from_secs(1)).await.unwrap();
+        let sent = tokio::time::timeout(Duration::from_secs(1), peer).await.unwrap().unwrap();
+        assert_eq!(sent[0], 0x88); // complete WebSocket Close frame precedes write EOF
+        assert_eq!(sent.len(), 6); // masked empty client Close, no extra application data
+    }
+
+    #[tokio::test]
+    async fn explicit_tls_shutdown_times_out_when_close_cannot_flush() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        let (client, _unread_remote) = tokio::io::duplex(1);
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let error = close_tls_after_completed(&mut ws, Duration::from_millis(20)).await.unwrap_err();
+        assert_eq!(error.to_string(), "Codex shutdown timed out");
+    }
 
     #[test]
     fn current_compatibility_headers_keep_fixed_provider_route_and_honest_identity() {

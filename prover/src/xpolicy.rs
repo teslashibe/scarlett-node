@@ -14,6 +14,22 @@ use serde_json::{Map, Value};
 use crate::policy::find;
 
 pub const HOST: &str = "x.com";
+pub const PROXY_EXPERIMENT_POLICY: &str = "x-proxy-experimental-v1";
+pub const BATCH_EXPERIMENT_POLICY: &str = "x-mpc-batch-experimental-v1";
+pub const BATCH_READS: usize = 2;
+/// The authenticated control connection identifies batch framing before the
+/// TLSNotary session starts. A production session cannot accept this preface.
+pub const BATCH_PREFACE: &[u8] = b"x-mpc-batch-v1\n";
+pub const BATCH_ACK: &[u8] = b"x-mpc-batch-ready-v1\n";
+
+/// Experiment mode is part of the immutable registered job, not supplier choice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofMode {
+    #[default]
+    Mpc,
+    Proxy,
+}
 const GRAPHQL: &str = "/i/api/graphql/";
 /// Cookies whose values the supplier may hide, with the longest value allowed.
 /// Their names, the other cookies and the rest of the request stay revealed.
@@ -82,6 +98,24 @@ struct Job {
     exchanges: Vec<Spec>,
     #[serde(default)]
     max_attempts: Option<usize>,
+    #[serde(default)]
+    proof_mode: ProofMode,
+    #[serde(default)]
+    proof_policy: Option<String>,
+}
+
+pub fn proof_mode(job: &Value) -> Result<ProofMode> {
+    let job: Job = serde_json::from_value(job.clone()).context("invalid x.read job")?;
+    match (job.proof_mode, job.proof_policy.as_deref()) {
+        (ProofMode::Mpc, None) => Ok(ProofMode::Mpc),
+        (ProofMode::Mpc, Some(BATCH_EXPERIMENT_POLICY)) => Ok(ProofMode::Mpc),
+        (ProofMode::Proxy, Some(PROXY_EXPERIMENT_POLICY)) => Ok(ProofMode::Proxy),
+        _ => bail!("X proof mode and policy do not match"),
+    }
+}
+
+pub fn batch(job: &Value) -> bool {
+    job["proof_policy"] == BATCH_EXPERIMENT_POLICY
 }
 
 /// A proven X read as the verifier parsed it from the transcript.
@@ -99,6 +133,7 @@ pub struct Exchange {
 /// An X job payload: `{"type":"x.read","exchanges":[Spec...],"max_attempts":n}`.
 /// Returns the pinned exchanges and how many proofs the session allows.
 pub fn validate_job(job: &Value) -> Result<(Vec<Spec>, usize)> {
+    proof_mode(job)?;
     let job: Job = serde_json::from_value(job.clone()).context("invalid x.read job")?;
     if job.kind != "x.read" {
         bail!("job payload must be an x.read");
@@ -143,6 +178,11 @@ pub fn validate_job(job: &Value) -> Result<(Vec<Spec>, usize)> {
         }
     }
     let max = job.max_attempts.unwrap_or((2 * n).min(MAX_ATTEMPTS));
+    if job.proof_policy.as_deref() == Some(BATCH_EXPERIMENT_POLICY)
+        && (n != BATCH_READS || max != BATCH_READS || job.exchanges.iter().any(|s| s.cursor_from.is_some() || s.variables.get("cursor").is_some()))
+    {
+        bail!("batch experiment requires exactly two independent reads and two logical attempts");
+    }
     if !(n..=MAX_ATTEMPTS).contains(&max) {
         bail!("max_attempts must be between the number of exchanges and {MAX_ATTEMPTS}");
     }
@@ -308,6 +348,94 @@ pub fn check(server_name: &str, sent: &[u8], sent_hidden: &[Range<usize>], recei
     let (variables, features, field_toggles) = query_params(query)?;
     let (http_status, body) = response_body(received)?;
     Ok(Exchange { operation: operation.to_owned(), query_id: query_id.to_owned(), variables, features, field_toggles, http_status, body })
+}
+
+/// Fixed experimental pipeline: two bodyless requests, with keep-alive only on
+/// the first. Production `check` continues to reject a second request.
+pub fn batch_request_ranges(sent: &[u8]) -> Result<Vec<Range<usize>>> {
+    let mut ranges = Vec::new();
+    let mut at = 0;
+    for connection in [b"keep-alive".as_slice(), b"close".as_slice()] {
+        let head_end = find(&sent[at..], b"\r\n\r\n").context("batch request is truncated")?;
+        let end = at + head_end + 4;
+        let part = &sent[at..end];
+        let line_end = find(part, b"\r\n").context("no batch request line")?;
+        let secrets = secret_spans(part, head_end)?;
+        let connections: Vec<_> = header_lines(part, line_end + 2, head_end, &secrets)?.into_iter().filter(|(name, _)| name == "connection").map(|(_, value)| value).collect();
+        if connections != [connection] { bail!("batch connection framing is invalid"); }
+        ranges.push(at..end);
+        at = end;
+    }
+    if at != sent.len() { bail!("batch carries extra request bytes"); }
+    Ok(ranges)
+}
+
+/// Boundaries are authenticated transcript offsets. Every response needs one
+/// unambiguous length or chunked framing; trailers and interim responses fail.
+pub fn batch_response_ranges(received: &[u8]) -> Result<Vec<Range<usize>>> {
+    let mut ranges = Vec::new();
+    let mut at = 0;
+    for _ in 0..BATCH_READS {
+        let part = &received[at..];
+        let head_end = find(part, b"\r\n\r\n").context("batch response is truncated")?;
+        let line_end = find(part, b"\r\n").context("no response line")?;
+        let line = std::str::from_utf8(&part[..line_end])?;
+        if !line.starts_with("HTTP/1.1 ") || line.len() < 13 || line.as_bytes()[12] != b' ' || !line.as_bytes()[9..12].iter().all(u8::is_ascii_digit) || !line.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+            bail!("invalid batch response status");
+        }
+        let h = parse_head(part)?;
+        if !(200..=599).contains(&h.status) { bail!("interim or invalid batch responses are unsupported"); }
+        let headers = header_lines(part, line_end + 2, head_end, &[])?;
+        for name in ["content-length", "transfer-encoding", "content-encoding"] {
+            if headers.iter().filter(|(n, _)| n == name).count() > 1 { bail!("duplicate batch response framing"); }
+        }
+        if headers.iter().any(|(n, v)| n == "content-length" && (v.is_empty() || !v.iter().all(u8::is_ascii_digit))) { bail!("noncanonical batch content length"); }
+        let transfer: Vec<_> = headers.iter().filter(|(n, _)| n == "transfer-encoding").map(|(_, v)| *v).collect();
+        if !transfer.is_empty() && (transfer != [b"chunked".as_slice()] || h.length.is_some()) {
+            bail!("ambiguous batch response framing");
+        }
+        let mut end = h.body_start;
+        if h.chunked {
+            let mut body_size: usize = 0;
+            loop {
+                let size_end = end + find(&part[end..], b"\r\n").context("truncated chunk size")?;
+                let size = &part[end..size_end];
+                if size.is_empty() || !size.iter().all(u8::is_ascii_hexdigit) { bail!("noncanonical batch chunk size"); }
+                let n = usize::from_str_radix(std::str::from_utf8(size)?, 16)?;
+                end = size_end + 2;
+                body_size = body_size.checked_add(n).context("chunk size overflow")?;
+                if body_size > MAX_BODY { bail!("batch body too large"); }
+                let next = end.checked_add(n).context("chunk size overflow")?;
+                if part.get(next..next + 2) != Some(b"\r\n".as_slice()) { bail!("truncated or trailer-bearing batch chunk"); }
+                end = next + 2;
+                if n == 0 { break; }
+            }
+        } else {
+            end = end.checked_add(h.length.context("unframed batch response")?).context("response size overflow")?;
+            if end > part.len() { bail!("truncated batch body"); }
+        }
+        ranges.push(at..at + end);
+        at += end;
+    }
+    if at != received.len() { bail!("extra batch response bytes"); }
+    Ok(ranges)
+}
+
+pub fn check_batch(server_name: &str, sent: &[u8], sent_hidden: &[Range<usize>], received: &[u8], received_hidden: &[Range<usize>]) -> Result<Vec<(Exchange, usize, usize)>> {
+    if !received_hidden.is_empty() { bail!("part of batch response was hidden"); }
+    if sent_hidden.iter().any(|r| r.start >= r.end || r.end > sent.len()) { bail!("invalid batch hidden range"); }
+    let requests = batch_request_ranges(sent)?;
+    let responses = batch_response_ranges(received)?;
+    requests.into_iter().zip(responses).map(|(request, response)| {
+        let raw = &sent[request.clone()];
+        let hidden: Vec<_> = sent_hidden.iter().filter(|r| r.start < request.end && r.end > request.start).map(|r| r.start.saturating_sub(request.start)..r.end.min(request.end) - request.start).collect();
+        // Batch authentication values must all be redacted, including request 2.
+        for secret in secret_spans(raw, raw.len() - 4)? {
+            if !(secret.start..secret.end).all(|i| hidden.iter().any(|r| r.contains(&i))) { bail!("batch authentication value was not redacted"); }
+        }
+        let exchange = check(server_name, raw, &hidden, &received[response.clone()], &[])?;
+        Ok((exchange, request.len(), response.len()))
+    }).collect()
 }
 
 /// The header lines between `start` and the blank line at `head_end`, as
@@ -598,6 +726,78 @@ mod tests {
 
     const COOKIE: &str = "auth_token=SECRET; ct0=CSRF; twid=u%3D1";
 
+    fn batch_fixture() -> (Vec<u8>, Vec<Range<usize>>, Vec<u8>) {
+        let first = String::from_utf8(get("UserByScreenName", &json!({"screen_name":"jack"}), Some(&json!({})))).unwrap().replace("Connection: close", "Connection: keep-alive").into_bytes();
+        let second = get("TweetResultByRestId", &json!({"tweetId":"20"}), Some(&json!({})));
+        let mut spans = hidden(&first);
+        spans.extend(hidden(&second).into_iter().map(|r| r.start + first.len()..r.end + first.len()));
+        let mut sent = first;
+        sent.extend(second);
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"data\":{}}";
+        let received = [response.as_slice(), response.as_slice()].concat();
+        (sent, spans, received)
+    }
+
+    #[test]
+    fn batch_authenticates_two_exact_reads_and_redacts_both_requests() {
+        let (sent, hidden, received) = batch_fixture();
+        let parsed = check_batch(HOST, &blank(&sent, &hidden), &hidden, &received, &[]).unwrap();
+        assert_eq!(parsed.len(), BATCH_READS);
+        assert_eq!(parsed[0].0.operation, "UserByScreenName");
+        assert_eq!(parsed[1].0.variables, json!({"tweetId":"20"}));
+        assert_eq!(parsed.iter().map(|r| r.1).sum::<usize>(), sent.len());
+        assert_eq!(parsed.iter().map(|r| r.2).sum::<usize>(), received.len());
+        assert!(check(HOST, &blank(&sent, &hidden), &hidden, &received, &[]).is_err(), "production accepted a second request");
+        assert!(check_batch("example.invalid", &sent, &hidden, &received, &[]).is_err());
+        assert!(check_batch(HOST, &sent, &hidden[..3], &received, &[]).is_err(), "second request auth was revealed");
+        assert!(check_batch(HOST, &sent, &hidden, &received, &[0..1]).is_err());
+        let mut hidden_query = hidden.clone();
+        hidden_query.push(4..5);
+        assert!(check_batch(HOST, &blank(&sent, &hidden_query), &hidden_query, &received, &[]).is_err());
+    }
+
+    #[test]
+    fn batch_rejects_ambiguous_or_incomplete_framing() {
+        let (sent, hidden, received) = batch_fixture();
+        for raw in [
+            received[..received.len()-1].to_vec(),
+            [received.as_slice(), b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"].concat(),
+            String::from_utf8(received.clone()).unwrap().replacen("Content-Length: 11", "Content-Length: 11\r\nContent-Length: 11", 1).into_bytes(),
+            String::from_utf8(received.clone()).unwrap().replacen("Content-Length: 11", "Transfer-Encoding: chunked\r\nContent-Length: 11", 1).into_bytes(),
+            String::from_utf8(received.clone()).unwrap().replacen("HTTP/1.1 200", "HTTP/1.1 100", 1).into_bytes(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}xx0\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Trailer: no\r\n\r\n".to_vec(),
+        ] {
+            assert!(check_batch(HOST, &sent, &hidden, &raw, &[]).is_err());
+        }
+        for raw in [
+            [sent.as_slice(), b"GET / HTTP/1.1\r\n\r\n"].concat(),
+            String::from_utf8(sent.clone()).unwrap().replacen("Connection: keep-alive", "Connection: close", 1).into_bytes(),
+            String::from_utf8(sent.clone()).unwrap().replacen("Connection: close", "Content-Length: 0\r\nConnection: close", 1).into_bytes(),
+        ] { assert!(check_batch(HOST, &raw, &hidden, &received, &[]).is_err()); }
+        let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nb\r\n{\"data\":{}}\r\n0\r\n\r\n";
+        assert!(check_batch(HOST, &sent, &hidden, &[chunked.as_slice(), chunked.as_slice()].concat(), &[]).is_ok());
+        let gzip = gzip_response("{\"data\":{\"synthetic\":true}}");
+        let parsed = check_batch(HOST, &sent, &hidden, &[gzip.as_slice(), gzip.as_slice()].concat(), &[]).unwrap();
+        assert_eq!(parsed[1].0.body,"{\"data\":{\"synthetic\":true}}");
+    }
+
+    #[test]
+    fn batch_job_is_a_separate_bounded_mpc_policy() {
+        let mut value = json!({"type":"x.read", "proof_mode":"mpc", "proof_policy":BATCH_EXPERIMENT_POLICY, "max_attempts":2, "exchanges":[spec("Viewer",json!({})),spec("TweetResultByRestId",json!({"tweetId":"20"}))]});
+        assert!(validate_job(&value).is_ok());
+        value["proof_mode"] = json!("proxy");
+        assert!(validate_job(&value).is_err());
+        value["proof_mode"] = json!("mpc");
+        value["max_attempts"] = json!(3);
+        assert!(validate_job(&value).is_err());
+        value["max_attempts"] = json!(2);
+        value["exchanges"][1]["cursor_from"] = json!(0);
+        assert!(validate_job(&value).is_err());
+        value["exchanges"] = json!([spec("Viewer",json!({}))]);
+        assert!(validate_job(&value).is_err());
+    }
+
     fn sent_with(line: &str, extra: &str) -> Vec<u8> {
         format!("{line}\r\nHost: x.com\r\nAuthorization: Bearer PUBLIC\r\nX-Csrf-Token: CSRF\r\nCookie: {COOKIE}\r\nConnection: close\r\n{extra}\r\n").into_bytes()
     }
@@ -878,6 +1078,22 @@ mod tests {
         ] {
             assert!(validate_job(&bad).is_err(), "{bad} was accepted");
         }
+    }
+
+    #[test]
+    fn experiment_proof_mode_requires_its_own_policy() {
+        let mut job = json!({"type":"x.read", "exchanges":[spec("Viewer", json!({}))], "max_attempts":1});
+        assert_eq!(proof_mode(&job).unwrap(), ProofMode::Mpc);
+        job["proof_mode"] = json!("proxy");
+        assert!(validate_job(&job).is_err());
+        job["proof_policy"] = json!(PROXY_EXPERIMENT_POLICY);
+        assert_eq!(proof_mode(&job).unwrap(), ProofMode::Proxy);
+        assert!(validate_job(&job).is_ok());
+        job["proof_mode"] = json!("mpc");
+        assert!(validate_job(&job).is_err());
+        job["proof_mode"] = json!("proxy");
+        job["proof_policy"] = json!("x-mpc-production");
+        assert!(validate_job(&job).is_err());
     }
 
     #[test]

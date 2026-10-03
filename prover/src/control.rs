@@ -164,13 +164,25 @@ fn client(ca: Option<&str>) -> Result<TlsConnector> {
         .with_no_client_auth();
     Ok(TlsConnector::from(Arc::new(config)))
 }
+#[cfg(test)]
 pub async fn connect(address: &str, ca: Option<&str>, plaintext_fixture: bool) -> Result<(Socket, Traffic)> {
+    connect_named(address, ca, plaintext_fixture, None).await
+}
+
+/// A local encrypted transport experiment may dial a loopback tunnel/shaper
+/// while preserving the original verifier's certificate identity.
+pub async fn connect_named(address: &str, ca: Option<&str>, plaintext_fixture: bool, server_name: Option<&str>) -> Result<(Socket, Traffic)> {
+    if server_name.is_some() && (plaintext_fixture || !address.parse::<std::net::SocketAddr>().is_ok_and(|a| a.ip().is_loopback())) {
+        bail!("verifier name override requires a literal loopback TLS transport");
+    }
     if plaintext_fixture && (!fixture_address(address) || ca.is_some()) {
         bail!("plaintext is restricted to explicit unpaid fixtures");
     }
     let connector = if plaintext_fixture { None } else { Some(client(ca)?) };
     // Bracket an IPv6 literal only for parsing; certificate validation uses its IP.
-    let host = if let Ok(parsed) = address.parse::<std::net::SocketAddr>() {
+    let host = if let Some(name) = server_name {
+        name.to_owned()
+    } else if let Ok(parsed) = address.parse::<std::net::SocketAddr>() {
         parsed.ip().to_string()
     } else {
         let (host, port) = address.rsplit_once(':').context("verifier must be host:port")?;
@@ -290,6 +302,21 @@ mod tests {
             token == *b"token"
         });
         (port, server)
+    }
+    #[tokio::test]
+    async fn loopback_shaping_preserves_tls_identity_and_never_allows_plaintext_or_remote_override() {
+        assert!(connect_named("verifier.example:7047", None, false, Some("localhost")).await.is_err());
+        assert!(connect_named("192.0.2.1:7047", None, false, Some("localhost")).await.is_err());
+        assert!(connect_named("127.0.0.1:7047", None, true, Some("localhost")).await.is_err());
+        let dir = Temp::new();
+        let (cert, key, ca) = certificate(&dir, false);
+        let (port, server) = endpoint(acceptor(&cert, &key).unwrap()).await;
+        let (mut socket, _) = connect_named(&format!("127.0.0.1:{port}"), Some(&ca), false, Some("localhost")).await.unwrap();
+        socket.write_all(b"token").await.unwrap();
+        assert!(server.await.unwrap());
+        let (port, server) = endpoint(acceptor(&cert, &key).unwrap()).await;
+        assert!(connect_named(&format!("127.0.0.1:{port}"), Some(&ca), false, Some("wrong.example")).await.is_err());
+        assert!(!server.await.unwrap());
     }
     #[tokio::test]
     async fn verified_tls_accepts_local_ca_and_sends_bytes_only_after_handshake() {
