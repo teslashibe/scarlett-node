@@ -2,7 +2,7 @@
 
 Tauri 2 with bundled vanilla TypeScript. The native bridge delegates execution and account scheduling to the independently built Go node and its Rust proof helper. It does not embed the private Scarlett application.
 
-The desktop provides pairing, status, start/drain/resume/stop, a menu-bar/tray supervisor and account controls. Account management requires the native pool release; older node binaries show it as unavailable. Automatic Codex token refresh for the proof-only runtime, signed public installers, automatic updates and full installed Windows GUI acceptance remain separate release gates. The Mac development app is unsigned and is not a community release.
+The desktop provides pairing, status, start/drain/resume/stop, a menu-bar/tray supervisor and account controls. Account management requires the native pool release; older node binaries show it as unavailable. Automatic Codex token refresh for the proof-only runtime, automatic updates and full installed Windows GUI acceptance remain separate release gates. Release installers are signed with Scarlett's own stable self-signed certificates by the release workflow (see [Release signing](#release-signing)); they are not notarized by Apple and Windows shows an unknown publisher. The Mac development app is unsigned and is not a community release.
 
 ## Build
 
@@ -54,11 +54,17 @@ Windows runtime operations require private NTFS storage and the bundled native h
 
 Windows release signing uses an existing current-user code-signing identity and
 the trusted Microsoft SDK SignTool. No certificate or key is imported by the
-release helper. Set `SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT` to the reviewed public
-certificate thumbprint, `SCARLETT_WINDOWS_SIGNTOOL` to the absolute SDK executable
-and `SCARLETT_WINDOWS_TIMESTAMP_URL` to the approved HTTPS RFC3161 endpoint on a
-disposable native Windows release runner. Keep hardware-provider credentials and
-key access on that runner.
+release helper, and it never adds a trust root. On a disposable native Windows
+release runner, set `SCARLETT_SIGNING_SCHEME` (`self-signed-stable` or
+`authenticode`; there is no default), `SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT` to
+the reviewed public certificate thumbprint and `SCARLETT_WINDOWS_SIGNTOOL` to the
+absolute SDK executable. In `self-signed-stable` mode the thumbprint must equal
+`windows.sha1` in `desktop/signing/identities.json`. The helper then exports the
+pinned certificate SHA-256 (`SCARLETT_WINDOWS_CERT_SHA256`) and the reviewed
+RFC3161 endpoint (`SCARLETT_WINDOWS_TIMESTAMP_URL`, exactly
+`http://timestamp.digicert.com`) to the Tauri callback and the checker. The
+timestamp token is itself signed and verified, so the endpoint is an exact-match
+allowlist rather than an HTTPS rule. Keep key access on that runner.
 
 After preparing the complete native runtime, build the release executable with
 `npm run tauri -- build --no-bundle --config src-tauri/tauri.complete.generated.json`.
@@ -66,8 +72,10 @@ Then run `python scripts/sign-windows-bundle.py <absolute-desktop-checkout> <new
 The helper validates the original inventory, signs Scarlett executables and
 the pinned NSIS packaging components,
 retains unsigned sidecar hashes and preserves provider bytes. It packages NSIS
-with Tauri's binary patching disabled, verifies trusted publisher/timestamp
-signatures and tests that exact installer with isolated local state. Evidence is
+with Tauri's binary patching disabled, verifies pinned publisher and trusted
+timestamp signatures and tests that exact installer with isolated local state.
+Tauri invokes the callback again for files it already signed; the callback
+leaves our pinned signature byte for byte and refuses any other signature. Evidence is
 written only after installed payload, lifecycle, preferences and browser tests
 pass. Real account login, signed upgrade/downgrade and publication remain
 separate gates; contract tests and unsigned rejection do not prove real signing.
@@ -183,23 +191,32 @@ Installed Windows import acceptance uses new synthetic Chrome/Firefox stores bel
 ## Windows release signature acceptance
 
 Verify the final signed setup and its installed complete payload on a clean native
-Windows machine before selecting a stable download. Supply the reviewed publisher
-certificate's public thumbprint; private keys and certificate passwords are not
-inputs to this read-only checker. Do not install a test certificate or add trust
-roots to make a release pass.
+Windows machine before selecting a stable download. Supply the scheme and the
+reviewed certificate's public thumbprint and SHA-256; private keys and certificate
+passwords are not inputs to this read-only checker. Never install a test
+certificate or add trust roots to make a release pass.
 
 ```powershell
 & desktop/scripts/check-windows-signatures.ps1 `
-  -Installer 'C:\release\Scarlett-Node-setup.exe' `
+  -Installer 'C:\release\Scarlett-Node-0.1.0-windows-amd64.exe' `
   -InstalledDirectory 'C:\acceptance\Scarlett Node' `
   -ExpectedPublisherThumbprint $ReviewedCertificateThumbprint `
+  -Scheme self-signed-stable -CertificateSha256 $ReviewedCertificateSha256 `
   -EvidenceFile 'C:\evidence\windows-signatures.json'
 ```
 
-The setup, desktop, node, proof helper and local model API must each have a
-Windows-trusted embedded Authenticode signature matching that certificate and a
-trusted timestamp. Unsigned, altered, untrusted, catalog-only, self-signed,
-untimestamped or unexpected-publisher files fail. Read hashes before and after
+The setup, desktop, node, proof helper and local model API must each have an
+embedded Authenticode signature matching that certificate and a timestamp whose
+certificate chains to a root Windows trusts. In `self-signed-stable` mode every
+file must report `UnknownError`, and a direct WinVerifyTrust call (no UI, no
+revocation, cache-only retrieval) must return exactly `0x800B0109`
+(CERT_E_UNTRUSTEDROOT): the digest verified and only the root is untrusted. The
+signer must be self-issued, and its SHA-1 thumbprint and SHA-256 over the raw
+certificate must equal the pins. `Valid` is rejected in this mode, because it
+would mean someone made the certificate a trusted root. In `authenticode` mode
+the signature must be `Valid` and the publisher may not be self-issued. Unsigned,
+altered, catalog-only, untimestamped or unexpected-publisher files fail in both
+modes. Read hashes before and after
 signature validation to reject changes during the check. Local file paths cannot
 use alternate streams or traverse reparse points. A new outcome/digest file is
 written only after all signature checks; existing evidence is never overwritten.
@@ -209,9 +226,14 @@ Run the complete installed payload/hash/protected-API checker and installed UI
 acceptance separately. These signature checks do not establish that an arbitrary
 installed directory came from the supplied setup, validate every provider byte,
 or prove login, upgrades, paid jobs or SmartScreen reputation. The native CI gate
-tests signature-record rejection and rejects the actual unsigned Go executable
-without creating signing certificates or modifying trust stores. Genuine signed
-installer acceptance and the Windows signing integration remain release work.
+tests signature-record rejection, rejects the actual unsigned Go executable and
+runs an ephemeral self-signed fixture with no secrets: two RSA-3072
+`New-SelfSignedCertificate` code-signing certificates in `CurrentUser\My` (never
+a root store), the real signer, SDK SignTool and DigiCert sign a copy of the Go
+executable, which must pass with its own pins, fail with HashMismatch after one
+flipped byte and fail against the second certificate. Both certificates and keys
+are deleted afterwards. The installed release acceptance runs in the release
+workflow.
 The checker uses [Windows Authenticode validation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/get-authenticodesignature).
 
 ## Mac release signing
@@ -222,37 +244,105 @@ src-tauri/tauri.complete.generated.json`. Omit `--debug`. Keep the original unsi
 build as provenance and sign a separate copy. The provider archives must already
 have passed their pinned archive checks during complete-bundle preparation.
 
-Configure an existing `APPLE_SIGNING_IDENTITY` that starts with `Developer ID
-Application: `, its ten-character `SCARLETT_APPLE_TEAM_ID`, and an existing
+`SCARLETT_SIGNING_SCHEME` is required and has no default.
+
+`self-signed-stable` (current releases) signs with Scarlett's own certificate,
+pinned in `desktop/signing/identities.json`. Set `SCARLETT_MAC_KEYCHAIN` to the
+absolute path of a temporary keychain that holds that identity, created by
+`desktop/scripts/import-macos-identity.sh` (it imports with `-T /usr/bin/codesign`,
+deletes the PKCS#12 file and sets the key partition list). Never use the login
+keychain. codesign finds an untrusted self-signed identity only through the user
+keychain search list, so the signer puts the temporary keychain first while it
+signs and restores the original list afterwards, also when signing fails. Every
+signature selects the identity by its pinned SHA-1 and uses `--timestamp=none`, a
+fixed `--identifier` (`ai.scarlett.node`, `ai.scarlett.node.<sidecar>` and
+`ai.scarlett.node.dmg`) and the explicit designated requirement
+`identifier "<identifier>" and certificate leaf = H"<sha1>"`. That requirement keeps
+Full Disk Access and other TCC grants valid across updates signed by the same
+certificate. There is no notarization, stapling or Gatekeeper assessment: users
+approve the unverified developer in Privacy & Security after each download.
+
+`developer-id` (kept for when an Apple Developer ID arrives) needs an existing
+`APPLE_SIGNING_IDENTITY` that starts with `Developer ID Application: `, its
+ten-character `SCARLETT_APPLE_TEAM_ID`, and an existing
 `SCARLETT_NOTARY_KEYCHAIN_PROFILE`. Store notarization credentials through Apple's
 Keychain tooling, outside the repository and chat. The signing script does not
-create certificates, import credentials or alter Keychain settings.
+create certificates, import credentials or alter Keychain trust settings.
 
 ```sh
+SCARLETT_SIGNING_SCHEME=self-signed-stable SCARLETT_MAC_KEYCHAIN=/absolute/release.keychain-db \
 python3 desktop/scripts/sign-macos-bundle.py \
   "/absolute/release-copy/Scarlett Node.app" \
-  "/absolute/new-output/Scarlett-Node.dmg"
+  "/absolute/new-output/Scarlett-Node-0.1.0-darwin-arm64.dmg"
 ```
 
 The script refuses a changed component inventory, altered input bytes, links,
 another product identity or an already finalized signing manifest. It verifies
 every bundled native provider object's existing Developer ID signature and
-hardened runtime, preserving those exact bytes and notices. It signs Scarlett's
-three sidecars and desktop executable, verifies their team and hardened runtime,
-records both input and signed sidecar digests, then seals the outer app. A generic
+hardened runtime, preserving those exact bytes and notices in both schemes. It
+signs Scarlett's three sidecars and desktop executable, verifies them, records both
+input and signed sidecar digests, then seals the outer app. In
+`self-signed-stable` mode each verification requires the pinned requirement
+(`codesign --verify --strict -R`), the exact designated requirement from
+`codesign -d -r-`, exactly one embedded certificate whose SHA-256 equals the pin,
+`TeamIdentifier=not set` and hardened runtime. In `developer-id` mode it requires
+the configured team. A generic
 hash refresh cannot turn an altered vendor binary into an accepted release.
 
-The packaged integrity and protected local API check must pass before notarization.
-Both the app and resulting drag-to-Applications DMG require an Accepted notarization
-response and a valid stapled ticket. The app must pass Gatekeeper assessment;
-the DMG signature must match the configured team. Only then is a neighboring
-`.evidence.json` written with artifact digests and notarization IDs. A failed or
+The packaged integrity and protected local API check must pass under the new
+signatures. In `developer-id` mode both the app and resulting drag-to-Applications
+DMG then require an Accepted notarization response and a valid stapled ticket, the
+app must pass Gatekeeper assessment and the DMG signature must match the
+configured team. In `self-signed-stable` mode the signed DMG must pass the pinned
+verification. Only then is a neighboring `.evidence.json` written with the
+artifact digest: notarization IDs for `developer-id`, or the certificate pins,
+designated requirement, `"notarization": "not-performed"` and
+`"gatekeeper": "user-approval-required"` for `self-signed-stable`. A failed or
 partly signed app must be rebuilt from its reviewed inputs, rather than signed
 again in place. Tool failures expose no raw signing or Keychain output.
 
-This is a Mac release preparation step, not automatic publication. It requires
-real signing credentials and does not replace downloaded-installer UI, remote
-account, upgrade/downgrade or paid-loop acceptance. Stable download publication
-still uses the infrastructure release process after those checks. Windows
-Authenticode signing remains a separate native release requirement. Platform
-setup follows [Tauri's signing guide](https://v2.tauri.app/distribute/sign/macos/).
+This is a Mac release preparation step, not automatic publication. It does not
+replace downloaded-installer UI, remote account, upgrade/downgrade or paid-loop
+acceptance. Stable download publication still uses the infrastructure release
+process after those checks. Platform setup follows
+[Tauri's signing guide](https://v2.tauri.app/distribute/sign/macos/).
+
+## Release signing
+
+`desktop/signing/` holds the only signing material in this repository: the two
+public certificates (`macos-codesign.cert.pem`, `windows-authenticode.cert.pem`)
+and `identities.json`, which records each subject, expiry and lowercase SHA-1 and
+SHA-256 over the DER certificate, the Mac identifiers and designated requirement,
+and the Windows timestamp endpoint. `desktop/scripts/signing_identities.py`
+recomputes every pin from the certificates on each load, so a pin changes only
+together with its certificate in a reviewed pull request. The download publisher
+and the download page carry reviewed copies of the four hashes. Private keys never
+enter the repository; they exist only as `release-signing` environment secrets.
+
+`.github/workflows/desktop-release.yml` is the release path. It runs only by
+manual dispatch on `main`, with a `version` input that must equal
+`tauri.conf.json`, a read-only token and no caches. Its `sign` job uses the
+`release-signing` environment on macos-15, macos-15-intel and windows-2025: it
+builds the runtime with the same `build-complete-runtime.sh` as PR CI, builds the
+unsigned app, imports the key (the secrets are visible to that step alone), signs,
+removes the key in an `always()` cleanup and, on Mac, launches the signed app
+from its DMG. The `assemble` job has no secrets. It runs `release-manifest.py`,
+which checks every evidence file and component manifest against
+`identities.json` and the installer SHA-256, then writes `release/`
+(`manifest.json`, `provenance.json` and `Scarlett-Node-<version>-{darwin-arm64.dmg,
+darwin-amd64.dmg,windows-amd64.exe}`, the set the publisher accepts) beside
+`SHA256SUMS` and `evidence/`.
+
+PR CI rehearses both platforms with no secrets.
+`desktop/scripts/rehearse-macos-signing.sh` makes a throwaway certificate with the
+release extensions, imports it with the release import script and runs the
+`self-signed-stable` signer over a copy of the complete debug app, then the launch
+smoke runs on the rehearsal DMG. The Windows fixture is described above.
+A rehearsal may substitute its own identities file through
+`SCARLETT_SIGNING_IDENTITIES`, which is honoured only with
+`SCARLETT_SIGNING_REHEARSAL=1`. Everything signed that way records
+`"rehearsal": true`, which the release assembler rejects.
+
+When an Apple Developer ID and a commercial Windows certificate arrive, run the
+`developer-id` and `authenticode` schemes, which are kept and tested. The Mac
+designated requirement then changes, so users grant Full Disk Access once more.
