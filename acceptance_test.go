@@ -3,8 +3,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/teslashibe/scarlett-node/internal/attempts"
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
 )
@@ -38,7 +41,7 @@ func TestCommunityAcceptanceBeforeProviderAndLostAcknowledgementRecovery(t *test
 			marker := filepath.Join(dir, "synthetic-provider-calls")
 			prover := filepath.Join(dir, "synthetic-prover")
 			// A trusted local test helper writes proof_sent without contacting a provider.
-			script := "#!/bin/sh\nprintf 'called\\n' >> '" + marker + "'\nprintf '{\"status\":\"proof_sent\"}\\n'\n"
+			script := "#!/bin/sh\nprintf 'called\\n' >> '" + marker + "'\nprintf '{\"status\":\"proof_sent\",\"verifier_sent_bytes\":0,\"verifier_received_bytes\":31,\"verifier_transport_layer\":\"tcp_payload\"}\\n'\n"
 			if err := os.WriteFile(prover, []byte(script), 0700); err != nil {
 				t.Fatal(err)
 			}
@@ -86,6 +89,15 @@ func TestCommunityAcceptanceBeforeProviderAndLostAcknowledgementRecovery(t *test
 					}
 				} else if !strings.HasSuffix(r.URL.Path, "/proven") {
 					t.Error("wrong proof route")
+				} else {
+					body, _ := io.ReadAll(r.Body)
+					want, _ := json.Marshal(coordinator.Proven{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence})
+					pending, err := journal.Pending()
+					if err != nil || len(pending) != 1 || !bytes.Equal(body, want) || !bytes.Equal(pending[0].Body, want) || pending[0].SubmissionSHA256 != attempts.Hash(want) {
+						t.Error("local counters changed node-v1 body or hash", err)
+					} else if traffic := pending[0].ProofTraffic; traffic == nil || !traffic.WorkerFinished || len(traffic.Samples) != 1 || traffic.Samples[0].State != "complete" || *traffic.Samples[0].SentBytes != 0 || *traffic.Samples[0].ReceivedBytes != 31 {
+						t.Error("accepted helper evidence not durable before submit")
+					}
 				}
 				w.WriteHeader(204)
 			}))
@@ -123,6 +135,29 @@ func TestCommunityAcceptanceBeforeProviderAndLostAcknowledgementRecovery(t *test
 			pending, e := journal.Pending()
 			if e != nil || len(pending) != 0 || acceptCalls.Load() != 1 || posts.Load() != 1 {
 				t.Fatal("duplicate/uncertain execution was replayed", e)
+			}
+			entries, e := os.ReadDir(filepath.Join(dir, "attempts"))
+			if e != nil {
+				t.Fatal(e)
+			}
+			for _, entry := range entries {
+				if !strings.HasSuffix(entry.Name(), ".json") {
+					continue
+				}
+				raw, e := os.ReadFile(filepath.Join(dir, "attempts", entry.Name()))
+				if e != nil {
+					t.Fatal(e)
+				}
+				var record attempts.Record
+				if json.Unmarshal(raw, &record) != nil || record.State != "terminal" {
+					t.Fatal("terminal metadata missing")
+				}
+				if lost && record.ProofTraffic != nil {
+					t.Fatal("unacknowledged offer invented traffic")
+				}
+				if !lost && (record.ProofTraffic == nil || len(record.ProofTraffic.Samples) != 1 || len(record.Body) != 0) {
+					t.Fatal("duplicate/recovery lost terminal evidence")
+				}
 			}
 		})
 	}

@@ -64,9 +64,16 @@ func (t XTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	var stdout, stderr limitedBuffer
 	stdout.max, stderr.max = 4<<20, 4096
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	observe, err := beginProofObservation(req.Context())
+	if err != nil {
+		return nil, errors.New("proof traffic journal unavailable")
+	}
+	helperOK := false
+	defer func() { observe(stdout.Bytes(), helperOK) }()
 	if err := process.Run(cmd); err != nil {
 		return nil, fmt.Errorf("prover: %v: %s", err, strings.TrimSpace(stderr.String()))
 	}
+	helperOK = true
 	var summary struct {
 		Status   string `json:"status"`
 		Response string `json:"response"`

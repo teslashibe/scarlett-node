@@ -20,6 +20,11 @@ func TestMain(m *testing.M) {
 	if mode == "" {
 		os.Exit(m.Run())
 	}
+	if marker := os.Getenv("SCARLETT_FAKE_PROVER_MARKER"); marker != "" {
+		if err := os.WriteFile(marker, []byte("synthetic helper invoked"), 0600); err != nil {
+			os.Exit(1)
+		}
+	}
 	if strings.HasPrefix(mode, "x") {
 		fakeXProver(mode)
 	}
@@ -36,6 +41,8 @@ func TestMain(m *testing.M) {
 	switch mode {
 	case "ok":
 		fmt.Println(`{"status":"proof_sent","codex_ms":1,"sent_bytes":1,"received_bytes":1}`)
+	case "traffic":
+		fmt.Println(`{"status":"proof_sent","verifier_sent_bytes":0,"verifier_received_bytes":23,"verifier_transport_layer":"tcp_payload"}`)
 	case "auth":
 		fmt.Fprintln(os.Stderr, "Error: Codex provider error: unauthenticated")
 		os.Exit(1)

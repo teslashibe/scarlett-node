@@ -35,7 +35,13 @@ func fakeXProver(mode string) {
 	fmt.Fprintf(zw, `{"echo":%q}`, strings.SplitN(req, "\r\n", 2)[0])
 	zw.Close()
 	resp := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n0\r\n\r\n", gz.Len(), gz.String())
-	out, _ := json.Marshal(map[string]any{"status": "proof_sent", "response": base64.StdEncoding.EncodeToString([]byte(resp))})
+	summary := map[string]any{"status": "proof_sent", "response": base64.StdEncoding.EncodeToString([]byte(resp))}
+	if mode == "xtraffic" {
+		summary["verifier_sent_bytes"] = 41
+		summary["verifier_received_bytes"] = 71
+		summary["verifier_transport_layer"] = "tcp_payload"
+	}
+	out, _ := json.Marshal(summary)
 	fmt.Println(string(out))
 	os.Exit(0)
 }

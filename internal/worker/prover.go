@@ -55,6 +55,12 @@ func (p Prover) Run(ctx context.Context, l coordinator.Lease) (code, detail stri
 	var stdout, stderr limitedBuffer
 	stdout.max, stderr.max = 4096, 4096
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	observe, err := beginProofObservation(ctx)
+	if err != nil {
+		return "prover_error", "proof traffic journal unavailable"
+	}
+	helperOK := false
+	defer func() { observe(stdout.Bytes(), helperOK) }()
 	if err := process.Run(cmd); err != nil {
 		if ctx.Err() != nil {
 			return "expired", "prover timed out"
@@ -68,6 +74,7 @@ func (p Prover) Run(ctx context.Context, l coordinator.Lease) (code, detail stri
 		}
 		return "prover_error", diagnostic
 	}
+	helperOK = true
 	var summary struct {
 		Status string `json:"status"`
 	}

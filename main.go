@@ -392,6 +392,21 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 			return "", err
 		}
 	}
+	provenExecutor := c.Executor == config.ExecutorCodexTLSN || c.Executor == config.ExecutorServices
+	if l.AcceptanceRequired && provenExecutor {
+		if limit := worker.ProofSampleLimit(c, l); limit > 0 {
+			ctx = worker.WithProofObserver(ctx, func() (func(attempts.ProofSample) error, error) {
+				ordinal, err := journal.BeginProof(record, limit)
+				if err != nil {
+					return nil, err
+				}
+				return func(sample attempts.ProofSample) error {
+					sample.Ordinal = ordinal
+					return journal.CompleteProof(record, sample)
+				}, nil
+			})
+		}
+	}
 	var body any
 	code := ""
 	if c.Executor == config.ExecutorCodexTLSN || c.Executor == config.ExecutorServices {
@@ -425,6 +440,11 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	}
 	// Persist the exact report before touching the coordinator. Recovery may
 	// retry only after the authenticated replay-safe contract is confirmed.
+	if l.AcceptanceRequired && provenExecutor {
+		if err := journal.FinishProofTraffic(record); err != nil {
+			return code, err
+		}
+	}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return code, err
