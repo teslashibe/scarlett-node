@@ -958,7 +958,13 @@ foreach ($file in @($executable, (Join-Path $install 'scarlett-node.exe'),
 python desktop/scripts/check-complete-bundle.py $install $install
 if ($LASTEXITCODE -ne 0) { throw 'Installed component integrity or API payload validation failed' }
 
-$script:pythonExe = (Get-Command python -CommandType Application).Source
+# Keep one absolute interpreter for installation validation after PATH cleanup.
+# Application discovery can return several paths; the call operator needs one.
+$script:pythonExe = Get-Command python -CommandType Application | Select-Object -First 1 -ExpandProperty Path
+if (-not [System.IO.Path]::IsPathRooted($script:pythonExe) -or
+    -not (Test-Path -LiteralPath $script:pythonExe -PathType Leaf)) {
+    throw 'Installation validation requires one existing absolute Python executable'
+}
 $previousPath = $env:PATH
 $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
 $application = $null
