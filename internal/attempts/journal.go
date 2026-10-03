@@ -53,16 +53,18 @@ type Capacity struct {
 }
 
 type Record struct {
-	JobID            string    `json:"job_id"`
-	Attempt          string    `json:"attempt"`
-	Fence            string    `json:"fence"`
-	Fingerprint      string    `json:"fingerprint"`
-	Deadline         time.Time `json:"deadline"`
-	State            string    `json:"state"` // started, ready, terminal
-	Kind             string    `json:"kind,omitempty"`
-	Body             []byte    `json:"body,omitempty"` // base64 on disk preserves exact report bytes
-	SubmissionSHA256 string    `json:"submission_sha256,omitempty"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	ProviderAccountID string    `json:"provider_account_id,omitempty"`
+	ProviderService   string    `json:"provider_service,omitempty"`
+	JobID             string    `json:"job_id"`
+	Attempt           string    `json:"attempt"`
+	Fence             string    `json:"fence"`
+	Fingerprint       string    `json:"fingerprint"`
+	Deadline          time.Time `json:"deadline"`
+	State             string    `json:"state"` // started, ready, terminal
+	Kind              string    `json:"kind,omitempty"`
+	Body              []byte    `json:"body,omitempty"` // base64 on disk preserves exact report bytes
+	SubmissionSHA256  string    `json:"submission_sha256,omitempty"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 type Journal struct {
@@ -152,6 +154,9 @@ func validHash(s string) bool {
 	return e == nil && len(b) == 32 && hex.EncodeToString(b) == s
 }
 func valid(r Record) bool {
+	if r.ProviderAccountID != "" && (!validField(r.ProviderAccountID) || (r.ProviderService != "codex" && r.ProviderService != "x_read")) || r.ProviderAccountID == "" && r.ProviderService != "" {
+		return false
+	}
 	if !validField(r.JobID) || !validField(r.Attempt) || !validField(r.Fence) || !validHash(r.Fingerprint) || r.Deadline.IsZero() || r.UpdatedAt.IsZero() {
 		return false
 	}
@@ -332,7 +337,7 @@ func (j *Journal) Begin(r Record) error {
 	}
 	old, err := j.read(filepath.Join(j.dir, key(r)+".json"))
 	if err == nil {
-		if old.Fingerprint != r.Fingerprint || !old.Deadline.Equal(r.Deadline) {
+		if old.Fingerprint != r.Fingerprint || !old.Deadline.Equal(r.Deadline) || old.ProviderAccountID != r.ProviderAccountID || old.ProviderService != r.ProviderService {
 			return ErrConflict
 		}
 		return ErrExists
@@ -360,7 +365,7 @@ func (j *Journal) Ready(r Record, kind string, body []byte) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
-	if old.Fingerprint != r.Fingerprint {
+	if old.Fingerprint != r.Fingerprint || old.ProviderAccountID != r.ProviderAccountID || old.ProviderService != r.ProviderService {
 		return Record{}, ErrConflict
 	}
 	if old.State != "started" {
@@ -388,7 +393,7 @@ func (j *Journal) Terminal(r Record) error {
 	if err != nil {
 		return err
 	}
-	if old.Fingerprint != r.Fingerprint {
+	if old.Fingerprint != r.Fingerprint || old.ProviderAccountID != r.ProviderAccountID || old.ProviderService != r.ProviderService {
 		return ErrConflict
 	}
 	old.State = "terminal"

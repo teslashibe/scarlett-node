@@ -18,6 +18,7 @@ import (
 // Local observations contain no credentials, prompts, outputs or proof tokens.
 // A fresh observation is not independent provider or coordinator evidence.
 type runtimeStatus struct {
+	Accounts           []accountStatus             `json:"accounts,omitempty"`
 	JournalCapacity    *attempts.Capacity          `json:"journal_capacity,omitempty"`
 	Version            string                      `json:"version"`
 	State              string                      `json:"state"`
@@ -68,6 +69,9 @@ func localCommand(command string, output io.Writer) error {
 		decoder.DisallowUnknownFields()
 		if decoder.Decode(&status) != nil || decoder.Decode(new(any)) != io.EOF || status.Version != coordinator.Version || len(status.Services) > 2 || status.InFlight < 0 || status.InFlight > 64 || status.UnresolvedAttempts < 0 || status.UnresolvedAttempts > 1000000 || !validIdentityField(status.NodeID, 128) || (status.State != "running" && status.State != "draining" && status.State != "stopped") {
 			return errors.New("invalid local status")
+		}
+		if !validAccountStatuses(status.Accounts) {
+			return errors.New("invalid local account status")
 		}
 		if c := status.JournalCapacity; c != nil && (c.Limits.Validate() != nil || c.Records < 0 || c.Records > c.Limits.MaxRecords || c.Bytes < 0 || c.Bytes > c.Limits.MaxTotalBytes || c.ReservedBytes < c.Bytes || c.AvailableRecords < 0 || c.AvailableRecords > c.Limits.MaxRecords-c.Records) {
 			return errors.New("invalid journal capacity status")

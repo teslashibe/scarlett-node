@@ -26,6 +26,11 @@ func TestActualServicesCLIHeartbeatOnly(t *testing.T) {
 	if binary == "" {
 		t.Skip("set SCARLETT_TEST_NODE_BINARY to an explicitly built node")
 	}
+	for _, empty := range []bool{false, true} {
+		t.Run(map[bool]string{false: "legacy-credentials", true: "all-accounts-blocked"}[empty], func(t *testing.T) { actualServicesCLIHeartbeat(t, binary, empty) })
+	}
+}
+func actualServicesCLIHeartbeat(t *testing.T, binary string, empty bool) {
 	seen := make(chan coordinator.Heartbeat, 1)
 	credential := strings.Repeat("ab", 32)
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -54,6 +59,10 @@ func TestActualServicesCLIHeartbeatOnly(t *testing.T) {
 	ca := filepath.Join(dir, "ca.pem")
 	os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600)
 	state := filepath.Join(dir, "state")
+	if empty {
+		os.Mkdir(state, 0700)
+		os.WriteFile(filepath.Join(state, "accounts.json"), []byte(`{"version":1,"accounts":[]}`), 0600)
+	}
 	helper := filepath.Join(dir, "synthetic-prover")
 	if e := os.WriteFile(helper, []byte("#!/bin/sh\nexit 1\n"), 0700); e != nil {
 		t.Fatal(e)
@@ -82,7 +91,11 @@ func TestActualServicesCLIHeartbeatOnly(t *testing.T) {
 	})
 	select {
 	case h := <-seen:
-		if h.Capacity != 2 || h.State != "available" || len(h.Services) != 2 || h.Services[0].State != "configured" || h.Services[1].State != "configured" {
+		if empty {
+			if h.Capacity != 0 || h.State != "exhausted" || len(h.Services) != 2 || h.Services[0].Capacity != 0 || h.Services[1].Capacity != 0 || h.Services[0].State != "auth_required" || h.Services[1].State != "auth_required" {
+				t.Fatal("blocked account pools inflated capacity")
+			}
+		} else if h.Capacity != 2 || h.State != "available" || len(h.Services) != 2 || h.Services[0].State != "configured" || h.Services[1].State != "configured" {
 			t.Fatal("CLI invented readiness or mixed capacities")
 		}
 	case <-time.After(10 * time.Second):

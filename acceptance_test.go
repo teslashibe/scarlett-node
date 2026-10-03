@@ -40,6 +40,7 @@ func TestCommunityAcceptanceBeforeProviderAndLostAcknowledgementRecovery(t *test
 			if err := os.WriteFile(prover, []byte(script), 0700); err != nil {
 				t.Fatal(err)
 			}
+			journal := testJournal(t, filepath.Join(dir, "attempts"))
 			var accepted atomic.Bool
 			var posts atomic.Int32
 			var acceptCalls atomic.Int32
@@ -48,6 +49,10 @@ func TestCommunityAcceptanceBeforeProviderAndLostAcknowledgementRecovery(t *test
 					t.Error("missing credential")
 				}
 				if strings.HasSuffix(r.URL.Path, "/accept") {
+					pending, e := journal.Pending()
+					if e != nil || len(pending) != 1 || pending[0].ProviderAccountID != "selected-local-account" || pending[0].ProviderService != "codex" {
+						t.Error("account was not pinned before acceptance")
+					}
 					acceptCalls.Add(1)
 					accepted.Store(true)
 					if lost {
@@ -85,8 +90,7 @@ func TestCommunityAcceptanceBeforeProviderAndLostAcknowledgementRecovery(t *test
 			defer server.Close()
 			client := coordinator.New(server.URL, "synthetic-credential")
 			client.HTTP = server.Client()
-			journal := testJournal(t, filepath.Join(dir, "attempts"))
-			cfg := config.Config{Executor: config.ExecutorServices, Services: []string{"codex"}, Profile: l.Profile, Verifier: "locally-configured.invalid:7047", Prover: prover, MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: time.Second}
+			cfg := config.Config{LocalAccountID: "selected-local-account", Executor: config.ExecutorServices, Services: []string{"codex"}, Profile: l.Profile, Verifier: "locally-configured.invalid:7047", Prover: prover, MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: 3 * time.Second}
 			code, err := submitLease(context.Background(), client, cfg, l, nil, journal)
 			if lost {
 				if err == nil || code != "" {
@@ -110,6 +114,7 @@ func TestCommunityAcceptanceBeforeProviderAndLostAcknowledgementRecovery(t *test
 			} else if e != nil || string(raw) != "called\n" {
 				t.Fatal("synthetic helper was not called once", e)
 			}
+			cfg.LocalAccountID = "different-local-account"
 			if _, err = submitLease(context.Background(), client, cfg, l, nil, journal); err == nil {
 				t.Fatal("duplicate accepted lease executed")
 			}
