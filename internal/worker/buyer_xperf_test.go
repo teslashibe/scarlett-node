@@ -125,6 +125,9 @@ func runBuyerXPerf(args buyerXPerfArgs, pool *xPerfClientPool) error {
 		worker.clientFactory = pool.factory(local.Profile)
 	}
 	if failure := worker.Run(ctx, l); failure != "" {
+		// Persist only bounded diagnostics before the parent cleans temporary
+		// credential/lease files. The failed attempt is never replayed.
+		_ = writeBuyerXPerfFailure(dir, failure, started, bootstrap, transport)
 		return errors.New("bound X worker failed; uncertain provider work was not retried")
 	}
 	if len(transport.observed) != 1 {
@@ -165,6 +168,7 @@ type buyerXPerfTransport struct {
 	observed                          []xperfObserved
 	started                           time.Time
 	proofStarted                      time.Duration
+	helperFailure                     string
 }
 
 func (t *buyerXPerfTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -184,11 +188,13 @@ func (t *buyerXPerfTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	}
 	t.observed = append(t.observed, o) // A failed call also spends the experiment attempt.
 	if err != nil {
+		t.helperFailure = "native_execution_failed"
 		return nil, err
 	}
 	o, body, err := xperfDecodeResponse(o, req, o.summary.Response)
 	t.observed[0] = o
 	if err != nil {
+		t.helperFailure = "native_response_invalid"
 		return nil, err
 	}
 	headers := make(http.Header)
@@ -198,6 +204,43 @@ func (t *buyerXPerfTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		}
 	}
 	return &http.Response{StatusCode: 200, Header: headers, Body: io.NopCloser(bytes.NewReader(body)), Request: req}, nil
+}
+
+func writeBuyerXPerfFailure(dir, code string, started time.Time, bootstrap *buyerXPerfBootstrap, transport *buyerXPerfTransport) error {
+	switch code {
+	case "expired", "auth_required", "x_rate_limited", "invalid_lease", "x_incomplete", "x_request_failed":
+	default:
+		code = "worker_failed"
+	}
+	report := map[string]any{"schema": 1, "status": "failed", "failure": code, "service": "x_read", "mode": "mpc", "worker_ms": time.Since(started).Milliseconds(), "proof_invocations": len(transport.observed), "helper_failure": transport.helperFailure, "provider_work_not_retried": true, "bootstrap": bootstrap.report(transport.proofStarted)}
+	report["failure_phase"] = "before_proof_invocation"
+	if len(transport.observed) == 1 {
+		o := transport.observed[0]
+		report["helper_ms"], report["response_ready_ms"], report["provider_http_status"] = o.helperMS, o.provisionalMS, o.httpStatus
+		report["failure_phase"] = "before_response_ready"
+		if o.provisionalMS != nil {
+			report["failure_phase"] = "after_response_ready"
+		}
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "node-failure.json"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return json.NewEncoder(f).Encode(report)
+}
+
+func TestBuyerXPerfFailureReportPrivacy(t *testing.T) {
+	dir := t.TempDir()
+	started := time.Now()
+	transport := &buyerXPerfTransport{lease: coordinator.Lease{JobID: "PRIVATE_JOB", VerifierToken: "PRIVATE_TOKEN"}, helperFailure: "native_execution_failed", observed: []xperfObserved{{helperMS: 90_000}}}
+	if err := writeBuyerXPerfFailure(dir, "PRIVATE_ERROR", started, &buyerXPerfBootstrap{started: started}, transport); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "node-failure.json"))
+	if err != nil || strings.Contains(string(raw), "PRIVATE") || !bytes.Contains(raw, []byte(`"failure":"worker_failed"`)) || !bytes.Contains(raw, []byte(`"helper_ms":90000`)) {
+		t.Fatal("failure report leaked private data or lost bounded diagnostics")
+	}
 }
 
 type buyerXPerfProvisional struct {
