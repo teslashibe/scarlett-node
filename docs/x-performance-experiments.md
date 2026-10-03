@@ -62,13 +62,34 @@ Build the public node bridge independently of the private application:
 go test -c -tags xperf -o /absolute/private/node-buyer-xperf.test ./internal/worker
 ```
 
-The application's `networkperf` tests supply a newly funded synthetic `node-v1` acceptance through a private `0600` file, then invoke `TestBuyerBoundXPerformance` with `SCARLETT_BUYER_XPERF=1`, `SCARLETT_BUYER_X_LEASE_FILE`, `SCARLETT_BUYER_X_OUTPUT` and the locally configured helper, verifier, CA and X session. The bridge validates the acceptance and runs the existing X worker with minimal headers, a 32 KiB receive ceiling and three sent/online receive records. It keeps the exact accepted request, uses MPC and does not register a replacement job. The application independently reconciles the verifier receipt and tests its REST/MCP result and prepaid settlement. All users and money are synthetic in a fresh disposable database.
+The application's `networkperf` tests supply a newly funded synthetic `node-v1` acceptance through a private `0600` file, then invoke `TestBuyerBoundXPerformance` with `SCARLETT_BUYER_XPERF=1`, `SCARLETT_BUYER_X_LEASE_FILE`, `SCARLETT_BUYER_X_OUTPUT` and the locally configured helper, verifier, CA and X session. The bridge validates the acceptance and runs the existing X worker with minimal headers and three sent/online receive records. `SCARLETT_BUYER_X_MAX_RECV` accepts 32768 (the experimental default), 65536 or 262144 bytes. A bound that worked for one response does not establish safety for arbitrary jobs. The bridge keeps the exact accepted request, uses MPC and does not register a replacement job. The application independently reconciles the verifier receipt and tests its REST/MCP result and prepaid settlement. All users and money are synthetic in a fresh disposable database.
 
 The bridge also measures the worker's four initialization reads using fixed phase labels, timings, body sizes and numeric quota headers. It preserves the original headers and bodies. The interval before proof execution is split into HTTP/body time and other time, which includes quota pacing and client processing. It does not identify every non-HTTP millisecond as pacing. The standalone harness initializes a client before its measured jobs, so its helper/sample timings cannot be compared directly with a fresh full-worker run as a client-reuse benchmark.
 
 For the provisional experiment, the application provides a loopback `SCARLETT_BUYER_PROVISIONAL_API` ending in `/experimental/provisional` and a private `SCARLETT_BUYER_PROVISIONAL_KEY_FILE`. The bridge opts into the helper's `provisional_response` field and reads its private stdout pipe. A single decoded response body arrives in a `response_provisional` event marked `state: unverified`, `verified: false` and `settled: false`. HTTP headers are excluded. The normal helper output remains a single final summary when this option is omitted; the option is refused for batched reads.
 
 The application experiment checks the job, attempt, fence, request hash, deadline and reserved balance before storing a preview. Its authenticated buyer HTTP endpoint must deliver that preview while the actual verifier receipt remains incomplete. Final REST/MCP results remain unavailable until reconciliation and settlement. The preview body must match the eventual independent receipt, and the preview endpoint withdraws it when the job leaves its leased state. These endpoints exist only in tagged local tests and do not enable production provisional delivery. The bridge never retries uncertain provider work. Reports contain fixed labels and numeric timing, byte and charge observations; provider bodies and raw diagnostics stay private.
+
+The continuous bridge, `TestBuyerContinuousXPerformance`, accepts bounded JSON commands through private parent pipes. It can retain a bounded account-client cache across jobs. The cache contains account metadata and operation quotas, while each invocation rereads validated credential files and uses the current accepted lease's context-owned transport. Cache rotation, expiry, cancelled construction and capacity are checked separately. Proof sessions and cryptographic material are fresh for every job. This tagged one-hour cache does not establish production readiness refresh, restart quota persistence or prepared-session assignment.
+
+The buyer bridge accepts one or two planned reads. A two-page job uses a fresh proof per page, preserves cursor binding and counts both exchanges before the application settles usage. A third provider exchange is rejected. The report sums helper phases, CPU and traffic, records the largest child RSS and marks whether resource observations are complete. Its quota fields describe the final response only; missing headers remain unknown. A continuous campaign stops rather than estimating a remaining count. Waiting until the last proven reset before a new campaign is a separate recorded admission decision.
+
+Native X execution supervises its TLS backend while writing and reading the framed response. A backend failure terminates a stalled reader; successful backend completion can still drain a buffered response. Cancellation, timeout or error aborts the owned background task. Retained failure files use fixed stage/reason labels and numeric measurements. They exclude provider bodies and private error strings.
+
+### Testing a public x-go candidate
+
+The tracked node dependency remains unchanged. To compare a separately pinned x-go checkout, create a private alternate module file and build the bridge with it:
+
+```sh
+cp go.mod /absolute/private/xperf.mod
+cp go.sum /absolute/private/xperf.sum
+go mod edit -modfile=/absolute/private/xperf.mod \
+  -replace=github.com/teslashibe/x-go=/absolute/checkout/x-go
+go test -mod=mod -modfile=/absolute/private/xperf.mod -c -tags xperf \
+  -o /absolute/private/node-buyer-xperf.test ./internal/worker
+```
+
+Pin the x-go revision and alternate module files with the source/helper/test-binary hashes. Record that the override is experimental. The application invokes the public binary and does not import a private application package into this node. Run only one live campaign per account at a time, retain failed observations, and do not restart a still-running process after an observation timeout.
 
 ## Two independent reads in one connection
 
