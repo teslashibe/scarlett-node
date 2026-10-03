@@ -429,6 +429,17 @@ function Set-Text([string]$Name, [string]$Value) {
         return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
     } 10 'Synthetic input did not acquire keyboard focus'
     [ScarlettAcceptanceWindow]::SelectAllAndClear()
+    # Native keyboard events can still be queued when SendInput returns.
+    # Observe the ordinary field's empty value before sending the next text,
+    # as the per-window keyboard probe already does. Never read secret fields.
+    if (-not $control.Current.IsPassword) {
+        Wait-Check {
+            $current = Find-Input $Name
+            $pattern = $null
+            return $null -ne $current -and $current.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern) -and
+                $pattern.Current.Value -ceq ''
+        } 10 'Synthetic input did not clear before typing'
+    }
     [System.Windows.Forms.SendKeys]::SendWait($Value)
     # Masked cookie fields may refuse value readback. Exact persistence is
     # checked against the synthetic fixture after the Connect action.
