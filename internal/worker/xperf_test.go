@@ -478,6 +478,7 @@ type xperfObserved struct {
 	helperFailure                                       string
 	userCPUSeconds, systemCPUSeconds                    float64
 	peakRSSBytes                                        int64
+	resourceMetrics                                     bool
 	provisionalMS                                       *uint64
 	rateLimit, rateRemaining, rateReset                 *uint64
 	receiptObserved, receiptBound, receiptComplete      bool
@@ -509,15 +510,7 @@ func xperfExecute(ctx context.Context, c xperfConfig, input []byte, diagnostic s
 	started := time.Now()
 	err := cmd.Run()
 	o.helperMS = time.Since(started).Milliseconds()
-	if state := cmd.ProcessState; state != nil {
-		o.userCPUSeconds, o.systemCPUSeconds = state.UserTime().Seconds(), state.SystemTime().Seconds()
-		if ru, ok := state.SysUsage().(*syscall.Rusage); ok {
-			o.peakRSSBytes = ru.Maxrss
-			if runtime.GOOS != "darwin" {
-				o.peakRSSBytes *= 1024
-			}
-		}
-	}
+	xperfResourceUsage(&o, cmd.ProcessState)
 	if len(stderr.Bytes()) > 0 {
 		f, e := os.OpenFile(diagnostic, os.O_WRONLY|os.O_CREATE|os.O_EXCL|unix.O_NOFOLLOW, 0600)
 		if e != nil {
@@ -541,6 +534,20 @@ func xperfExecute(ctx context.Context, c xperfConfig, input []byte, diagnostic s
 		return o, errors.New("helper_summary_invalid")
 	}
 	return o, nil
+}
+
+func xperfResourceUsage(o *xperfObserved, state *os.ProcessState) {
+	if state == nil {
+		return
+	}
+	o.userCPUSeconds, o.systemCPUSeconds = state.UserTime().Seconds(), state.SystemTime().Seconds()
+	if ru, ok := state.SysUsage().(*syscall.Rusage); ok {
+		o.peakRSSBytes = ru.Maxrss
+		if runtime.GOOS != "darwin" {
+			o.peakRSSBytes *= 1024
+		}
+		o.resourceMetrics = true
+	}
 }
 
 // Native errors stay private. Retain only fixed classifications after temporary

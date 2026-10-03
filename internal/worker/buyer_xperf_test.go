@@ -33,6 +33,7 @@ type buyerXPerfArgs struct {
 	ProvisionalAPI     string `json:"provisional_api,omitempty"`
 	ProvisionalKeyFile string `json:"provisional_key_file,omitempty"`
 	Reuse              bool   `json:"reuse,omitempty"`
+	MaxRecv            int    `json:"max_recv,omitempty"`
 }
 
 func TestBuyerBoundXPerformance(t *testing.T) {
@@ -40,6 +41,13 @@ func TestBuyerBoundXPerformance(t *testing.T) {
 		t.Skip("live buyer X experiment not enabled")
 	}
 	args := buyerXPerfArgs{LeaseFile: os.Getenv("SCARLETT_BUYER_X_LEASE_FILE"), Output: os.Getenv("SCARLETT_BUYER_X_OUTPUT"), ProvisionalAPI: os.Getenv("SCARLETT_BUYER_PROVISIONAL_API"), ProvisionalKeyFile: os.Getenv("SCARLETT_BUYER_PROVISIONAL_KEY_FILE")}
+	if value := os.Getenv("SCARLETT_BUYER_X_MAX_RECV"); value != "" {
+		var err error
+		args.MaxRecv, err = strconv.Atoi(value)
+		if err != nil {
+			t.Fatal("invalid experimental receive allocation")
+		}
+	}
 	if err := runBuyerXPerf(args, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -78,6 +86,13 @@ func TestBuyerContinuousXPerformance(t *testing.T) {
 
 func runBuyerXPerf(args buyerXPerfArgs, pool *xPerfClientPool) error {
 	c := xperfConfig{session: os.Getenv("SCARLETT_X_SESSION"), prover: os.Getenv("SCARLETT_PROVER"), verifier: os.Getenv("SCARLETT_VERIFIER"), ca: os.Getenv("SCARLETT_VERIFIER_CA_FILE"), mode: "mpc", headers: "minimal", maxRecv: 32768, sentRecords: 3, recvRecords: 3, responseReady: true}
+	switch args.MaxRecv {
+	case 0:
+	case 32768, 65536, 262144:
+		c.maxRecv = args.MaxRecv
+	default:
+		return errors.New("unsupported experimental receive allocation")
+	}
 	host, _, err := net.SplitHostPort(c.verifier)
 	if err != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() || !filepath.IsAbs(c.prover) || !filepath.IsAbs(c.ca) {
 		return errors.New("explicit native helper and authenticated loopback verifier required")
@@ -90,14 +105,17 @@ func runBuyerXPerf(args buyerXPerfArgs, pool *xPerfClientPool) error {
 	l := accepted.Lease
 	local := config.Config{Profile: os.Getenv("SCARLETT_PROFILE"), XSession: c.session, Prover: c.prover, Verifier: c.verifier, VerifierCA: c.ca, MaxInputBytes: 32768, InferenceTimeout: 90 * time.Second}
 	plan, deadline, failure := validateXLease(local, l)
-	if failure != "" || l.RequestSHA256 == "" || len(plan.Exchanges) != 1 {
-		return errors.New("buyer experiment requires one exact valid leased read")
+	if failure != "" || l.RequestSHA256 == "" || len(plan.Exchanges) < 1 || len(plan.Exchanges) > 2 {
+		return errors.New("buyer experiment requires one or two exact valid leased reads")
+	}
+	if args.ProvisionalAPI != "" && len(plan.Exchanges) != 1 {
+		return errors.New("provisional experiment requires one independent read")
 	}
 	dir := args.Output
 	if xperfPrivateDirectory(dir) != nil {
 		return errors.New("private experiment directory required")
 	}
-	transport := &buyerXPerfTransport{config: c, lease: l, output: dir}
+	transport := &buyerXPerfTransport{config: c, lease: l, output: dir, maxExchanges: len(plan.Exchanges)}
 	if origin := args.ProvisionalAPI; origin != "" {
 		u, err := url.Parse(origin)
 		if err != nil || u.Scheme != "http" || net.ParseIP(u.Hostname()) == nil || !net.ParseIP(u.Hostname()).IsLoopback() || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "/experimental/provisional" {
@@ -130,23 +148,66 @@ func runBuyerXPerf(args buyerXPerfArgs, pool *xPerfClientPool) error {
 		_ = writeBuyerXPerfFailure(dir, failure, started, bootstrap, transport)
 		return errors.New("bound X worker failed; uncertain provider work was not retried")
 	}
-	if len(transport.observed) != 1 {
-		return errors.New("bound worker did not prove exactly one exchange")
+	if len(transport.observed) != len(plan.Exchanges) {
+		return errors.New("bound worker did not prove the exact exchange count")
 	}
-	o := transport.observed[0]
-	if o.summary.VerifierSent == nil || o.summary.VerifierReceived == nil || o.summary.TransportLayer != "tcp_payload" || o.summary.TransportSaturated {
-		return errors.New("helper traffic telemetry incomplete")
+	report, err := buyerXPerfReport(args.Reuse, started, bootstrap, transport)
+	if err != nil {
+		return err
 	}
 	f, err := os.OpenFile(filepath.Join(dir, "node-report.json"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return errors.New("report must be new")
 	}
 	defer f.Close()
-	if err := json.NewEncoder(f).Encode(map[string]any{"schema": 1, "service": "x_read", "mode": "mpc", "headers": "minimal", "max_recv": 32768, "max_sent_records": 3, "max_recv_records_online": 3, "proven_exchanges": 1, "worker_ms": time.Since(started).Milliseconds(), "helper_ms": o.helperMS, "response_ready_ms": o.provisionalMS, "provisional_callback": transport.provisionalOrigin != "", "verifier_tcp_payload_bytes": *o.summary.VerifierSent + *o.summary.VerifierReceived, "final_proof_sent": true, "provider_work_not_retried": true, "bootstrap": bootstrap.report(transport.proofStarted), "client_reuse_enabled": args.Reuse, "quota_limit": o.rateLimit, "quota_remaining": o.rateRemaining, "quota_reset": o.rateReset}); err != nil {
+	if err := json.NewEncoder(f).Encode(report); err != nil {
 		return errors.New("report write failed")
 	}
 
 	return nil
+}
+
+func buyerXPerfReport(reuse bool, started time.Time, bootstrap *buyerXPerfBootstrap, transport *buyerXPerfTransport) (map[string]any, error) {
+	if len(transport.observed) == 0 {
+		return nil, errors.New("no helper observations")
+	}
+	var helperMS, peakRSS int64
+	var sent, received, transcriptSent, transcriptReceived uint64
+	var userCPU, systemCPU float64
+	resourcesComplete := true
+	timings := map[string]uint64{}
+	for _, o := range transport.observed {
+		s := o.summary
+		if s.VerifierSent == nil || s.VerifierReceived == nil || s.TransportLayer != "tcp_payload" || s.TransportSaturated {
+			return nil, errors.New("helper traffic telemetry incomplete")
+		}
+		helperMS += o.helperMS
+		resourcesComplete = resourcesComplete && o.resourceMetrics
+		peakRSS = max(peakRSS, o.peakRSSBytes)
+		userCPU += o.userCPUSeconds
+		systemCPU += o.systemCPUSeconds
+		sent += *s.VerifierSent
+		received += *s.VerifierReceived
+		transcriptSent += s.SentBytes
+		transcriptReceived += s.ReceivedBytes
+		for _, phase := range []string{"control_connect", "commit", "request_write", "response_read", "tls_finish", "prove", "finalize", "total"} {
+			timings[phase] += s.Timings[phase]
+		}
+	}
+	last := transport.observed[len(transport.observed)-1]
+	return map[string]any{
+		"schema": 1, "service": "x_read", "mode": "mpc", "headers": "minimal",
+		"max_recv": transport.config.maxRecv, "max_sent_records": transport.config.sentRecords, "max_recv_records_online": transport.config.recvRecords,
+		"proven_exchanges": len(transport.observed), "proof_connections": len(transport.observed),
+		"worker_ms": time.Since(started).Milliseconds(), "helper_ms": helperMS,
+		"response_ready_ms": transport.observed[0].provisionalMS, "provisional_callback": transport.provisionalOrigin != "",
+		"verifier_tcp_payload_bytes": sent + received, "verifier_sent_tcp_payload_bytes": sent, "verifier_received_tcp_payload_bytes": received,
+		"transcript_sent_bytes": transcriptSent, "transcript_received_bytes": transcriptReceived,
+		"helper_peak_rss_bytes": peakRSS, "helper_user_cpu_seconds": userCPU, "helper_system_cpu_seconds": systemCPU,
+		"helper_resource_metrics_complete": resourcesComplete, "helper_timings_ms": timings,
+		"final_proof_sent": true, "provider_work_not_retried": true, "bootstrap": bootstrap.report(transport.proofStarted),
+		"client_reuse_enabled": reuse, "quota_limit": last.rateLimit, "quota_remaining": last.rateRemaining, "quota_reset": last.rateReset,
+	}, nil
 }
 func decodeBuyerXPerf(raw []byte, out any) error {
 	d := json.NewDecoder(bytes.NewReader(raw))
@@ -169,20 +230,23 @@ type buyerXPerfTransport struct {
 	started                           time.Time
 	proofStarted                      time.Duration
 	helperFailure                     string
+	maxExchanges                      int
 }
 
 func (t *buyerXPerfTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if len(t.observed) != 0 {
+	if len(t.observed) >= t.maxExchanges {
 		return nil, errors.New("experiment provider invocation already consumed")
 	}
-	t.proofStarted = time.Since(t.started)
+	if len(t.observed) == 0 {
+		t.proofStarted = time.Since(t.started)
+	}
 	input, _, err := xperfProverInput(t.config, t.lease.VerifierToken, req)
 	if err != nil {
 		return nil, err
 	}
 	var o xperfObserved
 	if t.provisionalOrigin == "" {
-		o, err = xperfExecute(req.Context(), t.config, input, filepath.Join(t.output, "helper.stderr"))
+		o, err = xperfExecute(req.Context(), t.config, input, filepath.Join(t.output, "helper-"+strconv.Itoa(len(t.observed))+".stderr"))
 	} else {
 		o, err = t.executeProvisional(req.Context(), input)
 	}
@@ -217,8 +281,9 @@ func writeBuyerXPerfFailure(dir, code string, started time.Time, bootstrap *buye
 	}
 	report := map[string]any{"schema": 1, "status": "failed", "failure": code, "service": "x_read", "mode": "mpc", "worker_ms": time.Since(started).Milliseconds(), "proof_invocations": len(transport.observed), "helper_failure": transport.helperFailure, "provider_work_not_retried": true, "bootstrap": bootstrap.report(transport.proofStarted)}
 	report["failure_phase"] = "before_proof_invocation"
-	if len(transport.observed) == 1 {
-		o := transport.observed[0]
+	if len(transport.observed) > 0 {
+		o := transport.observed[len(transport.observed)-1]
+		report["exchange_index"] = len(transport.observed) - 1
 		report["helper_ms"], report["response_ready_ms"], report["provider_http_status"] = o.helperMS, o.provisionalMS, o.httpStatus
 		report["failure_phase"] = "before_response_ready"
 		if o.provisionalMS != nil {
@@ -243,6 +308,30 @@ func TestBuyerXPerfFailureReportPrivacy(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(dir, "node-failure.json"))
 	if err != nil || strings.Contains(string(raw), "PRIVATE") || !bytes.Contains(raw, []byte(`"failure":"worker_failed"`)) || !bytes.Contains(raw, []byte(`"helper_ms":90000`)) {
 		t.Fatal("failure report leaked private data or lost bounded diagnostics")
+	}
+}
+
+func TestBuyerXPerfMultiPageReportConservesTelemetryAndPrivacy(t *testing.T) {
+	started := time.Now()
+	sent, received, remaining := uint64(3), uint64(7), uint64(48)
+	o := xperfObserved{helperMS: 5, peakRSSBytes: 11, userCPUSeconds: 1, summary: xperfSummary{Response: "PRIVATE_BODY", SentBytes: 2, ReceivedBytes: 4, VerifierSent: &sent, VerifierReceived: &received, TransportLayer: "tcp_payload", Timings: map[string]uint64{"commit": 3, "PRIVATE_PHASE": 99}}}
+	transport := &buyerXPerfTransport{config: xperfConfig{maxRecv: 32768, sentRecords: 3, recvRecords: 3}, observed: []xperfObserved{o, o}, started: started, maxExchanges: 2}
+	transport.observed[1].rateRemaining = &remaining
+	report, err := buyerXPerfReport(true, started, &buyerXPerfBootstrap{started: started}, transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(report)
+	if strings.Contains(string(raw), "PRIVATE") || report["proven_exchanges"] != 2 || report["verifier_tcp_payload_bytes"] != uint64(20) || report["helper_ms"] != int64(10) || report["helper_peak_rss_bytes"] != int64(11) || report["quota_remaining"] != &remaining || report["helper_timings_ms"].(map[string]uint64)["commit"] != 6 {
+		t.Fatal("multi-page observations leaked private data or failed conservation")
+	}
+	transport.observed[1].summary.TransportSaturated = true
+	if _, err := buyerXPerfReport(true, started, &buyerXPerfBootstrap{started: started}, transport); err == nil {
+		t.Fatal("incomplete transport telemetry accepted")
+	}
+	request, _ := http.NewRequest(http.MethodGet, "https://x.com/i/api/graphql/synthetic/SearchTimeline", nil)
+	if _, err := transport.RoundTrip(request); err == nil {
+		t.Fatal("third provider invocation was accepted")
 	}
 }
 
@@ -330,6 +419,7 @@ func (t *buyerXPerfTransport) executeProvisional(ctx context.Context, input []by
 	err = command.Wait()
 	finished = true
 	o.helperMS = time.Since(started).Milliseconds()
+	xperfResourceUsage(&o, command.ProcessState)
 	if len(stderr.Bytes()) != 0 {
 		if err := os.WriteFile(filepath.Join(t.output, "helper.stderr"), stderr.Bytes(), 0600); err != nil {
 			return o, errors.New("private helper diagnostic write failed")
