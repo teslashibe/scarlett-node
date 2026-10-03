@@ -127,3 +127,37 @@ The native complete-bundle workflow installs its testing NSIS package into a cle
 Passing this check establishes the tested installer and UI lifecycle. It does not establish signature trust, remote provider login or verified paid network execution; those remain release requirements.
 
 Installed Windows import acceptance uses new synthetic Chrome/Firefox stores below RUNNER_TEMP and redirects only browser roots for the test app. It exercises profile-specific consent and reset, Firefox import, the protected Chrome paste fallback, masked paste, unchanged stores and native private account persistence. It makes no provider requests. Account ID fields have distinct X/Codex labels for assistive technology. This acceptance is a release gate; test configuration is not a browser import mode for operators.
+
+## Windows release signature acceptance
+
+Verify the final signed setup and its installed complete payload on a clean native
+Windows machine before selecting a stable download. Supply the reviewed publisher
+certificate's public thumbprint; private keys and certificate passwords are not
+inputs to this read-only checker. Do not install a test certificate or add trust
+roots to make a release pass.
+
+```powershell
+& desktop/scripts/check-windows-signatures.ps1 `
+  -Installer 'C:\release\Scarlett-Node-setup.exe' `
+  -InstalledDirectory 'C:\acceptance\Scarlett Node' `
+  -ExpectedPublisherThumbprint $ReviewedCertificateThumbprint `
+  -EvidenceFile 'C:\evidence\windows-signatures.json'
+```
+
+The setup, desktop, node, proof helper and local model API must each have a
+Windows-trusted embedded Authenticode signature matching that certificate and a
+trusted timestamp. Unsigned, altered, untrusted, catalog-only, self-signed,
+untimestamped or unexpected-publisher files fail. Read hashes before and after
+signature validation to reject changes during the check. Local file paths cannot
+use alternate streams or traverse reparse points. A new outcome/digest file is
+written only after all signature checks; existing evidence is never overwritten.
+Native tool failures disclose no raw certificate details or local paths.
+
+Run the complete installed payload/hash/protected-API checker and installed UI
+acceptance separately. These signature checks do not establish that an arbitrary
+installed directory came from the supplied setup, validate every provider byte,
+or prove login, upgrades, paid jobs or SmartScreen reputation. The native CI gate
+tests signature-record rejection and rejects the actual unsigned Go executable
+without creating signing certificates or modifying trust stores. Genuine signed
+installer acceptance and the Windows signing integration remain release work.
+The checker uses [Windows Authenticode validation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/get-authenticodesignature).
