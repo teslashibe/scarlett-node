@@ -43,8 +43,9 @@ public static class ScarlettAcceptanceWindow {
             if ((GetAsyncKeyState(key) & 0x8000) != 0) return false;
         return true;
     }
+    public static int InputSize() { return Marshal.SizeOf(typeof(Input)); }
     private static void Send(Input[] inputs) {
-        if (Marshal.SizeOf(typeof(Input)) != (IntPtr.Size == 8 ? 40 : 28))
+        if (InputSize() != (IntPtr.Size == 8 ? 40 : 28))
             throw new InvalidOperationException("Native input layout mismatch");
         if (!ModifiersReleased()) throw new InvalidOperationException("CI keyboard modifier was already pressed");
         if (SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Input))) != (uint)inputs.Length)
@@ -52,6 +53,19 @@ public static class ScarlettAcceptanceWindow {
     }
     public static void ControlKey(ushort key) {
         Send(new Input[] { Key(0x11, false), Key(key, false), Key(key, true), Key(0x11, true) });
+    }
+    public static void Text(string text) {
+        if (text.Length == 0 || text.Length > 512) throw new InvalidOperationException("Synthetic text size is unsupported");
+        Input[] inputs = new Input[text.Length * 2];
+        for (int i = 0; i < text.Length; i++) {
+            inputs[i * 2] = Key(0, false);
+            inputs[i * 2].value.keyboard.scan = text[i];
+            inputs[i * 2].value.keyboard.flags = 4;
+            inputs[i * 2 + 1] = Key(0, true);
+            inputs[i * 2 + 1].value.keyboard.scan = text[i];
+            inputs[i * 2 + 1].value.keyboard.flags = 6;
+        }
+        Send(inputs);
     }
     public static void SelectAllAndClear() {
         Send(new Input[] { Key(0x11, false), Key(0x41, false), Key(0x41, true), Key(0x11, true),
@@ -411,27 +425,34 @@ function Check-Preferences {
 }
 
 function Set-Text([string]$Name, [string]$Value) {
+    # Use the native input stream for real input/change events. WebView2 can
+    # advertise ValuePattern while SetValue fails to commit the browser field.
+    # Only disposable fixtures call this helper, never real credentials.
+    if ($Value -notmatch '^[a-z0-9-]+$' -or $Value.Length -gt 512) { throw 'Synthetic input contains unsupported characters' }
     Wait-Check { (Find-Input $Name).Current.IsEnabled } 15 "Text input did not become ready: $Name"
     $control = Find-Input $Name
     if (-not $control -or -not $control.Current.IsEnabled) { throw "Text input unavailable: $Name" }
-    $pattern = $null
-    if (-not $control.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) {
-        # Password fields can refuse ValuePattern. These test-only values have
-        # no SendKeys metacharacters; never pass a real browser credential here.
-        if ($Value -notmatch '^[a-z0-9-]+$') { throw 'Synthetic input contains unsupported characters' }
-        $handle = $application.MainWindowHandle
-        [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
-        [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
-        $control.SetFocus()
+    $handle = $application.MainWindowHandle
+    [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
+    [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
+    $scroll = $null
+    if ($control.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) { $scroll.ScrollIntoView() }
+    $control.SetFocus()
+    Wait-Check {
+        return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+    } 10 'Synthetic input did not acquire keyboard focus'
+    [ScarlettAcceptanceWindow]::SelectAllAndClear()
+    [ScarlettAcceptanceWindow]::Text($Value)
+    # Masked cookie fields may refuse value readback. Exact persistence is
+    # checked against the synthetic fixture after the Connect action.
+    if (-not $control.Current.IsPassword) {
         Wait-Check {
-            return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
-        } 10 'Synthetic input did not acquire keyboard focus'
-        [System.Windows.Forms.SendKeys]::SendWait('^a')
-        [System.Windows.Forms.SendKeys]::SendWait($Value)
-        return
+            $current = Find-Input $Name
+            $pattern = $null
+            return $null -ne $current -and $current.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern) -and
+                ([string]$pattern.Current.Value) -ceq $Value
+        } 10 'Synthetic text value did not commit'
     }
-    $pattern.SetValue($Value)
-    Wait-Check { ([string]$pattern.Current.Value) -ceq $Value } 10 'Synthetic text value did not commit'
 }
 function Select-Browser([int]$Index, [string]$ExpectedBrowser) {
     if ($Index -notin @(1, 2) -or $ExpectedBrowser -notin @('Chrome', 'Firefox')) { throw 'Unexpected synthetic browser selection' }
