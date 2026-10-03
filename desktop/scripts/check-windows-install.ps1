@@ -3,7 +3,9 @@ param(
     [Parameter(Mandatory = $true)][string]$Installer,
     [Parameter(Mandatory = $true)][string]$EvidenceDirectory,
     [switch]$Preferences,
-    [string]$BrowserFixture = ''
+    [string]$BrowserFixture = '',
+    [string]$UpgradeFixture = '',
+    [string]$UpgradeInstaller = ''
 )
 $ErrorActionPreference = 'Stop'
 $script:apiPort = 8088
@@ -438,6 +440,132 @@ function Check-BrowserImport {
     }
 }
 
+function Write-SyntheticPrivateJSON([string]$Path, $Value) {
+    if (Test-Path -LiteralPath $Path) { throw 'Synthetic identity/journal fixture would overwrite existing state' }
+    # Reuse the installed helper's private atomic creator, then replace its
+    # test-only bytes without changing the Windows ACL. Capture its bearer
+    # output privately; it is never logged or used as a provider credential.
+    $privateOutput = & (Join-Path $install 'scarlett-node.exe') desktop bearer $Path | Out-String
+    $privateOutput = $null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not create private installation fixture' }
+    [System.IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Compress), [System.Text.UTF8Encoding]::new($false))
+}
+function Durable-Hashes {
+    $files = @('identity.json', 'accounts.json', 'preferences.json', 'local-api/bearer') | ForEach-Object {
+        Get-Item -LiteralPath (Join-Path $script:importState $_)
+    }
+    $files += @(Get-ChildItem -LiteralPath (Join-Path $script:importState 'accounts') -Recurse -File)
+    $files += @(Get-ChildItem -LiteralPath (Join-Path $script:importState 'attempts') -Filter '*.json' -File)
+    if ($files.Count -gt 256) { throw 'Installation fixture exceeded its file bound' }
+    $hashes = @{}
+    foreach ($file in $files) {
+        if (($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $file.Length -gt 16MB) {
+            throw 'Unexpected private installation fixture file'
+        }
+        $hashes[$file.FullName] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+    }
+    return $hashes
+}
+function Check-InstallationRoundTrip {
+    if (-not $BrowserFixture -or -not $script:importState -or
+        @(([System.IO.File]::ReadAllText((Join-Path $script:importState 'accounts.json')) | ConvertFrom-Json).accounts).Count -ne 2) {
+        throw 'Installation acceptance requires its own two synthetic X accounts'
+    }
+    $temporary = [System.IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
+    foreach ($path in @($UpgradeFixture, $UpgradeInstaller)) {
+        if (-not [System.IO.Path]::GetFullPath($path).StartsWith($temporary, [StringComparison]::OrdinalIgnoreCase) -and
+            -not [System.IO.Path]::GetFullPath($path).StartsWith([System.IO.Path]::GetFullPath($env:GITHUB_WORKSPACE) + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Installation fixtures must remain in the disposable runner'
+        }
+    }
+    $fixture = [System.IO.File]::ReadAllText($UpgradeFixture) | ConvertFrom-Json
+    if (-not $fixture.syntheticOnly -or -not $fixture.sameRuntimeSource -or $fixture.signedInstaller -or
+        $fixture.baselineVersion -notmatch '^\d+\.\d+\.\d+$' -or $fixture.upgradeVersion -notmatch '^\d+\.\d+\.\d+$' -or
+        $fixture.baselineVersion -ceq $fixture.upgradeVersion -or
+        [System.IO.Path]::GetFullPath($fixture.baselineInstaller) -cne [System.IO.Path]::GetFullPath($Installer) -or
+        (Get-FileHash -LiteralPath $Installer -Algorithm SHA256).Hash.ToLowerInvariant() -cne $fixture.baselineSha256) {
+        throw 'Installation round-trip metadata does not match its testing installers'
+    }
+    $browser = [System.IO.File]::ReadAllText($BrowserFixture) | ConvertFrom-Json
+    $roamingBefore, $localBefore, $stateBefore = $env:APPDATA, $env:LOCALAPPDATA, $script:state
+    try {
+        $env:APPDATA, $env:LOCALAPPDATA = $browser.roaming, $browser.local
+        $script:state = $script:importState
+        Write-SyntheticPrivateJSON (Join-Path $script:importState 'identity.json') @{
+            node_id = 'synthetic-installer-node'; supplier_pubkey = 'synthetic-local-wallet'
+            credential = 'synthetic-installation-credential-never-used-remotely'
+        }
+        $journal = Join-Path $script:importState 'attempts'
+        $privateOutput = & (Join-Path $install 'scarlett-node.exe') desktop private-dir $journal | Out-String
+        $privateOutput = $null
+        if ($LASTEXITCODE -ne 0) { throw 'Could not create private journal fixture directory' }
+        $job, $attempt, $fence = 'synthetic-upgrade-job', 'synthetic-upgrade-attempt', 'synthetic-upgrade-fence'
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $digest = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($job + [char]0 + $attempt + [char]0 + $fence)) }
+        finally { $sha.Dispose() }
+        $name = [BitConverter]::ToString($digest).Replace('-', '').ToLowerInvariant() + '.json'
+        Write-SyntheticPrivateJSON (Join-Path $journal $name) @{
+            job_id = $job; attempt = $attempt; fence = $fence; fingerprint = ('a' * 64)
+            deadline = [DateTime]::UtcNow.AddHours(2).ToString('o'); updated_at = [DateTime]::UtcNow.ToString('o')
+            state = 'started'; provider_account_id = 'browser-firefox'; provider_service = 'x_read'
+        }
+        Start-App
+        $version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($executable).ProductVersion
+        if ($version -notin @($fixture.baselineVersion, ($fixture.baselineVersion + '.0'))) { throw 'Baseline executable has the wrong product version' }
+        Wait-Check { $null -eq (Find-Button 'Pair node') } 15 'Baseline app did not recognize its private synthetic identity'
+        Set-Number 'Saved local API port' 18088
+        Click-Button 'Save device preferences'
+        Wait-Check { Saved-Preferences 18088 $false } 15 'Baseline app did not retain its test port'
+        Click-Button 'Start local API'
+        Wait-Check { (Api-Status '/health') -eq 200 } 30 'Baseline private API did not start'
+        Click-Button 'Quit Scarlett'
+        if (-not $application.WaitForExit(135000)) { throw 'Baseline app did not drain before installation' }
+        Wait-Check { (Api-Status '/health') -eq 0 } 30 'Baseline app left API running before installation'
+        $before = Durable-Hashes
+        foreach ($candidate in @(@{ path = $UpgradeInstaller; version = $fixture.upgradeVersion; direction = 'upgrade' },
+                                  @{ path = $Installer; version = $fixture.baselineVersion; direction = 'downgrade' })) {
+            if ((Api-Status '/health') -ne 0) { throw 'Installation began while local API was running' }
+            $setup = Start-Process -FilePath $candidate.path -ArgumentList '/S', "/D=$install" -PassThru
+            if (-not $setup.WaitForExit(120000)) { $setup.Kill(); throw 'Installation round trip timed out' }
+            if ($setup.ExitCode -ne 0) { throw 'Installation round trip failed' }
+            $version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($executable).ProductVersion
+            if ($version -notin @($candidate.version, ($candidate.version + '.0'))) { throw 'Installed executable has the wrong product version' }
+            & $script:pythonExe desktop/scripts/check-complete-bundle.py $install $install
+            if ($LASTEXITCODE -ne 0) { throw 'Replaced installation failed complete component validation' }
+            $after = Durable-Hashes
+            if ($after.Count -ne $before.Count) { throw 'Installation changed private account/identity/journal files' }
+            foreach ($path in $before.Keys) { if ($after[$path] -cne $before[$path]) { throw 'Installation changed private retained bytes' } }
+            Start-App
+            Wait-Check { $null -eq (Find-Button 'Pair node') } 15 'Installed app lost its synthetic node identity'
+            Wait-Check { UI-Contains 'browser-firefox' } 15 'Installed app lost the connected X account'
+            if ((Api-Status '/health') -ne 0 -or -not (Saved-Preferences 18088 $false)) { throw 'Opening replaced app started API or lost saved preferences' }
+            Click-Button 'Start local API'
+            Wait-Check { (Api-Status '/health') -eq 200 } 30 'Replaced app could not start the retained local API'
+            $key = [System.IO.File]::ReadAllText((Join-Path $script:importState 'local-api/bearer'))
+            if ((Api-Status '/v1/models' $key) -ne 200) { throw 'Replaced app refused its retained private API bearer' }
+            $key = $null
+            Click-Button 'Quit Scarlett'
+            if (-not $application.WaitForExit(135000)) { throw 'Replaced app did not drain and quit' }
+            Wait-Check { (Api-Status '/health') -eq 0 } 30 'Replaced app left local API running'
+            $after = Durable-Hashes
+            if ($after.Count -ne $before.Count) { throw 'Replaced app changed durable file inventory' }
+            foreach ($path in $before.Keys) { if ($after[$path] -cne $before[$path]) { throw 'Replaced app changed private durable state' } }
+            Write-Output "Installed round trip: $($candidate.direction) retained private state and protected API"
+        }
+        @{
+            baselineVersion = $fixture.baselineVersion; upgradeVersion = $fixture.upgradeVersion
+            upgrade = 'passed'; downgrade = 'passed'; privateIdentity = 'passed'; XAccounts = 'passed'
+            uncertainJournalBytes = 'passed'; preferences = 'passed'; APIBearer = 'passed'; protectedAPI = 'passed'
+            sameRuntimeSource = $true; signedInstaller = $false; historicalSchemaCompatibility = 'not tested'
+            realProviderJobs = 0
+        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-installation-round-trip.json')
+    } finally {
+        $key = $null
+        $env:APPDATA, $env:LOCALAPPDATA = $roamingBefore, $localBefore
+        $script:state = $stateBefore
+    }
+}
+
 $install = Join-Path $env:RUNNER_TEMP 'Scarlett Installed UI Acceptance'
 $state = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'ai.scarlett.node'
 if ((Test-Path $install) -or (Test-Path $state)) {
@@ -456,6 +584,7 @@ foreach ($file in @($executable, (Join-Path $install 'scarlett-node.exe'),
 python desktop/scripts/check-complete-bundle.py $install $install
 if ($LASTEXITCODE -ne 0) { throw 'Installed component integrity or API payload validation failed' }
 
+$script:pythonExe = (Get-Command python -CommandType Application).Source
 $previousPath = $env:PATH
 $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
 $application = $null
@@ -501,6 +630,10 @@ try {
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-installed-ui.json')
     if ($Preferences) { Check-Preferences }
     if ($BrowserFixture) { Check-BrowserImport }
+    if ($UpgradeFixture -or $UpgradeInstaller) {
+        if (-not $UpgradeFixture -or -not $UpgradeInstaller) { throw 'Both installation fixture and upgrade installer are required' }
+        Check-InstallationRoundTrip
+    }
 } finally {
     $key = $null
     $env:PATH = $previousPath
