@@ -226,6 +226,8 @@ where
 
     let mut handshake = Handshake::default();
     let mut record_sent = false;
+    let mut sealed: Option<Vec<u8>> = None;
+    let mut checked = false;
     let mut response = Vec::new();
     while let Some(event) = inbox.recv().await {
         match event {
@@ -275,6 +277,7 @@ where
                 to_server.write_all(&record).await?;
                 to_server.flush().await?;
                 record_sent = true;
+                sealed = Some(record);
             }
             Event::Frame(wire::PLAIN, payload) => {
                 if !record_sent || response.len() + payload.len() > MAX_RECV {
@@ -282,9 +285,18 @@ where
                 }
                 response.extend_from_slice(&payload);
             }
+            Event::Frame(wire::OPENING, payload) => {
+                let record = sealed.take().context("verifier opened a record that was not sent")?;
+                opened_as(&payload, &record, raw)?;
+                checked = true;
+            }
             Event::Frame(wire::DONE, _) => {
                 if !record_sent {
                     bail!("verifier finished before the request was sent");
+                }
+                // No result is reported for a record the supplier could not check.
+                if !checked {
+                    bail!("{MISUSE}: it did not open the request record");
                 }
                 return Ok(response);
             }
@@ -292,6 +304,29 @@ where
         }
     }
     bail!("relay session ended without a result")
+}
+
+/// Start of the error a supplier reports when the verifier made it send
+/// something other than its own request, or would not show that it had not.
+/// Only the verifier holds the key, so it decides what is sealed; this check
+/// comes after the fact and cannot undo the request, but it is certain.
+pub const MISUSE: &str = "verifier misused this node's X session";
+
+/// Checks, with the key the verifier revealed, that the record this supplier
+/// sent to X was exactly `raw`. A key that authenticates the record cannot
+/// make another plaintext come out of it.
+fn opened_as(opening: &[u8], record: &[u8], raw: &[u8]) -> Result<()> {
+    let (Some(key), Some(iv), Some(seq)) = (opening.get(..16), opening.get(16..28), opening.get(28..36)) else { bail!("{MISUSE}: malformed record opening") };
+    if opening.len() != 36 {
+        bail!("{MISUSE}: malformed record opening");
+    }
+    let key: [u8; 16] = key.try_into().expect("sixteen bytes");
+    let mut keys = record::Keys::new(&key, iv.try_into().expect("twelve bytes"), u64::from_be_bytes(seq.try_into().expect("eight bytes")))?;
+    match keys.open(record) {
+        Ok((record::APPLICATION_DATA, sent)) if sent == raw => Ok(()),
+        Ok(_) => bail!("{MISUSE}: the record it sealed was not this node's request"),
+        Err(_) => bail!("{MISUSE}: its key does not open the request record"),
+    }
 }
 
 struct Abort(Vec<tokio::task::AbortHandle>);
@@ -381,6 +416,45 @@ mod tests {
         assert!(!refuses(&[&hello, &CCS, &hello, &protected(53)]));
         // An alert or anything else unprotected is not part of a client handshake.
         assert!(refuses(&[&hello, &[21, 3, 3, 0, 2, 1, 0]]));
+    }
+
+    #[test]
+    fn a_verifier_that_seals_another_request_is_caught_when_it_opens_the_record() {
+        // The verifier holds the key, so it can seal any plaintext of the same
+        // length around the hidden positions and the supplier will complete a
+        // valid record for it, secrets included. The supplier cannot stop that,
+        // but once the key is shown it sees exactly what was sent.
+        let (key, iv, seq) = (*b"relay-test-key-2", *b"relay-iv-345", 1u64);
+        let raw = b"GET /i/api/graphql/q/Viewer HTTP/1.1\r\nCookie: ct0=SECRETSECRETSECR\r\n\r\n".to_vec();
+        let hidden = [50..66];
+        let secret = raw[50..66].to_vec();
+        let seal = |public: &[u8]| {
+            let (mut node, mut verifier) = crate::relay::ot::pair(128);
+            let (choices, received) = node.take(128).unwrap();
+            let corrections = tag::corrections(&secret, &choices).unwrap();
+            let material = tag::verifier_material(&key, &iv, seq, public, &hidden, &corrections, &verifier.take(128).unwrap()).unwrap();
+            tag::node_record(&material, &hidden, &secret, &received).unwrap()
+        };
+        let opening = [&key[..], &iv[..], &seq.to_be_bytes()[..]].concat();
+        let mut honest = raw.clone();
+        honest[50..66].fill(0);
+        assert!(opened_as(&opening, &seal(&honest), &raw).is_ok());
+
+        // Same length, same hidden positions, another request line.
+        let mut other = honest.clone();
+        other[..35].copy_from_slice(b"GET /i/api/1.1/dm/inbox.json?a=bbbb");
+        let record = seal(&other);
+        // The record is valid and carries the supplier's secret: X would act on it.
+        let mut reader = record::Keys::new(&key, iv, seq).unwrap();
+        let (_, sent) = reader.open(&record).unwrap();
+        assert!(sent.starts_with(b"GET /i/api/1.1/dm/inbox.json") && sent[50..66] == secret[..]);
+        let error = opened_as(&opening, &record, &raw).unwrap_err();
+        assert!(format!("{error:#}").starts_with(MISUSE));
+        // A different key cannot make the honest plaintext come out of that record.
+        let mut wrong = opening.clone();
+        wrong[0] ^= 1;
+        assert!(opened_as(&wrong, &record, &raw).is_err());
+        assert!(opened_as(&opening[..35], &record, &raw).is_err());
     }
 
     #[test]

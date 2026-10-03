@@ -64,6 +64,11 @@ func (p *servicePool) health() []coordinator.ServiceHealth {
 				h.MaxOutputTokens = p.config.MaxOutputTokens
 				h.Models = config.AvailableModelsAt(time.Now())
 			}
+			// Only an opted-in node says so, and a node that has not opted
+			// in sends exactly the heartbeat it sent before the field existed.
+			if kind == "x_read" && p.config.XRelay {
+				h.ProofModes = []string{"mpc", "relay"}
+			}
 		}
 		out = append(out, h)
 	}

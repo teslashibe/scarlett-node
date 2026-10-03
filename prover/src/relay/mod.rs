@@ -10,10 +10,27 @@
 //!
 //! What this keeps from MPC-TLS: the supplier cannot forge or alter a
 //! response, and cannot send any request byte the verifier did not seal
-//! outside the hidden values. What it gives up: the verifier knows the client
-//! key, so a verifier that could also capture the supplier's traffic to X
-//! could read the hidden values. Verifiers are operator-run; the policy name
-//! pins that assumption.
+//! outside the hidden values.
+//!
+//! What it gives up: the supplier has to trust the verifier with its X
+//! session for the length of a relay session. Only the verifier holds the
+//! client key, so the verifier decides what plaintext is sealed. A dishonest
+//! verifier can seal a different request of the same length around the
+//! hidden positions, and the supplier will complete a valid record for it
+//! with its real cookie and CSRF values: one request of the verifier's
+//! choosing, as the supplier's account, per session. It needs no access to
+//! the supplier's traffic for that, and it reads the response. It can also
+//! learn a chosen hidden bit, or a parity of several, from whether X accepts
+//! a record whose correlations it altered. With the supplier's traffic to X
+//! it could read the hidden values outright. Nothing short of proving the
+//! sealing to the supplier prevents the first of these; the supplier only
+//! detects it afterwards, when the verifier opens the record (`node::MISUSE`).
+//!
+//! Hidden bytes are not checked for content, as under MPC-TLS: the verifier
+//! cannot see them, so a supplier can put any bytes there, line breaks
+//! included, within the allowed lengths.
+//!
+//! Verifiers are operator-run; the policy name pins that assumption.
 
 pub mod node;
 pub mod ot;

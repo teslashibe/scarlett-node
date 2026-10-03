@@ -44,6 +44,31 @@ type xPlan struct {
 // verifier, not the node, holds the TLS session keys for the X connection.
 const xRelayPolicy = "x-relay-v1"
 
+// xTransport is the proving transport a validated plan asks for.
+func xTransport(c config.Config, plan xPlan, token string) XTransport {
+	relay, ok := plan.relay(c)
+	return XTransport{Prover: c.Prover, Verifier: c.Verifier, VerifierCA: c.VerifierCA, PlaintextFixture: c.VerifierPlaintextFixture, Token: token, Relay: relay && ok}
+}
+
+// XOfferServable reports whether this node could serve an x_read offer's
+// proof mode, from the payload the offer carries. It lets the node decline
+// before funded acceptance instead of burning the job afterwards. An offer
+// without a payload cannot be judged yet and passes.
+func XOfferServable(c config.Config, payload json.RawMessage) bool {
+	if len(payload) == 0 {
+		return true
+	}
+	var plan struct {
+		ProofMode   string `json:"proof_mode"`
+		ProofPolicy string `json:"proof_policy"`
+	}
+	if json.Unmarshal(payload, &plan) != nil {
+		return false
+	}
+	_, ok := xPlan{ProofMode: plan.ProofMode, ProofPolicy: plan.ProofPolicy}.relay(c)
+	return ok
+}
+
 // relay reports whether the plan asks for a keyed relay proof, and whether
 // its proof mode and policy are a pair this node may serve.
 func (p xPlan) relay(c config.Config) (relay, ok bool) {
@@ -352,8 +377,7 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 	}
 	proof := w.Proof
 	if proof == nil {
-		relay, _ := plan.relay(w.Config)
-		proof = XTransport{Prover: w.Config.Prover, Verifier: w.Config.Verifier, VerifierCA: w.Config.VerifierCA, PlaintextFixture: w.Config.VerifierPlaintextFixture, Token: l.VerifierToken, Relay: relay}
+		proof = xTransport(w.Config, plan, l.VerifierToken)
 	}
 	transport := &xBoundTransport{base: base, proof: proof, bootstrap: true, specs: plan.Exchanges}
 	ids := map[string]string{}

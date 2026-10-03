@@ -25,6 +25,9 @@ pub const TO_SERVER: u8 = 20;
 pub const MATERIAL: u8 = 21;
 pub const PLAIN: u8 = 22;
 pub const DONE: u8 = 23;
+/// The client write key, IV and sequence number of the request record, sent
+/// once the response is complete so the supplier can check what it was made to send.
+pub const OPENING: u8 = 24;
 
 /// Largest tunnel chunk either side forwards in one frame.
 pub const CHUNK: usize = 32 << 10;
@@ -32,7 +35,7 @@ pub const CHUNK: usize = 32 << 10;
 fn limit(kind: u8) -> Option<usize> {
     Some(match kind {
         HELLO | DONE => 1 << 10,
-        CO_SETUP | KOS_CHI => 1 << 8,
+        CO_SETUP | KOS_CHI | OPENING => 1 << 8,
         CO_CHOOSE | CO_PAYLOAD | KOS_CHECK => 32 << 10,
         // The KOS matrix is 16 bytes per transfer, plus its padding rows.
         KOS_EXTEND => 16 * (MAX_HIDDEN_BITS + 1024) + 64,

@@ -240,6 +240,11 @@ where
             break;
         }
     }
+    // The response is recorded and this connection is finished, so the client
+    // key has no further use to us. Handing it over lets the supplier check
+    // that the record it completed was its own request and nothing else.
+    let ((key, iv, seq), _) = keys.as_ref().expect("keys exist once a request was sent");
+    wire::send(&mut writer, wire::OPENING, &[&key[..], &iv[..], &seq.to_be_bytes()[..]].concat()).await?;
     wire::send(&mut writer, wire::DONE, b"{\"status\":\"complete\"}").await?;
     // The supplier may still be forwarding X's close. Dropping the socket
     // with those frames unread can reset it and lose the result on its way

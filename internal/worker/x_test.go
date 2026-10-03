@@ -312,6 +312,40 @@ func TestXRelayLeaseNeedsOperatorOptInAndTheExactPolicy(t *testing.T) {
 	}
 }
 
+// The transport a lease gets and the pre-acceptance check both follow the
+// validated plan and the operator's opt-in, never the plan alone.
+func TestXTransportAndOfferCheckFollowPlanAndOptIn(t *testing.T) {
+	c := config.Config{Prover: "p", Verifier: "v:1", VerifierCA: "/ca"}
+	relay := xPlan{ProofMode: "relay", ProofPolicy: xRelayPolicy}
+	if got := xTransport(c, relay, "t"); got.Relay || got.Prover != "p" || got.Verifier != "v:1" || got.VerifierCA != "/ca" || got.Token != "t" {
+		t.Fatalf("relay plan without opt-in built %+v", got)
+	}
+	c.XRelay = true
+	if !xTransport(c, relay, "t").Relay || xTransport(c, xPlan{}, "t").Relay || xTransport(c, xPlan{ProofMode: "relay", ProofPolicy: "other"}, "t").Relay {
+		t.Fatal("transport relay flag does not follow the plan")
+	}
+	for _, tc := range []struct {
+		payload string
+		optIn   bool
+		ok      bool
+	}{
+		{``, false, true},
+		{`{"type":"x.read"}`, false, true},
+		{`{"proof_mode":"mpc"}`, false, true},
+		{`{"proof_mode":"relay","proof_policy":"x-relay-v1"}`, false, false},
+		{`{"proof_mode":"relay","proof_policy":"x-relay-v1"}`, true, true},
+		{`{"proof_mode":"relay"}`, true, false},
+		{`{"proof_mode":"relay","proof_policy":"x-relay-v2"}`, true, false},
+		{`{"proof_policy":"x-relay-v1"}`, true, false},
+		{`not json`, true, false},
+	} {
+		c.XRelay = tc.optIn
+		if got := XOfferServable(c, json.RawMessage(tc.payload)); got != tc.ok {
+			t.Fatalf("offer %q opt-in %v: servable %v, want %v", tc.payload, tc.optIn, got, tc.ok)
+		}
+	}
+}
+
 func TestTypedXQuotaCarriesOnlyCooldownIntoLocalScheduler(t *testing.T) {
 	observed := time.Duration(0)
 	w := X{Config: config.Config{AccountCooldown: func(wait time.Duration) { observed = wait }}}

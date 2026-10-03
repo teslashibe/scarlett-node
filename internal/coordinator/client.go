@@ -73,6 +73,9 @@ type ServiceHealth struct {
 	MaxInputBytes   int      `json:"max_input_bytes,omitempty"`
 	MaxOutputTokens int      `json:"max_output_tokens,omitempty"`
 	Models          []string `json:"models,omitempty"`
+	// Proof modes this node serves for the kind beyond the default. Absent
+	// means MPC-TLS only, which is what every node before this field serves.
+	ProofModes []string `json:"proof_modes,omitempty"`
 }
 
 // Proven tells the coordinator a proof was sent; it reads the answer from the verifier.

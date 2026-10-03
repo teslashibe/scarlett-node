@@ -374,6 +374,10 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	if _, err := coordinator.JobPath(l.JobID, "result"); err != nil {
 		return "invalid_lease", err
 	}
+	// Decline a proof mode this node does not serve before accepting funds for it.
+	if l.ServiceType == "x_read" && !worker.XOfferServable(c, l.XPayload) {
+		return "invalid_lease", errors.New("x_read offer asks for a proof mode this node does not serve")
+	}
 	record, err := attemptRecord(l)
 	if err != nil {
 		return "invalid_lease", err

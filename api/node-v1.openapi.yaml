@@ -237,6 +237,17 @@ components:
           uniqueItems: true
           description: Codex base models accepted locally; absent for X and legacy nodes, never proof of subscription access
           items: {type: string, enum: [gpt-6.1-sol, gpt-6-astra, gpt-6-sol, gpt-6-luna, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5]}
+        proof_modes:
+          type: array
+          minItems: 1
+          maxItems: 2
+          uniqueItems: true
+          description: >-
+            x_read only. Proof modes the operator lets this node serve. Absent means mpc only,
+            which is all a node without the field serves. A coordinator must not send a relay
+            job to a node that does not list relay, and should omit proof_mode on mpc jobs so
+            nodes that predate the field still accept them.
+          items: {type: string, enum: [mpc, relay]}
     Challenge:
       type: object
       required: [version, nonce, expires_at]

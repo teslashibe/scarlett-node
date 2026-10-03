@@ -112,6 +112,8 @@ enum Verdict {
     Last(Vec<u8>),
     /// Forward the item, then these further frames in the same direction.
     Also(Vec<(u8, Vec<u8>)>),
+    /// Do not forward the item.
+    Skip,
 }
 
 /// Relays TLS records between the supplier and the server, letting `tamper`
@@ -138,7 +140,8 @@ where
                         let verdict = tamper(true, up_count, &record);
                         up_count += 1;
                         match verdict {
-                            Verdict::Pass | Verdict::Also(_) => { let _ = to_server.write_all(&record).await; }
+                            Verdict::Skip => {}
+                        Verdict::Pass | Verdict::Also(_) => { let _ = to_server.write_all(&record).await; }
                             Verdict::Replace(bytes) => { let _ = to_server.write_all(&bytes).await; }
                             Verdict::Last(bytes) => { let _ = to_server.write_all(&bytes).await; let _ = to_server.shutdown().await; up_open = false; }
                         }
@@ -152,7 +155,8 @@ where
                         let verdict = tamper(false, down_count, &record);
                         down_count += 1;
                         match verdict {
-                            Verdict::Pass | Verdict::Also(_) => { let _ = to_node.write_all(&record).await; }
+                            Verdict::Skip => {}
+                        Verdict::Pass | Verdict::Also(_) => { let _ = to_node.write_all(&record).await; }
                             Verdict::Replace(bytes) => { let _ = to_node.write_all(&bytes).await; }
                             Verdict::Last(bytes) => { let _ = to_node.write_all(&bytes).await; let _ = to_node.shutdown().await; down_open = false; }
                         }
@@ -184,6 +188,7 @@ where
                             let _ = wire::send(&mut to_verifier, kind, &payload).await;
                             for (kind, payload) in extra { let _ = wire::send(&mut to_verifier, kind, &payload).await; }
                         }
+                        Verdict::Skip => {}
                         Verdict::Pass => { let _ = wire::send(&mut to_verifier, kind, &payload).await; }
                         Verdict::Replace(bytes) | Verdict::Last(bytes) => { let _ = wire::send(&mut to_verifier, kind, &bytes).await; }
                     }
@@ -195,6 +200,7 @@ where
                             let _ = wire::send(&mut to_node, kind, &payload).await;
                             for (kind, payload) in extra { let _ = wire::send(&mut to_node, kind, &payload).await; }
                         }
+                        Verdict::Skip => {}
                         Verdict::Pass => { let _ = wire::send(&mut to_node, kind, &payload).await; }
                         Verdict::Replace(bytes) | Verdict::Last(bytes) => { let _ = wire::send(&mut to_node, kind, &bytes).await; }
                     }
@@ -584,6 +590,32 @@ async fn the_verifier_can_send_only_its_handshake_and_gets_one_record() {
         if matches!(attack, "own_request_before" | "other_host" | "second_finished") {
             assert!(server.seen.lock().unwrap().is_none(), "{attack}: something reached the server as a request");
         }
+    }
+}
+
+#[tokio::test]
+async fn a_supplier_reports_no_result_unless_the_verifier_opens_its_record_correctly() {
+    for attack in ["withheld", "wrong_key", "wrong_sequence", "malformed"] {
+        let server = server(response(), |_| {}).await;
+        let (node_end, verifier_end) = link(move |from_node, kind, payload| {
+            if from_node || kind != wire::OPENING {
+                return Verdict::Pass;
+            }
+            let mut bytes = payload.to_vec();
+            match attack {
+                "withheld" => return Verdict::Skip,
+                "wrong_key" => bytes[3] ^= 1,
+                "wrong_sequence" => bytes[35] ^= 1,
+                _ => bytes.truncate(20),
+            }
+            Verdict::Replace(bytes)
+        });
+        let tcp = TcpStream::connect(server.addr).await.unwrap();
+        let (response_at_node, outcome) = run(server.roots.clone(), node_end, verifier_end, tcp).await;
+        // The verifier itself was honest here; only what reached the supplier was changed.
+        assert!(outcome.is_ok(), "{attack}");
+        let error = response_at_node.expect_err(attack);
+        assert!(format!("{error:#}").starts_with(node::MISUSE), "{attack}: {error:#}");
     }
 }
 
