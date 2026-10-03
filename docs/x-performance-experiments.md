@@ -40,7 +40,7 @@ The harness initializes x-go once before measuring samples. Its public transacti
 | `SCARLETT_XPERF_RECV_RECORDS` | `3`–`32`, omitted by default | MPC online receive TLS-record allocation, including protocol records |
 | `SCARLETT_XPERF_MPC_NETWORK` | `reduce_bandwidth` default, `reduce_roundtrips` | Use the pinned SDK's existing MPC tradeoff; fewer round trips can require more traffic; Proxy rejects the non-default option |
 | `SCARLETT_XPERF_PREPARE_HOLD_MS` | `0`–`30000`, default `0` | Prepares a known job, holds, then begins logical demand; fresh cryptographic material is used once |
-| `SCARLETT_XPERF_RESPONSE_READY` | `0` default, `1` | Emit a numeric response-ready event to private stderr |
+| `SCARLETT_XPERF_RESPONSE_READY` | `0` default, `1` | Emit fixed native execution phases and elapsed times to private stderr |
 | `SCARLETT_XPERF_CONCURRENCY` | `1` default, `2`, `4` | Maximum jobs admitted by the host |
 | `SCARLETT_XPERF_ACCOUNT_CAPACITY` | `1` to `4`, default `1` | In-flight job cap for the single local X account |
 | `SCARLETT_XPERF_RECEIPT_CAPACITY` | `1` to `4`, default `1` | Maximum jobs retaining a verifier session through receipt recovery |
@@ -75,6 +75,8 @@ The continuous bridge, `TestBuyerContinuousXPerformance`, accepts bounded JSON c
 The buyer bridge accepts one or two planned reads. A two-page job uses a fresh proof per page, preserves cursor binding and counts both exchanges before the application settles usage. A third provider exchange is rejected. The report sums helper phases, CPU and traffic, records the largest child RSS and marks whether resource observations are complete. Its quota fields describe the final response only; missing headers remain unknown. A continuous campaign stops rather than estimating a remaining count. Waiting until the last proven reset before a new campaign is a separate recorded admission decision.
 
 Native X execution supervises its TLS backend while writing and reading the framed response. A backend failure terminates a stalled reader; successful backend completion can still drain a buffered response. Cancellation, timeout or error aborts the owned background task. Retained failure files use fixed stage/reason labels and numeric measurements. They exclude provider bodies and private error strings.
+
+With phase events enabled, a stopped run retains its last recognized control, commit, provider-connect, request-write, response-read, TLS-finish or proof phase. Preview rejection also terminates the helper and collects its timing, resource use and progress before temporary-file cleanup. Missing progress remains unknown; a deadline alone does not establish the provider or protocol cause.
 
 ### Testing a public x-go candidate
 

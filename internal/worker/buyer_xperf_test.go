@@ -12,12 +12,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -286,6 +288,7 @@ func writeBuyerXPerfFailure(dir, code string, started time.Time, bootstrap *buye
 		o := transport.observed[len(transport.observed)-1]
 		report["exchange_index"] = len(transport.observed) - 1
 		report["helper_ms"], report["response_ready_ms"], report["provider_http_status"] = o.helperMS, o.provisionalMS, o.httpStatus
+		report["last_native_phase"], report["last_native_phase_ms"] = o.nativePhase, o.nativePhaseMS
 		report["failure_phase"] = "before_response_ready"
 		if o.provisionalMS != nil {
 			report["failure_phase"] = "after_response_ready"
@@ -387,8 +390,7 @@ type buyerXPerfProvisional struct {
 	ElapsedMS  uint64 `json:"elapsed_ms"`
 }
 
-func (t *buyerXPerfTransport) executeProvisional(ctx context.Context, input []byte) (xperfObserved, error) {
-	var o xperfObserved
+func (t *buyerXPerfTransport) executeProvisional(ctx context.Context, input []byte) (o xperfObserved, resultErr error) {
 	var params map[string]any
 	if json.Unmarshal(input, &params) != nil {
 		return o, errors.New("invalid helper input")
@@ -413,6 +415,21 @@ func (t *buyerXPerfTransport) executeProvisional(ctx context.Context, input []by
 		if !finished {
 			_ = command.Process.Kill()
 			_ = command.Wait()
+		}
+		o.helperMS = time.Since(started).Milliseconds()
+		xperfResourceUsage(&o, command.ProcessState)
+		o.nativePhase, o.nativePhaseMS = xperfLastNativePhase(stderr.Bytes())
+		if o.provisionalMS == nil {
+			o.provisionalMS = xperfProvisional(stderr.Bytes())
+		}
+		if resultErr != nil && o.helperFailure == "" {
+			o.helperFailure = xperfHelperFailure(ctx, stderr.Bytes())
+		}
+		if len(stderr.Bytes()) != 0 {
+			if err := os.WriteFile(filepath.Join(t.output, "helper.stderr"), stderr.Bytes(), 0600); err != nil && resultErr == nil {
+				o.helperFailure = "private_diagnostic_write_failed"
+				resultErr = errors.New("private helper diagnostic write failed")
+			}
 		}
 	}()
 	scanner := bufio.NewScanner(stdout)
@@ -442,10 +459,12 @@ func (t *buyerXPerfTransport) executeProvisional(ctx context.Context, input []by
 			response, err := client.Do(r)
 			base.CloseIdleConnections()
 			if err != nil {
+				o.helperFailure = "provisional_callback_failed"
 				return o, errors.New("provisional callback failed")
 			}
 			response.Body.Close()
 			if response.StatusCode != 202 {
+				o.helperFailure = "provisional_callback_rejected"
 				return o, errors.New("provisional callback rejected")
 			}
 		} else {
@@ -460,16 +479,35 @@ func (t *buyerXPerfTransport) executeProvisional(ctx context.Context, input []by
 	}
 	err = command.Wait()
 	finished = true
-	o.helperMS = time.Since(started).Milliseconds()
-	xperfResourceUsage(&o, command.ProcessState)
-	if len(stderr.Bytes()) != 0 {
-		if err := os.WriteFile(filepath.Join(t.output, "helper.stderr"), stderr.Bytes(), 0600); err != nil {
-			return o, errors.New("private helper diagnostic write failed")
-		}
-	}
 	if err != nil || scanner.Err() != nil || !provisional || !final {
 		o.helperFailure = xperfHelperFailure(ctx, stderr.Bytes())
 		return o, errors.New("provisional helper failed; provider work was not retried")
 	}
 	return o, nil
+}
+
+func TestBuyerXPerfRejectedPreviewRetainsProgressAndStopsHelper(t *testing.T) {
+	dir := t.TempDir()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusConflict)
+	}))
+	defer server.Close()
+	event, err := json.Marshal(buyerXPerfProvisional{Phase: "response_provisional", State: "unverified", Verified: new(bool), Settled: new(bool), HTTPStatus: 200, Body: `{"data":{"synthetic":{}}}`, ElapsedMS: 11})
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := filepath.Join(dir, "fixture-helper")
+	content := "#!/bin/sh\nprintf '%s\\n' '{\"phase\":\"response_read_started\",\"elapsed_ms\":7}' >&2\nprintf '%s\\n' '" + string(event) + "'\nexec sleep 30\n"
+	if err := os.WriteFile(helper, []byte(content), 0700); err != nil {
+		t.Fatal(err)
+	}
+	transport := &buyerXPerfTransport{config: xperfConfig{prover: helper}, output: dir, provisionalOrigin: server.URL, provisionalKey: "synthetic-private-key"}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	observation, err := transport.executeProvisional(ctx, []byte(`{}`))
+	if err == nil || calls.Load() != 1 || ctx.Err() != nil || observation.helperFailure != "provisional_callback_rejected" || observation.nativePhase != "response_read_started" || observation.nativePhaseMS == nil || *observation.nativePhaseMS != 7 || observation.provisionalMS == nil || *observation.provisionalMS != 11 || !observation.resourceMetrics {
+		t.Fatal("rejected preview lost progress, kept the helper running or replayed its callback")
+	}
 }

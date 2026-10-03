@@ -165,6 +165,12 @@ fn provisional_response(response: &[u8], elapsed_ms: u128) -> Result<Option<serd
     Ok(Some(serde_json::json!({"phase":"response_provisional", "state":"unverified", "verified":false, "settled":false, "http_status":status, "body":body, "elapsed_ms":elapsed_ms})))
 }
 
+fn phase_event(request: &Request, phase: &'static str, started: Instant) {
+    if request.response_ready_event {
+        eprintln!("{}", serde_json::json!({"phase":phase, "elapsed_ms":started.elapsed().as_millis()}));
+    }
+}
+
 async fn batch_handshake(socket: &mut crate::control::Socket) -> Result<()> {
     socket.write_all(xpolicy::BATCH_PREFACE).await?;
     let mut ack = vec![0; xpolicy::BATCH_ACK.len()];
@@ -222,14 +228,17 @@ pub async fn run(request: Request) -> Result<Summary> {
     let started = Instant::now();
     let mut timings = Timings::default();
 
+    phase_event(&request, "control_started", started);
     let (mut socket, traffic) = crate::control::connect_named(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture, request.verifier_server_name.as_deref()).await?;
     socket.write_all(format!("{}\n", request.token).as_bytes()).await?;
     if request.batch_reads != 0 { batch_handshake(&mut socket).await?; }
     timings.control_connect = started.elapsed().as_millis();
+    phase_event(&request, "control_connected", started);
     let (driver, mut handle) = Session::new(socket.compat()).split();
     let mut session = Driver::new(tokio::spawn(driver));
     let work = async {
         let phase = Instant::now();
+        phase_event(&request, "commit_started", started);
         let prover = handle.new_prover(ProverConfig::builder().build()?)?;
         let tls_config = TlsClientConfig::builder().server_name(ServerName::Dns(HOST.try_into()?)).root_store(RootCertStore::mozilla()).build()?;
         // Both protocol variants finish as the same committed-prover type.
@@ -241,10 +250,13 @@ pub async fn run(request: Request) -> Result<Summary> {
                 if let Some(network) = request.mpc_network { config = config.network(network.setting()); }
                 let prover = prover.commit(config.build()?).await?;
                 timings.commit = phase.elapsed().as_millis();
+                phase_event(&request, "commit_ready", started);
                 if request.prepare_hold_ms != 0 { tokio::time::sleep(Duration::from_millis(request.prepare_hold_ms)).await; }
                 let execution_started = Instant::now();
+                phase_event(&request, "provider_connect_started", started);
                 let tcp = TcpStream::connect((HOST, 443)).await.context("x.com unreachable")?;
                 tcp.set_nodelay(true)?;
+                phase_event(&request, "provider_connected", started);
                 let end = Arc::new(End::default());
                 let (tls, prover) = prover.connect(tls_config, Server { tcp, end: end.clone() }.compat())?;
                 (tls, tokio::spawn(prover.into_future()), Some(end), execution_started)
@@ -252,8 +264,10 @@ pub async fn run(request: Request) -> Result<Summary> {
             ProofMode::Proxy => {
                 let prover = prover.commit(ProxyTlsConfig::builder().server_name(DnsName::try_from(HOST)?).build()?).await?;
                 timings.commit = phase.elapsed().as_millis();
+                phase_event(&request, "commit_ready", started);
                 let execution_started = Instant::now();
                 let (tls, prover) = prover.connect(tls_config)?;
+                phase_event(&request, "proxy_stream_ready", started);
                 (tls, tokio::spawn(prover.into_future()), None, execution_started)
             }
         };
@@ -264,11 +278,14 @@ pub async fn run(request: Request) -> Result<Summary> {
         // the framed response rather than waiting for the connection to end.
         let response_io = async {
             let phase = Instant::now();
+            phase_event(&request, "request_write_started", started);
             tls.write_all(&raw).await?;
             tls.flush().await?;
             timings.request_write = phase.elapsed().as_millis();
+            phase_event(&request, "request_written", started);
             let mut response = Vec::new();
             let phase = Instant::now();
+            phase_event(&request, "response_read_started", started);
             let mut chunk = [0u8; 16 << 10];
             while !complete(&response) {
                 let n = tls.read(&mut chunk).await?;
@@ -287,9 +304,7 @@ pub async fn run(request: Request) -> Result<Summary> {
         .await
         .context("timed out waiting for X")??;
         if !complete(&response) { bail!("X response framing incomplete"); }
-        if request.response_ready_event {
-            eprintln!("{}", serde_json::json!({"phase":"response_ready", "elapsed_ms":started.elapsed().as_millis()}));
-        }
+        phase_event(&request, "response_ready", started);
         if request.provisional_response {
             if let Some(event) = provisional_response(&response, started.elapsed().as_millis())? {
                 use std::io::Write;
@@ -300,6 +315,7 @@ pub async fn run(request: Request) -> Result<Summary> {
         // tlsn finalizes only once the server stream ends, and X may hold the
         // connection open indefinitely, so end it here.
         let phase = Instant::now();
+        phase_event(&request, "tls_finish_started", started);
         if let Some(end) = end { end.finish(); }
         drop(tls);
 
@@ -308,6 +324,7 @@ pub async fn run(request: Request) -> Result<Summary> {
             None => tokio::time::timeout(Duration::from_secs(120), prover_task).await.context("TLS finalization timeout")???,
         };
         timings.tls_finish = phase.elapsed().as_millis();
+        phase_event(&request, "tls_finished", started);
         let sent = prover.transcript().sent().to_vec();
         let received_bytes = prover.transcript().received().len();
         let mut builder = ProveConfig::builder(prover.transcript());
@@ -317,14 +334,18 @@ pub async fn run(request: Request) -> Result<Summary> {
         }
         builder.reveal_recv(&(0..received_bytes))?;
         let phase = Instant::now();
+        phase_event(&request, "prove_started", started);
         prover.prove(&builder.build()?).await?;
         timings.prove = phase.elapsed().as_millis();
+        phase_event(&request, "proof_sent", started);
         anyhow::Ok((prover, response, sent.len(), received_bytes, execution_started))
     };
     let (prover, response, sent_bytes, received_bytes, execution_started) = session.step(work).await?;
     let phase = Instant::now();
+    phase_event(&request, "finalize_started", started);
     session.finish(async { Ok(prover.close().await?) }, || handle.close()).await?;
     timings.finalize = phase.elapsed().as_millis();
+    phase_event(&request, "finalized", started);
     timings.total = started.elapsed().as_millis();
 
     let batch_exchanges = if request.batch_reads != 0 {

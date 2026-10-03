@@ -480,6 +480,8 @@ type xperfObserved struct {
 	peakRSSBytes                                        int64
 	resourceMetrics                                     bool
 	provisionalMS                                       *uint64
+	nativePhase                                         string
+	nativePhaseMS                                       *uint64
 	rateLimit, rateRemaining, rateReset                 *uint64
 	receiptObserved, receiptBound, receiptComplete      bool
 	receiptPending, receiptRemaining, receiptRejections int
@@ -522,6 +524,7 @@ func xperfExecute(ctx context.Context, c xperfConfig, input []byte, diagnostic s
 			return o, errors.New("private_diagnostic_write_failed")
 		}
 		o.provisionalMS = xperfProvisional(stderr.Bytes())
+		o.nativePhase, o.nativePhaseMS = xperfLastNativePhase(stderr.Bytes())
 	}
 	if err != nil {
 		o.helperFailure = xperfHelperFailure(ctx, stderr.Bytes())
@@ -721,6 +724,35 @@ func xperfProvisional(raw []byte) *uint64 {
 		}
 	}
 	return nil
+}
+
+func xperfLastNativePhase(raw []byte) (string, *uint64) {
+	var phase string
+	var elapsed *uint64
+	for _, line := range bytes.Split(raw, []byte("\n")) {
+		var event struct {
+			Phase   string  `json:"phase"`
+			Elapsed *uint64 `json:"elapsed_ms"`
+		}
+		if json.Unmarshal(line, &event) != nil || event.Elapsed == nil || *event.Elapsed > 600000 || elapsed != nil && *event.Elapsed < *elapsed {
+			continue
+		}
+		switch event.Phase {
+		case "control_started", "control_connected", "commit_started", "commit_ready", "provider_connect_started", "provider_connected", "proxy_stream_ready", "request_write_started", "request_written", "response_read_started", "response_ready", "tls_finish_started", "tls_finished", "prove_started", "proof_sent", "finalize_started", "finalized":
+			phase, elapsed = event.Phase, event.Elapsed
+		}
+	}
+	return phase, elapsed
+}
+
+func TestXPerfLastNativePhasePrivacyAndOrder(t *testing.T) {
+	phase, elapsed := xperfLastNativePhase([]byte("PRIVATE_DIAGNOSTIC\n" + `{"phase":"commit_started","elapsed_ms":4}` + "\n" + `{"phase":"response_read_started","elapsed_ms":7}` + "\n" + `{"phase":"PRIVATE_PHASE","elapsed_ms":8}` + "\n" + `{"phase":"request_written","elapsed_ms":3}` + "\n" + `{"phase":"response_ready","elapsed_ms":600001}`))
+	if phase != "response_read_started" || elapsed == nil || *elapsed != 7 {
+		t.Fatal("untrusted, out-of-order or out-of-bound phase replaced valid progress")
+	}
+	if phase, elapsed := xperfLastNativePhase([]byte(`{"phase":"PRIVATE_PHASE","elapsed_ms":8}`)); phase != "" || elapsed != nil {
+		t.Fatal("unknown native progress escaped its allowlist")
+	}
 }
 
 type xperfReceipt struct {
