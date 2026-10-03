@@ -368,6 +368,7 @@ function Set-Text([string]$Name, [string]$Value) {
         return
     }
     $pattern.SetValue($Value)
+    Wait-Check { ([string]$pattern.Current.Value) -ceq $Value } 10 'Synthetic text value did not commit'
 }
 function Select-Browser([int]$Index, [string]$ExpectedBrowser) {
     if ($Index -notin @(1, 2) -or $ExpectedBrowser -notin @('Chrome', 'Firefox')) { throw 'Unexpected synthetic browser selection' }
@@ -425,7 +426,7 @@ function Select-Browser([int]$Index, [string]$ExpectedBrowser) {
 }
 function UI-Contains([string]$Text) {
     $elements = $script:window.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-    foreach ($element in $elements) { if ($element.Current.Name.Contains($Text)) { return $true } }
+    foreach ($element in $elements) { if (([string]$element.Current.Name).Contains($Text)) { return $true } }
     return $false
 }
 function Imported-Accounts {
@@ -464,7 +465,33 @@ function Check-BrowserImport {
         Set-Text 'Local X account ID' 'browser-firefox'
         Set-Checkbox 'Import only X session cookies from this profile' $true
         Click-Button 'Import X account'
-        Wait-Check { (Imported-Accounts).Count -eq 1 } 20 'Installed Firefox UI import did not persist'
+        try {
+            # The native import contract permits 45 seconds, then the UI refresh
+            # runs. Observe that complete contract rather than timing out at 20.
+            Wait-Check { (Imported-Accounts).Count -eq 1 } 55 'Installed Firefox UI import did not persist'
+        } catch {
+            $errors = @{
+                invalid_input = 'Check the account ID, capacity and cookie values'
+                command_failed = 'The node could not complete that action'
+                command_timeout = 'The action timed out'
+                private_storage = 'Scarlett could not open its private local storage'
+                browser_protected = 'The browser or OS protected this profile'
+                browser_busy = 'Close the selected browser, then try importing again'
+                browser_invalid = 'Scarlett could not read this cookie store safely'
+                browser_no_x_session = 'No complete X session was found in that profile'
+                browser_ambiguous = 'This profile contains multiple X sessions'
+                browser_unsupported = 'This browser format is not supported on this device'
+            }
+            $classifications = @{}
+            foreach ($classification in $errors.Keys) { $classifications[$classification] = UI-Contains $errors[$classification] }
+            $failure = @{ accountCount = (Imported-Accounts).Count
+                importButtonEnabled = (Find-Button 'Import X account').Current.IsEnabled
+                successNoticeVisible = (UI-Contains 'X account imported on this device')
+                errorClasses = $classifications; realProviderJobs = 0 }
+            $failure | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-browser-import-failure.json')
+            Write-Output ($failure | ConvertTo-Json -Depth 3 -Compress)
+            throw
+        }
         Wait-Check { Checkbox-Is 'Import only X session cookies from this profile' $false } 10 'Successful import retained consent'
         Wait-Check { UI-Contains 'access not verified' } 15 'Imported account claimed verified access'
         Select-Browser 1 'Chrome'
