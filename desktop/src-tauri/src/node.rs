@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
 };
@@ -267,6 +267,22 @@ fn new_codex_profile(profiles: &Path, accounts: &[Account]) -> Result<(String, P
         }
     }
     Err(Error::AccountsUnavailable)
+}
+// The node renews only Codex profiles directly under this root: the app's own
+// completed logins. The node and the local API never run together, so the node
+// is the only writer while it renews. The node rejects a root that is not a clean
+// absolute path; such a state path leaves renewal off rather than stopping it.
+fn managed_codex_root(state: &Path) -> Option<PathBuf> {
+    let root = state.join("codex-logins");
+    let normal: PathBuf = root.components().collect();
+    let text = root.to_str()?;
+    (root.is_absolute()
+        && normal.as_os_str() == root.as_os_str()
+        && !root
+            .components()
+            .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+        && !text.contains(['\0', '\r', '\n']))
+    .then_some(root)
 }
 #[cfg(unix)]
 fn private_dir(path: &Path) -> Result<()> {
@@ -541,6 +557,9 @@ impl Node {
             .kill_on_drop(true);
         #[cfg(windows)]
         cmd.creation_flags(0x08000000);
+        if let Some(root) = managed_codex_root(&self.state) {
+            cmd.env("SCARLETT_CODEX_MANAGED_ROOT", root);
+        }
         if let Some(ca) = &self.endpoints.verifier_ca {
             cmd.env("SCARLETT_VERIFIER_CA_FILE", ca);
         }
@@ -1136,6 +1155,23 @@ mod tests {
         );
         assert!(!env.contains_key(std::ffi::OsStr::new("SCARLETT_VERIFIER_PLAINTEXT_FIXTURE")));
         assert!(!env.contains_key(std::ffi::OsStr::new("SCARLETT_LOCAL_FIXTURE")));
+        // Renewal covers exactly the app-owned login profiles new_codex_profile makes.
+        let managed = temp.path().join("state").join("codex-logins");
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("SCARLETT_CODEX_MANAGED_ROOT")),
+            Some(&Some(managed.as_os_str()))
+        );
+        let state = temp.path().join("state");
+        let state_text = state.to_str().unwrap();
+        for unusable in [
+            PathBuf::from("relative-state"),
+            PathBuf::from(format!("{state_text}{0}{0}x", std::path::MAIN_SEPARATOR)),
+            state.join(".").join("x"),
+            state.join("..").join("x"),
+            PathBuf::from(format!("{state_text}\nx")),
+        ] {
+            assert_eq!(managed_codex_root(&unusable), None, "{unusable:?}");
+        }
         assert_eq!(
             node.network_url("setup").unwrap(),
             "https://localhost:18443/setup/"

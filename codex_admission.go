@@ -18,6 +18,11 @@ import (
 // signature verification; the provider and verifier still authenticate the job.
 const codexAdmissionClockMargin = 30 * time.Second
 
+// codexLocalAuthExpired is a node-local result, never reported to the
+// coordinator: the selected credential failed the admission guard before
+// acceptance. finishAccount records it as local expiry that renewal may repair.
+const codexLocalAuthExpired = "local_auth_expired"
+
 func codexAdmissionValid(home string, deadline time.Time) bool {
 	if !filepath.IsAbs(home) || deadline.IsZero() {
 		return false

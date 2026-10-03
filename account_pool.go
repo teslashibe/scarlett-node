@@ -15,9 +15,11 @@ import (
 )
 
 type pooledAccount struct {
-	spec    providerAccount
-	entry   *serviceEntry
-	removed bool
+	spec       providerAccount
+	entry      *serviceEntry
+	removed    bool
+	renewing   *renewalAttempt
+	renewAfter time.Time
 }
 type accountLease struct {
 	id, kind string
@@ -34,10 +36,12 @@ type accountStatus struct {
 	RestUntil time.Time `json:"rest_until,omitempty"`
 }
 type savedAccountHealth struct {
-	State     string    `json:"state"`
-	Error     string    `json:"error,omitempty"`
-	Stamp     string    `json:"stamp,omitempty"`
-	RestUntil time.Time `json:"rest_until,omitempty"`
+	// Older readers ignore this optional marker and conservatively quarantine.
+	LocalAuthInvalid bool      `json:"local_auth_invalid,omitempty"`
+	State            string    `json:"state"`
+	Error            string    `json:"error,omitempty"`
+	Stamp            string    `json:"stamp,omitempty"`
+	RestUntil        time.Time `json:"rest_until,omitempty"`
 }
 
 func validAccountStatuses(status []accountStatus) bool {
@@ -104,10 +108,18 @@ func (p *servicePool) initAccounts() {
 			p.healthError = true
 			return
 		}
+		// The marker only qualifies a local auth_required state. Drop it from any
+		// other state rather than reject the file: without it the account is
+		// quarantined conservatively, as an older reader would do.
+		if h.LocalAuthInvalid && (h.State != "auth_required" || h.Error != "auth_required") {
+			h.LocalAuthInvalid = false
+			p.saved[key] = h
+		}
 	}
 	for key, a := range p.accounts {
 		if h, ok := p.saved[key]; ok {
 			a.entry.state, a.entry.lastError, a.entry.stamp, a.entry.restUntil = h.State, h.Error, h.Stamp, h.RestUntil
+			a.entry.localAuthInvalid = h.LocalAuthInvalid
 		}
 	}
 }
@@ -127,7 +139,8 @@ func (p *servicePool) saveHealth() {
 	for key, a := range p.accounts {
 		e := a.entry
 		if e.state == "exhausted" || e.state == "auth_required" || e.state == "unreachable" {
-			p.saved[key] = savedAccountHealth{e.state, e.lastError, e.stamp, e.restUntil}
+			local := e.localAuthInvalid && e.state == "auth_required" && e.lastError == "auth_required"
+			p.saved[key] = savedAccountHealth{State: e.state, Error: e.lastError, Stamp: e.stamp, RestUntil: e.restUntil, LocalAuthInvalid: local}
 		} else {
 			delete(p.saved, key)
 		}
@@ -185,12 +198,16 @@ func (p *servicePool) refreshAccounts(now time.Time) bool {
 			a = &pooledAccount{spec: spec, entry: &serviceEntry{capacity: spec.Concurrency}}
 			if h, ok := p.saved[key]; ok {
 				a.entry.state, a.entry.lastError, a.entry.stamp, a.entry.restUntil = h.State, h.Error, h.Stamp, h.RestUntil
+				a.entry.localAuthInvalid = h.LocalAuthInvalid
 			}
 			p.accounts[key] = a
 		} else if a.spec.Path != spec.Path {
 			// A changed credential location drains the selected snapshot. Admission
 			// waits for its outstanding work, retaining cooldown under this local ID.
-			if a.entry.inFlight > 0 {
+			if a.entry.inFlight > 0 || a.renewing != nil {
+				if a.renewing != nil {
+					a.renewing.cancel()
+				}
 				continue
 			}
 			a.spec.Path = spec.Path
@@ -203,12 +220,17 @@ func (p *servicePool) refreshAccounts(now time.Time) bool {
 	_, helperErr := exec.LookPath(p.config.Prover)
 	for key, a := range p.accounts {
 		if a.removed {
-			if a.entry.inFlight == 0 {
+			if a.renewing != nil {
+				a.renewing.cancel()
+			}
+			if a.entry.inFlight == 0 && a.renewing == nil {
 				delete(p.accounts, key)
 			}
 			continue
 		}
-		refreshAccount(a, now, helperErr != nil)
+		if a.renewing == nil {
+			refreshAccount(a, now, helperErr != nil)
+		}
 	}
 	for kind, s := range p.entries {
 		s.inFlight = 0
@@ -221,10 +243,14 @@ func (p *servicePool) refreshAccounts(now time.Time) bool {
 				continue
 			}
 			s.inFlight += a.entry.inFlight
-			if !a.removed && (a.entry.state == "ready" || a.entry.state == "configured") {
+			held := p.renewalHolds(a)
+			if !a.removed && !held && (a.entry.state == "ready" || a.entry.state == "configured") {
 				available += max(0, a.entry.capacity-a.entry.inFlight)
 			}
-			if a.removed {
+			if a.removed || held {
+				if held {
+					unreachable = true
+				}
 				continue
 			}
 			switch a.entry.state {
@@ -280,18 +306,36 @@ func refreshAccount(a *pooledAccount, now time.Time, helperMissing bool) {
 	if a.spec.Service == "codex" {
 		configured = configured && codexAdmissionValid(a.spec.Path, codexAdmissionWindow(now))
 	}
-	if s.state == "" || stamp != s.stamp {
+	wasLocalInvalid := s.localAuthInvalid
+	stampChanged := stamp != s.stamp
+	if s.state == "" || stampChanged {
 		s.stamp = stamp
+		s.localAuthInvalid = false
 		// Credential changes can repair authentication, but do not erase a known
 		// quota cooldown (including one restored after a process restart).
 		if s.restUntil.IsZero() || !now.Before(s.restUntil) {
 			s.lastError = ""
 			s.state = "configured"
+		} else if s.state == "auth_required" && wasLocalInvalid {
+			s.state, s.lastError = "exhausted", "capacity_unavailable"
 		}
 	}
 	if !configured {
+		// Preserve real provider denial even as its unchanged credential ages.
+		if stampChanged || s.state != "auth_required" || s.localAuthInvalid {
+			s.localAuthInvalid = a.spec.Service == "codex"
+		}
 		s.state, s.lastError = "auth_required", "auth_required"
 		return
+	}
+	if s.state == "auth_required" && s.localAuthInvalid {
+		// Only local evaluation sets this marker, and it no longer holds.
+		s.localAuthInvalid = false
+		if s.restUntil.IsZero() || !now.Before(s.restUntil) {
+			s.state, s.lastError = "configured", ""
+		} else {
+			s.state, s.lastError = "exhausted", "capacity_unavailable"
+		}
 	}
 	if !s.restUntil.IsZero() && !now.Before(s.restUntil) {
 		s.restUntil = time.Time{}
@@ -345,7 +389,7 @@ func (p *servicePool) acquireAccount(kind string) (*accountLease, bool) {
 		idx := (p.next[kind] + offset) % len(keys)
 		a := p.accounts[keys[idx]]
 		e := a.entry
-		if e.inFlight >= e.capacity || e.state != "configured" && e.state != "ready" {
+		if p.renewalHolds(a) || e.inFlight >= e.capacity || e.state != "configured" && e.state != "ready" {
 			continue
 		}
 		e.inFlight++
@@ -373,6 +417,15 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 	if s.inFlight > 0 {
 		s.inFlight--
 	}
+	if code == codexLocalAuthExpired {
+		// Local evidence only, so renewal may repair it. It never overrides a
+		// provider denial already recorded for this credential.
+		if s.state != "auth_required" {
+			s.state, s.lastError, s.localAuthInvalid = "auth_required", "auth_required", l.account.spec.Service == "codex"
+		}
+		p.saveHealth()
+		return
+	}
 	// An older concurrent result cannot repair an authoritative auth failure.
 	if s.state == "auth_required" && code != "auth_required" {
 		p.saveHealth()
@@ -392,6 +445,7 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 		}
 	case "auth_required":
 		s.state = "auth_required"
+		s.localAuthInvalid = false
 	case "x_rate_limited", "capacity_unavailable":
 		s.state = "exhausted"
 		if until := time.Now().Add(15 * time.Minute); until.After(s.restUntil) {
@@ -426,6 +480,9 @@ func (p *servicePool) accountStatus() []accountStatus {
 		if p.accountsError {
 			state, capacity, lastError = "unreachable", 0, "prover_error"
 		}
+		if p.renewalHolds(a) {
+			state, capacity, lastError = "unreachable", 0, ""
+		}
 		if a.removed {
 			state = "draining"
 			capacity = 0
@@ -446,6 +503,7 @@ func (p *servicePool) cooldown(a *pooledAccount) func(time.Duration) {
 		// than resuming earlier than an authoritative provider reset.
 		if wait > 30*24*time.Hour {
 			a.entry.state, a.entry.lastError = "auth_required", "auth_required"
+			a.entry.localAuthInvalid = false
 			p.saveHealth()
 			return
 		}
@@ -470,6 +528,8 @@ func (p *servicePool) blockAccounts() {
 			}
 		}
 		s.inFlight, s.capacity = inFlight, inFlight
+		// A legacy account shares this entry; the forced state is not local expiry.
+		s.localAuthInvalid = false
 		if s.enabled {
 			s.state, s.lastError = "unreachable", "prover_error"
 		} else {

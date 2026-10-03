@@ -15,9 +15,11 @@ type serviceEntry struct {
 	state, lastError, stamp string
 	restUntil               time.Time
 	helperMissing           bool
+	localAuthInvalid        bool
 }
 type servicePool struct {
 	mu                                      sync.Mutex
+	renewal                                 *codexRenewal
 	config                                  config.Config
 	entries                                 map[string]*serviceEntry
 	accounts                                map[string]*pooledAccount
@@ -82,11 +84,14 @@ func (p *servicePool) finish(kind, code string) {
 		p.finishAccount(&accountLease{kind: kind, account: a}, code)
 	}
 }
+
+// capacity is the static configured slot ceiling. It reads only immutable
+// configuration, never the advertised capacity that refresh and renewal adjust.
 func (p *servicePool) capacity() int {
 	total := 0
-	for _, s := range p.entries {
-		if s.enabled {
-			total += s.capacity
+	for kind, ceiling := range map[string]int{"codex": p.config.CodexConcurrency, "x_read": p.config.XConcurrency} {
+		if p.config.Enabled(kind) {
+			total += ceiling
 		}
 	}
 	return total

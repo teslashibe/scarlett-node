@@ -30,17 +30,19 @@ type Config struct {
 	// CodexHome holds this node's `codex login` auth.json; CodexProfile and
 	// CodexScaffold are open-agent-api's codex_profile.json and codex_scaffold.json.
 	CodexHome, CodexProfile, CodexScaffold string
-	Verifier                               string
-	VerifierCA                             string
-	VerifierPlaintextFixture               bool
-	Prover                                 string
-	Gateway                                string
-	Profile                                string
-	StateDir                               string
-	GatewayKey                             string
-	Credential                             string
-	NodeID                                 string
-	Bid                                    int64
+	// CodexManagedRoot opts into registered app-owned profile renewal only.
+	CodexManagedRoot         string
+	Verifier                 string
+	VerifierCA               string
+	VerifierPlaintextFixture bool
+	Prover                   string
+	Gateway                  string
+	Profile                  string
+	StateDir                 string
+	GatewayKey               string
+	Credential               string
+	NodeID                   string
+	Bid                      int64
 	// Concurrency is how many leases the node runs at once. The default matches
 	// the local Open Agent API baseline of 20 in-flight requests per account.
 	Concurrency      int
@@ -73,7 +75,7 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	c := Config{Coordinator: os.Getenv("SCARLETT_COORDINATOR"), CoordinatorCA: os.Getenv("SCARLETT_COORDINATOR_CA_FILE"), Executor: os.Getenv("SCARLETT_EXECUTOR"), Verifier: os.Getenv("SCARLETT_VERIFIER"), VerifierCA: os.Getenv("SCARLETT_VERIFIER_CA_FILE"), VerifierPlaintextFixture: os.Getenv("SCARLETT_VERIFIER_PLAINTEXT_FIXTURE") == "1", Prover: os.Getenv("SCARLETT_PROVER"), Gateway: os.Getenv("SCARLETT_GATEWAY"), Profile: os.Getenv("SCARLETT_PROFILE"), StateDir: os.Getenv("SCARLETT_STATE_DIR"), GatewayKey: os.Getenv("SCARLETT_GATEWAY_KEY"), Credential: os.Getenv("SCARLETT_CREDENTIAL"), NodeID: os.Getenv("SCARLETT_NODE_ID"), CodexHome: os.Getenv("SCARLETT_CODEX_HOME"), CodexProfile: os.Getenv("SCARLETT_CODEX_PROFILE"), CodexScaffold: os.Getenv("SCARLETT_CODEX_SCAFFOLD"), Bid: 100, LocalFixture: os.Getenv("SCARLETT_LOCAL_FIXTURE") == "1", InferenceTimeout: 45 * time.Second, MaxInputBytes: 32768, MaxOutputTokens: 2048}
+	c := Config{Coordinator: os.Getenv("SCARLETT_COORDINATOR"), CoordinatorCA: os.Getenv("SCARLETT_COORDINATOR_CA_FILE"), Executor: os.Getenv("SCARLETT_EXECUTOR"), Verifier: os.Getenv("SCARLETT_VERIFIER"), VerifierCA: os.Getenv("SCARLETT_VERIFIER_CA_FILE"), VerifierPlaintextFixture: os.Getenv("SCARLETT_VERIFIER_PLAINTEXT_FIXTURE") == "1", Prover: os.Getenv("SCARLETT_PROVER"), Gateway: os.Getenv("SCARLETT_GATEWAY"), Profile: os.Getenv("SCARLETT_PROFILE"), StateDir: os.Getenv("SCARLETT_STATE_DIR"), GatewayKey: os.Getenv("SCARLETT_GATEWAY_KEY"), Credential: os.Getenv("SCARLETT_CREDENTIAL"), NodeID: os.Getenv("SCARLETT_NODE_ID"), CodexManagedRoot: os.Getenv("SCARLETT_CODEX_MANAGED_ROOT"), CodexHome: os.Getenv("SCARLETT_CODEX_HOME"), CodexProfile: os.Getenv("SCARLETT_CODEX_PROFILE"), CodexScaffold: os.Getenv("SCARLETT_CODEX_SCAFFOLD"), Bid: 100, LocalFixture: os.Getenv("SCARLETT_LOCAL_FIXTURE") == "1", InferenceTimeout: 45 * time.Second, MaxInputBytes: 32768, MaxOutputTokens: 2048}
 	c.JournalLimits = attempts.DefaultLimits()
 	for name, destination := range map[string]*int{"SCARLETT_JOURNAL_MAX_RECORDS": &c.JournalLimits.MaxRecords, "SCARLETT_JOURNAL_MAX_RECORD_BYTES": &c.JournalLimits.MaxRecordBytes} {
 		if raw := os.Getenv(name); raw != "" {
@@ -196,6 +198,9 @@ func Serves(id string) (string, bool) {
 }
 
 func (c Config) Validate() error {
+	if c.CodexManagedRoot != "" && (c.Executor != ExecutorServices || !filepath.IsAbs(c.CodexManagedRoot) || filepath.Clean(c.CodexManagedRoot) != c.CodexManagedRoot || strings.ContainsAny(c.CodexManagedRoot, "\x00\r\n")) {
+		return errors.New("SCARLETT_CODEX_MANAGED_ROOT requires a clean absolute root and services executor")
+	}
 	if c.JournalLimits != (attempts.Limits{}) {
 		if err := c.JournalLimits.Validate(); err != nil {
 			return err

@@ -92,7 +92,35 @@ Alternatively, `scarlett-node accounts connect SERVICE ID CONCURRENCY` imports
 credential JSON from protected stdin into a private node-owned account directory.
 Terminal input is hidden. The command refuses to overwrite existing credentials;
 Codex owns its authentication schema and the proof helper validates it when used.
-The helper does not refresh Codex tokens. Account IDs use 1–32 lowercase letters,
+The helper does not refresh Codex tokens. The node renews them itself through
+`open-agent-api`'s authentication-only `pkg/codex` wrapper, with no inference and
+no credential returned, but only for registered Codex homes directly under
+`SCARLETT_CODEX_MANAGED_ROOT`, a private user-owned root. The variable is empty by
+default and requires the services executor. External, legacy and global profiles
+(including `~/.codex`) stay manual. The wrapper serializes writers only within one
+process, so nothing else may refresh a managed profile while the node runs. The
+desktop app sets the root to its own login profiles and never runs the node and
+its local model API at the same time.
+
+Renewal reserves an idle profile only when its token expires within 30 minutes,
+offers no new slots for that profile while renewing, and preserves selected work,
+quota cooldowns and provider-auth failures. Idleness is per directory: a profile
+is not renewed while any account ID on it, including a draining one, has selected
+work. Each operation is bounded to 15 seconds (an exchange already sent finishes
+under the wrapper's own bound), and a failure is retried after five minutes,
+which leaves several retries before funded admission drops the profile. Removal
+and profile-path changes cancel and join the operation; nothing else interrupts
+it. Attempts left pending by an earlier process block their pinned account, and
+block the whole pool if that account is no longer registered or the binding is
+missing or ambiguous, until reconciliation (every 30 seconds while running)
+resolves them. Local expiry, including the funded-admission guard refusing a
+selected profile, is recorded with an optional private `local_auth_invalid` health
+marker; older readers ignore it and conservatively quarantine. Provider auth
+failures, and historical ones without that marker, require a genuine credential
+change before automatic recovery. The final funded-admission expiry guard remains
+in place.
+
+Account IDs use 1–32 lowercase letters,
 digits, underscores or hyphens; `legacy` is reserved. Two names cannot refer to
 the same credential path or inode.
 
