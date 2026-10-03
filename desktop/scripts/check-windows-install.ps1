@@ -453,7 +453,7 @@ function Check-BrowserImport {
         $env:APPDATA, $env:LOCALAPPDATA = $script:fixture.roaming, $script:fixture.local
         Start-App
         Wait-Check { (Find-Input 'Browser profile').Current.IsEnabled } 15 'Isolated browser profiles were not discovered'
-        if ((Imported-Accounts).Count -ne 0) { throw 'Browser test encountered existing accounts' }
+        if (@(Imported-Accounts).Count -ne 0) { throw 'Browser test encountered existing accounts' }
         if (-not (Checkbox-Is 'Import only X session cookies from this profile' $false) -or (Find-Button 'Import X account').Current.IsEnabled) { throw 'Browser import did not require opt-in consent' }
         # The two fixture profiles sort Chrome, then Firefox after the prompt.
         Select-Browser 1 'Chrome'
@@ -468,7 +468,7 @@ function Check-BrowserImport {
         try {
             # The native import contract permits 45 seconds, then the UI refresh
             # runs. Observe that complete contract rather than timing out at 20.
-            Wait-Check { (Imported-Accounts).Count -eq 1 } 55 'Installed Firefox UI import did not persist'
+            Wait-Check { @(Imported-Accounts).Count -eq 1 } 55 'Installed Firefox UI import did not persist'
         } catch {
             $errors = @{
                 invalid_input = 'Check the account ID, capacity and cookie values'
@@ -484,7 +484,7 @@ function Check-BrowserImport {
             }
             $classifications = @{}
             foreach ($classification in $errors.Keys) { $classifications[$classification] = UI-Contains $errors[$classification] }
-            $failure = @{ accountCount = (Imported-Accounts).Count
+            $failure = @{ accountCount = @(Imported-Accounts).Count
                 importButtonEnabled = (Find-Button 'Import X account').Current.IsEnabled
                 successNoticeVisible = (UI-Contains 'X account imported on this device')
                 errorClasses = $classifications; realProviderJobs = 0 }
@@ -499,7 +499,7 @@ function Check-BrowserImport {
         Set-Checkbox 'Import only X session cookies from this profile' $true
         Click-Button 'Import X account'
         Wait-Check { UI-Contains 'The browser or OS protected this profile' } 20 'Protected Chrome did not show the paste fallback'
-        if ((Imported-Accounts).Count -ne 1) { throw 'Protected Chrome import added an account' }
+        if (@(Imported-Accounts).Count -ne 1) { throw 'Protected Chrome import added an account' }
         foreach ($name in @('auth_token', 'ct0')) {
             if (-not (Find-Input $name).Current.IsPassword) { throw 'Cookie paste field was not masked' }
         }
@@ -507,7 +507,7 @@ function Check-BrowserImport {
         Set-Text 'auth_token' $script:fixture.authToken
         Set-Text 'ct0' $script:fixture.csrf
         Click-Button 'Connect X'
-        Wait-Check { (Imported-Accounts).Count -eq 2 } 20 'Installed masked paste did not persist'
+        Wait-Check { @(Imported-Accounts).Count -eq 2 } 20 'Installed masked paste did not persist'
         foreach ($record in (Imported-Accounts)) {
             if ($record.service -ne 'x_read' -or $record.id -notin @('browser-firefox', 'browser-paste')) { throw 'Unexpected imported account' }
             $credentialRoot = [System.IO.Path]::GetFullPath((Join-Path $script:importState 'accounts')).TrimEnd('\') + '\'
@@ -525,9 +525,12 @@ function Check-BrowserImport {
         try {
             $env:SCARLETT_STATE_DIR, $env:SCARLETT_ACCOUNTS_FILE = $script:importState, (Join-Path $script:importState 'accounts.json')
             $inventory = & (Join-Path $install 'scarlett-node.exe') accounts list | Out-String
-            if ($LASTEXITCODE -ne 0 -or @($inventory | ConvertFrom-Json).Count -ne 2) { throw 'Installed helper refused private imported accounts' }
+            $inventoryExit = $LASTEXITCODE
+            $inventoryRecords = $inventory | ConvertFrom-Json
+            if ($inventoryExit -ne 0 -or @($inventoryRecords).Count -ne 2) { throw 'Installed helper refused private imported accounts' }
             if ($inventory.Contains($script:fixture.authToken) -or $inventory.Contains($script:fixture.csrf) -or (UI-Contains $script:fixture.authToken) -or (UI-Contains $script:fixture.csrf)) { throw 'Import exposed fixture credentials in status' }
             $inventory = $null
+            $inventoryRecords = $null
         } finally { $env:SCARLETT_STATE_DIR, $env:SCARLETT_ACCOUNTS_FILE = $stateBefore, $accountsBefore }
         Click-Button 'Quit Scarlett'
         if (-not $application.WaitForExit(135000)) { throw 'Browser acceptance app did not quit' }
