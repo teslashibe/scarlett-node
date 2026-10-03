@@ -125,6 +125,10 @@ async fn save_desktop_preferences(
 #[tauri::command]
 fn desktop_autostart(window: WebviewWindow, app: tauri::AppHandle) -> node::Result<bool> {
     local_window(&window)?;
+    #[cfg(windows)]
+    if !windows_autostart::registration_present(&app.package_info().name)? {
+        return Ok(false);
+    }
     app.autolaunch()
         .is_enabled()
         .map_err(|_| Error::AutostartUnavailable)
@@ -139,6 +143,12 @@ async fn set_desktop_autostart(
     local_window(&window)?;
     let _guard = runtime.0.lock().await;
     let manager = app.autolaunch();
+    #[cfg(windows)]
+    if enabled {
+        windows_autostart::prepare_registration()?;
+    } else if !windows_autostart::registration_present(&app.package_info().name)? {
+        return Ok(());
+    }
     if enabled {
         manager.enable()
     } else {
