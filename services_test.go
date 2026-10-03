@@ -19,7 +19,7 @@ func poolFixture(t *testing.T, selected ...string) *servicePool {
 	dir := privateTestDir(t)
 	home := filepath.Join(dir, "codex")
 	privateFixtureMkdir(home, 0700)
-	writePrivateFixture(filepath.Join(home, "auth.json"), []byte(`{"synthetic_fixture":true}`), 0600)
+	writePrivateFixture(filepath.Join(home, "auth.json"), freshSyntheticCodexAuth(), 0600)
 	session := filepath.Join(dir, "session.json")
 	writePrivateFixture(session, []byte(`{"auth_token":"synthetic-auth","ct0":"synthetic-csrf"}`), 0600)
 	helper := fixtureHelperPath(dir)

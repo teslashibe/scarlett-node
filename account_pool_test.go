@@ -26,7 +26,7 @@ func multiPool(t *testing.T) *servicePool {
 			path := filepath.Join(dir, kind+"-"+id)
 			if kind == "codex" {
 				privateFixtureMkdir(path, 0700)
-				writePrivateFixture(filepath.Join(path, "auth.json"), []byte(`{"synthetic_fixture":true}`), 0600)
+				writePrivateFixture(filepath.Join(path, "auth.json"), freshSyntheticCodexAuth(), 0600)
 			} else {
 				writePrivateFixture(path, []byte(`{"auth_token":"synthetic-private-auth","ct0":"synthetic-private-csrf"}`), 0600)
 			}
@@ -555,7 +555,7 @@ func TestQuotaExpiryDoesNotRepairAuthoritativeAuthentication(t *testing.T) {
 			}
 			// An actual credential change after expiry can repair authentication.
 			path := filepath.Join(l.config.CodexHome, "auth.json")
-			if err := writePrivateFixture(path, []byte(`{"synthetic_replacement":true,"revision":2}`), 0600); err != nil {
+			if err := writePrivateFixture(path, syntheticCodexAuth(time.Now().Add(366*24*time.Hour)), 0600); err != nil {
 				t.Fatal(err)
 			}
 			refreshAccount(l.account, reset.Add(2*time.Second), false)

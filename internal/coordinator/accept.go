@@ -17,6 +17,9 @@ type LeaseAcceptance struct {
 	Lease            Lease  `json:"lease"`
 }
 
+// MaxOfferLifetime bounds the unchanged community offer accepted by a node.
+const MaxOfferLifetime = 120 * time.Second
+
 func digest(value string) bool {
 	raw, err := hex.DecodeString(value)
 	return err == nil && len(raw) == 32 && hex.EncodeToString(raw) == value
@@ -32,7 +35,7 @@ func (c *Client) Accept(ctx context.Context, offer Lease) (Lease, error) {
 		return Lease{}, errors.New("funded acceptance requires the configured HTTPS coordinator")
 	}
 	now := time.Now()
-	if !offer.AcceptanceRequired || offer.Version != Version || offer.VerifierToken != "" || !digest(offer.RequestSHA256) || !digest(offer.SignedJobID) || (offer.ServiceType != "codex" && offer.ServiceType != "x_read") || !offer.LeaseDeadline.After(now) || offer.LeaseDeadline.After(now.Add(120*time.Second)) || !offer.SettlementDeadline.Equal(offer.LeaseDeadline) {
+	if !offer.AcceptanceRequired || offer.Version != Version || offer.VerifierToken != "" || !digest(offer.RequestSHA256) || !digest(offer.SignedJobID) || (offer.ServiceType != "codex" && offer.ServiceType != "x_read") || !offer.LeaseDeadline.After(now) || offer.LeaseDeadline.After(now.Add(MaxOfferLifetime)) || !offer.SettlementDeadline.Equal(offer.LeaseDeadline) {
 		return Lease{}, errors.New("invalid community offer")
 	}
 	path, err := JobPath(offer.JobID, "accept")

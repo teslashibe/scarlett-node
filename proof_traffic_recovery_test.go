@@ -58,7 +58,14 @@ func TestProofTrafficRecoveryOnlyRepostsOriginalReport(t *testing.T) {
 	defer s.Close()
 	client := coordinator.New(s.URL, "synthetic-credential")
 	client.HTTP = s.Client()
-	cfg := config.Config{LocalAccountID: "synthetic-account", Executor: config.ExecutorServices, Services: []string{"codex"}, Profile: l.Profile, Verifier: "synthetic.invalid:7047", Prover: prover, MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: 3 * time.Second}
+	home := filepath.Join(dir, "codex")
+	if err := privateFixtureMkdir(home, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrivateFixture(filepath.Join(home, "auth.json"), freshSyntheticCodexAuth(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{CodexHome: home, LocalAccountID: "synthetic-account", Executor: config.ExecutorServices, Services: []string{"codex"}, Profile: l.Profile, Verifier: "synthetic.invalid:7047", Prover: prover, MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: 3 * time.Second}
 	if _, err := submitLease(context.Background(), client, cfg, l, nil, j); err == nil {
 		t.Fatal("lost report was acknowledged")
 	}

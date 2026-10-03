@@ -34,7 +34,7 @@ func TestActualAccountShutdownSnapshotsDrainingAndFinishedWork(t *testing.T) {
 	os.Mkdir(state, 0700)
 	home := filepath.Join(dir, "codex")
 	os.Mkdir(home, 0700)
-	os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"synthetic_fixture":true}`), 0600)
+	os.WriteFile(filepath.Join(home, "auth.json"), freshSyntheticCodexAuth(), 0600)
 	registry := filepath.Join(state, "accounts.json")
 	raw, _ := json.Marshal(accountFile{Version: 1, Accounts: []providerAccount{{"sole", "codex", home, 1}}})
 	os.WriteFile(registry, raw, 0600)

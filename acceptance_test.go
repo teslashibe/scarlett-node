@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -104,7 +105,14 @@ func TestCommunityAcceptanceBeforeProviderAndLostAcknowledgementRecovery(t *test
 			defer server.Close()
 			client := coordinator.New(server.URL, "synthetic-credential")
 			client.HTTP = server.Client()
-			cfg := config.Config{LocalAccountID: "selected-local-account", Executor: config.ExecutorServices, Services: []string{"codex"}, Profile: l.Profile, Verifier: "locally-configured.invalid:7047", Prover: prover, MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: 3 * time.Second}
+			home := filepath.Join(dir, "codex")
+			if err := privateFixtureMkdir(home, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := writePrivateFixture(filepath.Join(home, "auth.json"), freshSyntheticCodexAuth(), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg := config.Config{CodexHome: home, LocalAccountID: "selected-local-account", Executor: config.ExecutorServices, Services: []string{"codex"}, Profile: l.Profile, Verifier: "locally-configured.invalid:7047", Prover: prover, MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: 3 * time.Second}
 			code, err := submitLease(context.Background(), client, cfg, l, nil, journal)
 			if lost {
 				if err == nil || code != "" {
@@ -172,5 +180,127 @@ func TestCommunityProviderRejectsLegacyUnfundedLease(t *testing.T) {
 	pending, err := j.Pending()
 	if err != nil || len(pending) != 0 {
 		t.Fatal("legacy lease touched execution journal", err)
+	}
+}
+
+func TestCodexAdmissionRechecksSelectedProfileBeforeAcceptance(t *testing.T) {
+	for _, change := range []string{"deleted", "replaced-expired", "replaced-unknown", "replaced-malformed", "replaced-too-short"} {
+		t.Run(change, func(t *testing.T) {
+			p := multiPool(t)
+			selected, ok := p.acquireAccount("codex")
+			if !ok || selected.id != "one" {
+				t.Fatal("fresh account was not selected")
+			}
+			defer p.finishAccount(selected, "auth_required")
+			l := communityOffer(t)
+			path := filepath.Join(selected.config.CodexHome, "auth.json")
+			var err error
+			switch change {
+			case "deleted":
+				err = os.Remove(path)
+			case "replaced-expired":
+				err = writePrivateFixture(path, syntheticCodexAuth(time.Now().Add(-time.Hour)), 0600)
+			case "replaced-unknown":
+				err = writePrivateFixture(path, []byte(`{"tokens":{"access_token":"synthetic-opaque","account_id":"synthetic"}}`), 0600)
+			case "replaced-malformed":
+				err = writePrivateFixture(path, []byte(`{"tokens":`), 0600)
+			case "replaced-too-short":
+				err = writePrivateFixture(path, syntheticCodexAuth(l.LeaseDeadline.Add(codexAdmissionClockMargin)), 0600)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var calls atomic.Int32
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			defer server.Close()
+			client := coordinator.New(server.URL, "synthetic-credential")
+			client.HTTP = server.Client()
+			j := testJournal(t, filepath.Join(privateTestDir(t), "attempts"))
+			c := selected.config
+			c.Profile = l.Profile
+			// An executable that would fail the test if invoked, even without a
+			// provider. Insufficient credentials must return before spawning it.
+			marker := filepath.Join(privateTestDir(t), "synthetic-provider-called")
+			c.Prover = marker + "-helper"
+			if err := os.WriteFile(c.Prover, []byte("#!/bin/sh\nprintf called > '"+marker+"'\nexit 1\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			code, err := submitLease(context.Background(), client, c, l, nil, j)
+			if code != "auth_required" || err == nil || calls.Load() != 0 {
+				t.Fatal("invalid selected profile funded or submitted an offer")
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatal("provider helper executed without valid selected credentials")
+			}
+			pending, err := j.Pending()
+			if err != nil || len(pending) != 0 {
+				t.Fatal("locally unaccepted offer became execution uncertainty")
+			}
+			// A healthy alternate profile must not substitute for the pinned one.
+			other, ok := p.acquireAccount("codex")
+			if !ok || other.id != "two" {
+				t.Fatal("unrelated profile was blocked")
+			}
+			other.config.Profile = l.Profile
+			if _, err := submitLease(context.Background(), client, other.config, l, nil, j); err == nil || calls.Load() != 0 {
+				t.Fatal("local rejection switched accounts or replayed acceptance")
+			}
+			p.finishAccount(other, "")
+		})
+	}
+}
+
+func TestUnavailableCodexOfferNeverFundsThroughRejection(t *testing.T) {
+	p := poolFixture(t, "codex")
+	c := p.config
+	c.Executor, c.Profile = config.ExecutorServices, "standard"
+	c.Credential, c.NodeID = "synthetic-credential", "synthetic-node"
+	c.JournalLimits = attempts.DefaultLimits()
+	if err := writePrivateFixture(filepath.Join(c.CodexHome, "auth.json"), syntheticCodexAuth(time.Now().Add(-time.Hour)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	var heartbeats, providerReports atomic.Int32
+	l := communityOffer(t)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/node/v1/heartbeat" {
+			providerReports.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var heartbeat coordinator.Heartbeat
+		if json.NewDecoder(r.Body).Decode(&heartbeat) != nil || heartbeat.Capacity != 0 || heartbeat.State != "exhausted" {
+			t.Error("expired account advertised usable capacity")
+		}
+		if heartbeats.Add(1) == 1 {
+			// Even an unsolicited offer delivered to a blocked node cannot
+			// trigger the rejection helper's funded acceptance.
+			json.NewEncoder(w).Encode(map[string]any{"lease": l})
+		} else {
+			writer.Close()
+			io.WriteString(w, `{"lease":null}`)
+		}
+	}))
+	defer server.Close()
+	c.Coordinator = server.URL
+	c.CoordinatorCA = filepath.Join(privateTestDir(t), "synthetic-coordinator-ca.pem")
+	if err := writePrivateFixture(c.CoordinatorCA, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- runWithOwner(c, reader) }()
+	select {
+	case err := <-done:
+		if err != nil || providerReports.Load() != 0 || heartbeats.Load() < 2 {
+			t.Fatal("blocked offer called acceptance or failure-report HTTP", err)
+		}
+	case <-time.After(10 * time.Second):
+		writer.Close()
+		t.Fatal("synthetic node did not stop")
 	}
 }

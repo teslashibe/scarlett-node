@@ -332,7 +332,13 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 				var err error
 				if !serviceAvailable {
 					code = "service_unavailable"
-					err = rejectLease(workCtx, client, journal, l, code)
+					if l.AcceptanceRequired && l.ServiceType == "codex" {
+						// No selected valid profile: leave the unaccepted offer to
+						// expire rather than funding it through rejectLease.
+						err = errors.New("Codex offer has no locally valid account")
+					} else {
+						err = rejectLease(workCtx, client, journal, l, code)
+					}
 				} else {
 					code, err = submitLease(workCtx, client, selected, l, local, journal)
 					if services != nil {
@@ -385,6 +391,15 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 		return "", err
 	}
 	if l.AcceptanceRequired {
+		if l.ServiceType == "codex" && !codexAdmissionValid(c.CodexHome, l.LeaseDeadline) {
+			// No acceptance HTTP or provider execution has happened. Keep terminal
+			// replay metadata for this pinned attempt; let its offer expire remotely.
+			// rejectLease cannot be used here because it performs funded acceptance.
+			if err := journal.Terminal(record); err != nil {
+				return "auth_required", err
+			}
+			return "auth_required", errors.New("Codex credential validity is insufficient for the offered deadline")
+		}
 		// Persist uncertainty before acceptance HTTP. A lost acknowledgement
 		// keeps this journal pending; recovery never re-executes the provider.
 		l, err = client.Accept(ctx, l)

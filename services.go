@@ -56,6 +56,9 @@ func (p *servicePool) health() []coordinator.ServiceHealth {
 		capacity := 0
 		if s.enabled {
 			capacity = s.capacity
+			if s.state != "configured" && s.state != "ready" {
+				capacity = s.inFlight
+			}
 		}
 		h := coordinator.ServiceHealth{Kind: kind, State: s.state, Capacity: capacity, InFlight: s.inFlight, LastErrorCode: s.lastError}
 		if s.enabled {

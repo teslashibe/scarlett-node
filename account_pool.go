@@ -277,6 +277,9 @@ func refreshAccount(a *pooledAccount, now time.Time, helperMissing bool) {
 		configured = true
 	}
 	configured = configured && (a.spec.Service != "x_read" || worker.XConfigured(path))
+	if a.spec.Service == "codex" {
+		configured = configured && codexAdmissionValid(a.spec.Path, codexAdmissionWindow(now))
+	}
 	if s.state == "" || stamp != s.stamp {
 		s.stamp = stamp
 		// Credential changes can repair authentication, but do not erase a known

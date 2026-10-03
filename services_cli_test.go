@@ -55,7 +55,7 @@ func actualServicesCLIHeartbeat(t *testing.T, binary string, empty bool) {
 	dir := t.TempDir()
 	home := filepath.Join(dir, "codex")
 	os.Mkdir(home, 0700)
-	os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"synthetic_fixture":true}`), 0600)
+	os.WriteFile(filepath.Join(home, "auth.json"), freshSyntheticCodexAuth(), 0600)
 	session := filepath.Join(dir, "session.json")
 	os.WriteFile(session, []byte(`{"auth_token":"synthetic-auth","ct0":"synthetic-csrf"}`), 0600)
 	ca := filepath.Join(dir, "ca.pem")
