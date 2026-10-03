@@ -95,3 +95,9 @@ The desktop starts `scarlett-node desktop run` and holds its input pipe open. St
 The local API runs through `scarlett-node desktop api PORT`. That host selects only the API binary beside its own executable, fixes the listener to loopback and stops its owned API tree when desktop input closes. Unix uses an owned process group; Windows uses suspended startup and a kill-on-close Job Object. Windowless creation does not grant process breakaway. Local API stop can cancel requests in progress; it does not submit them again.
 
 The Windows bridge creates or checks private directories before starting the webview and obtains its bearer through fixed `desktop private-dir` and `desktop bearer` helpers. Existing broad ACLs, symlinks/reparse points and unsupported filesystems fail closed. The API bearer stays in the private local file and protected helper output; it is never a process argument or a status field.
+
+## Installed Windows validation
+
+The native complete-bundle workflow installs its testing NSIS package into a clean disposable runner directory, checks the installed component hashes and versions, then clears the development PATH before launching the installed desktop. Windows UI Automation invokes the real Start and Stop controls. Authenticated and unauthenticated model requests check the private bearer; a forced desktop exit and Ctrl-Q check API cleanup and recovery. All profiles are new, no provider accounts are connected and no inference or X requests run. Evidence records only outcomes, never credentials. The script refuses to run outside a disposable Windows CI runner or against existing app-owned state.
+
+Passing this check establishes the tested installer and UI lifecycle. It does not establish signature trust, remote provider login or verified paid network execution; those remain release requirements.
