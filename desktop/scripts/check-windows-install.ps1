@@ -343,7 +343,9 @@ function Select-Browser([int]$Index, [string]$ExpectedBrowser) {
         return $target.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
     } 10 'Browser chooser did not acquire input focus'
     [System.Windows.Forms.SendKeys]::SendWait('{HOME}')
-    for ($index = 0; $index -lt $Index; $index++) { [System.Windows.Forms.SendKeys]::SendWait('{DOWN}') }
+    # PowerShell variable names are case-insensitive; the loop counter must
+    # not overwrite the requested Index before sending its navigation keys.
+    for ($step = 0; $step -lt $Index; $step++) { [System.Windows.Forms.SendKeys]::SendWait('{DOWN}') }
     # Commit the native select before clicking consent. Keyboard navigation can
     # leave a preview choice in the popup; consent belongs to the committed
     # profile and must not race its change event.
