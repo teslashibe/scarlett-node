@@ -188,7 +188,10 @@ func (t *buyerXPerfTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	}
 	t.observed = append(t.observed, o) // A failed call also spends the experiment attempt.
 	if err != nil {
-		t.helperFailure = "native_execution_failed"
+		t.helperFailure = o.helperFailure
+		if t.helperFailure == "" {
+			t.helperFailure = "native_execution_failed"
+		}
 		return nil, err
 	}
 	o, body, err := xperfDecodeResponse(o, req, o.summary.Response)
@@ -333,6 +336,7 @@ func (t *buyerXPerfTransport) executeProvisional(ctx context.Context, input []by
 		}
 	}
 	if err != nil || scanner.Err() != nil || !provisional || !final {
+		o.helperFailure = xperfHelperFailure(ctx, stderr.Bytes())
 		return o, errors.New("provisional helper failed; provider work was not retried")
 	}
 	return o, nil

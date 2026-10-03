@@ -173,6 +173,30 @@ async fn batch_handshake(socket: &mut crate::control::Socket) -> Result<()> {
     Ok(())
 }
 
+// The SDK's plaintext reader can stay pending after the TLS backend fails,
+// including when a received record exceeds its allocation. Supervise both;
+// successful backend completion may precede draining the buffered response.
+async fn supervise_io<R, T, E: Into<anyhow::Error>>(
+    io: impl Future<Output = Result<R>>,
+    backend: &mut tokio::task::JoinHandle<std::result::Result<T, E>>,
+) -> Result<(R, Option<T>)> {
+    tokio::pin!(io);
+    tokio::select! {
+        response = &mut io => Ok((response?, None)),
+        result = backend => {
+            let completed = result.context("X TLS backend task failed")?
+                .map_err(Into::into).context("X TLS backend failed")?;
+            Ok((io.await?, Some(completed)))
+        }
+    }
+}
+
+struct AbortBackend(tokio::task::AbortHandle);
+
+impl Drop for AbortBackend {
+    fn drop(&mut self) { self.0.abort(); }
+}
+
 pub async fn run(request: Request) -> Result<Summary> {
     validate_experiment(&request)?;
     let raw = STANDARD.decode(request.request.as_bytes()).context("request is not base64")?;
@@ -209,7 +233,7 @@ pub async fn run(request: Request) -> Result<Summary> {
         let prover = handle.new_prover(ProverConfig::builder().build()?)?;
         let tls_config = TlsClientConfig::builder().server_name(ServerName::Dns(HOST.try_into()?)).root_store(RootCertStore::mozilla()).build()?;
         // Both protocol variants finish as the same committed-prover type.
-        let (mut tls, prover_task, end, execution_started) = match request.proof_mode {
+        let (mut tls, mut prover_task, end, execution_started) = match request.proof_mode {
             ProofMode::Mpc => {
                 let mut config = MpcTlsConfig::builder().max_sent_data(raw.len()).max_recv_data(max_recv);
                 if let Some(n) = request.max_sent_records { config = config.max_sent_records(n); }
@@ -233,15 +257,18 @@ pub async fn run(request: Request) -> Result<Summary> {
                 (tls, tokio::spawn(prover.into_future()), None, execution_started)
             }
         };
-        let phase = Instant::now();
-        tls.write_all(&raw).await?;
-        tls.flush().await?;
-        timings.request_write = phase.elapsed().as_millis();
+        // Dropping the response future on error, timeout or session failure
+        // must also terminate its background TLS task.
+        let _backend_guard = AbortBackend(prover_task.abort_handle());
         // X does not always close after `Connection: close`, so stop at the end of
         // the framed response rather than waiting for the connection to end.
-        let mut response = Vec::new();
-        let phase = Instant::now();
-        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        let response_io = async {
+            let phase = Instant::now();
+            tls.write_all(&raw).await?;
+            tls.flush().await?;
+            timings.request_write = phase.elapsed().as_millis();
+            let mut response = Vec::new();
+            let phase = Instant::now();
             let mut chunk = [0u8; 16 << 10];
             while !complete(&response) {
                 let n = tls.read(&mut chunk).await?;
@@ -251,11 +278,14 @@ pub async fn run(request: Request) -> Result<Summary> {
                 if response.len().saturating_add(n) > max_recv { bail!("X response exceeds receive limit"); }
                 response.extend_from_slice(&chunk[..n]);
             }
-            anyhow::Ok(())
-        })
+            timings.response_read = phase.elapsed().as_millis();
+            anyhow::Ok(response)
+        };
+        let (response, completed) = tokio::time::timeout(
+            Duration::from_secs(120), supervise_io(response_io, &mut prover_task),
+        )
         .await
         .context("timed out waiting for X")??;
-        timings.response_read = phase.elapsed().as_millis();
         if !complete(&response) { bail!("X response framing incomplete"); }
         if request.response_ready_event {
             eprintln!("{}", serde_json::json!({"phase":"response_ready", "elapsed_ms":started.elapsed().as_millis()}));
@@ -273,7 +303,10 @@ pub async fn run(request: Request) -> Result<Summary> {
         if let Some(end) = end { end.finish(); }
         drop(tls);
 
-        let mut prover = tokio::time::timeout(Duration::from_secs(120), prover_task).await.context("TLS finalization timeout")???;
+        let mut prover = match completed {
+            Some(prover) => prover,
+            None => tokio::time::timeout(Duration::from_secs(120), prover_task).await.context("TLS finalization timeout")???,
+        };
         timings.tls_finish = phase.elapsed().as_millis();
         let sent = prover.transcript().sent().to_vec();
         let received_bytes = prover.transcript().received().len();
@@ -383,6 +416,61 @@ fn reveal_requests(sent: &[u8], batch: bool) -> Result<Vec<Range<usize>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn backend_failure_interrupts_a_stalled_plaintext_reader() {
+        let mut backend = tokio::spawn(async {
+            tokio::task::yield_now().await;
+            Err::<(), _>(anyhow::anyhow!("fixture receive allocation exceeded"))
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            supervise_io(std::future::pending::<Result<()>>(), &mut backend),
+        ).await.expect("backend failure left the reader waiting");
+        assert!(format!("{:#}", result.unwrap_err()).contains("fixture receive allocation exceeded"));
+    }
+
+    #[tokio::test]
+    async fn successful_backend_completion_still_drains_the_response() {
+        let mut backend = tokio::spawn(async { Ok::<_, anyhow::Error>(42) });
+        let io = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".to_vec())
+        };
+        let (response, completed) = supervise_io(io, &mut backend).await.unwrap();
+        assert!(xpolicy::response_complete(&response));
+        assert_eq!(completed, Some(42));
+    }
+
+    #[tokio::test]
+    async fn completed_response_preserves_the_backend_for_finalization() {
+        let mut backend = tokio::spawn(std::future::pending::<Result<()>>());
+        let guard = AbortBackend(backend.abort_handle());
+        let (response, completed) = supervise_io(async { Ok(7) }, &mut backend).await.unwrap();
+        assert_eq!(response, 7);
+        assert!(completed.is_none());
+        assert!(!backend.is_finished());
+        drop(guard);
+        assert!(backend.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn io_error_and_timeout_abort_the_background_backend() {
+        for timeout in [false, true] {
+            let mut backend = tokio::spawn(std::future::pending::<Result<()>>());
+            let result = {
+                let _guard = AbortBackend(backend.abort_handle());
+                let io = async {
+                    if timeout { std::future::pending::<Result<()>>().await }
+                    else { Err(anyhow::anyhow!("fixture framing incomplete")) }
+                };
+                tokio::time::timeout(Duration::from_millis(10), supervise_io(io, &mut backend)).await
+            };
+            assert_eq!(result.is_err(), timeout);
+            if !timeout { assert!(result.unwrap().is_err()); }
+            assert!(backend.await.unwrap_err().is_cancelled());
+        }
+    }
 
     #[test]
     fn provisional_data_is_unverified_and_excludes_headers() {

@@ -475,6 +475,7 @@ type xperfObserved struct {
 	bodyBytes, items, httpStatus                        int
 	summary                                             xperfSummary
 	helperMS                                            int64
+	helperFailure                                       string
 	userCPUSeconds, systemCPUSeconds                    float64
 	peakRSSBytes                                        int64
 	provisionalMS                                       *uint64
@@ -530,6 +531,7 @@ func xperfExecute(ctx context.Context, c xperfConfig, input []byte, diagnostic s
 		o.provisionalMS = xperfProvisional(stderr.Bytes())
 	}
 	if err != nil {
+		o.helperFailure = xperfHelperFailure(ctx, stderr.Bytes())
 		return o, errors.New("helper_failed")
 	}
 	if json.Unmarshal(stdout.Bytes(), &o.summary) != nil || o.summary.Status != "proof_sent" || o.summary.Mode != c.mode {
@@ -539,6 +541,47 @@ func xperfExecute(ctx context.Context, c xperfConfig, input []byte, diagnostic s
 		return o, errors.New("helper_summary_invalid")
 	}
 	return o, nil
+}
+
+// Native errors stay private. Retain only fixed classifications after temporary
+// files are removed, so allocation failures can be distinguished from timeouts.
+func xperfHelperFailure(ctx context.Context, diagnostic []byte) string {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return "deadline_exceeded"
+	}
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return "cancelled"
+	}
+	for _, rule := range []struct{ text, code string }{
+		{"attempted to receive more data than was configured", "receive_allocation_exceeded"},
+		{"attempted to send more data than was configured", "send_allocation_exceeded"},
+		{"X response exceeds receive limit", "response_limit_exceeded"},
+		{"X response framing incomplete", "response_framing_incomplete"},
+		{"X TLS backend failed", "backend_failed"},
+	} {
+		if bytes.Contains(diagnostic, []byte(rule.text)) {
+			return rule.code
+		}
+	}
+	return "native_execution_failed"
+}
+
+func TestXPerfHelperFailurePrivacy(t *testing.T) {
+	for _, tc := range []struct{ message, want string }{
+		{"PRIVATE_SESSION attempted to receive more data than was configured", "receive_allocation_exceeded"},
+		{"PRIVATE_ERROR X response exceeds receive limit", "response_limit_exceeded"},
+		{"PRIVATE_ERROR X TLS backend failed", "backend_failed"},
+		{"PRIVATE_ERROR", "native_execution_failed"},
+	} {
+		if got := xperfHelperFailure(context.Background(), []byte(tc.message)); got != tc.want {
+			t.Fatal("helper failure was not classified with a fixed label")
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if xperfHelperFailure(ctx, []byte("PRIVATE")) != "cancelled" {
+		t.Fatal("cancellation classification lost")
+	}
 }
 
 func xperfDecodeResponse(o xperfObserved, req *http.Request, encoded string) (xperfObserved, []byte, error) {
