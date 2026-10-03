@@ -20,3 +20,6 @@ func makeHelperUnusable(path string) error {
 	return os.WriteFile(path, []byte("#!/bin/sh\nexit 1\n"), 0600)
 }
 func restoreFixtureHelper(path string) error { return os.Chmod(path, 0700) }
+
+func makeFixturePublic(path string) error  { return os.Chmod(path, 0644) }
+func makeFixturePrivate(path string) error { return os.Chmod(path, 0600) }

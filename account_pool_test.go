@@ -206,13 +206,13 @@ func TestAccountConfigurationPrivacyAndStatusRedaction(t *testing.T) {
 	if bytes.Contains(heartbeat, []byte(`"id"`)) || bytes.Contains(heartbeat, []byte("rest_until")) {
 		t.Fatal("account identities leaked to coordinator")
 	}
-	if e := os.Chmod(p.config.AccountsFile, 0644); e != nil {
+	if e := makeFixturePublic(p.config.AccountsFile); e != nil {
 		t.Fatal(e)
 	}
 	if _, ok := p.acquireAccount("codex"); ok {
 		t.Fatal("public account configuration accepted")
 	}
-	if e := os.Chmod(p.config.AccountsFile, 0600); e != nil {
+	if e := makeFixturePrivate(p.config.AccountsFile); e != nil {
 		t.Fatal(e)
 	}
 	if _, ok := p.acquireAccount("codex"); !ok {

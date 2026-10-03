@@ -119,7 +119,7 @@ func TestIndependentProvenServices(t *testing.T) {
 
 func TestVerifierTLSConfiguration(t *testing.T) {
 	c := Config{Coordinator: "https://example.org", Executor: ExecutorCodexTLSN, Verifier: "verifier.example.org:7047", Prover: "scarlett-prover", Profile: "standard", StateDir: filepath.Join(t.TempDir(), "state"), InferenceTimeout: time.Second, MaxInputBytes: 1024, MaxOutputTokens: 20}
-	c.VerifierCA = "/absolute/private-test-ca.pem"
+	c.VerifierCA = filepath.Join(t.TempDir(), "public-test-ca.pem")
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestVerifierTLSConfiguration(t *testing.T) {
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	c.VerifierCA = "/absolute/ca.pem"
+	c.VerifierCA = filepath.Join(t.TempDir(), "public-test-ca.pem")
 	if c.Validate() == nil {
 		t.Fatal("mixed fixture plaintext and CA accepted")
 	}

@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"golang.org/x/sys/windows"
 )
 
 func createFIFOFixture(t *testing.T, _ string) error {
@@ -29,4 +31,24 @@ func restoreFixtureHelper(path string) error {
 		return err
 	}
 	return installFixtureHelper(path)
+}
+
+func makeFixturePublic(path string) error { return setFixtureACL(path, "D:P(A;;FA;;;WD)") }
+func makeFixturePrivate(path string) error {
+	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return err
+	}
+	return setFixtureACL(path, "D:P(A;;FA;;;"+u.User.Sid.String()+")(A;;FA;;;SY)")
+}
+func setFixtureACL(path, descriptor string) error {
+	sd, err := windows.SecurityDescriptorFromString(descriptor)
+	if err != nil {
+		return err
+	}
+	acl, _, err := sd.DACL()
+	if err != nil {
+		return err
+	}
+	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil)
 }

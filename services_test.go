@@ -26,7 +26,7 @@ func poolFixture(t *testing.T, selected ...string) *servicePool {
 	if e := installFixtureHelper(helper); e != nil {
 		t.Fatal(e)
 	}
-	return newServicePool(config.Config{Services: selected, CodexHome: home, XSession: session, Prover: helper, CodexConcurrency: 2, XConcurrency: 1, MaxInputBytes: 32768, MaxOutputTokens: 2048})
+	return newServicePool(config.Config{StateDir: dir, AccountsFile: filepath.Join(dir, "accounts.json"), Services: selected, CodexHome: home, XSession: session, Prover: helper, CodexConcurrency: 2, XConcurrency: 1, MaxInputBytes: 32768, MaxOutputTokens: 2048})
 }
 
 func TestMissingProofHelperNeverAdvertisesConfiguredCapacity(t *testing.T) {
@@ -139,7 +139,7 @@ func TestServiceMetadataDoesNotClaimAuthenticatedReadiness(t *testing.T) {
 	if healthKind(t, p, "codex").State != "configured" || healthKind(t, p, "x_read").State != "configured" {
 		t.Fatal("configuration invented provider readiness")
 	}
-	os.Chmod(p.config.XSession, 0644)
+	makeFixturePublic(p.config.XSession)
 	if healthKind(t, p, "x_read").State != "auth_required" || healthKind(t, p, "codex").State != "configured" {
 		t.Fatal("unsafe session affected wrong service")
 	}
