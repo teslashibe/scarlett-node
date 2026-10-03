@@ -211,6 +211,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	}()
 	var mu sync.Mutex
 	var restUntil time.Time
+	legacyCodexBlocked := false
 	lastRecovery := time.Now()
 	for ctx.Err() == nil {
 		drained, err := drainRequested(c.StateDir)
@@ -240,6 +241,17 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			state = "exhausted"
 		}
 		mu.Unlock()
+		// Legacy reports have no typed service health and node-v1 requires
+		// their capacity to stay positive; exhausted alone stops dispatch.
+		if blocked := legacyCodexAdmissionBlocked(c, time.Now()); blocked != legacyCodexBlocked {
+			legacyCodexBlocked = blocked
+			if blocked {
+				fmt.Fprintln(os.Stderr, "codex: local credential cannot cover a funded offer; advertising exhausted until it is renewed")
+			}
+		}
+		if legacyCodexBlocked {
+			state = "exhausted"
+		}
 		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: nodeID, Profile: c.Profile, State: state, Bid: c.Bid, Capacity: capacity}
 		if services != nil {
 			h.Services = services.health()

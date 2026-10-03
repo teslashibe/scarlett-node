@@ -3,11 +3,21 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/teslashibe/scarlett-node/internal/attempts"
+	"github.com/teslashibe/scarlett-node/internal/config"
+	"github.com/teslashibe/scarlett-node/internal/coordinator"
 )
 
 // No real provider token or identity is used. This unsigned JWT-shaped fixture
@@ -152,5 +162,120 @@ func TestCodexAdmissionRejectsMissingOrOversizedAuth(t *testing.T) {
 	}
 	if codexAdmissionValid(home, time.Now()) {
 		t.Fatal("missing credential file admitted")
+	}
+}
+
+func TestLegacyCodexAdmissionGateAppliesOnlyToFundedTLSNMode(t *testing.T) {
+	home := privateTestDir(t)
+	if err := writePrivateFixture(filepath.Join(home, "auth.json"), syntheticCodexAuth(time.Now().Add(-time.Hour)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	c := config.Config{Executor: config.ExecutorCodexTLSN, CodexHome: home}
+	if !legacyCodexAdmissionBlocked(c, now) {
+		t.Fatal("expired codex-tlsn credential advertised as available")
+	}
+	for _, other := range []config.Config{
+		{Executor: config.ExecutorCodexTLSN, CodexHome: home, LocalFixture: true},
+		{Executor: config.ExecutorServices, CodexHome: home},
+		{Executor: config.ExecutorGateway, CodexHome: home},
+	} {
+		if legacyCodexAdmissionBlocked(other, now) {
+			t.Fatal("legacy Codex gate applied outside funded codex-tlsn mode")
+		}
+	}
+	if err := writePrivateFixture(filepath.Join(home, "auth.json"), freshSyntheticCodexAuth(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if legacyCodexAdmissionBlocked(c, now) {
+		t.Fatal("renewed credential stayed blocked")
+	}
+}
+
+// Legacy codex-tlsn heartbeats have no typed service health. A credential that
+// cannot cover a funded offer must stop dispatch before polling; otherwise the
+// local admission guard refuses each offer silently and it waits out its deadline.
+func TestLegacyCodexTLSNHeartbeatHonorsLocalAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		auth  []byte
+		state string
+		offer bool
+	}{
+		{"expired", syntheticCodexAuth(time.Now().Add(-time.Hour)), "exhausted", true},
+		{"shorter than an offer", syntheticCodexAuth(time.Now().Add(coordinator.MaxOfferLifetime)), "exhausted", false},
+		{"unknown expiry", []byte(`{"tokens":{"access_token":"synthetic-opaque","account_id":"synthetic"}}`), "exhausted", false},
+		{"fresh", freshSyntheticCodexAuth(), "available", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := privateTestDir(t)
+			home := filepath.Join(dir, "codex")
+			if err := privateFixtureMkdir(home, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := writePrivateFixture(filepath.Join(home, "auth.json"), tc.auth, 0600); err != nil {
+				t.Fatal(err)
+			}
+			c := config.Config{Executor: config.ExecutorCodexTLSN, Profile: "standard", StateDir: filepath.Join(dir, "state"), CodexHome: home, Credential: "synthetic-credential", NodeID: "synthetic-node", Concurrency: 3, Bid: 100, Verifier: "locally-configured.invalid:7047", Prover: filepath.Join(dir, "synthetic-prover-never-run"), JournalLimits: attempts.DefaultLimits(), MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: 3 * time.Second}
+			offer := testLease()
+			offer.ServiceType, offer.AcceptanceRequired = "codex", true
+			offer.SettlementDeadline = offer.LeaseDeadline
+			offer.SignedJobID, offer.RequestSHA256 = strings.Repeat("a", 64), strings.Repeat("b", 64)
+			reader, writer := io.Pipe()
+			defer reader.Close()
+			defer writer.Close()
+			var heartbeats, other atomic.Int32
+			received := make(chan coordinator.Heartbeat, 8)
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/node/v1/heartbeat" {
+					other.Add(1)
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				var h coordinator.Heartbeat
+				if json.NewDecoder(r.Body).Decode(&h) != nil {
+					t.Error("invalid heartbeat")
+				}
+				select {
+				case received <- h:
+				default:
+				}
+				if heartbeats.Add(1) == 1 && tc.offer {
+					// An unsolicited offer to a blocked node is still never funded.
+					json.NewEncoder(w).Encode(map[string]any{"lease": offer})
+					return
+				}
+				writer.Close()
+				io.WriteString(w, `{"lease":null}`)
+			}))
+			defer server.Close()
+			c.Coordinator = server.URL
+			c.CoordinatorCA = filepath.Join(privateTestDir(t), "synthetic-coordinator-ca.pem")
+			if err := writePrivateFixture(c.CoordinatorCA, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- runWithOwner(c, reader) }()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(10 * time.Second):
+				writer.Close()
+				t.Fatal("synthetic node did not stop")
+			}
+			close(received)
+			count := 0
+			for h := range received {
+				count++
+				if h.State != tc.state || h.Capacity != 3 || len(h.Services) != 0 {
+					t.Fatalf("legacy heartbeat %s with capacity %d; want %s with positive legacy capacity", h.State, h.Capacity, tc.state)
+				}
+			}
+			if count == 0 || (tc.offer && count < 2) || other.Load() != 0 {
+				t.Fatal("missing heartbeat, or a blocked offer called acceptance or report HTTP")
+			}
+		})
 	}
 }
