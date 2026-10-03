@@ -36,9 +36,9 @@ The native pool contract landed in [node PR 27](https://github.com/teslashibe/sc
 
 ## Local release validation
 
-Debug builds accept explicit `SCARLETT_DESKTOP_LOCAL_COORDINATOR`, `SCARLETT_DESKTOP_LOCAL_VERIFIER` and `SCARLETT_DESKTOP_LOCAL_VERIFIER_CA` environment variables at startup. The coordinator must be a loopback HTTP/HTTPS origin with an explicit unprivileged port; credentials, paths, queries and fragments are rejected. The verifier must be a literal loopback socket address and requires an absolute regular CA file. Its certificate and server name are still verified by the existing native TLS client. There is no plaintext or insecure TLS option; the local verifier certificate must cover its supplied loopback address.
+Debug builds accept explicit `SCARLETT_DESKTOP_LOCAL_COORDINATOR`, `SCARLETT_DESKTOP_LOCAL_COORDINATOR_CA`, `SCARLETT_DESKTOP_LOCAL_VERIFIER` and `SCARLETT_DESKTOP_LOCAL_VERIFIER_CA` environment variables at startup. The coordinator must be a loopback HTTPS origin with its own absolute regular CA file with an explicit unprivileged port; credentials, paths, queries and fragments are rejected. The verifier must be a literal loopback socket address and requires an absolute regular CA file. Its certificate and server name are still verified by the existing native TLS client. There is no plaintext or insecure TLS option; the local verifier certificate must cover its supplied loopback address.
 
-For example, the release owner can start the debug executable with coordinator `http://localhost:18083`, verifier `127.0.0.1:17047` and the isolated verifier's CA path. Remote overrides fail startup. Release builds ignore these variables and retain the public defaults. Pair only disposable test identities against the isolated local API; the app uses its own private state directory.
+For example, the release owner can start the debug executable with coordinator `https://localhost:18443`, the coordinator CA path, verifier `127.0.0.1:17047` and the isolated verifier's CA path. Remote overrides fail startup. Release builds ignore these variables and retain the public defaults. Pair only disposable test identities against the isolated local API; the app uses its own private state directory.
 
 ## Security and lifecycle
 

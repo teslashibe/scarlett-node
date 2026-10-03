@@ -22,6 +22,7 @@ struct Endpoints {
     coordinator: String,
     verifier: String,
     verifier_ca: Option<PathBuf>,
+    coordinator_ca: Option<PathBuf>,
 }
 impl Default for Endpoints {
     fn default() -> Self {
@@ -29,6 +30,7 @@ impl Default for Endpoints {
             coordinator: COORDINATOR.into(),
             verifier: VERIFIER.into(),
             verifier_ca: None,
+            coordinator_ca: None,
         }
     }
 }
@@ -38,6 +40,7 @@ impl Endpoints {
         coordinator: Option<&str>,
         verifier: Option<&str>,
         ca: Option<&Path>,
+        coordinator_ca: Option<&Path>,
     ) -> Result<Self> {
         if !debug {
             return Ok(Self::default());
@@ -52,7 +55,7 @@ impl Endpoints {
                         .is_ok_and(|ip| ip.is_loopback())
             });
             if !loopback
-                || !matches!(url.scheme(), "http" | "https")
+                || url.scheme() != "https"
                 || !url.username().is_empty()
                 || url.password().is_some()
                 || url.query().is_some()
@@ -62,7 +65,14 @@ impl Endpoints {
             {
                 return Err(Error::InvalidInput);
             }
+            let ca = coordinator_ca.ok_or(Error::InvalidInput)?;
+            if !ca.is_absolute() || !regular(ca) {
+                return Err(Error::InvalidInput);
+            }
+            out.coordinator_ca = Some(ca.to_path_buf());
             out.coordinator = raw.trim_end_matches('/').to_owned();
+        } else if coordinator_ca.is_some() {
+            return Err(Error::InvalidInput);
         }
         if let Some(raw) = verifier {
             let address: std::net::SocketAddr = raw.parse().map_err(|_| Error::InvalidInput)?;
@@ -281,11 +291,14 @@ impl Node {
         let coordinator = std::env::var("SCARLETT_DESKTOP_LOCAL_COORDINATOR").ok();
         let verifier = std::env::var("SCARLETT_DESKTOP_LOCAL_VERIFIER").ok();
         let ca = std::env::var_os("SCARLETT_DESKTOP_LOCAL_VERIFIER_CA").map(PathBuf::from);
+        let coordinator_ca =
+            std::env::var_os("SCARLETT_DESKTOP_LOCAL_COORDINATOR_CA").map(PathBuf::from);
         node.endpoints = Endpoints::resolve(
             cfg!(debug_assertions),
             coordinator.as_deref(),
             verifier.as_deref(),
             ca.as_deref(),
+            coordinator_ca.as_deref(),
         )?;
         Ok(node)
     }
@@ -345,6 +358,9 @@ impl Node {
             .kill_on_drop(true);
         if let Some(ca) = &self.endpoints.verifier_ca {
             cmd.env("SCARLETT_VERIFIER_CA_FILE", ca);
+        }
+        if let Some(ca) = &self.endpoints.coordinator_ca {
+            cmd.env("SCARLETT_COORDINATOR_CA_FILE", ca);
         }
         Ok(cmd)
     }
@@ -740,34 +756,55 @@ mod tests {
             Some("http://remote.example:18083"),
             Some("192.0.2.1:7047"),
             Some(Path::new("relative.pem")),
+            Some(Path::new("ignored-coordinator.pem")),
         )
         .unwrap();
         assert_eq!(endpoints.coordinator, COORDINATOR);
         assert_eq!(endpoints.verifier, VERIFIER);
         assert!(endpoints.verifier_ca.is_none());
+        assert!(endpoints.coordinator_ca.is_none());
     }
     #[test]
-    fn debug_coordinator_only_accepts_loopback_origins() {
+    fn debug_coordinator_requires_trusted_https_loopback_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let ca = temp.path().join("coordinator-ca.pem");
+        std::fs::write(&ca, "synthetic CA fixture").unwrap();
+        for origin in [
+            "https://localhost:18443",
+            "https://127.0.0.1:18443/",
+            "https://[::1]:18443",
+        ] {
+            assert!(Endpoints::resolve(true, Some(origin), None, None, Some(&ca)).is_ok());
+            assert!(Endpoints::resolve(true, Some(origin), None, None, None).is_err());
+        }
         for origin in [
             "http://localhost:18083",
             "http://127.0.0.1:18083/",
-            "https://[::1]:18443",
-        ] {
-            assert!(Endpoints::resolve(true, Some(origin), None, None).is_ok());
-        }
-        for origin in [
             "https://network.scarlett.ai:18443",
-            "http://192.0.2.1:18083",
-            "http://localhost.evil.test:18083",
-            "http://user:secret@localhost:18083",
-            "http://localhost:18083/setup/",
-            "http://localhost:18083/?next=evil",
-            "http://localhost:18083/#evil",
-            "http://localhost",
-            "http://localhost:80",
-            "ftp://localhost:18083",
+            "https://192.0.2.1:18443",
+            "https://localhost.evil.test:18443",
+            "https://user:secret@localhost:18443",
+            "https://localhost:18443/setup/",
+            "https://localhost:18443/?next=evil",
+            "https://localhost:18443/#evil",
+            "https://localhost",
+            "https://localhost:443",
+            "ftp://localhost:18443",
         ] {
-            assert!(Endpoints::resolve(true, Some(origin), None, None).is_err());
+            assert!(Endpoints::resolve(true, Some(origin), None, None, Some(&ca)).is_err());
+        }
+        assert!(Endpoints::resolve(true, None, None, None, Some(&ca)).is_err());
+        for invalid in [temp.path(), Path::new("relative.pem")] {
+            assert!(
+                Endpoints::resolve(
+                    true,
+                    Some("https://localhost:18443"),
+                    None,
+                    None,
+                    Some(invalid)
+                )
+                .is_err()
+            );
         }
     }
     #[cfg(unix)]
@@ -780,16 +817,17 @@ mod tests {
         let link = temp.path().join("ca-link.pem");
         symlink(&ca, &link).unwrap();
         for verifier in ["127.0.0.1:17047", "[::1]:17047"] {
-            assert!(Endpoints::resolve(true, None, Some(verifier), Some(&ca)).is_ok());
+            assert!(Endpoints::resolve(true, None, Some(verifier), Some(&ca), None).is_ok());
         }
-        assert!(Endpoints::resolve(true, None, Some("127.0.0.1:17047"), None).is_err());
-        assert!(Endpoints::resolve(true, None, None, Some(&ca)).is_err());
+        assert!(Endpoints::resolve(true, None, Some("127.0.0.1:17047"), None, None).is_err());
+        assert!(Endpoints::resolve(true, None, None, Some(&ca), None).is_err());
         for verifier in ["192.0.2.1:17047", "remote.example:17047", "127.0.0.1:443"] {
-            assert!(Endpoints::resolve(true, None, Some(verifier), Some(&ca)).is_err());
+            assert!(Endpoints::resolve(true, None, Some(verifier), Some(&ca), None).is_err());
         }
         for invalid in [link.as_path(), temp.path(), Path::new("relative.pem")] {
             assert!(
-                Endpoints::resolve(true, None, Some("127.0.0.1:17047"), Some(invalid)).is_err()
+                Endpoints::resolve(true, None, Some("127.0.0.1:17047"), Some(invalid), None)
+                    .is_err()
             );
         }
         let binary = temp.path().join("node");
@@ -801,8 +839,9 @@ mod tests {
         );
         node.endpoints = Endpoints::resolve(
             true,
-            Some("http://localhost:18083"),
+            Some("https://localhost:18443"),
             Some("127.0.0.1:17047"),
+            Some(&ca),
             Some(&ca),
         )
         .unwrap();
@@ -815,11 +854,15 @@ mod tests {
             env.get(std::ffi::OsStr::new("SCARLETT_VERIFIER_CA_FILE")),
             Some(&Some(ca.as_os_str()))
         );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("SCARLETT_COORDINATOR_CA_FILE")),
+            Some(&Some(ca.as_os_str()))
+        );
         assert!(!env.contains_key(std::ffi::OsStr::new("SCARLETT_VERIFIER_PLAINTEXT_FIXTURE")));
         assert!(!env.contains_key(std::ffi::OsStr::new("SCARLETT_LOCAL_FIXTURE")));
         assert_eq!(
             node.network_url("setup").unwrap(),
-            "http://localhost:18083/setup/"
+            "https://localhost:18443/setup/"
         );
         assert_eq!(
             node.network_url("https://evil.test"),
