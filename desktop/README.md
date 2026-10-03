@@ -90,6 +90,8 @@ npm run tauri build -- --debug --config src-tauri/tauri.complete.generated.json
 
 Use `.exe` binary paths on Windows. The preparation script verifies native provider versions, the model API's reviewed release, Go package/target metadata and regular files. It preserves the provider binaries and bundled notices, and records resource and sidecar SHA-256 hashes in `runtime/COMPONENTS.json`. The archive verifier uses fixed SHA-512 pins for all three native provider targets. Generated resources and the config overlay are ignored.
 
+The repository's Cargo configuration statically links the C runtime for Scarlett's Windows x64 Rust binaries. Keep that configuration when building the proof helper. Native package checks inspect direct and delayed PE imports before starting any service and reject Scarlett executables that require a separately installed developer CRT. The pinned provider binaries and their own dependencies remain unchanged.
+
 On Mac, validate the installed payload with:
 
 ```sh
