@@ -47,7 +47,7 @@ func CheckDir(path string) error {
 	if err != nil {
 		return err
 	}
-	return validateACL(handles[len(handles)-1], user)
+	return validateACL(handles[len(handles)-1], user, false)
 }
 
 // EnsureDir creates missing components with protected ACLs at creation. It

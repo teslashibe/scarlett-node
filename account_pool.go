@@ -260,11 +260,13 @@ func (p *servicePool) refreshAccounts(now time.Time) bool {
 }
 func refreshAccount(a *pooledAccount, now time.Time, helperMissing bool) {
 	s := a.entry
-	path := a.spec.Path
+	path, open := a.spec.Path, localfs.OpenPrivate
 	if a.spec.Service == "codex" {
-		path = filepath.Join(path, "auth.json")
+		// codex-cli and open-agent-api write auth.json with an inherited Windows
+		// DACL; X sessions are written by the node itself.
+		path, open = filepath.Join(path, "auth.json"), localfs.OpenPrivateInherited
 	}
-	f, e := localfs.OpenPrivate(path)
+	f, e := open(path)
 	var info os.FileInfo
 	if e == nil {
 		info, e = f.Stat()

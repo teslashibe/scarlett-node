@@ -12,6 +12,14 @@ from the volume root downward and held without write/delete sharing while the
 final path resolves. Device namespaces, UNC paths and alternate streams are
 rejected. Locks use nonblocking exclusive `LockFileEx` ownership until handle
 close. Numeric Unix modes are never accepted as evidence of Windows privacy.
+Codex `auth.json` is the one read exception: codex-cli and open-agent-api
+create it without a security descriptor, so it carries only ACEs inherited
+from CODEX_HOME. Codex credential reads accept that unprotected DACL only below
+a pinned parent that passes the protected private-directory check, and the file
+must still belong to the current user and grant only it and LocalSystem.
+Node-owned state and writes keep the protected-DACL rule, and no ACL is
+repaired. A stock `~/.codex`, which inherits Administrators access, stays
+rejected.
 These contracts follow Microsoft's [CreateFileW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
 and [LockFileEx](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex)
 interfaces. The native Windows CI exercises file privacy and process locks,

@@ -67,3 +67,30 @@ func TestCreateDirRequiresPrivateParentAndSkipsLinks(t *testing.T) {
 		t.Fatal("directory claimed below a shared parent", err)
 	}
 }
+
+// Unix has no inherited ACLs: the credential read keeps every OpenPrivate check.
+func TestPrivateInheritedOpenKeepsUnixChecks(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(path, []byte("synthetic-only"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := OpenPrivateInherited(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0640); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{link, path, dir} {
+		if f, err := OpenPrivateInherited(name); err == nil {
+			f.Close()
+			t.Fatal("link, broad permission or directory accepted")
+		}
+	}
+}

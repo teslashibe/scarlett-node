@@ -14,6 +14,10 @@ func OpenPrivate(path string) (*os.File, error) {
 	return privateFile(path, false)
 }
 
+// OpenPrivateInherited is OpenPrivate on Unix: codex-cli and open-agent-api
+// already create credential files with mode 0600 there.
+func OpenPrivateInherited(path string) (*os.File, error) { return OpenPrivate(path) }
+
 func privateFile(path string, create bool) (*os.File, error) {
 	flags := os.O_RDONLY | unix.O_NOFOLLOW | unix.O_NONBLOCK
 	if create {

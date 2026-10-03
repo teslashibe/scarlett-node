@@ -18,6 +18,7 @@ import (
 	"github.com/teslashibe/scarlett-node/internal/attempts"
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
+	"github.com/teslashibe/scarlett-node/internal/localfs"
 )
 
 // No real provider token or identity is used. This unsigned JWT-shaped fixture
@@ -189,6 +190,92 @@ func TestLegacyCodexAdmissionGateAppliesOnlyToFundedTLSNMode(t *testing.T) {
 	}
 	if legacyCodexAdmissionBlocked(c, now) {
 		t.Fatal("renewed credential stayed blocked")
+	}
+}
+
+// codex-cli writes auth.json in place, and open-agent-api v0.1.31 persists a
+// renewal through os.CreateTemp in the same directory and a rename. Neither
+// applies a Windows security descriptor.
+func writeCodexAuthLikeCLI(t *testing.T, path string, raw []byte) {
+	t.Helper()
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	externalCredentialFixture(t, path)
+}
+
+func replaceCodexAuthLikeGateway(t *testing.T, path string, raw []byte) {
+	t.Helper()
+	temp, err := os.CreateTemp(filepath.Dir(path), ".codex-auth-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(temp.Name())
+	err = temp.Chmod(0600)
+	if err == nil {
+		_, err = temp.Write(raw)
+	}
+	if err == nil {
+		err = temp.Sync()
+	}
+	if closeErr := temp.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(temp.Name(), path)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	externalCredentialFixture(t, path)
+}
+
+// desktopCodexAccount reserves CODEX_HOME as desktop Connect Codex does and
+// registers it after codex-cli writes a fresh login there.
+func desktopCodexAccount(t *testing.T, p *servicePool) string {
+	t.Helper()
+	profiles := filepath.Join(p.config.StateDir, "codex-logins")
+	if err := localfs.EnsureDir(profiles); err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(profiles, "codex-1")
+	if err := localfs.CreateDir(home); err != nil {
+		t.Fatal(err)
+	}
+	writeCodexAuthLikeCLI(t, filepath.Join(home, "auth.json"), freshSyntheticCodexAuth())
+	saveAccountFixture(t, p, accountFile{Version: 1, Accounts: []providerAccount{{"codex-1", "codex", home, 1}}})
+	return home
+}
+
+// On Windows these writes leave auth.json with only ACEs inherited from the
+// profile. Strict private reads rejected it, so every desktop Codex account
+// stayed auth_required and codex-tlsn stayed exhausted.
+func TestDesktopCodexProfileAdmitsCLIAndGatewayWrittenLogins(t *testing.T) {
+	p := poolFixture(t, "codex")
+	home := desktopCodexAccount(t, p)
+	auth := filepath.Join(home, "auth.json")
+	if !codexAdmissionValid(home, codexAdmissionWindow(time.Now())) || legacyCodexAdmissionBlocked(config.Config{Executor: config.ExecutorCodexTLSN, CodexHome: home}, time.Now()) {
+		t.Fatal("fresh codex-cli login cannot admit an offer")
+	}
+	if h := healthKind(t, p, "codex"); h.State != "configured" || h.Capacity != 1 {
+		t.Fatal("codex-cli login left the desktop account unconfigured", h.State)
+	}
+	l, ok := p.acquireAccount("codex")
+	if !ok || l.config.CodexHome != home {
+		t.Fatal("codex-cli login was not selectable")
+	}
+	p.finishAccount(l, "")
+	if healthKind(t, p, "codex").State != "ready" {
+		t.Fatal("successful attempt did not mark the account ready")
+	}
+	// Each renewal is read again: an expired one blocks and a fresh one repairs.
+	replaceCodexAuthLikeGateway(t, auth, syntheticCodexAuth(time.Now().Add(-time.Hour)))
+	if healthKind(t, p, "codex").State != "auth_required" {
+		t.Fatal("expired renewal was not observed")
+	}
+	replaceCodexAuthLikeGateway(t, auth, freshSyntheticCodexAuth())
+	if h := healthKind(t, p, "codex"); h.State != "configured" || h.Capacity != 1 || !codexAdmissionValid(home, codexAdmissionWindow(time.Now())) {
+		t.Fatal("renewed login did not restore the desktop account", h.State)
 	}
 }
 

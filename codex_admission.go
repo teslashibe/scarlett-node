@@ -23,7 +23,8 @@ func codexAdmissionValid(home string, deadline time.Time) bool {
 	if !filepath.IsAbs(home) || deadline.IsZero() {
 		return false
 	}
-	f, err := localfs.OpenPrivate(filepath.Join(home, "auth.json"))
+	// codex-cli and open-agent-api write auth.json with an inherited Windows DACL.
+	f, err := localfs.OpenPrivateInherited(filepath.Join(home, "auth.json"))
 	if err != nil {
 		return false
 	}
