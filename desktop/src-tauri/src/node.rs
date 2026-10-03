@@ -477,6 +477,8 @@ impl Node {
         for name in [
             "HOME",
             "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
             "SystemRoot",
             "WINDIR",
             "TEMP",

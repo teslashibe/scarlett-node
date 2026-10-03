@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$Installer,
     [Parameter(Mandatory = $true)][string]$EvidenceDirectory,
-    [switch]$Preferences
+    [switch]$Preferences,
+    [string]$BrowserFixture = ''
 )
 $ErrorActionPreference = 'Stop'
 $script:apiPort = 8088
@@ -269,6 +270,136 @@ function Check-Preferences {
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-preferences-ui.json')
 }
 
+function Set-Text([string]$Name, [string]$Value) {
+    Wait-Check { (Find-Input $Name).Current.IsEnabled } 15 "Text input did not become ready: $Name"
+    $control = Find-Input $Name
+    if (-not $control -or -not $control.Current.IsEnabled) { throw "Text input unavailable: $Name" }
+    $pattern = $null
+    if (-not $control.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) {
+        # Password fields can refuse ValuePattern. These test-only values have
+        # no SendKeys metacharacters; never pass a real browser credential here.
+        if ($Value -notmatch '^[a-z0-9-]+$') { throw 'Synthetic input contains unsupported characters' }
+        $handle = $application.MainWindowHandle
+        [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
+        [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
+        $control.SetFocus()
+        Wait-Check {
+            return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+        } 10 'Synthetic input did not acquire keyboard focus'
+        [System.Windows.Forms.SendKeys]::SendWait('^a')
+        [System.Windows.Forms.SendKeys]::SendWait($Value)
+        return
+    }
+    $pattern.SetValue($Value)
+}
+function Select-Browser([int]$Index) {
+    Wait-Check { (Find-Input 'Browser profile').Current.IsEnabled } 15 'Browser chooser did not become ready'
+    $target = Find-Input 'Browser profile'
+    if (-not $target -or -not $target.Current.IsEnabled) { throw 'Browser chooser unavailable' }
+    $handle = $application.MainWindowHandle
+    [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
+    [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
+    $target.SetFocus()
+    Wait-Check {
+        return $target.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+    } 10 'Browser chooser did not acquire input focus'
+    [System.Windows.Forms.SendKeys]::SendWait('{HOME}')
+    for ($index = 0; $index -lt $Index; $index++) { [System.Windows.Forms.SendKeys]::SendWait('{DOWN}') }
+}
+function UI-Contains([string]$Text) {
+    $elements = $script:window.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+    foreach ($element in $elements) { if ($element.Current.Name.Contains($Text)) { return $true } }
+    return $false
+}
+function Imported-Accounts {
+    # Tauri resolves its native app-data directory; browser helpers use the
+    # explicitly redirected APPDATA roots. Accommodate either OS resolution.
+    $candidates = @($state, (Join-Path $script:fixture.roaming 'ai.scarlett.node')) | Select-Object -Unique
+    $registries = @($candidates | Where-Object { Test-Path -LiteralPath (Join-Path $_ 'accounts.json') -PathType Leaf })
+    if ($registries.Count -eq 0) { return @() }
+    if ($registries.Count -ne 1) { throw 'Browser acceptance has ambiguous account state' }
+    $script:importState = $registries[0]
+    return @(([System.IO.File]::ReadAllText((Join-Path $script:importState 'accounts.json')) | ConvertFrom-Json).accounts)
+}
+function Check-BrowserImport {
+    $root = [System.IO.Path]::GetFullPath((Split-Path -Parent $BrowserFixture))
+    $temporary = [System.IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
+    if (-not $root.StartsWith($temporary, [StringComparison]::OrdinalIgnoreCase)) { throw 'Browser fixtures must be below the disposable runner directory' }
+    $script:fixture = [System.IO.File]::ReadAllText($BrowserFixture) | ConvertFrom-Json
+    if (-not $script:fixture.syntheticOnly) { throw 'Browser acceptance requires synthetic fixtures' }
+    foreach ($path in @($script:fixture.roaming, $script:fixture.local) + @($script:fixture.stores | ForEach-Object { $_.path })) {
+        if (-not [System.IO.Path]::GetFullPath($path).StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Browser fixture escaped its isolated home' }
+    }
+    $roamingBefore, $localBefore = $env:APPDATA, $env:LOCALAPPDATA
+    try {
+        $env:APPDATA, $env:LOCALAPPDATA = $script:fixture.roaming, $script:fixture.local
+        Start-App
+        Wait-Check { (Find-Input 'Browser profile').Current.IsEnabled } 15 'Isolated browser profiles were not discovered'
+        if ((Imported-Accounts).Count -ne 0) { throw 'Browser test encountered existing accounts' }
+        if (-not (Checkbox-Is 'Import only X session cookies from this profile' $false) -or (Find-Button 'Import X account').Current.IsEnabled) { throw 'Browser import did not require opt-in consent' }
+        # The two fixture profiles sort Chrome, then Firefox after the prompt.
+        Select-Browser 1
+        Set-Checkbox 'Import only X session cookies from this profile' $true
+        Wait-Check { (Find-Button 'Import X account').Current.IsEnabled } 10 'Consent did not enable import'
+        Select-Browser 2
+        Wait-Check { Checkbox-Is 'Import only X session cookies from this profile' $false } 10 'Changing profile retained consent'
+        Wait-Check { -not (Find-Button 'Import X account').Current.IsEnabled } 10 'Profile change allowed import without new consent'
+        Set-Text 'Local X account ID' 'browser-firefox'
+        Set-Checkbox 'Import only X session cookies from this profile' $true
+        Click-Button 'Import X account'
+        Wait-Check { (Imported-Accounts).Count -eq 1 } 20 'Installed Firefox UI import did not persist'
+        Wait-Check { Checkbox-Is 'Import only X session cookies from this profile' $false } 10 'Successful import retained consent'
+        Wait-Check { UI-Contains 'access not verified' } 15 'Imported account claimed verified access'
+        Select-Browser 1
+        Set-Text 'Local X account ID' 'protected-chrome'
+        Set-Checkbox 'Import only X session cookies from this profile' $true
+        Click-Button 'Import X account'
+        Wait-Check { UI-Contains 'The browser or OS protected this profile' } 20 'Protected Chrome did not show the paste fallback'
+        if ((Imported-Accounts).Count -ne 1) { throw 'Protected Chrome import added an account' }
+        foreach ($name in @('auth_token', 'ct0')) {
+            if (-not (Find-Input $name).Current.IsPassword) { throw 'Cookie paste field was not masked' }
+        }
+        Set-Text 'Local X account ID' 'browser-paste'
+        Set-Text 'auth_token' $script:fixture.authToken
+        Set-Text 'ct0' $script:fixture.csrf
+        Click-Button 'Connect X'
+        Wait-Check { (Imported-Accounts).Count -eq 2 } 20 'Installed masked paste did not persist'
+        foreach ($record in (Imported-Accounts)) {
+            if ($record.service -ne 'x_read' -or $record.id -notin @('browser-firefox', 'browser-paste')) { throw 'Unexpected imported account' }
+            $credentialRoot = [System.IO.Path]::GetFullPath((Join-Path $script:importState 'accounts')).TrimEnd('\') + '\'
+            if (-not [System.IO.Path]::GetFullPath($record.path).StartsWith($credentialRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'Imported credential escaped disposable app state' }
+            $raw = [System.IO.File]::ReadAllText($record.path) | ConvertFrom-Json
+            if (@($raw.PSObject.Properties).Count -ne 2 -or $raw.auth_token -cne $script:fixture.authToken -or $raw.ct0 -cne $script:fixture.csrf) { throw 'Imported session differs from selected synthetic fields' }
+            $raw = $null
+        }
+        foreach ($store in $script:fixture.stores) {
+            if ((Get-FileHash -LiteralPath $store.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $store.sha256) { throw 'Import modified its browser store' }
+        }
+        # The installed helper checks native private ACLs before exposing its
+        # credential-free inventory. Never print cookie files or this output.
+        $stateBefore, $accountsBefore = $env:SCARLETT_STATE_DIR, $env:SCARLETT_ACCOUNTS_FILE
+        try {
+            $env:SCARLETT_STATE_DIR, $env:SCARLETT_ACCOUNTS_FILE = $script:importState, (Join-Path $script:importState 'accounts.json')
+            $inventory = & (Join-Path $install 'scarlett-node.exe') accounts list | Out-String
+            if ($LASTEXITCODE -ne 0 -or @($inventory | ConvertFrom-Json).Count -ne 2) { throw 'Installed helper refused private imported accounts' }
+            if ($inventory.Contains($script:fixture.authToken) -or $inventory.Contains($script:fixture.csrf) -or (UI-Contains $script:fixture.authToken) -or (UI-Contains $script:fixture.csrf)) { throw 'Import exposed fixture credentials in status' }
+            $inventory = $null
+        } finally { $env:SCARLETT_STATE_DIR, $env:SCARLETT_ACCOUNTS_FILE = $stateBefore, $accountsBefore }
+        Click-Button 'Quit Scarlett'
+        if (-not $application.WaitForExit(135000)) { throw 'Browser acceptance app did not quit' }
+        @{
+            redirectedBrowserRoots = 'passed'; profileConsent = 'passed'; consentReset = 'passed'
+            firefoxUIImport = 'passed'; protectedChromeFallback = 'passed'; maskedPaste = 'passed'
+            privatePersistence = 'passed'; unchangedBrowserStores = 'passed'; accessUnverified = $true
+            realBrowserAccountsTested = $false; realProviderJobs = 0
+        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-browser-import-ui.json')
+        Write-Output 'Installed browser acceptance: consent, Firefox import, protected Chrome and masked paste passed'
+    } finally {
+        $env:APPDATA, $env:LOCALAPPDATA = $roamingBefore, $localBefore
+        $script:fixture = $null
+    }
+}
+
 $install = Join-Path $env:RUNNER_TEMP 'Scarlett Installed UI Acceptance'
 $state = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'ai.scarlett.node'
 if ((Test-Path $install) -or (Test-Path $state)) {
@@ -330,6 +461,7 @@ try {
         signedInstaller = $false; remoteAccountLoginTested = $false
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-installed-ui.json')
     if ($Preferences) { Check-Preferences }
+    if ($BrowserFixture) { Check-BrowserImport }
 } finally {
     $key = $null
     $env:PATH = $previousPath
