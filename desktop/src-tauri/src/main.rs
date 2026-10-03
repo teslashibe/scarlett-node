@@ -151,6 +151,29 @@ async fn cancel_login(window: WebviewWindow, node: State<'_, Arc<Node>>) -> node
     node.cancel_login().await
 }
 #[tauri::command]
+async fn browser_profiles(
+    window: WebviewWindow,
+    node: State<'_, Arc<Node>>,
+) -> node::Result<Vec<node::BrowserProfile>> {
+    local_window(&window)?;
+    node.browser_profiles().await
+}
+#[tauri::command]
+async fn import_x_profile(
+    window: WebviewWindow,
+    node: State<'_, Arc<Node>>,
+    profile: String,
+    id: String,
+    concurrency: u8,
+    consent: bool,
+) -> node::Result<()> {
+    local_window(&window)?;
+    if !consent {
+        return Err(Error::InvalidInput);
+    }
+    node.import_x(profile, id, concurrency).await
+}
+#[tauri::command]
 fn open_network(
     window: WebviewWindow,
     node: State<'_, Arc<Node>>,
@@ -240,6 +263,8 @@ fn main() {
             connect_codex,
             remove_account,
             cancel_login,
+            browser_profiles,
+            import_x_profile,
             control_local_api,
             local_api_key
         ])

@@ -2,7 +2,7 @@
 
 Tauri 2 with bundled vanilla TypeScript. The native bridge delegates execution and account scheduling to the independently built Go node and its Rust proof helper. It does not embed the private Scarlett application.
 
-The desktop provides pairing, status, start/drain/resume/stop, a menu-bar/tray supervisor and account controls. Account management requires the native pool release; older node binaries show it as unavailable. Automatic Codex token refresh for the proof-only runtime, browser import, signed public installers, automatic updates and full installed Windows GUI acceptance remain separate release gates. The Mac development app is unsigned and is not a community release.
+The desktop provides pairing, status, start/drain/resume/stop, a menu-bar/tray supervisor and account controls. Account management requires the native pool release; older node binaries show it as unavailable. Automatic Codex token refresh for the proof-only runtime, signed public installers, automatic updates and full installed Windows GUI acceptance remain separate release gates. The Mac development app is unsigned and is not a community release.
 
 ## Build
 
@@ -95,3 +95,19 @@ The desktop starts `scarlett-node desktop run` and holds its input pipe open. St
 The local API runs through `scarlett-node desktop api PORT`. That host selects only the API binary beside its own executable, fixes the listener to loopback and stops its owned API tree when desktop input closes. Unix uses an owned process group; Windows uses suspended startup and a kill-on-close Job Object. Windowless creation does not grant process breakaway. Local API stop can cancel requests in progress; it does not submit them again.
 
 The Windows bridge creates or checks private directories before starting the webview and obtains its bearer through fixed `desktop private-dir` and `desktop bearer` helpers. Existing broad ACLs, symlinks/reparse points and unsupported filesystems fail closed. The API bearer stays in the private local file and protected helper output; it is never a process argument or a status field.
+
+## Import an X browser account
+
+Choose a local account ID and concurrency, select a browser profile, tick the X-session consent box, then press **Import X account**. Close the selected browser first so its cookie database has no active journal. Browsers with custom profile locations can use the existing masked cookie-paste form.
+
+Profile discovery reads directory/file metadata only. It returns opaque profile IDs and labels, without cookie-store paths or account credentials. Import reads only `auth_token` and `ct0` for a complete, secure, unexpired root-domain X/Twitter session at `/`. It keeps container/partition sessions separate and refuses conflicting identities. Credentials go directly from the native reader to the private account file; the renderer receives only success or a fixed error code. Existing accounts are never overwritten.
+
+| Browser | Mac | Windows | Limits |
+| --- | --- | --- | --- |
+| Chrome | Standard Google Chrome profiles; plaintext or v10 CBC cookies, with normal Keychain approval | Standard Google Chrome profiles; plaintext or v10 GCM cookies, with current-user DPAPI | App-bound v20 cookies are protected; use cookie paste. No password fallback, elevation or protection bypass |
+| Firefox | Standard Firefox profiles | Standard Firefox profiles | Root-domain session cookies in a closed SQLite store; containers are kept separate |
+| Safari | Standard container or legacy `Cookies.binarycookies` | Unavailable | macOS may deny access; use cookie paste. Scarlett does not grant itself Full Disk Access |
+
+The helper uses a bundled, cgo-free SQLite reader, opens stores read-only and immutable, and refuses populated WAL/journal files. It neither copies nor changes a browser database. Cookie-store changes during import fail with a retry message. Unsupported or inaccessible stores do not add an account. Linux CLI builds support standard Firefox profiles only; the desktop release targets remain Mac and Windows.
+
+Tests use disposable synthetic databases, encrypted cookie fixtures and malformed Safari records. Windows native tests generate their own current-user DPAPI fixture. These checks do not establish compatibility with every installed browser version or prove real X access. Imported accounts remain **Configured · access not verified** until their existing provider execution path verifies access.

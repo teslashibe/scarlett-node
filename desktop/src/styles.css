@@ -131,7 +131,8 @@ label {
   color: #ccc1bb;
   margin: 14px 0;
 }
-input {
+input,
+select {
   display: block;
   width: 100%;
   background: #0d0b0b;
@@ -206,4 +207,14 @@ footer p {
   button {
     transition: filter 0.12s;
   }
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.check input {
+  width: auto;
+  margin: 0;
 }

@@ -112,8 +112,75 @@ pub enum Error {
     ApiProcessExited,
     ModeConflict,
     PrivateStorageUnavailable,
+    BrowserProtected,
+    BrowserBusy,
+    BrowserInvalid,
+    BrowserNoXSession,
+    BrowserAmbiguous,
+    BrowserUnsupported,
 }
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserProfile {
+    pub id: String,
+    pub browser: String,
+    pub label: String,
+}
+
+fn browser_profile_id(id: &str) -> bool {
+    ["chrome_", "firefox_", "safari_"].iter().any(|prefix| {
+        id.strip_prefix(prefix).is_some_and(|hash| {
+            hash.len() == 32
+                && hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    })
+}
+
+fn browser_import_error(raw: &[u8]) -> Error {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Failure {
+        status: String,
+        code: String,
+    }
+    let Ok(failure) = serde_json::from_slice::<Failure>(raw) else {
+        return Error::CommandFailed;
+    };
+    if failure.status != "error" {
+        return Error::CommandFailed;
+    }
+    match failure.code.as_str() {
+        "browser_protected" => Error::BrowserProtected,
+        "browser_busy" => Error::BrowserBusy,
+        "browser_invalid" => Error::BrowserInvalid,
+        "browser_no_x_session" => Error::BrowserNoXSession,
+        "browser_ambiguous" => Error::BrowserAmbiguous,
+        "browser_unsupported" => Error::BrowserUnsupported,
+        _ => Error::CommandFailed,
+    }
+}
+
+fn browser_profile_projection(raw: &[u8]) -> Result<Vec<BrowserProfile>> {
+    let profiles: Vec<BrowserProfile> =
+        serde_json::from_slice(raw).map_err(|_| Error::CommandFailed)?;
+    if profiles.len() > 48
+        || profiles.iter().any(|p| {
+            !browser_profile_id(&p.id)
+                || !matches!(p.browser.as_str(), "chrome" | "firefox" | "safari")
+                || !p.id.starts_with(&format!("{}_", p.browser))
+                || p.label.is_empty()
+                || p.label.len() > 100
+                || p.label.chars().any(char::is_control)
+        })
+    {
+        return Err(Error::CommandFailed);
+    }
+    Ok(profiles)
+}
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Account {
@@ -481,6 +548,9 @@ impl Node {
                 .map_err(|_| Error::CommandFailed)?
                 .success()
             {
+                if args.first() == Some(&"accounts") && args.get(1) == Some(&"import-x") {
+                    return Err(browser_import_error(&output));
+                }
                 return Err(Error::CommandFailed);
             }
             Ok(output)
@@ -553,6 +623,46 @@ impl Node {
             5,
         )
         .await?;
+        Ok(())
+    }
+    pub async fn browser_profiles(&self) -> Result<Vec<BrowserProfile>> {
+        let raw = self
+            .call(&["accounts", "browser-profiles"], None, 5)
+            .await?;
+        browser_profile_projection(&raw)
+    }
+    pub async fn import_x(&self, profile: String, id: String, concurrency: u8) -> Result<()> {
+        let _guard = self.mutation.lock().await;
+        valid_selection("x_read", &id, concurrency)?;
+        if !browser_profile_id(&profile) {
+            return Err(Error::InvalidInput);
+        }
+        self.accounts().await?;
+        let raw = self
+            .call(
+                &[
+                    "accounts",
+                    "import-x",
+                    &profile,
+                    &id,
+                    &concurrency.to_string(),
+                ],
+                None,
+                45,
+            )
+            .await?;
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Updated {
+            status: String,
+        }
+        if serde_json::from_slice::<Updated>(&raw)
+            .map_err(|_| Error::CommandFailed)?
+            .status
+            != "updated"
+        {
+            return Err(Error::CommandFailed);
+        }
         Ok(())
     }
     pub async fn remove(&self, service: String, id: String) -> Result<()> {
@@ -828,6 +938,40 @@ impl Node {
 mod tests {
     use super::*;
     #[test]
+    fn browser_inventory_and_failures_never_project_paths_or_credentials() {
+        let profile = json!({"id":"firefox_0123456789abcdef0123456789abcdef", "browser":"firefox", "label":"Firefox / Isolated"});
+        let raw = serde_json::to_vec(&vec![profile.clone()]).unwrap();
+        assert_eq!(browser_profile_projection(&raw).unwrap().len(), 1);
+        for (key, value) in [
+            ("path", "/private/browser"),
+            ("auth_token", "synthetic-token"),
+            ("browser", "chrome"),
+            ("id", "../../escape"),
+            ("label", "unsafe\nlabel"),
+        ] {
+            let mut invalid = profile.clone();
+            invalid[key] = json!(value);
+            assert!(
+                browser_profile_projection(&serde_json::to_vec(&vec![invalid]).unwrap()).is_err()
+            );
+        }
+        assert!(
+            browser_profile_projection(&serde_json::to_vec(&vec![profile; 49]).unwrap()).is_err()
+        );
+        assert_eq!(
+            browser_import_error(br#"{"status":"error","code":"browser_busy"}"#),
+            Error::BrowserBusy
+        );
+        for raw in [
+            br#"{"status":"error","code":"private-token"}"#.as_slice(),
+            br#"{"status":"error","code":"browser_busy","auth_token":"private-token"}"#,
+            br#"{"status":"updated","code":"browser_busy"}"#,
+            b"private provider stderr",
+        ] {
+            assert_eq!(browser_import_error(raw), Error::CommandFailed);
+        }
+    }
+    #[test]
     fn release_defaults_ignore_debug_endpoint_overrides() {
         let endpoints = Endpoints::resolve(
             false,
@@ -1041,6 +1185,49 @@ mod tests {
             node.connect_x("../x".into(), 1, "token".into(), "csrf".into())
                 .await,
             Err(Error::InvalidInput)
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_import_delegates_only_ids_and_projects_fixed_nonzero_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("node");
+        let script = r##"#!/bin/sh
+case "$1 $2" in
+'accounts list') printf '[]';;
+'accounts browser-profiles') printf '[{"id":"firefox_0123456789abcdef0123456789abcdef","browser":"firefox","label":"Firefox / Isolated"}]';;
+'accounts import-x') printf '%s\n' "$@" > "$SCARLETT_STATE_DIR/args"; printf 'synthetic-private-provider-error' >&2; printf '{"status":"error","code":"browser_busy"}'; exit 1;;
+*) exit 1;;
+esac
+"##;
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let node = Node::new(
+            temp.path().join("state"),
+            binary,
+            temp.path().join("helper"),
+        );
+        let profiles = node.browser_profiles().await.unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(
+            node.import_x(profiles[0].id.clone(), "browser-one".into(), 2)
+                .await,
+            Err(Error::BrowserBusy)
+        );
+        let args = std::fs::read_to_string(node.state.join("args")).unwrap();
+        assert_eq!(
+            args,
+            "accounts\nimport-x\nfirefox_0123456789abcdef0123456789abcdef\nbrowser-one\n2\n"
+        );
+        assert_eq!(
+            node.import_x("/private/arbitrary-path".into(), "one".into(), 1)
+                .await,
+            Err(Error::InvalidInput)
+        );
+        assert_eq!(
+            std::fs::read_to_string(node.state.join("args")).unwrap(),
+            args
         );
     }
     #[cfg(unix)]

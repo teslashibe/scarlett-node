@@ -3,6 +3,7 @@ export type Account = {
   service: "codex" | "x_read";
   concurrency: number;
 };
+export type BrowserProfile = { id: string; browser: "chrome" | "firefox" | "safari"; label: string };
 export type AccountHealth = {
   id: string;
   service: string;
@@ -54,6 +55,12 @@ export const errorMessage = (code: unknown): string =>
     mode_conflict: "Stop the other service before switching between network jobs and the local API",
     private_storage_unavailable:
       "Scarlett could not open its private local storage",
+    browser_protected: "The browser or OS protected this profile. Approve access locally or paste the two X cookies",
+    browser_busy: "Close the selected browser, then try importing again or use cookie paste",
+    browser_invalid: "Scarlett could not read this cookie store safely. Use cookie paste",
+    browser_no_x_session: "No complete X session was found in that profile. Sign in to X there or use cookie paste",
+    browser_ambiguous: "This profile contains multiple X sessions. Paste the two cookies for the account you want",
+    browser_unsupported: "This browser format is not supported on this device. Use cookie paste",
     windows_pending:
       "Native Windows runtime support is not available in this build",
   })[String(code)] ?? "Scarlett could not complete that action";

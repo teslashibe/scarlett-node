@@ -6,6 +6,8 @@ fn main() {
             "control_node",
             "open_network",
             "connect_x",
+            "browser_profiles",
+            "import_x_profile",
             "connect_codex",
             "remove_account",
             "cancel_login",
