@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Snapshot } from "./model.ts";
 export const api = {
+  quit: () => invoke<void>("quit_desktop"),
   status: () => invoke<Snapshot>("desktop_status"),
   open: (destination: "setup" | "dashboard" | "settings") =>
     invoke<void>("open_network", { destination }),

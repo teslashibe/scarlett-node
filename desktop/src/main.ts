@@ -13,7 +13,7 @@ import {
 } from "./model.ts";
 const app = document.querySelector<HTMLDivElement>("#app")!;
 // Static markup only. Provider/native text is always inserted through textContent.
-app.innerHTML = `<header><span class="brand">SCARLETT <small>Node</small></span><button id="dashboard" class="quiet">Open dashboard ↗</button></header>
+app.innerHTML = `<header><span class="brand">SCARLETT <small>Node</small></span><div class="actions"><button id="dashboard" class="quiet">Open dashboard ↗</button><button id="quit" class="quiet">Quit Scarlett</button></div></header>
 <main><div class="intro"><p class="eyebrow">YOUR SUPPLIER NODE</p><h1>Put your accounts to work</h1><p>Connect Codex and X on this device, then choose when your node serves jobs</p></div>
 <p id="notice" role="status" aria-live="polite" hidden></p>
 <section aria-labelledby="runtime-heading"><div class="section-head"><h2 id="runtime-heading">Your node</h2><strong id="status">Checking local runtime</strong></div><p id="runtime-note">Connecting to the installed node</p><div class="actions"><button id="start">Start node</button><button id="pause" class="secondary">Pause</button><button id="resume" class="secondary">Resume</button><button id="stop" class="quiet">Stop</button></div><p id="work" class="muted"></p></section>
@@ -34,6 +34,18 @@ const notice = (text: string, error = false) => {
   n.hidden = !text;
   n.className = error ? "notice error" : "notice";
 };
+const requestQuit = () => {
+  void api.quit().catch((error) => notice(errorMessage(error), true));
+};
+$("quit").addEventListener("click", requestQuit);
+// WebView2 can retain accelerator input while a web control has focus.
+// Delegate to the same native drain handler used by the menu and tray.
+document.addEventListener("keydown", (event) => {
+  if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && event.key.toLowerCase() === "q") {
+    event.preventDefault();
+    if (!event.repeat) requestQuit();
+  }
+}, true);
 function render(s: Snapshot) {
   snapshot = s;
   const local = s.local_api;

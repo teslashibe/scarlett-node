@@ -10,6 +10,18 @@ use std::sync::{
 use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tauri_plugin_opener::OpenerExt;
 struct RuntimeControl(tokio::sync::Mutex<()>);
+struct ShutdownState(Arc<AtomicBool>);
+
+#[tauri::command]
+fn quit_desktop(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    shutdown: State<'_, ShutdownState>,
+) -> node::Result<()> {
+    local_window(&window)?;
+    quit(app, shutdown.0.clone());
+    Ok(())
+}
 
 fn local_window(window: &WebviewWindow) -> node::Result<()> {
     let url = window.url().map_err(|_| Error::InvalidInput)?;
@@ -199,6 +211,7 @@ fn main() {
     let exit_done = done.clone();
     let menu_done = done.clone();
     let app = tauri::Builder::default()
+        .manage(ShutdownState(done.clone()))
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
@@ -233,6 +246,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             desktop_status,
+            quit_desktop,
             pair_node,
             control_node,
             open_network,
