@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -259,7 +260,7 @@ func (t *buyerXPerfTransport) RoundTrip(req *http.Request) (*http.Response, erro
 		return nil, err
 	}
 	o, body, err := xperfDecodeResponse(o, req, o.summary.Response)
-	t.observed[0] = o
+	t.observed[len(t.observed)-1] = o
 	if err != nil {
 		t.helperFailure = "native_response_invalid"
 		return nil, err
@@ -332,6 +333,47 @@ func TestBuyerXPerfMultiPageReportConservesTelemetryAndPrivacy(t *testing.T) {
 	request, _ := http.NewRequest(http.MethodGet, "https://x.com/i/api/graphql/synthetic/SearchTimeline", nil)
 	if _, err := transport.RoundTrip(request); err == nil {
 		t.Fatal("third provider invocation was accepted")
+	}
+}
+
+func TestBuyerXPerfSuccessiveResponsesKeepDistinctPageTelemetry(t *testing.T) {
+	dir := t.TempDir()
+	started := time.Now()
+	transport := &buyerXPerfTransport{config: xperfConfig{mode: "mpc", headers: "minimal", verifier: "127.0.0.1:1"}, lease: coordinator.Lease{VerifierToken: strings.Repeat("ab", 32)}, output: dir, started: started, maxExchanges: 2}
+	for page := 1; page <= 2; page++ {
+		body := `{"page":` + strconv.Itoa(page) + `}`
+		remaining := 50 - page
+		raw := "HTTP/1.1 200 OK\r\nContent-Length: " + strconv.Itoa(len(body)) + "\r\nX-Rate-Limit-Limit: 50\r\nX-Rate-Limit-Remaining: " + strconv.Itoa(remaining) + "\r\nX-Rate-Limit-Reset: 1700000100\r\n\r\n" + body
+		sent, received := uint64(page*100), uint64(page*10)
+		summary, err := json.Marshal(xperfSummary{Status: "proof_sent", Mode: "mpc", Response: base64.StdEncoding.EncodeToString([]byte(raw)), VerifierSent: &sent, VerifierReceived: &received, TransportLayer: "tcp_payload", Timings: map[string]uint64{"prove": uint64(page)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Synthetic executables consume no credentials and open no network sockets.
+		helper := filepath.Join(dir, "fixture-helper-"+strconv.Itoa(page))
+		if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf '%s\\n' '"+string(summary)+"'\n"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		transport.config.prover = helper
+		req := mustRequest(t, http.MethodGet, "https://x.com/i/api/graphql/q/SearchTimeline?variables=%7B%22count%22%3A20%7D&features=%7B%7D")
+		response, err := transport.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := io.ReadAll(response.Body)
+		response.Body.Close()
+		if err != nil || string(decoded) != body || response.Header.Get("X-Rate-Limit-Remaining") != strconv.Itoa(remaining) {
+			t.Fatal("page response or quota changed")
+		}
+	}
+	for index, observation := range transport.observed {
+		if observation.httpStatus != 200 || observation.rateRemaining == nil || *observation.rateRemaining != uint64(49-index) || observation.summary.VerifierSent == nil || *observation.summary.VerifierSent != uint64((index+1)*100) {
+			t.Fatal("one page replaced another page's decoded telemetry")
+		}
+	}
+	report, err := buyerXPerfReport(true, started, &buyerXPerfBootstrap{started: started}, transport)
+	if err != nil || report["verifier_tcp_payload_bytes"] != uint64(330) || report["helper_timings_ms"].(map[string]uint64)["prove"] != 3 || report["quota_remaining"] != transport.observed[1].rateRemaining {
+		t.Fatal("distinct page telemetry was not conserved")
 	}
 }
 
