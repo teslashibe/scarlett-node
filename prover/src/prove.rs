@@ -268,9 +268,8 @@ pub async fn run(request: Request) -> Result<Summary> {
         timings_ms: timings, verifier_transport: traffic.snapshot() })
 }
 
-/// The task driving a prover's TLSNotary session. tlsn's handle waits
-/// forever once the session has ended, such as when the verifier refuses the
-/// token and hangs up, so the prover races each step against it.
+/// The task driving a TLSNotary session. A protocol handle may stay pending
+/// after the transport ends, so both participants race their work against it.
 pub struct Driver<S, E> {
     task: tokio::task::JoinHandle<Result<S, E>>,
     ended: bool,
@@ -289,9 +288,9 @@ impl<S, E: Into<anyhow::Error>> Driver<S, E> {
             ended = &mut self.task => {
                 self.ended = true;
                 match ended {
-                    Ok(Ok(_)) => bail!("verifier closed the session"),
-                    Ok(Err(e)) => Err(e.into().context("verifier session failed")),
-                    Err(e) => Err(anyhow::Error::from(e).context("verifier session failed")),
+                    Ok(Ok(_)) => bail!("TLSNotary session closed"),
+                    Ok(Err(e)) => Err(e.into().context("TLSNotary session failed")),
+                    Err(e) => Err(anyhow::Error::from(e).context("TLSNotary session failed")),
                 }
             }
         }

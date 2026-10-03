@@ -78,6 +78,17 @@ Native X execution supervises its TLS backend while writing and reading the fram
 
 With phase events enabled, a stopped run retains its last recognized control, commit, provider-connect, request-write, response-read, TLS-finish or proof phase. Preview rejection also terminates the helper and collects its timing, resource use and progress before temporary-file cleanup. Missing progress remains unknown; a deadline alone does not establish the provider or protocol cause.
 
+The verifier also supervises its TLSNotary session driver. If the supplier's
+transport ends while a protocol operation is pending, the verifier records a
+rejection and releases the reserved capacity without waiting for the job's
+expiry. The reservation stays spent, and restoring durable receipts does not
+make its token reusable. Regression tests cover Codex, one X read and a batch
+of two X reads: each disconnect happens after durable reservation and must
+finish within one second despite a thirty-second session limit. These tests
+failed before supervision was added and pass with it. They exercise synthetic
+disconnections before provider execution; they do not establish the cause of
+an intermittent MPC preparation timeout or prove live throughput.
+
 ### Testing a public x-go candidate
 
 The tracked node dependency remains unchanged. To compare a separately pinned x-go checkout, create a private alternate module file and build the bridge with it:

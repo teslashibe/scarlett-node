@@ -46,6 +46,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::{
     policy::{self, Verified},
+    prove::Driver,
     verifier_store::{self, Record, Store},
     xpolicy::{self, Exchange, Spec, ProofMode},
     xprove::{MAX_RECV, MAX_SENT},
@@ -417,6 +418,77 @@ mod durable_tests {
     fn batch_values(specs: &[Spec]) -> Vec<(Exchange, usize, usize)> {
         specs.iter().map(|s| (Exchange { operation:s.operation.clone(), query_id:s.query_id.clone(), variables:s.variables.clone(), features:Some(s.features.clone()), field_toggles:s.field_toggles.clone(), http_status:200, body:"{\"data\":{\"synthetic\":true}}".into() }, 100, 100)).collect()
     }
+
+    async fn disconnected_session_case(job: &str) {
+        use tokio::io::AsyncWriteExt;
+        let dir = Temp::new();
+        let mut s = shared(&dir.0);
+        Arc::get_mut(&mut s).unwrap().0.x_batch_experiment = job == "batch";
+        let mut r = request(now_ms() + 30_000);
+        if job == "batch" {
+            r = batch_request(now_ms() + 30_000);
+        } else if job == "x" {
+            r.payload = json!({"type":"x.read","max_attempts":1,"exchanges":[
+                {"operation":"UserByScreenName","query_id":"fixture_profile","variables":{"screen_name":"jack"},"features":{}}
+            ]});
+        }
+        let (code, Json(created)) = create(State(s.clone()), headers(), Json(r)).await;
+        assert_eq!(code, StatusCode::CREATED);
+        let token = created["token"].as_str().unwrap().to_owned();
+        let (socket, mut peer) = tokio::io::duplex(256);
+        peer.write_all(format!("{token}\n").as_bytes()).await.unwrap();
+        if job == "batch" { peer.write_all(xpolicy::BATCH_PREFACE).await.unwrap(); }
+        let mut task = tokio::spawn(handle(s.clone(), Box::new(socket)));
+        // Wait for the durable spent reservation before disconnecting. No
+        // TLSNotary commitment or provider connection is sent by this peer.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let (_, Json(view)) = capacity(State(s.clone()), headers()).await;
+                if view["in_flight_proofs"] == 1 { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        drop(peer);
+        match tokio::time::timeout(Duration::from_secs(1), &mut task).await {
+            Ok(done) => done.unwrap().unwrap(),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                panic!("disconnected {job} proof retained capacity until session expiry");
+            }
+        }
+        let (_, Json(view)) = capacity(State(s.clone()), headers()).await;
+        assert_eq!(view["in_flight_proofs"], 0);
+        assert_eq!(view["in_flight_attempts"], 0);
+        let (_, Json(receipt)) = status(State(s.clone()), headers(), Path(("synthetic".into(), "1".into()))).await;
+        if job == "codex" {
+            assert_eq!(receipt["status"], "rejected");
+            assert_eq!(receipt["reason"], "proof_rejected");
+        } else {
+            assert_eq!(receipt["complete"], false);
+            assert_eq!(receipt["remaining_attempts"], 0);
+            assert_eq!(receipt["exchanges"].as_array().unwrap().len(), 0);
+            let rejections = receipt["rejections"].as_array().unwrap();
+            assert_eq!(rejections.len(), if job == "batch" { 2 } else { 1 });
+            assert!(rejections.iter().all(|v| v == "proof_rejected"));
+        }
+        // Persist the rejection and retain the spent token after recovery.
+        drop(s);
+        let s = shared(&dir.0);
+        let (_, Json(view)) = capacity(State(s.clone()), headers()).await;
+        assert_eq!(view["in_flight_proofs"], 0);
+        let (socket, mut peer) = tokio::io::duplex(256);
+        peer.write_all(format!("{token}\n").as_bytes()).await.unwrap();
+        assert!(handle(s, Box::new(socket)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn disconnected_session_releases_codex_capacity() { disconnected_session_case("codex").await; }
+    #[tokio::test]
+    async fn disconnected_session_releases_x_capacity() { disconnected_session_case("x").await; }
+    #[tokio::test]
+    async fn disconnected_session_releases_batch_capacity() { disconnected_session_case("batch").await; }
+
     #[test]
     fn batch_receipt_rejects_a_half_reserved_connection() {
         let payload=batch_request(now_ms()+30_000).payload;
@@ -1402,42 +1474,45 @@ async fn prove_session(socket: crate::control::Socket, upstream: Option<&str>) -
     let driver_task = tokio::spawn(driver);
     // Cancelling a proof must also drop its session driver and transport.
     let _driver_guard = CancelDriver(driver_task.abort_handle());
+    let mut session = Driver::new(driver_task);
 
-    let verifier = handle.new_verifier(VerifierConfig::builder().root_store(RootCertStore::mozilla()).build()?)?;
-    let verifier = match (verifier.commit().await?, upstream) {
-        (VerifierCommitStart::Proxy(verifier), Some(upstream)) => {
-            // The verifier, not the supplier, opens the connection to OpenAI.
-            let server = TcpStream::connect(upstream).await?;
-            server.set_nodelay(true)?;
-            verifier.accept().await?.run(server.compat()).await?
-        }
-        (VerifierCommitStart::Mpc(verifier), None) => {
-            let cfg = verifier.config();
-            if cfg.max_sent_data() > MAX_SENT || cfg.max_recv_data() > MAX_RECV {
-                verifier.reject(Some("MPC-TLS limits are too large")).await?;
-                bail!("supplier asked for MPC-TLS limits above {MAX_SENT} sent / {MAX_RECV} received bytes");
+    let (server_name, transcript) = session.step(async {
+        let verifier = handle.new_verifier(VerifierConfig::builder().root_store(RootCertStore::mozilla()).build()?)?;
+        let verifier = match (verifier.commit().await?, upstream) {
+            (VerifierCommitStart::Proxy(verifier), Some(upstream)) => {
+                // The verifier, not the supplier, opens the connection to OpenAI.
+                let server = TcpStream::connect(upstream).await?;
+                server.set_nodelay(true)?;
+                verifier.accept().await?.run(server.compat()).await?
             }
-            verifier.accept().await?.run().await?
+            (VerifierCommitStart::Mpc(verifier), None) => {
+                let cfg = verifier.config();
+                if cfg.max_sent_data() > MAX_SENT || cfg.max_recv_data() > MAX_RECV {
+                    verifier.reject(Some("MPC-TLS limits are too large")).await?;
+                    bail!("supplier asked for MPC-TLS limits above {MAX_SENT} sent / {MAX_RECV} received bytes");
+                }
+                verifier.accept().await?.run().await?
+            }
+            (VerifierCommitStart::Proxy(verifier), None) => {
+                verifier.reject(Some("X reads must use MPC-TLS")).await?;
+                bail!("X reads must use MPC-TLS");
+            }
+            (VerifierCommitStart::Mpc(verifier), Some(_)) => {
+                verifier.reject(Some("only proxy mode is accepted")).await?;
+                bail!("only proxy mode is accepted");
+            }
+        };
+        let verifier = verifier.verify().await?;
+        if !verifier.request().server_identity() {
+            let verifier = verifier.reject(Some("server name must be revealed")).await?;
+            verifier.close().await?;
+            bail!("supplier did not reveal the server name");
         }
-        (VerifierCommitStart::Proxy(verifier), None) => {
-            verifier.reject(Some("X reads must use MPC-TLS")).await?;
-            bail!("X reads must use MPC-TLS");
-        }
-        (VerifierCommitStart::Mpc(verifier), Some(_)) => {
-            verifier.reject(Some("only proxy mode is accepted")).await?;
-            bail!("only proxy mode is accepted");
-        }
-    };
-    let verifier = verifier.verify().await?;
-    if !verifier.request().server_identity() {
-        let verifier = verifier.reject(Some("server name must be revealed")).await?;
+        let (VerifierOutput { server_name, transcript, .. }, verifier) = verifier.accept().await?;
         verifier.close().await?;
-        bail!("supplier did not reveal the server name");
-    }
-    let (VerifierOutput { server_name, transcript, .. }, verifier) = verifier.accept().await?;
-    verifier.close().await?;
-    handle.close();
-    driver_task.await??;
+        Ok((server_name, transcript))
+    }).await?;
+    session.finish(async { Ok(()) }, || handle.close()).await?;
 
     let ServerName::Dns(server_name) = server_name.context("server name missing")?;
     Ok((server_name.as_str().to_owned(), transcript.context("transcript missing")?))
