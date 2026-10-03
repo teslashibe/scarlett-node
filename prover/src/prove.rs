@@ -34,6 +34,16 @@ pub struct Request {
     pub plaintext_fixture: bool,
     pub token: String,
     pub payload: Value,
+    #[serde(default)]
+    pub close_strategy: CloseStrategy,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseStrategy {
+    #[default]
+    Normal,
+    TlsAfterCompleted,
 }
 
 #[derive(Serialize)]
@@ -43,6 +53,7 @@ pub struct Summary {
     pub verifier_transport: crate::control::TrafficSnapshot,
     pub status: &'static str,
     pub proof_mode: &'static str,
+    pub close_strategy: CloseStrategy,
     pub duration_ms: u128,
     pub codex_ms: u128,
     pub sent_bytes: usize,
@@ -122,6 +133,17 @@ fn codex_websocket_request() -> Result<tokio_tungstenite::tungstenite::http::Req
     Ok(request)
 }
 
+// Invoke only after a fully assembled, parsed response.completed. The original
+// TLSNotary task still requires authenticated TLS completion and disclosure.
+async fn close_tls_after_completed<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>, limit: Duration) -> Result<()>
+where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
+    tokio::time::timeout(limit, async {
+        ws.close(None).await.context("Codex WebSocket close failed")?;
+        ws.get_mut().shutdown().await.context("Codex TLS write shutdown failed")?;
+        anyhow::Ok(())
+    }).await.context("Codex shutdown timed out")?
+}
+
 pub async fn run(request: Request) -> Result<Summary> {
     validate_job(&request.payload)?;
     if request.token.len() != 64 || !request.token.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -192,8 +214,13 @@ pub async fn run(request: Request) -> Result<Summary> {
         timings.response_read = phase.elapsed().as_millis();
         let codex_ms = started.elapsed().as_millis();
         let phase = Instant::now();
-        let _ = ws.close(None).await;
-        while let Ok(Some(Ok(_))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await {}
+        match request.close_strategy {
+            CloseStrategy::Normal => {
+                let _ = ws.close(None).await;
+                while let Ok(Some(Ok(_))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await {}
+            }
+            CloseStrategy::TlsAfterCompleted => close_tls_after_completed(&mut ws, Duration::from_secs(5)).await?,
+        }
         drop(ws);
 
         let mut prover =
@@ -236,7 +263,8 @@ pub async fn run(request: Request) -> Result<Summary> {
     timings.finalize = phase.elapsed().as_millis();
     timings.total = started_total.elapsed().as_millis();
 
-    Ok(Summary { status: "proof_sent", proof_mode: "proxy", duration_ms: timings.total, codex_ms, sent_bytes, received_bytes,
+    Ok(Summary { status: "proof_sent", proof_mode: "proxy", close_strategy: request.close_strategy,
+        duration_ms: timings.total, codex_ms, sent_bytes, received_bytes,
         timings_ms: timings, verifier_transport: traffic.snapshot() })
 }
 
@@ -334,6 +362,32 @@ fn complement(len: usize, mut hidden: Vec<Range<usize>>) -> Vec<Range<usize>> {
 #[cfg(test)]
 mod provider_error_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn explicit_tls_shutdown_flushes_close_then_finishes_without_remote_ws_ack() {
+        use tokio::io::AsyncReadExt;
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        let (client, mut remote) = tokio::io::duplex(4096);
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let peer = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            remote.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        });
+        close_tls_after_completed(&mut ws, Duration::from_secs(1)).await.unwrap();
+        let sent = tokio::time::timeout(Duration::from_secs(1), peer).await.unwrap().unwrap();
+        assert_eq!(sent[0], 0x88); // complete WebSocket Close frame precedes write EOF
+        assert_eq!(sent.len(), 6); // masked empty client Close, no extra application data
+    }
+
+    #[tokio::test]
+    async fn explicit_tls_shutdown_times_out_when_close_cannot_flush() {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        let (client, _unread_remote) = tokio::io::duplex(1);
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let error = close_tls_after_completed(&mut ws, Duration::from_millis(20)).await.unwrap_err();
+        assert_eq!(error.to_string(), "Codex shutdown timed out");
+    }
 
     #[test]
     fn current_compatibility_headers_keep_fixed_provider_route_and_honest_identity() {
