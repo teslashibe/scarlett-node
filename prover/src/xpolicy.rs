@@ -266,6 +266,24 @@ pub fn check(server_name: &str, sent: &[u8], sent_hidden: &[Range<usize>], recei
     if !received_hidden.is_empty() {
         bail!("part of X's response was hidden");
     }
+    let request = check_request(sent, sent_hidden)?;
+    let (http_status, body) = response_body(received)?;
+    Ok(Exchange { operation: request.operation, query_id: request.query_id, variables: request.variables, features: request.features, field_toggles: request.field_toggles, http_status, body })
+}
+
+/// The read a request asks for, as `check` accepts it.
+pub struct ReadRequest {
+    pub operation: String,
+    pub query_id: String,
+    pub variables: Value,
+    pub features: Option<Value>,
+    pub field_toggles: Option<Value>,
+}
+
+/// The request half of `check`: `sent` is exactly one allowed GraphQL GET to
+/// x.com that hides nothing but the session cookie values and CSRF token.
+/// The relay verifier applies this before it authorizes a request.
+pub fn check_request(sent: &[u8], sent_hidden: &[Range<usize>]) -> Result<ReadRequest> {
     let head_end = find(sent, b"\r\n\r\n").context("no request header terminator")?;
     if sent.len() != head_end + 4 {
         bail!("request carries a body or a second request");
@@ -306,8 +324,7 @@ pub fn check(server_name: &str, sent: &[u8], sent_hidden: &[Range<usize>], recei
         bail!("{operation} is not an allowed read");
     }
     let (variables, features, field_toggles) = query_params(query)?;
-    let (http_status, body) = response_body(received)?;
-    Ok(Exchange { operation: operation.to_owned(), query_id: query_id.to_owned(), variables, features, field_toggles, http_status, body })
+    Ok(ReadRequest { operation: operation.to_owned(), query_id: query_id.to_owned(), variables, features, field_toggles })
 }
 
 /// The header lines between `start` and the blank line at `head_end`, as

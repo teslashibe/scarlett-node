@@ -10,6 +10,7 @@ mod control;
 mod fake;
 mod policy;
 mod prove;
+mod relay;
 #[cfg(unix)]
 mod verifier;
 #[cfg(unix)]
