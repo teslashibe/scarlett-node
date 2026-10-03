@@ -807,6 +807,35 @@ mod relay_tests {
     }
 
     #[tokio::test]
+    async fn a_relay_job_pins_only_the_reads_the_public_catalog_sells() {
+        // The node's catalog is the list; the verifier's must equal it.
+        let catalog: Value = serde_json::from_str(include_str!("../../api/x-request-catalog.json")).unwrap();
+        let mut sold: Vec<&str> = catalog["operations"].as_object().unwrap().values().map(|o| o["operation"].as_str().unwrap()).collect();
+        let mut allowed = xpolicy::RELAY_OPERATIONS.to_vec();
+        sold.sort();
+        allowed.sort();
+        assert_eq!(sold, allowed);
+
+        let x = server(response(), |_| {}).await;
+        for operation in xpolicy::READ_OPERATIONS {
+            let s = shared(x.roots.clone());
+            let payload = |mode: bool| {
+                let mut p = json!({"type":"x.read","max_attempts":1,"exchanges":[{"operation":operation,"query_id":"qid_1","variables":{},"features":{}}]});
+                if mode {
+                    p["proof_mode"] = "relay".into();
+                    p["proof_policy"] = crate::relay::POLICY.into();
+                }
+                CreateRequest { job_id: "synthetic".into(), attempt: "1".into(), fence: None, expires_at_ms: None, ttl_seconds: Some(60), payload: p }
+            };
+            let expected = if xpolicy::RELAY_OPERATIONS.contains(operation) { StatusCode::CREATED } else { StatusCode::BAD_REQUEST };
+            assert_eq!(create(State(s.clone()), headers(), Json(payload(true))).await.0, expected, "relay {operation}");
+            // The same read under MPC-TLS is unaffected, where the supplier alone decides what it sends.
+            let s = shared(x.roots.clone());
+            assert_eq!(create(State(s), headers(), Json(payload(false))).await.0, StatusCode::CREATED, "mpc {operation}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_job_must_name_the_relay_policy_exactly() {
         let x = server(response(), |_| {}).await;
         for mode in [("relay", None), ("relay", Some("x-relay-v2")), ("mpc", Some(crate::relay::POLICY)), ("proxy", None)] {

@@ -52,6 +52,11 @@ pub const READ_OPERATIONS: &[&str] = &[
     "HomeTimeline",
     "HomeLatestTimeline",
 ];
+/// The reads a relay job may pin: the four the node's public catalog sells
+/// (api/x-request-catalog.json). In relay mode the verifier's authorization
+/// is what decides which request a supplier's session values go on, so it
+/// accepts nothing personal to the supplier's account and nothing unused.
+pub const RELAY_OPERATIONS: &[&str] = &["SearchTimeline", "UserByScreenName", "TweetResultByRestId", "TweetDetail"];
 const MAX_BODY: usize = 8 << 20;
 const MAX_EXCHANGES: usize = 100;
 const MAX_ATTEMPTS: usize = 200;
@@ -105,7 +110,12 @@ pub fn proof_mode(job: &Value) -> Result<ProofMode> {
     let job: Job = serde_json::from_value(job.clone()).context("invalid x.read job")?;
     match (job.proof_mode, job.proof_policy.as_deref()) {
         (ProofMode::Mpc, None) => Ok(ProofMode::Mpc),
-        (ProofMode::Relay, Some(crate::relay::POLICY)) => Ok(ProofMode::Relay),
+        (ProofMode::Relay, Some(crate::relay::POLICY)) => {
+            if let Some(spec) = job.exchanges.iter().find(|spec| !RELAY_OPERATIONS.contains(&spec.operation.as_str())) {
+                bail!("relay jobs cannot pin {}", spec.operation);
+            }
+            Ok(ProofMode::Relay)
+        }
         _ => bail!("X proof mode and policy do not match"),
     }
 }
