@@ -106,6 +106,7 @@ pub enum Error {
     NotPaired,
     LoginBusy,
     LoginFailed,
+    #[cfg(unix)]
     PrivateStorageUnavailable,
     #[cfg(windows)]
     WindowsPending,
@@ -171,7 +172,7 @@ fn private_dir(path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         let _ = path;
-        return Err(Error::WindowsPending);
+        Err(Error::WindowsPending)
     }
     #[cfg(unix)]
     {
