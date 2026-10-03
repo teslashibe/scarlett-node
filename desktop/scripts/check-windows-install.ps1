@@ -18,6 +18,45 @@ public static class ScarlettAcceptanceWindow {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
+    [StructLayout(LayoutKind.Sequential)] private struct KeyboardInput {
+        public ushort key, scan; public uint flags, time; public UIntPtr extra;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct MouseInput {
+        public int x, y; public uint data, flags, time; public UIntPtr extra;
+    }
+    [StructLayout(LayoutKind.Explicit)] private struct InputUnion {
+        [FieldOffset(0)] public KeyboardInput keyboard;
+        [FieldOffset(0)] public MouseInput mouse;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct Input {
+        public uint type; public InputUnion value;
+    }
+    [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint count, Input[] inputs, int size);
+    private static Input Key(ushort key, bool up) {
+        Input input = new Input(); input.type = 1;
+        input.value.keyboard.key = key; input.value.keyboard.flags = up ? 2u : 0u;
+        return input;
+    }
+    public static bool ModifiersReleased() {
+        foreach (int key in new int[] { 0x10, 0x11, 0x12, 0x5B, 0x5C })
+            if ((GetAsyncKeyState(key) & 0x8000) != 0) return false;
+        return true;
+    }
+    private static void Send(Input[] inputs) {
+        if (Marshal.SizeOf(typeof(Input)) != (IntPtr.Size == 8 ? 40 : 28))
+            throw new InvalidOperationException("Native input layout mismatch");
+        if (!ModifiersReleased()) throw new InvalidOperationException("CI keyboard modifier was already pressed");
+        if (SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Input))) != (uint)inputs.Length)
+            throw new InvalidOperationException("Native input stream rejected events");
+    }
+    public static void ControlKey(ushort key) {
+        Send(new Input[] { Key(0x11, false), Key(key, false), Key(key, true), Key(0x11, true) });
+    }
+    public static void SelectAllAndClear() {
+        Send(new Input[] { Key(0x11, false), Key(0x41, false), Key(0x41, true), Key(0x11, true),
+            Key(0x08, false), Key(0x08, true) });
+    }
 }
 '@
 
@@ -118,6 +157,7 @@ function Start-App {
     Wait-AppWindow
 }
 function Focus-QuitShortcut {
+    Verify-KeyboardDelivery
     # UIA Invoke can operate a background window. SendKeys instead targets the
     # foreground input stream, so prove both the native host and WebView focus.
     $application.Refresh()
@@ -150,7 +190,9 @@ function Focus-QuitShortcut {
 }
 
 function Check-QuitShortcut([string]$Failure) {
-    [System.Windows.Forms.SendKeys]::SendWait('^q')
+    # Inject one native key-down/key-up sequence; no retry or button fallback
+    # can turn a failed shortcut into a pass.
+    [ScarlettAcceptanceWindow]::ControlKey(0x51)
     if ($application.WaitForExit(135000)) { return }
     # Keep the shortcut failure, but distinguish missed input from a native
     # shutdown error. Capture only fixed classifications, never UI text or keys.
@@ -218,8 +260,9 @@ function Verify-KeyboardDelivery {
     } 10 'Keyboard probe did not acquire foreground and field focus'
     [System.Windows.Forms.SendKeys]::SendWait('keyboard-probe')
     Wait-Check { $value.Current.Value -ceq 'keyboard-probe' } 10 'CI keyboard injection did not reach the editable control'
-    $value.SetValue('')
-    Write-Output 'Installed acceptance: synthetic keyboard delivery verified'
+    [ScarlettAcceptanceWindow]::SelectAllAndClear()
+    Wait-Check { $value.Current.Value -ceq '' } 10 'Native control-key input did not clear the disposable field'
+    Write-Output 'Installed acceptance: text and native control-key delivery verified'
 }
 
 
@@ -253,6 +296,26 @@ function Checkbox-Is([string]$Name, [bool]$Enabled) {
     if ($Enabled) { $wanted = [System.Windows.Automation.ToggleState]::On }
     return $pattern.Current.ToggleState -eq $wanted
 }
+function Check-DefaultCheckbox([string]$Name, [string]$Failure) {
+    try { Wait-Check { Checkbox-Is $Name $false } 15 $Failure }
+    catch {
+        $control = Find-Input $Name
+        $pattern = $null
+        $hasToggle = $null -ne $control -and $control.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)
+        $runKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Run')
+        $runKeyExists = $null -ne $runKey
+        if ($runKey) { $runKey.Dispose() }
+        $diagnostic = @{ controlPresent = $null -ne $control; controlEnabled = $null -ne $control -and $control.Current.IsEnabled
+            toggleSupported = $hasToggle; toggleOff = $hasToggle -and $pattern.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::Off
+            runKeyExists = $runKeyExists; appRegistrationExists = $null -ne (Registered-Command)
+            autostartErrorVisible = (UI-Contains 'Scarlett could not update the login setting')
+            interactive = [Environment]::UserInteractive; realProviderJobs = 0 }
+        New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+        $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-preference-default-failure.json')
+        Write-Output ($diagnostic | ConvertTo-Json -Compress)
+        throw
+    }
+}
 function Set-Checkbox([string]$Name, [bool]$Enabled) {
     Wait-Check { (Find-Input $Name).Current.IsEnabled } 15 "Checkbox unavailable: $Name"
     if (Checkbox-Is $Name $Enabled) { return }
@@ -284,8 +347,8 @@ function Registered-Command {
 function Check-Preferences {
     if ($null -ne (Registered-Command)) { throw 'Clean runner already has a Scarlett login registration' }
     Start-App
-    Wait-Check { Checkbox-Is 'Keep running when the window closes' $false } 15 'Background mode was not opt-in'
-    Wait-Check { Checkbox-Is 'Open Scarlett when I log in' $false } 15 'Start at login was not opt-in'
+    Check-DefaultCheckbox 'Keep running when the window closes' 'Background mode was not opt-in'
+    Check-DefaultCheckbox 'Open Scarlett when I log in' 'Start at login was not opt-in'
     Set-Number 'Saved local API port' 18088
     Click-Button 'Save device preferences'
     Wait-Check { Saved-Preferences 18088 $false } 15 'Device preferences were not saved privately'
@@ -596,7 +659,6 @@ try {
     Click-Button 'Start local API'
     Wait-Check { (Api-Status '/health') -eq 200 } 30 'Desktop recovery did not start the API'
     Write-Output 'Installed acceptance: unexpected exit and recovery passed'
-    Verify-KeyboardDelivery
     Focus-QuitShortcut
     Check-QuitShortcut 'Installed desktop Quit did not exit'
     Wait-Check { (Api-Status '/health') -eq 0 } 30 'Installed desktop Quit left the API running'
