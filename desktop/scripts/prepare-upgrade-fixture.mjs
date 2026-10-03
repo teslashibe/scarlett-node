@@ -20,6 +20,16 @@ export function upgradeConfig(config) {
   return next;
 }
 
+// prepare-complete-bundle emits a bundle-only Tauri overlay. Identity/version
+// and the security policy belong to the checked-in base configuration.
+export function completeUpgradeConfig(base, overlay) {
+  if (!overlay || Object.keys(overlay).length !== 1 || !overlay.bundle || typeof overlay.bundle !== 'object' ||
+      Object.keys(overlay)[0] !== 'bundle' || Array.isArray(overlay.bundle)) {
+    throw new Error('Expected the bundle-only complete runtime overlay');
+  }
+  return upgradeConfig({ ...base, bundle: { ...base.bundle, ...overlay.bundle } });
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   if (process.env.GITHUB_ACTIONS !== 'true' || process.env.RUNNER_OS !== 'Windows' ||
       process.platform !== 'win32' || process.argv.length !== 3 || !process.env.RUNNER_TEMP) {
@@ -31,8 +41,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     throw new Error('Installer fixtures must stay below the runner directory');
   }
   const configPath = resolve('src-tauri/tauri.complete.generated.json');
-  const config = JSON.parse(readFileSync(configPath, 'utf8'));
-  const next = upgradeConfig(config);
+  const base = JSON.parse(readFileSync(resolve('src-tauri/tauri.conf.json'), 'utf8'));
+  const overlay = JSON.parse(readFileSync(configPath, 'utf8'));
+  const next = completeUpgradeConfig(base, overlay);
   const directory = resolve('src-tauri/target/debug/bundle/nsis');
   const names = readdirSync(directory).filter(name => name.endsWith('.exe'));
   if (names.length !== 1) throw new Error('Expected one initial testing installer');
@@ -45,9 +56,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   const upgradePath = join(dirname(configPath), 'tauri.upgrade-testing.generated.json');
   writeFileSync(upgradePath, JSON.stringify(next, null, 2) + '\n');
   writeFileSync(join(output, 'fixture.json'), JSON.stringify({
-    syntheticOnly: true, baselineVersion: config.version, upgradeVersion: next.version,
+    syntheticOnly: true, baselineVersion: base.version, upgradeVersion: next.version,
     baselineInstaller: baseline, baselineSha256: createHash('sha256').update(readFileSync(baseline)).digest('hex'),
     sameRuntimeSource: true, signedInstaller: false,
   }, null, 2) + '\n');
-  console.log(`Prepared installation-only ${config.version} → ${next.version} → ${config.version} acceptance`);
+  console.log(`Prepared installation-only ${base.version} → ${next.version} → ${base.version} acceptance`);
 }
