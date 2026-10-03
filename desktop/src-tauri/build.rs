@@ -13,6 +13,7 @@ fn main() {
             "remove_account",
             "cancel_login",
             "control_local_api",
+            "control_claude",
             "local_api_key",
             "desktop_preferences",
             "save_desktop_preferences",

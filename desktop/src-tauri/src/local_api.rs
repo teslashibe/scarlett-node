@@ -21,6 +21,7 @@ pub struct Snapshot {
     pub ready: bool,
     pub base_url: Option<String>,
     pub claude_enabled: bool,
+    pub claude: crate::claude_auth::Snapshot,
 }
 struct Running {
     child: Child,
@@ -34,10 +35,24 @@ pub struct LocalApi {
     resources: PathBuf,
     node_state: PathBuf,
     running: Mutex<Option<Running>>,
+    pub claude: crate::claude_auth::ClaudeAuth,
 }
 impl LocalApi {
     pub fn new(node_state: &Path, binary: PathBuf, resources: PathBuf) -> Self {
+        let helper = binary
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(if cfg!(windows) {
+                "scarlett-node.exe"
+            } else {
+                "scarlett-node"
+            });
         Self {
+            claude: crate::claude_auth::ClaudeAuth::new(
+                node_state.join("local-api"),
+                helper,
+                resources.clone(),
+            ),
             state: node_state.join("local-api"),
             helper: binary
                 .parent()
@@ -56,7 +71,7 @@ impl LocalApi {
     fn prepare(&self) -> Result<()> {
         private_dir_with_helper(&self.node_state, &self.helper)?;
         private_dir_with_helper(&self.state, &self.helper)?;
-        for name in ["codex", "claude", "claude-runs", "tmp"] {
+        for name in ["codex", "claude", "claude-api-key", "claude-runs", "tmp"] {
             private_dir_with_helper(&self.state.join(name), &self.helper)?;
         }
         Ok(())
@@ -72,7 +87,13 @@ impl LocalApi {
         self.prepare()?;
         private_key(&self.state.join("bearer"), &self.helper)
     }
-    fn command(&self, port: u16, accounts: &[Account], claude_key: &str) -> Result<Command> {
+    fn command(
+        &self,
+        port: u16,
+        accounts: &[Account],
+        claude_key: &str,
+        subscription: bool,
+    ) -> Result<Command> {
         if port < 1024
             || (!claude_key.is_empty()
                 && (claude_key.len() > 512 || !claude_key.bytes().all(|b| (33..=126).contains(&b))))
@@ -135,13 +156,22 @@ impl LocalApi {
             .env("GATEWAY_BEARER_SECRET", key)
             .env(
                 "GATEWAY_PROVIDERS",
-                if claude_key.is_empty() {
+                if claude_key.is_empty() && !subscription {
                     "codex"
                 } else {
                     "codex,claude"
                 },
             )
-            .env("CLAUDE_CONFIG_DIR", self.state.join("claude"))
+            // API-key mode has no subscription credential source to fall back to.
+            .env(
+                "CLAUDE_CONFIG_DIR",
+                self.state.join(if claude_key.is_empty() {
+                    "claude"
+                } else {
+                    "claude-api-key"
+                }),
+            )
+            .env("DISABLE_AUTOUPDATER", "1")
             .env("CLAUDE_RUN_DIR", self.state.join("claude-runs"))
             .env(
                 "CLAUDE_EXECUTABLE",
@@ -161,14 +191,10 @@ impl LocalApi {
                 cmd.env(name, value);
             }
         }
+        if (!claude_key.is_empty() || subscription) && !self.claude.available() {
+            return Err(Error::ClaudeUnavailable);
+        }
         if !claude_key.is_empty() {
-            if !regular(&self.resources.join("claude").join(if cfg!(windows) {
-                "claude.exe"
-            } else {
-                "claude"
-            })) {
-                return Err(Error::ApiUnavailable);
-            }
             cmd.env("ANTHROPIC_API_KEY", claude_key);
         }
         #[cfg(unix)]
@@ -193,12 +219,16 @@ impl LocalApi {
         // Refuse an occupied socket before spawning, never adopt another local API.
         let reservation =
             std::net::TcpListener::bind(("127.0.0.1", port)).map_err(|_| Error::ApiPortInUse)?;
-        let mut command = self.command(port, accounts, &claude_key)?;
+        if self.claude.snapshot().await.pending {
+            return Err(Error::LoginBusy);
+        }
+        let subscription = claude_key.is_empty() && self.claude.connected().await;
+        let mut command = self.command(port, accounts, &claude_key, subscription)?;
         drop(reservation);
         let mut run = Running {
             child: command.spawn().map_err(|_| Error::ApiUnavailable)?,
             port,
-            claude_enabled: !claude_key.is_empty(),
+            claude_enabled: !claude_key.is_empty() || subscription,
         };
         let key = self.key()?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
@@ -225,6 +255,7 @@ impl LocalApi {
     pub async fn snapshot(&self) -> Snapshot {
         let mut result = Snapshot {
             available: self.available(),
+            claude: self.claude.snapshot().await,
             ..Default::default()
         };
         let mut running = self.running.lock().await;
@@ -443,7 +474,7 @@ mod tests {
             std::fs::write(resources.join(file), "{}").unwrap();
         }
         let api = LocalApi::new(&root.path().join("state"), binary, resources);
-        let command = api.command(8088, &[], "").unwrap();
+        let command = api.command(8088, &[], "", false).unwrap();
         let command = command.as_std();
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
@@ -462,13 +493,74 @@ mod tests {
         );
         assert!(!env.contains_key(std::ffi::OsStr::new("ANTHROPIC_API_KEY")));
         assert!(!env.contains_key(std::ffi::OsStr::new("PATH")));
-        assert!(api.command(80, &[], "").is_err());
-        assert!(api.command(8088, &[], "key\nINJECT=value").is_err());
+        assert!(api.command(80, &[], "", false).is_err());
+        assert!(api.command(8088, &[], "key\nINJECT=value", false).is_err());
         assert!(
             !serde_json::to_string(&Snapshot::default())
                 .unwrap()
                 .contains("bearer")
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn claude_modes_share_private_login_config_and_api_keys_are_explicit() {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().unwrap();
+        let resources = root.path().join("runtime");
+        std::fs::create_dir_all(resources.join("claude")).unwrap();
+        let binary = root.path().join("api");
+        std::fs::write(&binary, "synthetic-api").unwrap();
+        std::fs::write(root.path().join("scarlett-node"), "synthetic-helper").unwrap();
+        for name in ["codex_profile.json", "codex_scaffold.json"] {
+            std::fs::write(resources.join(name), "{}").unwrap();
+        }
+        let bytes = b"synthetic-cli";
+        std::fs::write(resources.join("claude/claude"), bytes).unwrap();
+        let target = if cfg!(target_arch = "aarch64") {
+            "aarch64-apple-darwin"
+        } else {
+            "x86_64-apple-darwin"
+        };
+        std::fs::write(resources.join("COMPONENTS.json"), serde_json::to_vec(&json!({"schemaVersion":1,"target":target,"claudeVersion":"2.1.286","files":[{"path":"claude/claude","bytes":bytes.len(),"sha256":format!("{:x}",Sha256::digest(bytes))}]})).unwrap()).unwrap();
+        let api = LocalApi::new(&root.path().join("state"), binary, resources);
+        for (key, subscription, providers) in [
+            ("", false, "codex"),
+            ("", true, "codex,claude"),
+            ("synthetic-api-key", false, "codex,claude"),
+        ] {
+            let command = api.command(8088, &[], key, subscription).unwrap();
+            let env = command
+                .as_std()
+                .get_envs()
+                .collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(
+                env.get(std::ffi::OsStr::new("GATEWAY_PROVIDERS")),
+                Some(&Some(std::ffi::OsStr::new(providers)))
+            );
+            assert_eq!(
+                env.get(std::ffi::OsStr::new("CLAUDE_CONFIG_DIR")),
+                Some(&Some(
+                    api.state
+                        .join(if key.is_empty() {
+                            "claude"
+                        } else {
+                            "claude-api-key"
+                        })
+                        .as_os_str()
+                ))
+            );
+            assert_eq!(
+                env.contains_key(std::ffi::OsStr::new("ANTHROPIC_API_KEY")),
+                !key.is_empty()
+            );
+            assert!(!env.contains_key(std::ffi::OsStr::new("PATH")));
+            assert!(!env.contains_key(std::ffi::OsStr::new("ANTHROPIC_AUTH_TOKEN")));
+        }
+        std::fs::write(api.resources.join("claude/claude"), "tampered").unwrap();
+        assert!(matches!(
+            api.command(8088, &[], "", true),
+            Err(Error::ClaudeUnavailable)
+        ));
     }
     #[tokio::test]
     async fn readiness_requires_authenticated_models_and_rejects_open_service() {
@@ -569,6 +661,8 @@ mod tests {
         let status = api.snapshot().await;
         assert!(status.ready && status.running);
         assert!(!status.claude_enabled);
+        assert!(status.claude.available);
+        assert!(!status.claude.connected && !status.claude.pending);
         assert_eq!(
             api.start(port, &[], String::new()).await,
             Err(Error::AlreadyRunning)

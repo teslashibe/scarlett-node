@@ -1,4 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod claude_auth;
 mod local_api;
 mod node;
 mod preferences;
@@ -65,12 +66,19 @@ async fn control_local_api(
     action: String,
     port: Option<u16>,
     claude_key: Option<String>,
+    claude_mode: Option<String>,
     runtime: State<'_, RuntimeControl>,
 ) -> node::Result<()> {
     local_window(&window)?;
     let _guard = runtime.0.lock().await;
     match action.as_str() {
         "start" => {
+            let key = claude_key.unwrap_or_default();
+            match claude_mode.as_deref().unwrap_or("subscription") {
+                "subscription" if key.is_empty() => {}
+                "api_key" if !key.is_empty() => {}
+                _ => return Err(Error::InvalidInput),
+            }
             let status = node.snapshot().await;
             if status.supervised
                 || matches!(
@@ -87,11 +95,36 @@ async fn control_local_api(
             api.start(
                 port.ok_or(Error::InvalidInput)?,
                 &node.accounts().await?,
-                claude_key.unwrap_or_default(),
+                key,
             )
             .await
         }
         "stop" => api.stop().await,
+        _ => Err(Error::InvalidInput),
+    }
+}
+#[tauri::command]
+async fn control_claude(
+    window: WebviewWindow,
+    api: State<'_, Arc<LocalApi>>,
+    runtime: State<'_, RuntimeControl>,
+    action: String,
+) -> node::Result<()> {
+    local_window(&window)?;
+    let _guard = runtime.0.lock().await;
+    match action.as_str() {
+        "connect" => {
+            api.stop().await?;
+            api.claude.connect().await
+        }
+        "cancel" => {
+            api.stop().await?;
+            api.claude.cancel().await
+        }
+        "disconnect" => {
+            api.stop().await?;
+            api.claude.disconnect().await
+        }
         _ => Err(Error::InvalidInput),
     }
 }
@@ -292,7 +325,12 @@ fn quit(app: tauri::AppHandle, done: Arc<AtomicBool>) {
         let runtime = app.state::<RuntimeControl>();
         let _guard = runtime.0.lock().await;
         let stopped = match api.stop().await {
-            Ok(()) => node.stop().await,
+            Ok(()) => {
+                if api.claude.snapshot().await.pending {
+                    let _ = api.claude.cancel().await;
+                }
+                node.stop().await
+            }
             Err(error) => Err(error),
         };
         match stopped {
@@ -371,6 +409,7 @@ fn main() {
             browser_profiles,
             import_x_profile,
             control_local_api,
+            control_claude,
             local_api_key,
             desktop_preferences,
             save_desktop_preferences,
