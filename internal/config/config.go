@@ -102,18 +102,18 @@ func Load() (Config, error) {
 		c.Bid = v
 	}
 	if c.StateDir == "" {
-		c.StateDir = filepath.Join(home, ".local", "state", "scarlett-node")
+		c.StateDir = DefaultStateDir(home)
 	}
 	if c.Executor == "" {
 		c.Executor = ExecutorGateway
 	}
 	if c.Prover == "" {
-		c.Prover = "scarlett-prover"
+		c.Prover = proverFilename()
 		// Native bundles keep the helper beside the node. Absolute invocation
 		// works even before the installation's bin directory is added to PATH.
 		if exe, e := os.Executable(); e == nil {
-			sibling := filepath.Join(filepath.Dir(exe), "scarlett-prover")
-			if info, e := os.Stat(sibling); e == nil && info.Mode().IsRegular() && info.Mode().Perm()&0111 != 0 {
+			sibling := filepath.Join(filepath.Dir(exe), proverFilename())
+			if info, e := os.Stat(sibling); e == nil && executableFile(info) {
 				c.Prover = sibling
 			}
 		}

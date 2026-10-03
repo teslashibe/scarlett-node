@@ -17,6 +17,7 @@ import (
 
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
+	"github.com/teslashibe/scarlett-node/internal/localfs"
 	x "github.com/teslashibe/x-go"
 )
 
@@ -90,10 +91,13 @@ func xFixture(t *testing.T, request coordinator.XRequest) (config.Config, coordi
 	}
 	payload, _ := json.Marshal(plan)
 	raw, _ := json.Marshal(request)
-	dir := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "private")
+	if e := localfs.EnsureDir(dir); e != nil {
+		t.Fatal(e)
+	}
 	path := filepath.Join(dir, "session.json")
 	sessionJSON, _ := json.Marshal(session)
-	if e = os.WriteFile(path, sessionJSON, 0600); e != nil {
+	if e = localfs.WriteAtomic(path, sessionJSON, true); e != nil {
 		t.Fatal(e)
 	}
 	c := config.Config{Profile: "standard", XSession: path, MaxInputBytes: 1024, InferenceTimeout: 10 * time.Second}
@@ -213,7 +217,7 @@ func TestXCredentialsAndEmptyPaginationAreFailClosed(t *testing.T) {
 	if code := (X{Config: c, Base: roundTripFunc(xBootstrap), Proof: proof}).Run(context.Background(), l); code != "x_incomplete" || proofs != 1 {
 		t.Fatal("empty cursor claimed complete pagination", code, proofs)
 	}
-	if e := os.Chmod(c.XSession, 0644); e != nil {
+	if e := makeSessionPublic(c.XSession); e != nil {
 		t.Fatal(e)
 	}
 	if code := (X{Config: c, Base: roundTripFunc(xBootstrap), Proof: proof}).Run(context.Background(), l); code != "auth_required" || proofs != 1 {
@@ -222,8 +226,8 @@ func TestXCredentialsAndEmptyPaginationAreFailClosed(t *testing.T) {
 	for _, secret := range []string{"secret\r\nInjected: header", "secret;other=cookie", strings.Repeat("x", 161)} {
 		s := x.Session{AuthToken: "synthetic", CT0: secret}
 		raw, _ := json.Marshal(s)
-		os.WriteFile(c.XSession, raw, 0600)
-		os.Chmod(c.XSession, 0600)
+		makeSessionPrivate(c.XSession)
+		localfs.WriteAtomic(c.XSession, raw, true)
 		if XConfigured(c.XSession) {
 			t.Fatal("accepted unsafe secret")
 		}

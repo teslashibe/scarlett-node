@@ -11,11 +11,10 @@ import (
 	"time"
 
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
-	"golang.org/x/sys/unix"
 )
 
 func TestLocalDrainPersistsAcrossRestartAndStatusExcludesPrivateIdentity(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateTestDir(t)
 	t.Setenv("SCARLETT_STATE_DIR", dir)
 	t.Setenv("SCARLETT_CREDENTIAL", "synthetic-secret")
 	var output bytes.Buffer
@@ -58,7 +57,7 @@ func TestLocalDrainPersistsAcrossRestartAndStatusExcludesPrivateIdentity(t *test
 func TestLocalControlRejectsSymlinksFifosOversizeAndCredentialFields(t *testing.T) {
 	for _, kind := range []string{"symlink", "fifo", "public", "large", "credential"} {
 		t.Run(kind, func(t *testing.T) {
-			dir := t.TempDir()
+			dir := privateTestDir(t)
 			t.Setenv("SCARLETT_STATE_DIR", dir)
 			path := filepath.Join(dir, "status.json")
 			switch kind {
@@ -67,15 +66,15 @@ func TestLocalControlRejectsSymlinksFifosOversizeAndCredentialFields(t *testing.
 					t.Fatal(e)
 				}
 			case "fifo":
-				if e := unix.Mkfifo(path, 0600); e != nil {
+				if e := createFIFOFixture(t, path); e != nil {
 					t.Fatal(e)
 				}
 			case "public":
-				os.WriteFile(path, []byte(`{}`), 0644)
+				writePrivateFixture(path, []byte(`{}`), 0644)
 			case "large":
-				os.WriteFile(path, bytes.Repeat([]byte("x"), 16385), 0600)
+				writePrivateFixture(path, bytes.Repeat([]byte("x"), 16385), 0600)
 			case "credential":
-				os.WriteFile(path, []byte(`{"credential":"synthetic-private"}`), 0600)
+				writePrivateFixture(path, []byte(`{"credential":"synthetic-private"}`), 0600)
 			}
 			var output bytes.Buffer
 			if e := localCommand("status", &output); e == nil || output.Len() != 0 {

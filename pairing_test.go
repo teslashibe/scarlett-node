@@ -12,6 +12,8 @@ import (
 
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"golang.org/x/term"
+
+	"github.com/teslashibe/scarlett-node/internal/localfs"
 )
 
 func TestPairCodeCompletesOnEnterWithoutEOF(t *testing.T) {
@@ -53,7 +55,7 @@ func TestPairCodeInputBounds(t *testing.T) {
 }
 
 func TestIdentityPersistenceExclusiveAndPrivate(t *testing.T) {
-	c := config.Config{StateDir: filepath.Join(t.TempDir(), "node")}
+	c := config.Config{StateDir: filepath.Join(privateTestDir(t), "node")}
 	if err := prepareStateDir(c.StateDir); err != nil {
 		t.Fatal(err)
 	}
@@ -80,8 +82,11 @@ func TestIdentityPersistenceExclusiveAndPrivate(t *testing.T) {
 	if err != nil || (saved != ids[0] && saved != ids[1]) {
 		t.Fatal("identity was partial or mixed", err)
 	}
-	info, err := os.Stat(identityPath(c))
-	if err != nil || info.Mode().Perm() != 0600 {
+	f, err := localfs.OpenPrivate(identityPath(c))
+	if err == nil {
+		f.Close()
+	}
+	if err != nil {
 		t.Fatal("identity not private")
 	}
 	files, err := os.ReadDir(c.StateDir)
@@ -94,15 +99,15 @@ func TestIdentityPersistenceExclusiveAndPrivate(t *testing.T) {
 }
 
 func TestStateDirectoryAndIdentityRejectSymlinks(t *testing.T) {
-	target := t.TempDir()
-	link := filepath.Join(t.TempDir(), "link")
+	target := privateTestDir(t)
+	link := filepath.Join(privateTestDir(t), "link")
 	if err := os.Symlink(target, link); err != nil {
 		t.Skip(err)
 	}
 	if err := prepareStateDir(link); err == nil {
 		t.Fatal("symlink state directory accepted")
 	}
-	c := config.Config{StateDir: filepath.Join(t.TempDir(), "node")}
+	c := config.Config{StateDir: filepath.Join(privateTestDir(t), "node")}
 	if err := prepareStateDir(c.StateDir); err != nil {
 		t.Fatal(err)
 	}

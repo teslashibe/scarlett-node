@@ -14,7 +14,7 @@ import (
 func multiPool(t *testing.T) *servicePool {
 	t.Helper()
 	p := poolFixture(t, "codex", "x_read")
-	dir := t.TempDir()
+	dir := privateTestDir(t)
 	p.config.StateDir = dir
 	p.config.AccountsFile = filepath.Join(dir, "accounts.json")
 	p.config.CodexConcurrency = 2
@@ -25,10 +25,10 @@ func multiPool(t *testing.T) *servicePool {
 		for _, id := range []string{"one", "two"} {
 			path := filepath.Join(dir, kind+"-"+id)
 			if kind == "codex" {
-				os.Mkdir(path, 0700)
-				os.WriteFile(filepath.Join(path, "auth.json"), []byte(`{"synthetic_fixture":true}`), 0600)
+				privateFixtureMkdir(path, 0700)
+				writePrivateFixture(filepath.Join(path, "auth.json"), []byte(`{"synthetic_fixture":true}`), 0600)
 			} else {
-				os.WriteFile(path, []byte(`{"auth_token":"synthetic-private-auth","ct0":"synthetic-private-csrf"}`), 0600)
+				writePrivateFixture(path, []byte(`{"auth_token":"synthetic-private-auth","ct0":"synthetic-private-csrf"}`), 0600)
 			}
 			f.Accounts = append(f.Accounts, providerAccount{id, kind, path, 1})
 		}
@@ -131,7 +131,7 @@ func TestQuotaAndAuthenticationAreAccountLocalPersistedAndDoNotReplay(t *testing
 	if _, ok := restarted.acquireAccount("codex"); !ok {
 		t.Fatal("X failure disabled Codex")
 	}
-	if e := os.WriteFile(original, []byte(`{"auth_token":"replacement","ct0":"synthetic-csrf"}`), 0600); e != nil {
+	if e := writePrivateFixture(original, []byte(`{"auth_token":"replacement","ct0":"synthetic-csrf"}`), 0600); e != nil {
 		t.Fatal(e)
 	}
 	if _, ok := restarted.acquireAccount("x_read"); ok {
@@ -206,19 +206,19 @@ func TestAccountConfigurationPrivacyAndStatusRedaction(t *testing.T) {
 	if bytes.Contains(heartbeat, []byte(`"id"`)) || bytes.Contains(heartbeat, []byte("rest_until")) {
 		t.Fatal("account identities leaked to coordinator")
 	}
-	if e := os.Chmod(p.config.AccountsFile, 0644); e != nil {
+	if e := makeFixturePublic(p.config.AccountsFile); e != nil {
 		t.Fatal(e)
 	}
 	if _, ok := p.acquireAccount("codex"); ok {
 		t.Fatal("public account configuration accepted")
 	}
-	if e := os.Chmod(p.config.AccountsFile, 0600); e != nil {
+	if e := makeFixturePrivate(p.config.AccountsFile); e != nil {
 		t.Fatal(e)
 	}
 	if _, ok := p.acquireAccount("codex"); !ok {
 		t.Fatal("private configuration did not recover")
 	}
-	if e := os.WriteFile(p.config.AccountsFile, []byte(`{"version":1,"accounts":[],"secret":"never"}`), 0600); e != nil {
+	if e := writePrivateFixture(p.config.AccountsFile, []byte(`{"version":1,"accounts":[],"secret":"never"}`), 0600); e != nil {
 		t.Fatal(e)
 	}
 	if _, ok := p.acquireAccount("x_read"); ok {
@@ -268,13 +268,13 @@ func TestExplicitMissingFileAndDuplicateCredentialAliasesFailClosed(t *testing.T
 	if e != nil {
 		t.Fatal(e)
 	}
-	alias := filepath.Join(t.TempDir(), "home-alias")
+	alias := filepath.Join(privateTestDir(t), "home-alias")
 	if e = os.Symlink(f.Accounts[0].Path, alias); e != nil {
 		t.Fatal(e)
 	}
 	f.Accounts[1].Path = alias
 	raw, _ := json.Marshal(f)
-	os.WriteFile(p.config.AccountsFile, raw, 0600)
+	writePrivateFixture(p.config.AccountsFile, raw, 0600)
 	if _, ok := p.acquireAccount("codex"); ok {
 		t.Fatal("duplicate credential inode accepted under another local name")
 	}
@@ -423,7 +423,7 @@ func TestTypedSoleAccountRemovalAndInvalidFileRetainAcceptedSlots(t *testing.T) 
 			}
 			state := "auth_required"
 			if invalid {
-				os.WriteFile(p.config.AccountsFile, []byte(`{"invalid":true}`), 0600)
+				writePrivateFixture(p.config.AccountsFile, []byte(`{"invalid":true}`), 0600)
 				state = "unreachable"
 			} else {
 				f.Accounts = []providerAccount{}
@@ -442,7 +442,7 @@ func TestTypedSoleAccountRemovalAndInvalidFileRetainAcceptedSlots(t *testing.T) 
 }
 func TestTypedLegacyToManagedTransitionRetainsSelectedLegacySlot(t *testing.T) {
 	p := poolFixture(t, "codex")
-	p.config.StateDir = t.TempDir()
+	p.config.StateDir = privateTestDir(t)
 	p.config.AccountsFile = filepath.Join(p.config.StateDir, "accounts.json")
 	selected, ok := p.acquireAccount("codex")
 	if !ok {
@@ -555,7 +555,7 @@ func TestQuotaExpiryDoesNotRepairAuthoritativeAuthentication(t *testing.T) {
 			}
 			// An actual credential change after expiry can repair authentication.
 			path := filepath.Join(l.config.CodexHome, "auth.json")
-			if err := os.WriteFile(path, []byte(`{"synthetic_replacement":true,"revision":2}`), 0600); err != nil {
+			if err := writePrivateFixture(path, []byte(`{"synthetic_replacement":true,"revision":2}`), 0600); err != nil {
 				t.Fatal(err)
 			}
 			refreshAccount(l.account, reset.Add(2*time.Second), false)
