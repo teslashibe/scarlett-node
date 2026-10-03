@@ -36,8 +36,8 @@ for (const [binary, expectedPath] of [[node,'github.com/teslashibe/scarlett-node
   if (!info.includes(`\tpath\t${expectedPath}\n`) ||
       !info.includes(`\tbuild\tGOOS=${process.platform === 'win32' ? 'windows' : 'darwin'}\n`) ||
       !info.includes(`\tbuild\tGOARCH=${process.arch === 'x64' ? 'amd64' : 'arm64'}\n`)) throw new Error('Go sidecar package or native target mismatch');
-  if (binary === api && !info.includes('\tmod\tgithub.com/teslashibe/open-agent-api\tv0.1.28\t') &&
-      !(info.includes('\tbuild\tvcs.revision=26d9ffb63b9fd1c1fcfe46c6eb69c9bc12e2678c\n') && info.includes('\tbuild\tvcs.modified=false\n'))) throw new Error('The model API must come from the reviewed v0.1.28 source');
+  if (binary === api && !info.includes('\tmod\tgithub.com/teslashibe/open-agent-api\tv0.1.29\t') &&
+      !(info.includes('\tbuild\tvcs.revision=2cce1c536c3d011a7a4cf56f8cbb7db42acb8bb9\n') && info.includes('\tbuild\tvcs.modified=false\n'))) throw new Error('The model API must come from the reviewed v0.1.29 source');
 }
 for (const path of [codexPackage, claudePackage]) checkTree(path);
 const codexMeta = JSON.parse(readFileSync(join(codexPackage,'package.json'),'utf8'));
@@ -52,8 +52,8 @@ if (execFileSync(codexExe, ['--version'], {encoding:'utf8', timeout:10000}).trim
     execFileSync(claudeExe, ['--version'], {encoding:'utf8', timeout:10000}).trim() !== '2.1.286 (Claude Code)') throw new Error('Native provider executable version mismatch');
 
 const module = execFileSync('go', ['list', '-m', '-f', '{{.Version}} {{.Dir}}', 'github.com/teslashibe/open-agent-api'], {cwd:resolve(desktop,'..'),encoding:'utf8'}).trim();
-if (!module.startsWith('v0.1.28 ')) throw new Error('The shared Codex package must be pinned to v0.1.28');
-const moduleDir = module.slice('v0.1.28 '.length);
+if (!module.startsWith('v0.1.29 ')) throw new Error('The shared Codex package must be pinned to v0.1.29');
+const moduleDir = module.slice('v0.1.29 '.length);
 const runtime = join(desktop, 'src-tauri', 'runtime');
 if (existsSync(runtime)) throw new Error('Generated runtime already exists; preserve it or remove only this generated directory before preparing a new build');
 mkdirSync(runtime, {recursive:true});
@@ -87,7 +87,7 @@ function record(directory) {
 }
 record(runtime);
 writeFileSync(join(runtime,'COMPONENTS.json'),JSON.stringify({schemaVersion:1,target:triple,
-  codexVersion:'0.159.2',claudeVersion:'2.1.286',modelApiVersion:'0.1.28',sidecars,files},null,2)+'\n');
+  codexVersion:'0.159.2',claudeVersion:'2.1.286',modelApiVersion:'0.1.29',sidecars,files},null,2)+'\n');
 const config = {bundle:{targets: suffix ? ['nsis'] : ['app','dmg'],
   externalBin:['binaries/scarlett-node','binaries/scarlett-prover','binaries/open-agent-api'],
   resources:{'runtime/':'runtime/'}}};
