@@ -37,7 +37,10 @@ func TestWindowsProcessHarness(t *testing.T) {
 	if child.Start() != nil {
 		os.Exit(4)
 	}
-	if os.WriteFile(os.Getenv("SCARLETT_PROCESS_TEST_PID"), []byte(strconv.Itoa(child.Process.Pid)), 0600) != nil {
+	pidPath := os.Getenv("SCARLETT_PROCESS_TEST_PID")
+	// Publish only after the file is complete. The parent polls this path and
+	// can otherwise read the empty file between creation and writing its PID.
+	if os.WriteFile(pidPath+".tmp", []byte(strconv.Itoa(child.Process.Pid)), 0600) != nil || os.Rename(pidPath+".tmp", pidPath) != nil {
 		os.Exit(5)
 	}
 	child.Wait()

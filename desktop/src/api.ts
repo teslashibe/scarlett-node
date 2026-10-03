@@ -5,6 +5,7 @@ export const api = {
   savePreferences: (data: Preferences) => invoke<void>("save_desktop_preferences", { data }),
   autostart: () => invoke<boolean>("desktop_autostart"),
   setAutostart: (enabled: boolean) => invoke<void>("set_desktop_autostart", { enabled }),
+  quit: () => invoke<void>("quit_desktop"),
   status: () => invoke<Snapshot>("desktop_status"),
   open: (destination: "setup" | "dashboard" | "settings") =>
     invoke<void>("open_network", { destination }),
