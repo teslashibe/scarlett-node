@@ -14,7 +14,8 @@ rejected. Locks use nonblocking exclusive `LockFileEx` ownership until handle
 close. Numeric Unix modes are never accepted as evidence of Windows privacy.
 These contracts follow Microsoft's [CreateFileW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew)
 and [LockFileEx](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex)
-interfaces; native execution remains to be verified.
+interfaces. The native Windows CI exercises file privacy and process locks,
+including lock release after an owning process crashes.
 
 The proof client retains the existing pinned roots, hostname validation,
 request binding and telemetry. Windows cannot run the verifier or fake server.
@@ -28,8 +29,11 @@ with one synthetic benchmark ignored. The new Go Windows test binary
 cross-compiles, including Windows ACL tests. The local Rust Windows MSVC check
 reaches the dependency build and stops because `ml64.exe` and the Windows SDK
 are unavailable. This establishes a native build prerequisite, not a working
-Windows proof client. The new native Windows CI job checks only this first
-filesystem/client slice and uses no provider credentials.
+Windows proof client locally. Hosted Windows Server 2022 built the proof client
+with MSVC and passed all 27 Rust tests, plus the Go filesystem race tests and
+vet checks. The native CI job checks only this first filesystem/client slice
+and uses no provider credentials. It does not verify a complete Windows node
+or live provider proof.
 
 Complete the node port after the provider-account pool companion is reconciled:
 
