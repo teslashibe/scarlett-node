@@ -43,6 +43,48 @@ pub struct Summary {
     pub received_bytes: usize,
 }
 
+// Provider errors can contain prompts, authentication headers, and account IDs.
+// Inspect bounded error fields locally and return only one of these finite labels.
+// Never serialize the provider event, its message, code, or response headers.
+fn provider_error_kind(event: &Value) -> &'static str {
+    let error = if event["type"] == "response.failed" { &event["response"]["error"] } else { &event["error"] };
+    let code = error["code"].as_str().or_else(|| event["code"].as_str()).unwrap_or_default();
+    match code {
+        "model_not_found" | "model_not_supported" | "unsupported_model" | "model_unavailable" | "model_access_denied" => return "model_unavailable",
+        "invalid_api_key" | "authentication_error" | "unauthorized" | "invalid_authentication_token" | "token_expired" | "expired_token" => return "unauthenticated",
+        "rate_limit_exceeded" | "rate_limit_error" | "requests_per_minute_exceeded" | "tokens_per_minute_exceeded" | "insufficient_quota" => return "rate_limited",
+        "unsupported_parameter" | "unknown_parameter" | "invalid_parameter" => return "unsupported_request",
+        _ => {}
+    }
+    if code == "unsupported_value" && error["param"] == "model" {
+        return "model_unavailable";
+    }
+    // Some Codex WebSocket errors provide only a message. The entire bounded
+    // message stays private; only recognized conditions produce a fixed label.
+    let message = error["message"].as_str().or_else(|| event["message"].as_str()).unwrap_or_default();
+    if message.len() <= 4096 {
+        let message = message.to_ascii_lowercase();
+        if message.contains("unsupported parameter") || message.contains("unsupported value") || message.contains("unknown parameter") || message.contains("unrecognized request argument") || message.contains("reasoning") && message.contains("not supported") {
+            return "unsupported_request";
+        }
+        if message.contains("model") && (message.contains("not supported") || message.contains("not available") || message.contains("do not have access") || message.contains("does not exist") || message.contains("unsupported model")) {
+            return "model_unavailable";
+        }
+        if message.contains("authentication token has expired") || message.contains("invalid authentication token") || message.contains("invalid api key") || message.contains("authentication required") {
+            return "unauthenticated";
+        }
+        if message.contains("rate limit") || message.contains("usage limit") || message.contains("insufficient quota") {
+            return "rate_limited";
+        }
+    }
+    match error["type"].as_str().unwrap_or_default() {
+        "authentication_error" => "unauthenticated",
+        "rate_limit_error" => "rate_limited",
+        "invalid_request_error" => "unsupported_request",
+        _ => match code { "invalid_request_error" | "unsupported_value" => "unsupported_request", _ => "provider_error" },
+    }
+}
+
 pub async fn run(request: Request) -> Result<Summary> {
     validate_job(&request.payload)?;
     if request.token.len() != 64 || !request.token.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -103,7 +145,7 @@ pub async fn run(request: Request) -> Result<Summary> {
             let event: Value = serde_json::from_str(&text)?;
             match event["type"].as_str() {
                 Some("response.completed") => break,
-                Some("response.failed" | "error") => bail!("Codex returned {}", event["type"]),
+                Some("response.failed" | "error") => bail!("Codex provider error: {}", provider_error_kind(&event)),
                 _ => {}
             }
         }
@@ -238,4 +280,72 @@ fn complement(len: usize, mut hidden: Vec<Range<usize>>) -> Vec<Range<usize>> {
         reveal.push(at..len);
     }
     reveal
+}
+
+#[cfg(test)]
+mod provider_error_tests {
+    use super::*;
+
+    #[test]
+    fn classifies_nested_and_direct_errors_without_echoing_provider_fields() {
+        for (code, expected) in [
+            ("model_not_found", "model_unavailable"),
+            ("model_not_supported", "model_unavailable"),
+            ("invalid_authentication_token", "unauthenticated"),
+            ("token_expired", "unauthenticated"),
+            ("rate_limit_exceeded", "rate_limited"),
+            ("insufficient_quota", "rate_limited"),
+            ("unsupported_value", "unsupported_request"),
+            ("unknown_parameter", "unsupported_request"),
+        ] {
+            for event in [
+                json!({"type":"error", "error":{"code":code, "message":"SECRET_PROMPT SECRET_TOKEN", "headers":{"authorization":"SECRET_TOKEN"}}}),
+                json!({"type":"error", "code":code, "message":"SECRET_PROMPT SECRET_TOKEN"}),
+                json!({"type":"response.failed", "response":{"error":{"code":code, "message":"SECRET_PROMPT SECRET_TOKEN"}, "output":"SECRET_OUTPUT"}}),
+            ] {
+                assert_eq!(provider_error_kind(&event), expected);
+                let diagnostic = format!("Codex provider error: {}", provider_error_kind(&event));
+                assert!(!diagnostic.contains("SECRET"));
+            }
+        }
+    }
+
+    #[test]
+    fn message_only_conditions_return_finite_labels_without_messages() {
+        for (message, expected) in [
+            ("The 'SECRET_MODEL' model is not supported when using Codex with a ChatGPT account", "model_unavailable"),
+            ("You do not have access to model SECRET_MODEL", "model_unavailable"),
+            ("Unsupported value: SECRET_PROMPT is not supported with this model", "unsupported_request"),
+            ("Unsupported parameter: SECRET_PARAMETER", "unsupported_request"),
+            ("Your authentication token has expired SECRET_TOKEN", "unauthenticated"),
+            ("Rate limit reached for SECRET_ACCOUNT", "rate_limited"),
+            ("Unexpected provider response SECRET_TOKEN", "provider_error"),
+        ] {
+            let event = json!({"type":"error", "error":{"message":message}});
+            assert_eq!(provider_error_kind(&event), expected);
+            assert!(!format!("Codex provider error: {}", provider_error_kind(&event)).contains("SECRET"));
+        }
+    }
+
+    #[test]
+    fn unsupported_values_distinguish_model_access_from_reasoning_controls() {
+        let model = json!({"type":"error", "error":{"code":"unsupported_value", "param":"model", "message":"SECRET"}});
+        assert_eq!(provider_error_kind(&model), "model_unavailable");
+        let model_message = json!({"type":"error", "error":{"code":"unsupported_value", "message":"This model is not supported when using Codex with a ChatGPT account"}});
+        assert_eq!(provider_error_kind(&model_message), "model_unavailable");
+        let reasoning = json!({"type":"error", "error":{"code":"unsupported_value", "param":"reasoning.effort", "message":"Unsupported value: SECRET is not supported with this model"}});
+        assert_eq!(provider_error_kind(&reasoning), "unsupported_request");
+    }
+
+    #[test]
+    fn unknown_malformed_and_oversize_provider_fields_stay_generic() {
+        for event in [
+            json!({"type":"error", "error":{"code":"SECRET_TOKEN", "message":"SECRET_PROMPT", "type":"SECRET_ACCOUNT"}}),
+            json!({"type":"error", "error":{"code":["model_not_found"], "message":{}, "type":true}}),
+            json!({"type":"response.failed", "response":{"error":{"message":format!("model not supported {}", "SECRET".repeat(1000))}}}),
+            json!({"type":"error"}),
+        ] {
+            assert_eq!(provider_error_kind(&event), "provider_error");
+        }
+    }
 }
