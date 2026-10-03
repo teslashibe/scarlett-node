@@ -21,6 +21,7 @@ function Api-Status([string]$Path, [string]$Bearer = '') {
     $request = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:8088$Path")
     $request.Timeout = 2000
     $request.AllowAutoRedirect = $false
+    $request.Proxy = $null
     if ($Bearer) { $request.Headers['Authorization'] = "Bearer $Bearer" }
     try {
         $response = $request.GetResponse()

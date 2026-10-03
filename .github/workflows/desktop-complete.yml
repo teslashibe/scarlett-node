@@ -121,7 +121,7 @@ jobs:
           fi
       - name: Validate installed Windows desktop controls without login
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: powershell
         run: |
           $installers = @(Get-ChildItem -LiteralPath desktop/src-tauri/target/debug/bundle/nsis -Filter '*.exe')
           if ($installers.Count -ne 1) { throw 'Expected one native testing installer' }
