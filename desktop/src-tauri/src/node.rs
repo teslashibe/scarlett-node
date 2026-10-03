@@ -602,6 +602,9 @@ impl Node {
             let mut cmd = Command::new(&p);
             cmd.arg("--version")
                 .env_clear()
+                .env("HOME", &self.state)
+                .env("USERPROFILE", &self.state)
+                .env("CODEX_HOME", self.state.join("runtime-probe"))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -931,7 +934,7 @@ mod tests {
         std::fs::write(&bundled, "#!/bin/sh\nprintf 'codex-cli 0.154.0\\n'\n").unwrap();
         std::fs::set_permissions(&bundled, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(node.codex_cli().await.is_none());
-        std::fs::write(&bundled, "#!/bin/sh\nprintf 'codex-cli 0.159.2\\n'\n").unwrap();
+        std::fs::write(&bundled, "#!/bin/sh\n[ \"$CODEX_HOME\" = \"$HOME/runtime-probe\" ] || exit 1\nprintf 'codex-cli 0.159.2\\n'\n").unwrap();
         assert_eq!(
             node.codex_cli().await,
             Some(bundled.canonicalize().unwrap())
