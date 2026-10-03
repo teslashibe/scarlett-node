@@ -81,7 +81,7 @@ jobs:
           suffix=""
           if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
           go build -trimpath -o "$RUNNER_TEMP/scarlett-runtime/scarlett-node$suffix" .
-          GOBIN="$RUNNER_TEMP/scarlett-runtime" go install github.com/teslashibe/open-agent-api/cmd/open-agent-api@v0.1.30
+          GOBIN="$RUNNER_TEMP/scarlett-runtime" go install github.com/teslashibe/open-agent-api/cmd/open-agent-api@v0.1.31
           cargo +1.95 build --release --locked --manifest-path prover/Cargo.toml
       - name: Validate native Windows proof runtime fixtures
         if: runner.os == 'Windows'
