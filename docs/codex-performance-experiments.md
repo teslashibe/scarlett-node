@@ -42,7 +42,7 @@ Helper byte counters are supplier operational telemetry. Verifier counters count
 scripts/codexperf-report.py /absolute/private/runs/codex-proxy-001/metrics.jsonl
 ```
 
-The summary reports actual successes/failures and nearest-rank p50/p95. It flags fewer than 30 successful samples. It groups normal and candidate shutdown measurements separately; older metrics without a strategy are normal baseline samples. A single-strategy report retains the flat summary format, while mixed inputs return a `groups` comparison. Achieved throughput covers the recorded serial window including gaps and failures; measure concurrent and sustained capacity separately. Normal requested speed does not establish a provider-reported service tier.
+The summary reports actual successes/failures and nearest-rank p50/p95. It flags fewer than 30 successful samples. It groups normal and candidate shutdown measurements separately; older metrics without a strategy are normal baseline samples. A single-strategy report retains the flat summary format, while mixed inputs return a `groups` comparison. Throughput sums each input file's recorded serial window, including its gaps and failures. Time between separate blocks, including work on another comparison variant, is excluded. Measure concurrent and sustained capacity separately. Normal requested speed does not establish a provider-reported service tier.
 
 ## Offline checks
 

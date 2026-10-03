@@ -53,7 +53,12 @@ def summarize_strategy(rows, strategy, model, cohort):
     for r in cached:
         if number(r, "cached_input_tokens", 1e9) > number(r, "input_tokens", 1e9):
             raise ValueError("cached usage exceeds total input usage")
-    wall_seconds = (max(number(r, "finish_unix_ns", 1e20) for r in rows) - min(number(r, "start_unix_ns", 1e20) for r in rows)) / 1e9 if rows else 0
+    windows = {}
+    for r in rows:
+        windows.setdefault(r.get("_input_file_window", 0), []).append(r)
+    wall_seconds = sum((max(number(r, "finish_unix_ns", 1e20) for r in values)
+                        - min(number(r, "start_unix_ns", 1e20) for r in values)) / 1e9
+                       for values in windows.values())
     return {"schema": 1, "mode": "proxy", "workload": "codex_trivial", "reasoning": "low", "service_tier_request": "omitted",
             "close_strategy": strategy,
             "model": model, "account_cohort": cohort,
@@ -62,6 +67,8 @@ def summarize_strategy(rows, strategy, model, cohort):
             "verified_p50_ms": percentile([number(r, "duration_ms") for r in good], .5),
             "verified_p95_ms": percentile([number(r, "duration_ms") for r in good], .95),
             "verified_jobs_per_second": len(good) / wall_seconds if wall_seconds > 0 else None,
+            "throughput_scope": "sum_of_input_file_windows_including_internal_gaps_and_failures",
+            "recorded_windows": len(windows),
             "observed_serial_wall_seconds_including_gaps": wall_seconds,
             "codex_p50_ms": percentile([number(r, "codex_ms") for r in good if r.get("codex_ms") is not None], .5),
             "codex_p95_ms": percentile([number(r, "codex_ms") for r in good if r.get("codex_ms") is not None], .95),
@@ -101,6 +108,11 @@ def self_test():
     assert "PRIVATE" not in json.dumps(report)
     assert report["close_strategy"] == "normal"
     assert report["model"] == "gpt-6.1-sol" and report["account_cohort"] == "account-1"
+    separate = summarize([dict(good, _input_file_window=0),
+                          dict(good, _input_file_window=1, start_unix_ns=10000000001,
+                               finish_unix_ns=10100000001)])
+    assert separate["recorded_windows"] == 2 and separate["verified_jobs_per_second"] == 10
+    assert separate["observed_serial_wall_seconds_including_gaps"] == .2
     different_model = summarize([good, dict(good, model="gpt-5.6-luna", account_cohort="account-2")])
     assert len(different_model["groups"]) == 2
     mixed = summarize([good, dict(good, close_strategy="tls_after_completed", duration_ms=50)])
@@ -132,7 +144,12 @@ def main():
         return
     if not args.metrics:
         parser.error("provide private metrics.jsonl files")
-    json.dump(summarize([row for path in args.metrics for row in read_metrics(path)]), sys.stdout, indent=2, allow_nan=False)
+    rows = []
+    for index, path in enumerate(args.metrics):
+        for row in read_metrics(path):
+            row["_input_file_window"] = index
+            rows.append(row)
+    json.dump(summarize(rows), sys.stdout, indent=2, allow_nan=False)
     print()
 
 
