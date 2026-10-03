@@ -284,7 +284,11 @@ async function loadBrowserProfiles() {
   }
   if (snapshot) render(snapshot);
 }
-for (const id of ["x-profile", "x-consent"]) $(id).addEventListener("change", () => { if (snapshot) render(snapshot); });
+$("x-profile").addEventListener("change", () => {
+  $<HTMLInputElement>("x-consent").checked = false;
+  if (snapshot) render(snapshot);
+});
+$("x-consent").addEventListener("change", () => { if (snapshot) render(snapshot); });
 $("x-import").addEventListener("click", () => {
   const profile = $<HTMLSelectElement>("x-profile").value;
   const consent = $<HTMLInputElement>("x-consent").checked;

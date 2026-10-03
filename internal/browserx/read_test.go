@@ -118,6 +118,26 @@ func TestFirefoxImportRefusesMixedAmbiguousExpiredAndWrongScopeCookies(t *testin
 	}
 }
 
+func TestSQLiteReadOnlyURIHandlesSpacesAndEscapedProfileNames(t *testing.T) {
+	path := fixtureStore(t, "firefox", pairFixtures(".x.com", ""))
+	parent := filepath.Join(filepath.Dir(path), "profile space % & # +")
+	if err := os.Mkdir(parent, 0700); err != nil {
+		t.Fatal(err)
+	}
+	moved := filepath.Join(parent, "cookies.sqlite")
+	if err := os.Rename(path, moved); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(moved)
+	if raw, err := ReadSession(context.Background(), "firefox", moved); err != nil || !json.Valid(raw) {
+		t.Fatal("escaped profile filename could not be read", err)
+	}
+	after, _ := os.ReadFile(moved)
+	if !bytes.Equal(before, after) {
+		t.Fatal("read-only URI modified the browser store")
+	}
+}
+
 func TestImportRefusesLiveJournalSymlinkAndCancelledContext(t *testing.T) {
 	path := fixtureStore(t, "firefox", pairFixtures(".x.com", ""))
 	if err := os.WriteFile(path+"-wal", []byte("synthetic active WAL"), 0600); err != nil {

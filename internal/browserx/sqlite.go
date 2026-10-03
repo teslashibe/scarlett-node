@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"net/url"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -15,13 +14,12 @@ import (
 
 func storeURI(path string) string {
 	p := filepath.ToSlash(path)
-	if runtime.GOOS == "windows" {
-		p = "/" + p
-	}
-	u := url.URL{Scheme: "file", Path: p}
+	// SQLite's portable Go VFS needs the drive path itself on Windows. A
+	// file:///C:/ URI leaves a /C:/ prefix that its Go filesystem cannot open.
+	// Escape the filename separately so profile names cannot supply URI options.
+	u := url.URL{Path: p}
 	q := url.Values{"mode": {"ro"}, "immutable": {"1"}, "_pragma": {"query_only(ON)", "trusted_schema(OFF)", "busy_timeout(0)", "mmap_size(0)"}}
-	u.RawQuery = q.Encode()
-	return u.String()
+	return "file:" + u.EscapedPath() + "?" + q.Encode()
 }
 
 func readSQLite(ctx context.Context, browser, path string, selected selection) error {
