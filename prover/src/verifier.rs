@@ -618,6 +618,30 @@ mod durable_tests {
         }
     }
     #[tokio::test]
+    async fn a_relay_job_keeps_its_proof_mode_across_restart_and_cannot_change_it() {
+        let dir = Temp::new();
+        let s = shared(&dir.0);
+        let lease: Value = serde_json::from_str(include_str!("../../api/fixtures/lease-x.json")).unwrap();
+        let mut r = request(now_ms() + 30_000);
+        r.payload = lease["x_payload"].clone();
+        r.payload["proof_mode"] = "relay".into();
+        r.payload["proof_policy"] = crate::relay::POLICY.into();
+        let relay = r.payload.clone();
+        let (code, Json(first)) = create(State(s.clone()), headers(), Json(r)).await;
+        assert_eq!(code, StatusCode::CREATED);
+        drop(s);
+        let s = shared(&dir.0);
+        assert!(matches!(s.1.lock().unwrap().by_job[&job_key("synthetic", "1")].kind, Kind::X(_, ProofMode::Relay)));
+        // The same attempt cannot be re-registered as MPC-TLS; the identical job gets its token back.
+        let mut mpc = request(now_ms() + 30_000);
+        mpc.payload = lease["x_payload"].clone();
+        assert_eq!(create(State(s.clone()), headers(), Json(mpc)).await.0, StatusCode::CONFLICT);
+        let mut again = request(first["token"].as_str().map(|_| now_ms() + 30_000).unwrap());
+        again.payload = relay;
+        assert_ne!(create(State(s), headers(), Json(again)).await.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn capacity_requires_authority_and_reports_storage_health() {
         let dir = Temp::new(); let s = shared(&dir.0);
         assert_eq!(capacity(State(s.clone()), HeaderMap::new()).await.0, StatusCode::UNAUTHORIZED);
@@ -711,7 +735,7 @@ mod relay_tests {
         let session = tokio::spawn(handle(s.clone(), Box::new(verifier_end)));
         node_end.write_all(format!("{}\n", created["token"].as_str().unwrap()).as_bytes()).await.unwrap();
         let tcp = tokio::net::TcpStream::connect(x.addr).await.unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(30), crate::relay::node::session(node_end, tcp, &request())).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(30), crate::relay::node::session(node_end, tcp, &request(), xpolicy::HOST)).await.unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(30), session).await.unwrap();
         let (_, Json(view)) = status(State(s), headers(), Path(("synthetic".into(), "1".into()))).await;
         (result, view, x.seen.lock().unwrap().clone())
@@ -755,6 +779,31 @@ mod relay_tests {
             assert_eq!(view["complete"], false);
             assert_eq!(view["rejections"], json!(["proof_rejected"]));
         }
+    }
+
+    #[tokio::test]
+    async fn a_relay_job_refuses_a_session_that_is_not_a_relay_session() {
+        // What an MPC-TLS supplier would send first is not a relay hello.
+        let x = server(response(), |_| {}).await;
+        let s = shared(x.roots.clone());
+        let (_, Json(created)) = create(State(s.clone()), headers(), Json(job("jack", Some(("relay", Some(crate::relay::POLICY)))))).await;
+        let (mut node_end, verifier_end) = tokio::io::duplex(1 << 16);
+        let session = tokio::spawn(handle(s.clone(), Box::new(verifier_end)));
+        node_end.write_all(format!("{}\n", created["token"].as_str().unwrap()).as_bytes()).await.unwrap();
+        node_end.write_all(&[0, 0, 0, 0, 0, 0, 0, 16, 1, 2, 3, 4, 5, 6, 7, 8]).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(30), session).await.unwrap();
+        let (_, Json(view)) = status(State(s), headers(), Path(("synthetic".into(), "1".into()))).await;
+        assert_eq!(view["rejections"], json!(["proof_rejected"]));
+        assert_eq!((view["complete"].as_bool(), view["remaining_attempts"].as_u64()), (Some(false), Some(0)));
+        assert!(x.seen.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_failed_session_logs_one_bounded_line_whatever_the_supplier_sent() {
+        let hostile = anyhow::anyhow!("Viewer\nverifier: job other accepted, model forged \u{202e}{}", "x".repeat(1000));
+        let line = loggable(&hostile);
+        assert!(line.len() <= 240 && line.is_ascii() && !line.contains('\n') && !line.contains('\r'));
+        assert!(line.starts_with("Viewer\\nverifier"));
     }
 
     #[tokio::test]
@@ -1080,7 +1129,7 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
                     ProofMode::Mpc => verify_x(socket).await,
                     // The cause names only public job fields and protocol steps, never
                     // a hidden value, and is the one place a failed session can be diagnosed.
-                    ProofMode::Relay => relay_x(socket, config.relay_tls.clone(), &specs, &fulfilled).await.inspect_err(|e| println!("verifier: job {job_id} relay session failed: {e:#}")),
+                    ProofMode::Relay => relay_x(socket, config.relay_tls.clone(), &specs, &fulfilled).await.inspect_err(|e| println!("verifier: job {job_id} relay session failed: {}", loggable(e))),
                 }
             };
             let outcome = match tokio::time::timeout(limit, proof).await {
@@ -1154,6 +1203,12 @@ async fn verify(socket: crate::control::Socket, job: &Value, upstream: &str) -> 
     let sent_hidden: Vec<_> = transcript.sent_unauthed().iter().collect();
     let received_hidden: Vec<_> = transcript.received_unauthed().iter().collect();
     policy::check(&server_name, transcript.sent_unsafe(), &sent_hidden, transcript.received_unsafe(), &received_hidden, job)
+}
+
+/// An error as one bounded log line. Its text can quote what a supplier
+/// sent, so nothing in it may start a line or run on.
+fn loggable(error: &anyhow::Error) -> String {
+    format!("{error:#}").escape_default().take(240).collect()
 }
 
 /// A relay session: the verifier is X's TLS peer through the supplier's

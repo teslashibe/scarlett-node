@@ -12,7 +12,7 @@ use std::{io, ops::Range, sync::Arc};
 use anyhow::{Context, Result, bail};
 use rustls::{ClientConfig, ClientConnection, ConnectionTrafficSecrets, RootCertStore, pki_types::ServerName};
 use serde::Deserialize;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::{
     MAX_HIDDEN_BITS, MAX_REQUEST, VERSION,
@@ -241,6 +241,15 @@ where
         }
     }
     wire::send(&mut writer, wire::DONE, b"{\"status\":\"complete\"}").await?;
+    // The supplier may still be forwarding X's close. Dropping the socket
+    // with those frames unread can reset it and lose the result on its way
+    // out, so close our half and let the supplier finish, briefly.
+    let _ = writer.shutdown().await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut sink = [0u8; 4096];
+        while matches!(reader.read(&mut sink).await, Ok(n) if n > 0) {}
+    })
+    .await;
     let (sent, hidden) = sent.expect("loop ends only after a request was sent");
     Ok(Outcome { sent, hidden, received })
 }

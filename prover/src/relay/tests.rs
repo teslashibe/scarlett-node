@@ -110,6 +110,8 @@ enum Verdict {
     Replace(Vec<u8>),
     /// Forward this, then stop forwarding in that direction.
     Last(Vec<u8>),
+    /// Forward the item, then these further frames in the same direction.
+    Also(Vec<(u8, Vec<u8>)>),
 }
 
 /// Relays TLS records between the supplier and the server, letting `tamper`
@@ -136,7 +138,7 @@ where
                         let verdict = tamper(true, up_count, &record);
                         up_count += 1;
                         match verdict {
-                            Verdict::Pass => { let _ = to_server.write_all(&record).await; }
+                            Verdict::Pass | Verdict::Also(_) => { let _ = to_server.write_all(&record).await; }
                             Verdict::Replace(bytes) => { let _ = to_server.write_all(&bytes).await; }
                             Verdict::Last(bytes) => { let _ = to_server.write_all(&bytes).await; let _ = to_server.shutdown().await; up_open = false; }
                         }
@@ -150,7 +152,7 @@ where
                         let verdict = tamper(false, down_count, &record);
                         down_count += 1;
                         match verdict {
-                            Verdict::Pass => { let _ = to_node.write_all(&record).await; }
+                            Verdict::Pass | Verdict::Also(_) => { let _ = to_node.write_all(&record).await; }
                             Verdict::Replace(bytes) => { let _ = to_node.write_all(&bytes).await; }
                             Verdict::Last(bytes) => { let _ = to_node.write_all(&bytes).await; let _ = to_node.shutdown().await; down_open = false; }
                         }
@@ -178,6 +180,10 @@ where
                 frame = wire::recv(&mut from_node) => {
                     let Ok((kind, payload)) = frame else { let _ = to_verifier.shutdown().await; break };
                     match tamper(true, kind, &payload) {
+                        Verdict::Also(extra) => {
+                            let _ = wire::send(&mut to_verifier, kind, &payload).await;
+                            for (kind, payload) in extra { let _ = wire::send(&mut to_verifier, kind, &payload).await; }
+                        }
                         Verdict::Pass => { let _ = wire::send(&mut to_verifier, kind, &payload).await; }
                         Verdict::Replace(bytes) | Verdict::Last(bytes) => { let _ = wire::send(&mut to_verifier, kind, &bytes).await; }
                     }
@@ -185,6 +191,10 @@ where
                 frame = wire::recv(&mut from_verifier) => {
                     let Ok((kind, payload)) = frame else { let _ = to_node.shutdown().await; break };
                     match tamper(false, kind, &payload) {
+                        Verdict::Also(extra) => {
+                            let _ = wire::send(&mut to_node, kind, &payload).await;
+                            for (kind, payload) in extra { let _ = wire::send(&mut to_node, kind, &payload).await; }
+                        }
                         Verdict::Pass => { let _ = wire::send(&mut to_node, kind, &payload).await; }
                         Verdict::Replace(bytes) | Verdict::Last(bytes) => { let _ = wire::send(&mut to_node, kind, &bytes).await; }
                     }
@@ -207,7 +217,7 @@ where
 {
     let config = verifier::tls_config(roots).unwrap();
     let raw = request();
-    let node = tokio::spawn(async move { node::session(node_end, to_server, &raw).await });
+    let node = tokio::spawn(async move { node::session(node_end, to_server, &raw, xpolicy::HOST).await });
     let outcome = within(verifier::run(verifier_end, config, xpolicy::HOST, verifier::authorize_x)).await;
     // A verifier that gives up closes its side, which is how the supplier learns of it.
     let response = within(node).await.unwrap();
@@ -377,83 +387,124 @@ async fn a_server_without_the_pinned_identity_or_cipher_is_refused() {
     assert!(old.seen.lock().unwrap().is_none());
 }
 
-#[tokio::test]
-async fn a_request_outside_policy_gets_no_key_material() {
-    for case in ["post", "hide_path", "nonzero_hidden", "two_requests", "wrong_transfers"] {
-        let server = server(response(), |_| {}).await;
-        let (mut node_end, verifier_end) = tokio::io::duplex(1 << 20);
-        let config = verifier::tls_config(server.roots.clone()).unwrap();
-        let verifier = tokio::spawn(async move { within(verifier::run(verifier_end, config, xpolicy::HOST, verifier::authorize_x)).await });
+/// The REQUEST frame for a public view and its hidden ranges, with all-zero corrections.
+fn request_frame(public: &[u8], hidden: &[Range<usize>]) -> Vec<u8> {
+    let bits = hidden.iter().map(|r| r.len() * 8).sum::<usize>();
+    let mut payload = (public.len() as u32).to_be_bytes().to_vec();
+    payload.extend_from_slice(public);
+    payload.extend_from_slice(&(hidden.len() as u16).to_be_bytes());
+    for r in hidden {
+        payload.extend_from_slice(&(r.start as u32).to_be_bytes());
+        payload.extend_from_slice(&(r.end as u32).to_be_bytes());
+    }
+    payload.extend_from_slice(&vec![0u8; bits.div_ceil(8)]);
+    payload
+}
 
-        let raw = request();
-        let (public, hidden): (Vec<u8>, Vec<Range<usize>>) = match case {
-            "post" => (String::from_utf8(raw.clone()).unwrap().replacen("GET ", "POST ", 1).into_bytes(), vec![]),
-            // Hiding part of the request line is not one of the allowed values.
-            "hide_path" => {
-                let mut public = raw.clone();
-                public[20..28].fill(0);
-                (public, vec![20..28])
+/// A supplier that tunnels the handshake and runs the transfers honestly,
+/// then sends `requests` of its own choosing. It never writes a request
+/// record. Returns how many times the verifier released record material.
+async fn rogue_supplier(server: SocketAddr, mut verifier: DuplexStream, transfers: usize, requests: Vec<Vec<u8>>) -> usize {
+    let mut tcp = TcpStream::connect(server).await.unwrap();
+    wire::send(&mut verifier, wire::HELLO, format!("{{\"version\":1,\"transfers\":{transfers}}}").as_bytes()).await.unwrap();
+    let mut ot = None;
+    let mut pending = Some(requests);
+    if transfers > 0 {
+        let (state, (kind, setup)) = NodeOt::start(transfers).unwrap();
+        wire::send(&mut verifier, kind, &setup).await.unwrap();
+        ot = Some(state);
+    }
+    let (mut released, mut chunk, mut handshake_done) = (0, [0u8; 8192], false);
+    loop {
+        // Hold the requests until the verifier has its keys, so a verifier
+        // that wrongly accepted one would have everything it needs to act.
+        if handshake_done && ot.as_ref().is_none_or(NodeOt::ready) {
+            for payload in pending.take().into_iter().flatten() {
+                let _ = wire::send(&mut verifier, wire::REQUEST, &payload).await;
             }
-            // A hidden range that still carries bytes would be sealed as public.
-            "nonzero_hidden" => (raw.clone(), hidden_values(&raw)[..1].to_vec()),
-            _ => {
-                let mut public = raw.clone();
-                hidden_values(&raw).iter().for_each(|r| public[r.clone()].fill(0));
-                (public, hidden_values(&raw))
-            }
-        };
-        let bits = hidden.iter().map(|r| r.len() * 8).sum::<usize>();
-        let transfers = if case == "wrong_transfers" { bits - 8 } else { bits };
-        wire::send(&mut node_end, wire::HELLO, format!("{{\"version\":1,\"transfers\":{transfers}}}").as_bytes()).await.unwrap();
-        // The verifier's ClientHello arrives first; this supplier never forwards it.
-        let mut corrections = Vec::new();
-        if transfers > 0 {
-            let (mut ot, (kind, setup)) = NodeOt::start(transfers).unwrap();
-            wire::send(&mut node_end, kind, &setup).await.unwrap();
-            loop {
-                let (kind, payload) = wire::recv(&mut node_end).await.unwrap();
+        }
+        tokio::select! {
+            frame = wire::recv(&mut verifier) => {
+                let Ok((kind, payload)) = frame else { return released };
                 match kind {
                     wire::CO_CHOOSE => {
-                        for (kind, frame) in ot.on_choose(&payload).unwrap() {
-                            wire::send(&mut node_end, kind, &frame).await.unwrap();
+                        for (kind, frame) in ot.as_mut().unwrap().on_choose(&payload).unwrap() {
+                            wire::send(&mut verifier, kind, &frame).await.unwrap();
                         }
                     }
                     wire::KOS_CHI => {
-                        let (kind, check) = ot.on_chi(&payload).unwrap();
-                        wire::send(&mut node_end, kind, &check).await.unwrap();
-                        break;
+                        let (kind, check) = ot.as_mut().unwrap().on_chi(&payload).unwrap();
+                        wire::send(&mut verifier, kind, &check).await.unwrap();
                     }
+                    wire::TO_SERVER => {
+                        // The client's Finished is the protected record that ends the handshake.
+                        let mut records = payload.clone();
+                        while let Ok(Some((outer, _))) = record::take(&mut records) {
+                            handshake_done |= outer == record::APPLICATION_DATA;
+                        }
+                        tcp.write_all(&payload).await.unwrap();
+                    }
+                    wire::MATERIAL => released += 1,
                     _ => {}
                 }
             }
-            corrections = vec![false; bits];
+            n = tcp.read(&mut chunk) => {
+                let n = n.unwrap_or(0);
+                if n == 0 { continue; }
+                let _ = wire::send(&mut verifier, wire::FROM_SERVER, &chunk[..n]).await;
+            }
         }
-        let mut payload = (public.len() as u32).to_be_bytes().to_vec();
-        payload.extend_from_slice(&public);
-        payload.extend_from_slice(&(hidden.len() as u16).to_be_bytes());
-        for r in &hidden {
-            payload.extend_from_slice(&(r.start as u32).to_be_bytes());
-            payload.extend_from_slice(&(r.end as u32).to_be_bytes());
-        }
-        payload.extend_from_slice(&vec![0u8; corrections.len().div_ceil(8)]);
-        let _ = wire::send(&mut node_end, wire::REQUEST, &payload).await;
-        if case == "two_requests" {
-            let _ = wire::send(&mut node_end, wire::REQUEST, &payload).await;
-        }
-        // Whatever else arrives, it is never request material.
-        let mut got_material = false;
-        while let Ok(Ok((kind, _))) = tokio::time::timeout(Duration::from_secs(5), wire::recv(&mut node_end)).await {
-            got_material |= kind == wire::MATERIAL;
-        }
-        assert!(!got_material, "{case}: verifier released key material");
-        drop(node_end);
-        assert!(verifier.await.unwrap().is_err(), "{case}: verifier accepted");
+    }
+}
+
+#[tokio::test]
+async fn a_request_outside_policy_gets_no_key_material() {
+    let raw = request();
+    let all = hidden_values(&raw);
+    let mut blank = raw.clone();
+    all.iter().for_each(|r| blank[r.clone()].fill(0));
+    let bits = |hidden: &[Range<usize>]| hidden.iter().map(|r| r.len() * 8).sum::<usize>();
+    // (case, transfers, requests, the refusal the verifier must give, material allowed)
+    let cases: Vec<(&str, usize, Vec<Vec<u8>>, &str, usize)> = vec![
+        ("post", 0, vec![request_frame(String::from_utf8(raw.clone()).unwrap().replacen("GET ", "POST ", 1).as_bytes(), &[])], "not an HTTP/1.1 GET", 0),
+        // Hiding part of the request line is not one of the allowed values.
+        (
+            "hide_path",
+            64,
+            vec![{
+                let mut public = blank.clone();
+                public[20..28].fill(0);
+                let mut hidden = vec![20..28];
+                hidden.extend_from_slice(&all);
+                request_frame(&public, &hidden[..1])
+            }],
+            "outside the session cookie values",
+            0,
+        ),
+        // A hidden range that still carries bytes would be sealed as public.
+        ("nonzero_hidden", bits(&all[..1]), vec![request_frame(&raw, &all[..1])], "must be zero", 0),
+        ("wrong_transfers", bits(&all) - 8, vec![request_frame(&blank, &all)], "prepared", 0),
+        // The first request is legitimate and may be answered; the second ends the session.
+        ("two_requests", bits(&all), vec![request_frame(&blank, &all), request_frame(&blank, &all)], "one request", 1),
+    ];
+    for (case, transfers, requests, refusal, allowed) in cases {
+        let server = server(response(), |_| {}).await;
+        let (node_end, verifier_end) = tokio::io::duplex(1 << 20);
+        let config = verifier::tls_config(server.roots.clone()).unwrap();
+        let supplier = tokio::spawn(rogue_supplier(server.addr, node_end, transfers, requests));
+        // The verifier must refuse by itself, with the supplier still connected.
+        let error = within(verifier::run(verifier_end, config, xpolicy::HOST, verifier::authorize_x)).await.err().unwrap_or_else(|| panic!("{case}: verifier accepted"));
+        assert!(format!("{error:#}").contains(refusal), "{case}: refused for another reason: {error:#}");
+        assert!(within(supplier).await.unwrap() <= allowed, "{case}: verifier released key material");
+        assert!(server.seen.lock().unwrap().is_none(), "{case}: a request reached the server");
     }
 }
 
 #[tokio::test]
 async fn a_verifier_that_cheats_on_the_tag_gets_nothing_from_the_server() {
-    for attack in ["masked", "share", "ciphertext"] {
+    // The first hidden byte is 'c' (0x63): its top bit is clear, the next is set.
+    assert_eq!(csrf().as_bytes()[0], 0x63);
+    for attack in ["masked_clear_bit", "masked_set_bit", "share", "ciphertext"] {
         let server = server(response(), |_| {}).await;
         let (node_end, verifier_end) = link(move |from_node, kind, payload| {
             if from_node || kind != wire::MATERIAL {
@@ -461,9 +512,10 @@ async fn a_verifier_that_cheats_on_the_tag_gets_nothing_from_the_server() {
             }
             let mut bytes = payload.to_vec();
             let len = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+            let masked = 4 + len + 16;
             match attack {
-                // Probe one hidden bit: the tag is now wrong exactly when that bit is set.
-                "masked" => bytes[4 + len + 16 + 16 * 3] ^= 1,
+                "masked_clear_bit" => bytes[masked] ^= 1,
+                "masked_set_bit" => bytes[masked + 16] ^= 1,
                 "share" => bytes[4 + len] ^= 1,
                 _ => bytes[4 + 2] ^= 1,
             }
@@ -471,59 +523,67 @@ async fn a_verifier_that_cheats_on_the_tag_gets_nothing_from_the_server() {
         });
         let tcp = TcpStream::connect(server.addr).await.unwrap();
         let (response_at_node, outcome) = run(server.roots.clone(), node_end, verifier_end, tcp).await;
-        // "masked" flips a bit the supplier only uses when its hidden bit is 1; either
-        // way the server must never accept a request the verifier distorted.
-        if server.seen.lock().unwrap().is_some() {
-            assert_eq!(attack, "masked", "{attack}: server accepted a distorted request");
+        if attack == "masked_clear_bit" {
+            // The supplier never uses the correlation of a bit it does not set, so
+            // nothing changes. This is the probe a cheating verifier has: one hidden
+            // bit per session, learned from whether X accepts.
             assert_eq!(server.seen.lock().unwrap().as_deref(), Some(&request()[..]));
+            assert!(response_at_node.is_ok() && outcome.is_ok());
         } else {
+            assert!(server.seen.lock().unwrap().is_none(), "{attack}: server accepted a distorted request");
             assert!(response_at_node.is_err() && outcome.is_err(), "{attack}");
         }
     }
 }
 
+/// A ClientHello record as the verifier's TLS library writes it for `name`.
+fn client_hello(name: &str) -> Vec<u8> {
+    let config = verifier::tls_config(RootCertStore::empty()).unwrap();
+    let mut conn = rustls::ClientConnection::new(config, rustls::pki_types::ServerName::try_from(name.to_owned()).unwrap()).unwrap();
+    let mut out = Vec::new();
+    conn.write_tls(&mut out).unwrap();
+    out
+}
+
 #[tokio::test]
-async fn the_verifier_cannot_use_the_connection_after_the_request_or_get_a_second_record() {
-    for attack in ["late_bytes", "second_material"] {
+async fn the_verifier_can_send_only_its_handshake_and_gets_one_record() {
+    // A protected record of the verifier's own. It holds the keys, so only the
+    // supplier's refusal to forward keeps it from using the supplier's address.
+    let own_record = [&record::aad(60)[..], &[0x42; 76]].concat();
+    for attack in ["own_request_before", "own_request_after", "second_material", "other_host", "second_finished"] {
         let server = server(response(), |_| {}).await;
-        let (node_end, mut verifier_side) = tokio::io::duplex(1 << 20);
-        let tcp = TcpStream::connect(server.addr).await.unwrap();
-        let raw = request();
-        let node = tokio::spawn(async move { node::session(node_end, tcp, &raw).await });
-        // A scripted verifier: complete the transfers honestly, then misbehave.
-        let (_, hello) = wire::recv(&mut verifier_side).await.unwrap();
-        let transfers = serde_json::from_slice::<serde_json::Value>(&hello).unwrap()["transfers"].as_u64().unwrap() as usize;
-        let mut ot = super::ot::VerifierOt::new(transfers);
-        let public_len;
-        loop {
-            let (kind, payload) = wire::recv(&mut verifier_side).await.unwrap();
-            match kind {
-                wire::CO_SETUP => {
-                    let (kind, reply) = ot.on_setup(&payload).unwrap();
-                    wire::send(&mut verifier_side, kind, &reply).await.unwrap();
-                }
-                wire::CO_PAYLOAD => ot.on_payload(&payload).unwrap(),
-                wire::KOS_EXTEND => {
-                    if let Some((kind, chi)) = ot.on_extend(&payload).unwrap() {
-                        wire::send(&mut verifier_side, kind, &chi).await.unwrap();
-                    }
-                }
-                wire::KOS_CHECK => ot.on_check(&payload).unwrap(),
-                wire::REQUEST => {
-                    public_len = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize;
-                    break;
-                }
-                _ => {}
+        let other = client_hello("other.example");
+        let own = own_record.clone();
+        let mut to_server_frames = 0;
+        let (node_end, verifier_end) = link(move |from_node, kind, payload| {
+            if from_node {
+                return Verdict::Pass;
             }
+            match (attack, kind) {
+                ("other_host", wire::TO_SERVER) if to_server_frames == 0 => {
+                    to_server_frames += 1;
+                    Verdict::Replace(other.clone())
+                }
+                // The second frame carries the verifier's Finished: the handshake is done.
+                ("own_request_before" | "second_finished", wire::TO_SERVER) => {
+                    to_server_frames += 1;
+                    if to_server_frames != 2 {
+                        return Verdict::Pass;
+                    }
+                    let extra = if attack == "second_finished" { payload[payload.len() - 58..].to_vec() } else { own.clone() };
+                    Verdict::Also(vec![(wire::TO_SERVER, extra)])
+                }
+                ("own_request_after", wire::MATERIAL) => Verdict::Also(vec![(wire::TO_SERVER, own.clone())]),
+                ("second_material", wire::MATERIAL) => Verdict::Also(vec![(wire::MATERIAL, payload.to_vec())]),
+                _ => Verdict::Pass,
+            }
+        });
+        let tcp = TcpStream::connect(server.addr).await.unwrap();
+        let (response_at_node, _) = run(server.roots.clone(), node_end, verifier_end, tcp).await;
+        assert!(response_at_node.is_err(), "{attack}: supplier went along");
+        if matches!(attack, "own_request_before" | "other_host" | "second_finished") {
+            assert!(server.seen.lock().unwrap().is_none(), "{attack}: something reached the server as a request");
         }
-        let mut material = ((public_len + 1) as u32).to_be_bytes().to_vec();
-        material.extend_from_slice(&vec![0x11; public_len + 1 + 16 + 16 * transfers]);
-        wire::send(&mut verifier_side, wire::MATERIAL, &material).await.unwrap();
-        match attack {
-            "late_bytes" => wire::send(&mut verifier_side, wire::TO_SERVER, b"GET /anything HTTP/1.1\r\n\r\n").await.unwrap(),
-            _ => wire::send(&mut verifier_side, wire::MATERIAL, &material).await.unwrap(),
-        }
-        assert!(within(node).await.unwrap().is_err(), "{attack}: supplier went along");
     }
 }
 
@@ -607,7 +667,7 @@ async fn live_x_accepts_the_jointly_sealed_record() {
     let config = verifier::tls_config(verifier::mozilla_roots().unwrap()).unwrap();
     let tcp = TcpStream::connect((xpolicy::HOST, 443)).await.unwrap();
     let started = std::time::Instant::now();
-    let node = tokio::spawn(async move { node::session(node_end, tcp, &raw).await });
+    let node = tokio::spawn(async move { node::session(node_end, tcp, &raw, xpolicy::HOST).await });
     let outcome = within(verifier::run(verifier_end, config, xpolicy::HOST, verifier::authorize_x)).await;
     let response = within(node).await.unwrap();
     match (&outcome, &response) {

@@ -19,7 +19,7 @@ use tokio::{
 use super::{
     MAX_REQUEST, VERSION,
     ot::NodeOt,
-    tag,
+    record, tag,
     wire::{self, CHUNK},
 };
 use crate::{
@@ -28,9 +28,93 @@ use crate::{
     xprove::{MAX_RECV, Request},
 };
 
-/// Bytes of the verifier's handshake the supplier will forward to X. After
-/// the request record nothing more is forwarded.
-const MAX_HANDSHAKE: usize = 64 << 10;
+/// Largest protected record the verifier may send before the request: its
+/// TLS 1.3 Finished under SHA-256 is 53 bytes, far too small to matter if a
+/// verifier put anything else there, and the server accepts nothing else first.
+const MAX_FINISHED: usize = 64;
+
+/// What the verifier may have the supplier write to X: its handshake and
+/// nothing else. The verifier holds the session keys, so without this it
+/// could send requests of its own from the supplier's address.
+#[derive(Default)]
+struct Handshake {
+    buffer: Vec<u8>,
+    hellos: usize,
+    change_cipher_spec: bool,
+    finished: bool,
+}
+
+impl Handshake {
+    /// Takes bytes from the verifier and returns the whole records among
+    /// them that may go to the server. Anything outside a TLS 1.3 client
+    /// handshake for `host` is refused.
+    fn admit(&mut self, bytes: &[u8], host: &str) -> Result<Vec<u8>> {
+        self.buffer.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        while let Some((kind, record)) = record::take(&mut self.buffer)? {
+            match kind {
+                // A ClientHello, or its repeat after a HelloRetryRequest.
+                record::HANDSHAKE if self.hellos < 2 && !self.finished => {
+                    if client_hello_name(&record[5..]) != Some(host.as_bytes()) {
+                        bail!("verifier's handshake is not a ClientHello for {host}");
+                    }
+                    self.hellos += 1;
+                }
+                record::CHANGE_CIPHER_SPEC if !self.change_cipher_spec && record[5..] == [1] => self.change_cipher_spec = true,
+                record::APPLICATION_DATA if self.hellos > 0 && !self.finished && record.len() <= 5 + MAX_FINISHED => self.finished = true,
+                _ => bail!("verifier tried to send more than its handshake"),
+            }
+            out.extend_from_slice(&record);
+        }
+        Ok(out)
+    }
+}
+
+/// The single DNS name in a ClientHello's server_name extension, if `message`
+/// is exactly one well-formed ClientHello that carries one.
+fn client_hello_name(message: &[u8]) -> Option<&[u8]> {
+    fn take<'a>(at: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+        let (head, rest) = at.split_at_checked(n)?;
+        *at = rest;
+        Some(head)
+    }
+    fn vector<'a>(at: &mut &'a [u8], width: usize) -> Option<&'a [u8]> {
+        let len = take(at, width)?.iter().fold(0usize, |n, &b| n << 8 | b as usize);
+        take(at, len)
+    }
+    let mut at = message;
+    if take(&mut at, 1)? != [1] {
+        return None;
+    }
+    let mut body = vector(&mut at, 3)?;
+    if !at.is_empty() {
+        return None;
+    }
+    take(&mut body, 2 + 32)?; // legacy version and random
+    vector(&mut body, 1)?; // session id
+    vector(&mut body, 2)?; // cipher suites
+    vector(&mut body, 1)?; // compression methods
+    let mut extensions = vector(&mut body, 2)?;
+    if !body.is_empty() {
+        return None;
+    }
+    let mut name = None;
+    while !extensions.is_empty() {
+        let kind = take(&mut extensions, 2)?;
+        let mut data = vector(&mut extensions, 2)?;
+        if kind == [0, 0] {
+            let mut list = vector(&mut data, 2)?;
+            if name.is_some() || !data.is_empty() || take(&mut list, 1)? != [0] {
+                return None;
+            }
+            name = Some(vector(&mut list, 2)?);
+            if !list.is_empty() {
+                return None;
+            }
+        }
+    }
+    name
+}
 
 #[derive(Serialize)]
 pub struct Summary {
@@ -54,11 +138,12 @@ pub async fn run(request: Request) -> Result<Summary> {
         bail!("verifier token must be 64 hex characters");
     }
     let started = Instant::now();
-    let (mut socket, traffic) = crate::control::connect(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture).await?;
-    socket.write_all(format!("{}\n", request.token).as_bytes()).await?;
+    // Reach X first: presenting the token spends one of the job's attempts.
     let server = TcpStream::connect((HOST, 443)).await.context("x.com unreachable")?;
     server.set_nodelay(true)?;
-    let response = tokio::time::timeout(std::time::Duration::from_secs(120), session(socket, server, &raw)).await.context("relay session timed out")??;
+    let (mut socket, traffic) = crate::control::connect(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture).await?;
+    socket.write_all(format!("{}\n", request.token).as_bytes()).await?;
+    let response = tokio::time::timeout(std::time::Duration::from_secs(120), session(socket, server, &raw, HOST)).await.context("relay session timed out")??;
     Ok(Summary {
         verifier_transport: traffic.snapshot(),
         status: "proof_sent",
@@ -84,9 +169,9 @@ enum Event {
     Failed(anyhow::Error),
 }
 
-/// Runs the session over an established verifier socket and server
-/// connection, and returns the response the verifier decrypted.
-pub async fn session<V, X>(verifier: V, server: X, raw: &[u8]) -> Result<Vec<u8>>
+/// Runs the session over an established verifier socket and a connection to
+/// `host`, and returns the response the verifier decrypted.
+pub async fn session<V, X>(verifier: V, server: X, raw: &[u8], host: &str) -> Result<Vec<u8>>
 where
     V: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     X: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -139,14 +224,26 @@ where
         received = Some(Vec::new());
     }
 
-    let mut forwarded = 0usize;
+    let mut handshake = Handshake::default();
     let mut record_sent = false;
     let mut response = Vec::new();
     while let Some(event) = inbox.recv().await {
         match event {
             Event::Failed(e) => return Err(e),
-            Event::Server(bytes) => wire::send(&mut to_verifier, wire::FROM_SERVER, &bytes).await?,
-            Event::ServerEof => wire::send(&mut to_verifier, wire::SERVER_EOF, &[]).await?,
+            // Once the response is whole the verifier stops reading, so a late
+            // write to it may fail while its result is still on the way here.
+            Event::Server(bytes) => {
+                let sent = wire::send(&mut to_verifier, wire::FROM_SERVER, &bytes).await;
+                if !record_sent {
+                    sent?;
+                }
+            }
+            Event::ServerEof => {
+                let sent = wire::send(&mut to_verifier, wire::SERVER_EOF, &[]).await;
+                if !record_sent {
+                    sent?;
+                }
+            }
             Event::Frame(wire::CO_CHOOSE, payload) => {
                 for (kind, frame) in ot.as_mut().context("unexpected base-OT choice")?.on_choose(&payload)? {
                     wire::send(&mut to_verifier, kind, &frame).await?;
@@ -161,15 +258,17 @@ where
                 received = Some(blocks);
             }
             Event::Frame(wire::TO_SERVER, payload) => {
-                forwarded += payload.len();
-                // Only the handshake travels this way. Once the request record
-                // is out the verifier gets no further use of this connection.
-                if record_sent || forwarded > MAX_HANDSHAKE {
+                // Only the verifier's handshake travels this way, and nothing
+                // at all once the request record is out.
+                if record_sent {
                     bail!("verifier tried to send more than its handshake");
                 }
-                to_server.write_all(&payload).await?;
+                to_server.write_all(&handshake.admit(&payload, host)?).await?;
             }
             Event::Frame(wire::MATERIAL, payload) => {
+                if !handshake.finished {
+                    bail!("verifier sent request material before finishing its handshake");
+                }
                 let blocks = received.take().context("verifier sent request material twice or before the request")?;
                 let material = parse_material(&payload, public.len(), bits)?;
                 let record = tag::node_record(&material, &hidden, &secret, &blocks)?;
@@ -229,4 +328,70 @@ fn parse_material(payload: &[u8], request_len: usize, bits: usize) -> Result<tag
     let tag_share = payload[4 + len..4 + len + 16].try_into().expect("sixteen bytes");
     let masked = payload[4 + len + 16..].chunks_exact(16).map(|block| block.try_into().expect("sixteen bytes")).collect();
     Ok(tag::Material { ciphertext, masked, tag_share })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn hello(name: &str) -> Vec<u8> {
+        let config = crate::relay::verifier::tls_config(rustls::RootCertStore::empty()).unwrap();
+        let mut conn = rustls::ClientConnection::new(config, rustls::pki_types::ServerName::try_from(name.to_owned()).unwrap()).unwrap();
+        let mut out = Vec::new();
+        conn.write_tls(&mut out).unwrap();
+        out
+    }
+    const CCS: [u8; 6] = [20, 3, 3, 0, 1, 1];
+    fn protected(len: usize) -> Vec<u8> {
+        [&[23, 3, 3, (len >> 8) as u8, len as u8][..], &vec![7; len]].concat()
+    }
+
+    #[test]
+    fn only_a_client_handshake_for_the_host_is_forwarded() {
+        let hello = hello("x.com");
+        assert_eq!(client_hello_name(&hello[5..]), Some(&b"x.com"[..]));
+        // The whole handshake, in pieces that split a record.
+        let mut ok = Handshake::default();
+        let flight = [&hello[..], &CCS, &protected(53)].concat();
+        let (a, b) = flight.split_at(hello.len() - 3);
+        let mut forwarded = ok.admit(a, "x.com").unwrap();
+        assert!(forwarded.is_empty());
+        forwarded.extend(ok.admit(b, "x.com").unwrap());
+        assert_eq!(forwarded, flight);
+        assert!(ok.finished);
+
+        let refuses = |records: &[&[u8]]| {
+            let mut state = Handshake::default();
+            records.iter().any(|record| state.admit(record, "x.com").is_err())
+        };
+        // Another server name, a truncated or padded hello, or no hello at all.
+        assert!(refuses(&[&self::hello("other.example")]));
+        let mut longer = hello.clone();
+        longer.push(0);
+        longer[4] += 1;
+        assert!(refuses(&[&longer]));
+        assert!(refuses(&[&protected(53)]));
+        // More than the handshake: a second protected record, a large one, a third hello.
+        assert!(refuses(&[&hello, &CCS, &protected(53), &protected(53)]));
+        assert!(refuses(&[&hello, &protected(200)]));
+        assert!(refuses(&[&hello, &hello, &hello]));
+        assert!(refuses(&[&hello, &CCS, &CCS]));
+        assert!(refuses(&[&hello, &protected(53), &hello]));
+        // A retried hello before the Finished is the HelloRetryRequest path.
+        assert!(!refuses(&[&hello, &CCS, &hello, &protected(53)]));
+        // An alert or anything else unprotected is not part of a client handshake.
+        assert!(refuses(&[&hello, &[21, 3, 3, 0, 2, 1, 0]]));
+    }
+
+    #[test]
+    fn malformed_hellos_have_no_name() {
+        let hello = hello("x.com");
+        let message = &hello[5..];
+        for cut in [0, 1, 4, 40, message.len() - 1] {
+            assert_eq!(client_hello_name(&message[..cut]), None);
+        }
+        let mut server_hello = message.to_vec();
+        server_hello[0] = 2;
+        assert_eq!(client_hello_name(&server_hello), None);
+    }
 }
