@@ -72,6 +72,10 @@ function Find-Button([string]$Name) {
     return $script:window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
 }
 function Click-Button([string]$Name) {
+    Wait-Check {
+        $control = Find-Button $Name
+        return $null -ne $control -and $control.Current.IsEnabled
+    } 30 "UI control did not become available: $Name"
     $button = Find-Button $Name
     if (-not $button -or -not $button.Current.IsEnabled) { throw "UI control unavailable: $Name" }
     $scroll = $null
