@@ -300,3 +300,39 @@ func BenchmarkJournalSyntheticCommit(b *testing.B) {
 		}
 	}
 }
+
+func TestProviderAccountBindingSurvivesRestartAndCannotBeReassigned(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "attempts")
+	j := open(t, dir)
+	r := fixture()
+	r.ProviderAccountID = "local-one"
+	r.ProviderService = "codex"
+	if e := j.Begin(r); e != nil {
+		t.Fatal(e)
+	}
+	j.Close()
+	j = open(t, dir)
+	pending, e := j.Pending()
+	if e != nil || len(pending) != 1 || pending[0].ProviderAccountID != "local-one" || pending[0].ProviderService != "codex" {
+		t.Fatal("account binding lost", e)
+	}
+	switched := r
+	switched.ProviderAccountID = "local-two"
+	if e = j.Begin(switched); !errors.Is(e, ErrConflict) {
+		t.Fatal("replayed job switched account", e)
+	}
+	if _, e = j.Ready(switched, "fail", []byte(`{"code":"execution_uncertain"}`)); !errors.Is(e, ErrConflict) {
+		t.Fatal("report changed account binding", e)
+	}
+	ready, e := j.Ready(pending[0], "fail", []byte(`{"code":"execution_uncertain"}`))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = j.Terminal(ready); e != nil {
+		t.Fatal(e)
+	}
+	raw, e := os.ReadFile(filepath.Join(dir, key(r)+".json"))
+	if e != nil || !bytes.Contains(raw, []byte(`"provider_account_id":"local-one"`)) {
+		t.Fatal("terminal account audit lost", e)
+	}
+}

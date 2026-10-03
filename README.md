@@ -62,6 +62,83 @@ Recovery uses the authenticated `GET /api/node/v1/jobs/{job_id}/attempt` contrac
 
 The journal stores no provider credentials, verifier tokens, prompts or complete leases. Gateway result reports can contain private output; files are 0600 in a 0700 directory. Accepted content is removed immediately; unresolved report content expires 24 hours after its lease deadline while uncertainty metadata remains. Terminal metadata is removed after both deadline and acknowledgement are 24 hours old. The node journal uses `SCARLETT_JOURNAL_MAX_RECORDS` (default 1024, range 1 to 1,000,000), `SCARLETT_JOURNAL_MAX_RECORD_BYTES` (default 192000, range 192000 to 1048576), and `SCARLETT_JOURNAL_MAX_TOTAL_BYTES` (default 268435456, at least the per-record limit and at most 17179869184). Pending attempts reserve their full encoded-record budget before funded acceptance; terminal attempts use their actual bytes. A full journal advertises exhausted service health before requesting new offers. Local status includes `journal_capacity` with actual/reserved bytes and available record slots. Existing pending attempts still reconcile without repeating provider work. A full, corrupt or unwritable journal refuses new work. Abandoned atomic-write files are removed under the exclusive lock on startup. State-dir environment changes must preserve the journal for restart recovery; deleting it forfeits that protection.
 
+## Multiple local Codex and X accounts
+
+Services mode supports up to eight accounts for each enabled provider. Set
+`SCARLETT_EXECUTOR=services` and select `SCARLETT_SERVICES=codex,x_read` as usual.
+`SCARLETT_CODEX_CONCURRENCY` and `SCARLETT_X_CONCURRENCY` remain the total
+per-service limits, each at most 32; each account has its own limit underneath
+that ceiling. A private account file controls which accounts receive new jobs.
+Account configuration establishes compatibility, not provider authorization or
+model entitlement.
+
+For Codex, sign into each account with the Codex CLI using a separate
+`CODEX_HOME`, then register that absolute home directory. For X, register an
+absolute path to a private session file containing the existing session schema.
+Credentials must not appear in command arguments. These examples contain only
+local names and placeholder paths:
+
+```sh
+scarlett-node accounts add codex work /absolute/private/codex-home 1
+scarlett-node accounts add x_read research /absolute/private/x-session.json 1
+scarlett-node accounts list
+scarlett-node status
+scarlett-node accounts remove x_read research
+```
+
+Alternatively, `scarlett-node accounts connect SERVICE ID CONCURRENCY` imports
+credential JSON from protected stdin into a private node-owned account directory.
+Terminal input is hidden. The command refuses to overwrite existing credentials;
+Codex owns its authentication schema and the proof helper validates it when used.
+The helper does not refresh Codex tokens. Account IDs use 1–32 lowercase letters,
+digits, underscores or hyphens; `legacy` is reserved. Two names cannot refer to
+the same credential path or inode.
+
+The CLI writes `SCARLETT_STATE_DIR/accounts.json`, or the absolute private path
+in `SCARLETT_ACCOUNTS_FILE`. Its bounded schema is:
+
+```json
+{"version":1,"accounts":[
+  {"id":"work","service":"codex","path":"/absolute/private/codex-home","concurrency":1},
+  {"id":"research","service":"x_read","path":"/absolute/private/x-session.json","concurrency":1}
+]}
+```
+
+Keep the file and its directory private (0600 and 0700). The node reloads it
+before scheduling. A file with an empty `accounts` array disables admission for both services.
+When no default account file has ever existed, the existing
+`SCARLETT_CODEX_HOME` and `SCARLETT_X_SESSION` single-account configuration still
+works. An explicitly configured missing file, an invalid replacement, or a file
+removed after use blocks new work instead of falling back to legacy credentials.
+
+Selection rotates fairly among eligible accounts for fresh jobs. The local
+account ID and provider are journaled before funded acceptance. That job retains
+its selected configuration; all X pages use one loaded session. A failed or
+uncertain attempt never moves to another account or repeats provider work.
+Removing an account stops new admission and lets selected work drain; removal
+retains its credential files. Wait until its local `in_flight` count reaches zero
+before disposing of credentials. A changed credential location also waits for
+that account's selected work to drain.
+
+Authentication failures and quota cooldowns apply to the selected account.
+Private `account-health.json` preserves them across restart. The private
+`accounts-mode` marker keeps managed admission from falling back to legacy
+credentials after an account file disappears across restart. X's typed reset
+wait is honored, with a minimum 15-minute cooldown; Codex rate-limit errors use
+15 minutes when no reset time is available. Reset times outside the bounded
+30-day window require operator attention. Changing a credential file does not
+erase an outstanding quota cooldown. Corrupt or unwritable health state stops
+new admission. Preserve the state directory when upgrading or restarting.
+
+`status` includes safe local account names, service, health, configured capacity,
+in-flight count, a finite error code and cooldown time. `accounts list` lists
+only local names, provider and concurrency. Credential paths, account names and
+cooldown details are absent from coordinator heartbeats; those report aggregate
+service health and capacity within the existing ceilings. The top-level typed
+heartbeat capacity equals the service-capacity sum, including zero when all
+accounts are blocked. These observations
+provide no independently verified entitlement, billing or points evidence.
+
 **Local lifecycle**: `scarlett-node status` prints a private local JSON observation: runtime state, last acknowledged heartbeat, independent service reports, in-flight work and unresolved journal records. It contains no credentials, prompts, results or verifier tokens. A snapshot older than 30 seconds is offline; it does not prove current provider access or remote acceptance. These commands need only `SCARLETT_STATE_DIR`, which must match the running node.
 
 `scarlett-node drain` persists a drain request across process restarts. The next poll advertises exhausted capacity, and work delivered after the node observes the request is rejected without calling its provider. Already accepted jobs continue. `scarlett-node resume` removes the request; the next poll can accept work again if its service is available. The coordinator must honor exhausted nodes when dispatching. Drain is a local scheduling control, not remote unpairing or revocation.

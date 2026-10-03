@@ -58,7 +58,14 @@ func (p Prover) Run(ctx context.Context, l coordinator.Lease) (code, detail stri
 		if ctx.Err() != nil {
 			return "expired", "prover timed out"
 		}
-		return "prover_error", strings.TrimSpace(stderr.String())
+		diagnostic := strings.TrimSpace(stderr.String())
+		switch diagnostic {
+		case "Error: Codex provider error: unauthenticated":
+			return "auth_required", "Codex authentication required"
+		case "Error: Codex provider error: rate_limited":
+			return "capacity_unavailable", "Codex capacity unavailable"
+		}
+		return "prover_error", diagnostic
 	}
 	var summary struct {
 		Status string `json:"status"`

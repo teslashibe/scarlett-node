@@ -36,6 +36,15 @@ func TestMain(m *testing.M) {
 	switch mode {
 	case "ok":
 		fmt.Println(`{"status":"proof_sent","codex_ms":1,"sent_bytes":1,"received_bytes":1}`)
+	case "auth":
+		fmt.Fprintln(os.Stderr, "Error: Codex provider error: unauthenticated")
+		os.Exit(1)
+	case "quota":
+		fmt.Fprintln(os.Stderr, "Error: Codex provider error: rate_limited")
+		os.Exit(1)
+	case "raw-quota":
+		fmt.Fprintln(os.Stderr, "Error: Codex provider error: rate_limited SECRET_PRIVATE_ERROR")
+		os.Exit(1)
 	case "fail":
 		fmt.Fprintln(os.Stderr, "Codex returned \"error\"")
 		os.Exit(1)
@@ -60,6 +69,9 @@ func TestProverRun(t *testing.T) {
 	}{
 		{"proof sent", "ok", func(*coordinator.Lease) {}, ""},
 		{"prover failure", "fail", func(*coordinator.Lease) {}, "prover_error"},
+		{"safe authentication failure", "auth", func(*coordinator.Lease) {}, "auth_required"},
+		{"safe rate-limit failure", "quota", func(*coordinator.Lease) {}, "capacity_unavailable"},
+		{"unrecognized error cannot claim quota", "raw-quota", func(*coordinator.Lease) {}, "prover_error"},
 		{"unexpected output", "garbage", func(*coordinator.Lease) {}, "prover_error"},
 		{"payload for another model", "ok", func(l *coordinator.Lease) { l.CodexPayload = payload("gpt-5.6-terra", "hello") }, "invalid_lease"},
 		{"payload with another prompt", "ok", func(l *coordinator.Lease) { l.CodexPayload = payload("gpt-5.6-luna", "spend more") }, "invalid_lease"},

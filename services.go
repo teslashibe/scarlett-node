@@ -1,16 +1,12 @@
 package main
 
 import (
-	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
-	"github.com/teslashibe/scarlett-node/internal/worker"
 )
 
 type serviceEntry struct {
@@ -21,58 +17,33 @@ type serviceEntry struct {
 	helperMissing           bool
 }
 type servicePool struct {
-	mu      sync.Mutex
-	config  config.Config
-	entries map[string]*serviceEntry
+	mu                                      sync.Mutex
+	config                                  config.Config
+	entries                                 map[string]*serviceEntry
+	accounts                                map[string]*pooledAccount
+	saved                                   map[string]savedAccountHealth
+	next                                    map[string]int
+	accountMode, accountsError, healthError bool
 }
 
 func newServicePool(c config.Config) *servicePool {
-	p := &servicePool{config: c, entries: map[string]*serviceEntry{"codex": {capacity: c.CodexConcurrency}, "x_read": {capacity: c.XConcurrency}}}
+	p := &servicePool{next: map[string]int{}, config: c, entries: map[string]*serviceEntry{"codex": {capacity: c.CodexConcurrency}, "x_read": {capacity: c.XConcurrency}}}
 	for _, kind := range c.Services {
 		p.entries[kind].enabled = true
 	}
 	return p
 }
 func (p *servicePool) refresh(now time.Time) {
+	if p.refreshAccounts(now) {
+		return
+	}
 	_, helperError := exec.LookPath(p.config.Prover)
 	for kind, s := range p.entries {
 		if !s.enabled {
 			s.state = "not_added"
 			continue
 		}
-		path := p.config.XSession
-		if kind == "codex" {
-			path = filepath.Join(p.config.CodexHome, "auth.json")
-		}
-		info, e := os.Lstat(path)
-		stamp := "unavailable"
-		configured := false
-		if e == nil && info.Mode().IsRegular() && info.Mode().Perm()&0077 == 0 && info.Size() > 0 && info.Size() <= 65536 {
-			stamp = fmt.Sprintf("%d:%d:%d", info.ModTime().UnixNano(), info.Size(), info.Mode().Perm())
-			configured = true
-		}
-		configured = configured && (kind != "x_read" || worker.XConfigured(path))
-		if stamp != s.stamp || s.state == "" {
-			s.stamp = stamp
-			s.lastError = ""
-			s.restUntil = time.Time{}
-			s.state = "configured"
-			if !configured {
-				s.state = "auth_required"
-			}
-		}
-		if !s.restUntil.IsZero() && !now.Before(s.restUntil) {
-			s.restUntil = time.Time{}
-			s.state = "configured"
-		}
-		if configured && helperError != nil {
-			s.helperMissing = true
-			s.state, s.lastError = "unreachable", "prover_error"
-		} else if configured && s.helperMissing {
-			s.helperMissing = false
-			s.state, s.lastError = "configured", ""
-			s.restUntil = time.Time{}
-		}
+		refreshAccount(p.accounts[kind+":legacy"], now, helperError != nil)
 	}
 }
 func (p *servicePool) health() []coordinator.ServiceHealth {
@@ -98,37 +69,14 @@ func (p *servicePool) health() []coordinator.ServiceHealth {
 	}
 	return out
 }
-func (p *servicePool) acquire(kind string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.refresh(time.Now())
-	s := p.entries[kind]
-	if s == nil || !s.enabled || s.inFlight >= s.capacity || s.state != "configured" && s.state != "ready" {
-		return false
-	}
-	s.inFlight++
-	return true
-}
+func (p *servicePool) acquire(kind string) bool { _, ok := p.acquireAccount(kind); return ok }
 func (p *servicePool) finish(kind, code string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	s := p.entries[kind]
-	if s == nil {
-		return
-	}
-	s.inFlight--
-	s.lastError = code
-	switch code {
-	case "":
-		s.state = "ready"
-	case "auth_required":
-		s.state = "auth_required"
-	case "x_rate_limited", "capacity_unavailable":
-		s.state = "exhausted"
-		s.restUntil = time.Now().Add(capacityRest)
-	case "prover_error", "x_request_failed":
-		s.state = "unreachable"
-		s.restUntil = time.Now().Add(capacityRest)
+	p.initAccounts()
+	a := p.accounts[kind+":legacy"]
+	p.mu.Unlock()
+	if a != nil {
+		p.finishAccount(&accountLease{kind: kind, account: a}, code)
 	}
 }
 func (p *servicePool) capacity() int {
