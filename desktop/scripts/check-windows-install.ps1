@@ -149,6 +149,46 @@ function Focus-QuitShortcut {
     Write-Output 'Installed acceptance: foreground and WebView keyboard focus verified'
 }
 
+function Check-QuitShortcut([string]$Failure) {
+    [System.Windows.Forms.SendKeys]::SendWait('^q')
+    if ($application.WaitForExit(135000)) { return }
+    # Keep the shortcut failure, but distinguish missed input from a native
+    # shutdown error. Capture only fixed classifications, never UI text or keys.
+    $shutdownError = $false
+    $focusMatches = $false
+    $foregroundMatches = $false
+    try {
+        $elements = $script:window.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+            [System.Windows.Automation.Condition]::TrueCondition)
+        foreach ($element in $elements) {
+            if ($element.Current.Name.StartsWith('Scarlett could not stop safely. ', [StringComparison]::Ordinal)) {
+                $shutdownError = $true
+            }
+        }
+        $target = Find-Button 'Stop local API'
+        $focusMatches = $null -ne $target -and $target.Current.HasKeyboardFocus
+        $application.Refresh()
+        $foregroundMatches = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $application.MainWindowHandle
+    } catch { }
+    $diagnostic = @{
+        shortcutExited = $false; shutdownErrorVisible = $shutdownError
+        stopControlKeyboardFocus = $focusMatches; foregroundOwnedWindow = $foregroundMatches
+        apiStatusBeforeButton = (Api-Status '/health'); quitButtonInvoked = $false
+        quitButtonExited = $false; realProviderJobs = 0
+    }
+    try {
+        Click-Button 'Quit Scarlett'
+        $diagnostic.quitButtonInvoked = $true
+        $diagnostic.quitButtonExited = $application.WaitForExit(135000)
+    } catch { }
+    $diagnostic.apiStatusAfterButton = Api-Status '/health'
+    New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+    $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-quit-failure.json')
+    Write-Output ($diagnostic | ConvertTo-Json -Compress)
+    # A successful button quit is diagnostic evidence, never a passing shortcut.
+    throw $Failure
+}
+
 function Verify-KeyboardDelivery {
     # UIA Invoke/SetFocus can succeed without an interactive input desktop.
     # Prove SendKeys reaches a harmless empty field before blaming a shortcut.
@@ -269,8 +309,7 @@ function Check-Preferences {
     Click-Button 'Start local API'
     Wait-Check { (Api-Status '/health') -eq 200 } 30 'Saved API port did not survive reopening'
     Focus-QuitShortcut
-    [System.Windows.Forms.SendKeys]::SendWait('^q')
-    if (-not $application.WaitForExit(135000)) { throw 'Preferences app Quit did not exit' }
+    Check-QuitShortcut 'Preferences app Quit did not exit'
     Wait-Check { (Api-Status '/health') -eq 0 } 30 'Preferences Quit left API running'
     Start-App
     if (-not (Checkbox-Is 'Open Scarlett when I log in' $true)) { throw 'Native login registration did not survive app reopening' }
@@ -510,8 +549,7 @@ try {
     Write-Output 'Installed acceptance: unexpected exit and recovery passed'
     Verify-KeyboardDelivery
     Focus-QuitShortcut
-    [System.Windows.Forms.SendKeys]::SendWait('^q')
-    if (-not $application.WaitForExit(135000)) { throw 'Installed desktop Quit did not exit' }
+    Check-QuitShortcut 'Installed desktop Quit did not exit'
     Wait-Check { (Api-Status '/health') -eq 0 } 30 'Installed desktop Quit left the API running'
     New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
     @{
