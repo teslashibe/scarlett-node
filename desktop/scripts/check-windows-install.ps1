@@ -51,6 +51,24 @@ public static class ScarlettAcceptanceWindow {
         if (SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Input))) != (uint)inputs.Length)
             throw new InvalidOperationException("Native input stream rejected events");
     }
+    public static void UnicodeTextAndTab(string text) {
+        // Disposable ASCII fixtures only. One stream preserves text/Tab order.
+        if (String.IsNullOrEmpty(text) || text.Length > 512)
+            throw new InvalidOperationException("Synthetic text exceeds its bound");
+        Input[] inputs = new Input[text.Length * 2 + 2];
+        for (int i = 0; i < text.Length; i++) {
+            char c = text[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-'))
+                throw new InvalidOperationException("Synthetic text contains unsupported characters");
+            Input down = new Input(); down.type = 1;
+            down.value.keyboard.scan = c; down.value.keyboard.flags = 4u;
+            Input up = down; up.value.keyboard.flags = 6u;
+            inputs[i * 2] = down; inputs[i * 2 + 1] = up;
+        }
+        inputs[inputs.Length - 2] = Key(0x09, false);
+        inputs[inputs.Length - 1] = Key(0x09, true);
+        Send(inputs);
+    }
     public static void ControlKey(ushort key) {
         Send(new Input[] { Key(0x11, false), Key(key, false), Key(key, true), Key(0x11, true) });
     }
@@ -238,7 +256,7 @@ function Check-QuitShortcut([string]$Failure) {
 
 function Verify-KeyboardDelivery {
     # UIA Invoke/SetFocus can succeed without an interactive input desktop.
-    # Prove SendKeys reaches a harmless empty field before blaming a shortcut.
+    # Prove native text delivery reaches a harmless empty field before blaming a shortcut.
     Write-Output "Installed keyboard probe: interactive=$([Environment]::UserInteractive), session=$([System.Diagnostics.Process]::GetCurrentProcess().SessionId)"
     $target = $null
     foreach ($name in @('Local Codex account ID', 'Local account ID')) {
@@ -263,9 +281,13 @@ function Verify-KeyboardDelivery {
     Wait-Check {
         return $target.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
     } 10 'Keyboard probe did not acquire foreground and field focus'
-    [System.Windows.Forms.SendKeys]::SendWait('keyboard-probe')
+    [ScarlettAcceptanceWindow]::UnicodeTextAndTab('keyboard-probe')
+    Wait-Check { Input-Advanced $name 'Concurrent jobs' $handle } 10 'Keyboard probe text was not acknowledged by successor focus'
     Wait-Check { $value.Current.Value -ceq 'keyboard-probe' } 10 'CI keyboard injection did not reach the editable control'
-    [ScarlettAcceptanceWindow]::SelectAllAndClear()
+    $target.SetFocus()
+    Wait-Check { $target.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle } 10 'Keyboard probe did not reacquire field focus'
+    [ScarlettAcceptanceWindow]::SelectAllClearAndTab()
+    Wait-Check { Input-Advanced $name 'Concurrent jobs' $handle } 10 'Keyboard probe clear was not acknowledged by successor focus'
     Wait-Check { $value.Current.Value -ceq '' } 10 'Native control-key input did not clear the disposable field'
     Write-Output 'Installed acceptance: text and native control-key delivery verified'
 }
@@ -415,11 +437,35 @@ function Check-Preferences {
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-preferences-ui.json')
 }
 
-function Set-Text([string]$Name, [string]$Value, [string]$NextName = '') {
-    # Use the same text delivery already proved by the per-window probe.
-    # WebView2 can advertise ValuePattern while SetValue fails to commit.
-    # Only disposable fixtures call this helper, never real credentials.
+function Input-Advanced([string]$Name, [string]$NextName, [IntPtr]$Handle) {
+    $source = Find-Input $Name
+    if ($null -eq $source -or $source.Current.HasKeyboardFocus -or
+        [ScarlettAcceptanceWindow]::GetForegroundWindow() -ne $Handle) { return $false }
+    $condition = [System.Windows.Automation.AndCondition]::new(
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::NameProperty, $NextName),
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::IsKeyboardFocusableProperty, $true)
+    )
+    $matches = $script:window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    $focusedCount = 0
+    $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
+    foreach ($match in $matches) {
+        if ($match.Current.IsEnabled -and $match.Current.HasKeyboardFocus -and
+            $match.Current.ProcessId -eq $source.Current.ProcessId -and
+            $null -ne $focused -and [System.Windows.Automation.Automation]::Compare($match, $focused)) { $focusedCount++ }
+    }
+    # Concurrent jobs appears in both forms; require the actually focused one.
+    return $focusedCount -eq 1
+}
+
+function Set-Text([string]$Name, [string]$Value, [string]$NextName) {
+    # All inputs are disposable fixtures, never real credentials. Use one native
+    # text/Tab stream and acknowledge focus changes instead of SendKeys timing.
     if ($Value -notmatch '^[a-z0-9-]+$' -or $Value.Length -gt 512) { throw 'Synthetic input contains unsupported characters' }
+    if (-not (($Name -eq 'Local X account ID' -and $NextName -eq 'Concurrent jobs') -or
+        ($Name -eq 'auth_token' -and $NextName -eq 'ct0') -or
+        ($Name -eq 'ct0' -and $NextName -eq 'Connect X'))) { throw 'Synthetic input requires its reviewed successor control' }
     Wait-Check { (Find-Input $Name).Current.IsEnabled } 15 "Text input did not become ready: $Name"
     $control = Find-Input $Name
     if (-not $control -or -not $control.Current.IsEnabled) { throw "Text input unavailable: $Name" }
@@ -432,35 +478,9 @@ function Set-Text([string]$Name, [string]$Value, [string]$NextName = '') {
     Wait-Check {
         return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
     } 10 'Synthetic input did not acquire keyboard focus'
-    if ($control.Current.IsPassword) {
-        if (-not (($Name -eq 'auth_token' -and $NextName -eq 'ct0') -or
-            ($Name -eq 'ct0' -and $NextName -eq 'Connect X'))) { throw 'Masked input requires its reviewed successor control' }
-        # SendWait can return before another process handles input. Tab focus
-        # acknowledges the clear and text queues without reading a password.
-        [ScarlettAcceptanceWindow]::SelectAllClearAndTab()
-        Wait-Check {
-            $next = Find-Input $NextName
-            return $null -ne $next -and $next.Current.HasKeyboardFocus -and
-                [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
-        } 10 'Masked clear input was not acknowledged by successor focus'
-        $control = Find-Input $Name
-        $control.SetFocus()
-        Wait-Check {
-            return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
-        } 10 'Masked input did not reacquire keyboard focus'
-        [System.Windows.Forms.SendKeys]::SendWait($Value + '{TAB}')
-        Wait-Check {
-            $next = Find-Input $NextName
-            return $null -ne $next -and $next.Current.HasKeyboardFocus -and
-                [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
-        } 10 'Masked text input was not acknowledged by successor focus'
-        return
-    }
-    if ($NextName) { throw 'Ordinary input cannot use a masked successor' }
-    [ScarlettAcceptanceWindow]::SelectAllAndClear()
-    # Native keyboard events can still be queued when SendInput returns.
-    # Observe the ordinary field's empty value before sending the next text,
-    # as the per-window keyboard probe already does. Never read secret fields.
+    [ScarlettAcceptanceWindow]::SelectAllClearAndTab()
+    # An initially empty value is not evidence that queued clear events ran.
+    Wait-Check { Input-Advanced $Name $NextName $handle } 10 'Synthetic clear input was not acknowledged by successor focus'
     if (-not $control.Current.IsPassword) {
         Wait-Check {
             $current = Find-Input $Name
@@ -469,7 +489,13 @@ function Set-Text([string]$Name, [string]$Value, [string]$NextName = '') {
                 $pattern.Current.Value -ceq ''
         } 10 'Synthetic input did not clear before typing'
     }
-    [System.Windows.Forms.SendKeys]::SendWait($Value)
+    $control = Find-Input $Name
+    $control.SetFocus()
+    Wait-Check {
+        return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+    } 10 'Synthetic input did not reacquire keyboard focus'
+    [ScarlettAcceptanceWindow]::UnicodeTextAndTab($Value)
+    Wait-Check { Input-Advanced $Name $NextName $handle } 10 'Synthetic text input was not acknowledged by successor focus'
     # Masked cookie fields may refuse value readback. Exact persistence is
     # checked against the synthetic fixture after the Connect action.
     if (-not $control.Current.IsPassword) {
@@ -590,7 +616,8 @@ function Check-BrowserImport {
         Select-Browser 2 'Firefox'
         Wait-Check { Checkbox-Is 'Import only X session cookies from this profile' $false } 10 'Changing profile retained consent'
         Wait-Check { -not (Find-Button 'Import X account').Current.IsEnabled } 10 'Profile change allowed import without new consent'
-        Set-Text 'Local X account ID' 'browser-firefox'
+        Verify-KeyboardDelivery
+        Set-Text 'Local X account ID' 'browser-firefox' 'Concurrent jobs'
         Set-Checkbox 'Import only X session cookies from this profile' $true
         Click-Button 'Import X account'
         try {
@@ -623,7 +650,7 @@ function Check-BrowserImport {
         Wait-Check { Checkbox-Is 'Import only X session cookies from this profile' $false } 10 'Successful import retained consent'
         Wait-Check { UI-Contains 'access not verified' } 15 'Imported account claimed verified access'
         Select-Browser 1 'Chrome'
-        Set-Text 'Local X account ID' 'protected-chrome'
+        Set-Text 'Local X account ID' 'protected-chrome' 'Concurrent jobs'
         Set-Checkbox 'Import only X session cookies from this profile' $true
         Click-Button 'Import X account'
         Wait-Check { UI-Contains 'The browser or OS protected this profile' } 20 'Protected Chrome did not show the paste fallback'
@@ -631,7 +658,7 @@ function Check-BrowserImport {
         foreach ($name in @('auth_token', 'ct0')) {
             if (-not (Find-Input $name).Current.IsPassword) { throw 'Cookie paste field was not masked' }
         }
-        Set-Text 'Local X account ID' 'browser-paste'
+        Set-Text 'Local X account ID' 'browser-paste' 'Concurrent jobs'
         Set-Text 'auth_token' $script:fixture.authToken 'ct0'
         Set-Text 'ct0' $script:fixture.csrf 'Connect X'
         Click-Button 'Connect X'
