@@ -75,6 +75,10 @@ test("An existing unsupervised node is not launched again", () => {
   assert.equal(canStart(s), false);
   assert.equal(statusText(s), "Running outside this app");
 });
+test("Local API mode prevents starting a second executor for the same account pool", () => {
+  assert.equal(canStart({ ...base, local_api: { available: true, running: true, ready: true, claude_enabled: false } }), false);
+  assert.equal(canStart({ ...base, local_api: { available: true, running: false, ready: false, claude_enabled: false } }), true);
+});
 test("Removed accounts remain visible while draining and omitted snapshots clear them", () => {
   const s: Snapshot = {
     ...base,

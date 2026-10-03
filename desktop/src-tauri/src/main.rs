@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod local_api;
 mod node;
+use local_api::LocalApi;
 use node::{Error, Node};
 use std::sync::{
     Arc,
@@ -7,6 +9,7 @@ use std::sync::{
 };
 use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tauri_plugin_opener::OpenerExt;
+struct RuntimeControl(tokio::sync::Mutex<()>);
 
 fn local_window(window: &WebviewWindow) -> node::Result<()> {
     let url = window.url().map_err(|_| Error::InvalidInput)?;
@@ -30,9 +33,55 @@ fn local_url(url: &tauri::Url) -> bool {
 async fn desktop_status(
     window: WebviewWindow,
     node: State<'_, Arc<Node>>,
+    api: State<'_, Arc<LocalApi>>,
 ) -> node::Result<node::Snapshot> {
     local_window(&window)?;
-    Ok(node.snapshot().await)
+    let mut status = node.snapshot().await;
+    status.local_api = api.snapshot().await;
+    Ok(status)
+}
+#[tauri::command]
+async fn control_local_api(
+    window: WebviewWindow,
+    node: State<'_, Arc<Node>>,
+    api: State<'_, Arc<LocalApi>>,
+    action: String,
+    port: Option<u16>,
+    claude_key: Option<String>,
+    runtime: State<'_, RuntimeControl>,
+) -> node::Result<()> {
+    local_window(&window)?;
+    let _guard = runtime.0.lock().await;
+    match action.as_str() {
+        "start" => {
+            let status = node.snapshot().await;
+            if status.supervised
+                || matches!(
+                    status
+                        .observation
+                        .as_ref()
+                        .and_then(|v| v.get("state"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("running" | "draining")
+                )
+            {
+                return Err(Error::ModeConflict);
+            }
+            api.start(
+                port.ok_or(Error::InvalidInput)?,
+                &node.accounts().await?,
+                claude_key.unwrap_or_default(),
+            )
+            .await
+        }
+        "stop" => api.stop().await,
+        _ => Err(Error::InvalidInput),
+    }
+}
+#[tauri::command]
+fn local_api_key(window: WebviewWindow, api: State<'_, Arc<LocalApi>>) -> node::Result<String> {
+    local_window(&window)?;
+    api.key()
 }
 #[tauri::command]
 async fn pair_node(
@@ -48,8 +97,14 @@ async fn control_node(
     window: WebviewWindow,
     node: State<'_, Arc<Node>>,
     action: String,
+    api: State<'_, Arc<LocalApi>>,
+    runtime: State<'_, RuntimeControl>,
 ) -> node::Result<()> {
     local_window(&window)?;
+    let _guard = runtime.0.lock().await;
+    if action == "start" && api.snapshot().await.running {
+        return Err(Error::ModeConflict);
+    }
     node.control(&action).await
 }
 #[tauri::command]
@@ -78,10 +133,16 @@ async fn connect_codex(
 async fn remove_account(
     window: WebviewWindow,
     node: State<'_, Arc<Node>>,
+    api: State<'_, Arc<LocalApi>>,
     service: String,
     id: String,
+    runtime: State<'_, RuntimeControl>,
 ) -> node::Result<()> {
     local_window(&window)?;
+    let _guard = runtime.0.lock().await;
+    if service == "codex" {
+        api.stop().await?;
+    }
     node.remove(service, id).await
 }
 #[tauri::command]
@@ -111,7 +172,14 @@ fn quit(app: tauri::AppHandle, done: Arc<AtomicBool>) {
     }
     tauri::async_runtime::spawn(async move {
         let node = app.state::<Arc<Node>>().inner().clone();
-        match node.stop().await {
+        let api = app.state::<Arc<LocalApi>>().inner().clone();
+        let runtime = app.state::<RuntimeControl>();
+        let _guard = runtime.0.lock().await;
+        let stopped = match api.stop().await {
+            Ok(()) => node.stop().await,
+            Err(error) => Err(error),
+        };
+        match stopped {
             Ok(()) => {
                 done.store(true, Ordering::SeqCst);
                 app.exit(0);
@@ -129,6 +197,7 @@ fn quit(app: tauri::AppHandle, done: Arc<AtomicBool>) {
 fn main() {
     let done = Arc::new(AtomicBool::new(false));
     let exit_done = done.clone();
+    let menu_done = done.clone();
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(window) = app.get_webview_window("main") {
@@ -137,6 +206,31 @@ fn main() {
             }
         }))
         .plugin(tauri_plugin_opener::init())
+        .menu(|app| {
+            use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+            // The native predefined macOS Quit terminates directly, bypassing
+            // asynchronous drain. Both Cmd-Q and the menu must use our handler.
+            let quit =
+                MenuItem::with_id(app, "app-quit", "Quit Scarlett", true, Some("CmdOrCtrl+Q"))?;
+            let application = Submenu::with_items(app, "Scarlett Node", true, &[&quit])?;
+            let edit = Submenu::with_items(
+                app,
+                "Edit",
+                true,
+                &[
+                    &PredefinedMenuItem::cut(app, None)?,
+                    &PredefinedMenuItem::copy(app, None)?,
+                    &PredefinedMenuItem::paste(app, None)?,
+                    &PredefinedMenuItem::select_all(app, None)?,
+                ],
+            )?;
+            Menu::with_items(app, &[&application, &edit])
+        })
+        .on_menu_event(move |app, event| {
+            if event.id.as_ref() == "app-quit" {
+                quit(app.clone(), menu_done.clone());
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             desktop_status,
             pair_node,
@@ -145,7 +239,9 @@ fn main() {
             connect_x,
             connect_codex,
             remove_account,
-            cancel_login
+            cancel_login,
+            control_local_api,
+            local_api_key
         ])
         .setup(move |app| {
             let state = app.path().app_data_dir()?;
@@ -153,6 +249,17 @@ fn main() {
             let exe = std::env::current_exe()?;
             let directory = exe.parent().ok_or("missing application directory")?;
             let suffix = if cfg!(windows) { ".exe" } else { "" };
+            node::private_dir_with_helper(
+                &state,
+                &directory.join(format!("scarlett-node{suffix}")),
+            )
+            .map_err(|_| "private desktop storage unavailable")?;
+            app.manage(RuntimeControl(tokio::sync::Mutex::new(())));
+            app.manage(Arc::new(LocalApi::new(
+                &state,
+                directory.join(format!("open-agent-api{suffix}")),
+                resources.join("runtime"),
+            )));
             app.manage(Arc::new(
                 Node::from_environment(
                     state,

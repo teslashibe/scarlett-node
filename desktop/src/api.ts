@@ -14,4 +14,6 @@ export const api = {
   remove: (service: string, id: string) =>
     invoke<void>("remove_account", { service, id }),
   cancelLogin: () => invoke<void>("cancel_login"),
+  localApi: (action: "start" | "stop", port?: number, claudeKey?: string) => invoke<void>("control_local_api", { action, port, claudeKey }),
+  localKey: () => invoke<string>("local_api_key"),
 };

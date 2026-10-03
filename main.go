@@ -33,6 +33,9 @@ func main() {
 	}
 }
 func start(args []string) error {
+	if len(args) > 0 && args[0] == "desktop" {
+		return desktopCommand(args[1:], os.Stdin, os.Stdout)
+	}
 	if len(args) > 0 && args[0] == "accounts" {
 		return accountsCommand(args[1:], os.Stdin, os.Stdout)
 	}
@@ -118,6 +121,9 @@ func loadIdentity(c config.Config) (identity, error) {
 const capacityRest = 30 * time.Second
 
 func run(c config.Config) error {
+	return runWithOwner(c, nil)
+}
+func runWithOwner(c config.Config, owner io.Reader) error {
 	if err := prepareStateDir(c.StateDir); err != nil {
 		return err
 	}
@@ -148,6 +154,9 @@ func run(c config.Config) error {
 		wait = time.Second
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	if owner != nil {
+		go func() { _, _ = io.Copy(io.Discard, owner); stop() }()
+	}
 	defer stop()
 	workCtx, cancelWork := context.WithCancel(context.Background())
 	defer cancelWork()
