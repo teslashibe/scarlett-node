@@ -192,7 +192,7 @@ impl LocalApi {
         }
         // Refuse an occupied socket before spawning, never adopt another local API.
         let reservation =
-            std::net::TcpListener::bind(("127.0.0.1", port)).map_err(|_| Error::ApiNotReady)?;
+            std::net::TcpListener::bind(("127.0.0.1", port)).map_err(|_| Error::ApiPortInUse)?;
         let mut command = self.command(port, accounts, &claude_key)?;
         drop(reservation);
         let mut run = Running {
@@ -209,7 +209,7 @@ impl LocalApi {
                 .map_err(|_| Error::CommandFailed)?
                 .is_some()
             {
-                return Err(Error::ApiNotReady);
+                return Err(Error::ApiProcessExited);
             }
             if protected_ready(port, &key).await {
                 *running = Some(run);
@@ -282,7 +282,22 @@ async fn status(port: u16, path: &str, key: Option<&str>) -> Option<u16> {
         if !line.starts_with("HTTP/1.1 ") {
             return None;
         }
-        line.split_whitespace().nth(1)?.parse().ok()
+        let code = line.split_whitespace().nth(1)?.parse().ok()?;
+        // Finish this Connection: close exchange before stopping its server.
+        // Dropping after only the status line can leave response data active
+        // during a Windows restart. Bound both bytes and the existing deadline.
+        let mut received = 0_usize;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let count = stream.read(&mut buffer).await.ok()?;
+            if count == 0 {
+                return Some(code);
+            }
+            received += count;
+            if received > 512 * 1024 {
+                return None;
+            }
+        }
     })
     .await
     .ok()
@@ -477,6 +492,61 @@ mod tests {
         server.await.unwrap();
     }
     #[tokio::test]
+    async fn readiness_finishes_the_response_and_bounds_its_body() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (written, wait_written) = tokio::sync::oneshot::channel();
+        let (release, wait_release) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(connection.read_u8().await.unwrap());
+                assert!(request.len() <= 4096);
+            }
+            connection.write_all(b"HTTP/1.1 200 OK\r\n").await.unwrap();
+            written.send(()).unwrap();
+            wait_release.await.unwrap();
+            connection
+                .write_all(b"Content-Length: 1\r\nConnection: close\r\n\r\nx")
+                .await
+                .unwrap();
+            connection.shutdown().await.unwrap();
+        });
+        let response = tokio::spawn(status(port, "/health", None));
+        wait_written.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !response.is_finished(),
+            "readiness returned before response finished"
+        );
+        release.send(()).unwrap();
+        assert_eq!(response.await.unwrap(), Some(200));
+        server.await.unwrap();
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(connection.read_u8().await.unwrap());
+                assert!(request.len() <= 4096);
+            }
+            connection
+                .write_all(b"HTTP/1.1 200 OK\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = connection.write_all(&vec![b'x'; 512 * 1024 + 1]).await;
+        });
+        assert_eq!(status(port, "/health", None).await, None);
+        server.await.unwrap();
+    }
+    #[tokio::test]
     #[ignore = "requires explicitly supplied reviewed native API and resources; makes no provider jobs"]
     async fn native_api_supervisor_uses_disposable_profiles_and_stops() {
         let binary = PathBuf::from(
@@ -492,7 +562,7 @@ mod tests {
         let port = socket.local_addr().unwrap().port();
         assert_eq!(
             api.start(port, &[], String::new()).await,
-            Err(Error::ApiNotReady)
+            Err(Error::ApiPortInUse)
         );
         drop(socket);
         api.start(port, &[], String::new()).await.unwrap();
