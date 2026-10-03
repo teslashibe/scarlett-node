@@ -251,16 +251,20 @@ fn quit(app: tauri::AppHandle, done: Arc<AtomicBool>) {
         }
     });
 }
+fn open_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 fn main() {
     let done = Arc::new(AtomicBool::new(false));
     let exit_done = done.clone();
     let menu_done = done.clone();
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            open_window(app);
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
@@ -273,7 +277,9 @@ fn main() {
             // asynchronous drain. Both Cmd-Q and the menu must use our handler.
             let quit =
                 MenuItem::with_id(app, "app-quit", "Quit Scarlett", true, Some("CmdOrCtrl+Q"))?;
-            let application = Submenu::with_items(app, "Scarlett Node", true, &[&quit])?;
+            let open =
+                MenuItem::with_id(app, "app-open", "Open Scarlett", true, Some("CmdOrCtrl+1"))?;
+            let application = Submenu::with_items(app, "Scarlett Node", true, &[&open, &quit])?;
             let edit = Submenu::with_items(
                 app,
                 "Edit",
@@ -287,10 +293,10 @@ fn main() {
             )?;
             Menu::with_items(app, &[&application, &edit])
         })
-        .on_menu_event(move |app, event| {
-            if event.id.as_ref() == "app-quit" {
-                quit(app.clone(), menu_done.clone());
-            }
+        .on_menu_event(move |app, event| match event.id.as_ref() {
+            "app-open" => open_window(app),
+            "app-quit" => quit(app.clone(), menu_done.clone()),
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             desktop_status,
@@ -390,12 +396,7 @@ fn main() {
                 .menu(&menu)
                 .show_menu_on_left_click(true)
                 .on_menu_event(move |app, event| match event.id.as_ref() {
-                    "show" => {
-                        if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.set_focus();
-                        }
-                    }
+                    "show" => open_window(app),
                     "quit" => quit(app.clone(), tray_done.clone()),
                     _ => {}
                 })
@@ -405,6 +406,14 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("cannot initialize desktop shell");
     app.run(move |app, event| {
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen {
+            has_visible_windows: false,
+            ..
+        } = &event
+        {
+            open_window(app);
+        }
         if let tauri::RunEvent::ExitRequested { api, .. } = event
             && !exit_done.load(Ordering::SeqCst)
         {
