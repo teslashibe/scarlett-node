@@ -32,14 +32,17 @@ func main() {
 	}
 }
 func start(args []string) error {
+	if len(args) > 0 && args[0] == "accounts" {
+		return accountsCommand(args[1:], os.Stdin, os.Stdout)
+	}
 	if len(args) != 1 {
-		return errors.New("usage: scarlett-node pair|run|status|drain|resume")
+		return errors.New("usage: scarlett-node pair|run|status|drain|resume|accounts")
 	}
 	if args[0] == "status" || args[0] == "drain" || args[0] == "resume" {
 		return localCommand(args[0], os.Stdout)
 	}
 	if args[0] != "pair" && args[0] != "run" {
-		return errors.New("usage: scarlett-node pair|run|status|drain|resume")
+		return errors.New("usage: scarlett-node pair|run|status|drain|resume|accounts")
 	}
 	c, err := config.Load()
 	if err != nil {
@@ -190,6 +193,10 @@ func run(c config.Config) error {
 	defer func() {
 		status.State = "draining"
 		status.InFlight = len(slots)
+		if services != nil {
+			status.Services = services.health()
+			status.Accounts = services.accountStatus()
+		}
 		_ = saveRuntimeStatus(c.StateDir, status)
 		waitForWorkers(&running, cancelWork, 2*time.Minute)
 		status.State = "stopped"
@@ -199,6 +206,7 @@ func run(c config.Config) error {
 		}
 		if services != nil {
 			status.Services = services.health()
+			status.Accounts = services.accountStatus()
 		}
 		_ = saveRuntimeStatus(c.StateDir, status)
 	}()
@@ -236,6 +244,10 @@ func run(c config.Config) error {
 		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: nodeID, Profile: c.Profile, State: state, Bid: c.Bid, Capacity: capacity}
 		if services != nil {
 			h.Services = services.health()
+			h.Capacity = 0
+			for _, service := range h.Services {
+				h.Capacity += service.Capacity
+			}
 			h.State = "exhausted"
 			for _, s := range h.Services {
 				if (s.State == "configured" || s.State == "ready") && s.InFlight < s.Capacity {
@@ -262,6 +274,9 @@ func run(c config.Config) error {
 			}
 		}
 		status.Services = h.Services
+		if services != nil {
+			status.Accounts = services.accountStatus()
+		}
 		status.InFlight = len(slots)
 		if records, err := journal.Pending(); err != nil {
 			return err
@@ -301,7 +316,15 @@ func run(c config.Config) error {
 				return nil
 			}
 			l := *reply.Lease
-			serviceAvailable := services == nil || services.acquire(l.ServiceType)
+			selected := c
+			var account *accountLease
+			serviceAvailable := true
+			if services != nil {
+				account, serviceAvailable = services.acquireAccount(l.ServiceType)
+				if serviceAvailable {
+					selected = account.config
+				}
+			}
 			running.Add(1)
 			go func() {
 				defer running.Done()
@@ -312,12 +335,12 @@ func run(c config.Config) error {
 					code = "service_unavailable"
 					err = rejectLease(workCtx, client, journal, l, code)
 				} else {
-					code, err = submitLease(workCtx, client, c, l, local, journal)
+					code, err = submitLease(workCtx, client, selected, l, local, journal)
 					if services != nil {
 						if err != nil && code == "" {
-							services.finish(l.ServiceType, "report_pending")
+							services.finishAccount(account, "report_pending")
 						} else {
-							services.finish(l.ServiceType, code)
+							services.finishAccount(account, code)
 						}
 					}
 				}
@@ -355,6 +378,9 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	record, err := attemptRecord(l)
 	if err != nil {
 		return "invalid_lease", err
+	}
+	if c.LocalAccountID != "" {
+		record.ProviderAccountID, record.ProviderService = c.LocalAccountID, l.ServiceType
 	}
 	if err := journal.Begin(record); err != nil {
 		return "", err

@@ -253,3 +253,15 @@ func TestXWireFixtureMatchesPinnedClientRequest(t *testing.T) {
 		t.Fatal("X wire policy no longer matches pinned x-go")
 	}
 }
+
+func TestTypedXQuotaCarriesOnlyCooldownIntoLocalScheduler(t *testing.T) {
+	observed := time.Duration(0)
+	w := X{Config: config.Config{AccountCooldown: func(wait time.Duration) { observed = wait }}}
+	if code := w.failure(context.Background(), &x.RateLimitError{Wait: 2 * time.Hour}); code != "x_rate_limited" || observed != 2*time.Hour {
+		t.Fatal("authoritative quota duration lost", code, observed)
+	}
+	observed = 0
+	if code := w.failure(context.Background(), errors.New("private error with rate limit words")); code != "x_request_failed" || observed != 0 {
+		t.Fatal("raw error drove account scheduler")
+	}
+}
