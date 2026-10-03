@@ -21,6 +21,7 @@ public static class ScarlettAcceptanceWindow {
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
+    [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
     [StructLayout(LayoutKind.Sequential)] private struct KeyboardInput {
         public ushort key, scan; public uint flags, time; public UIntPtr extra;
     }
@@ -73,6 +74,20 @@ public static class ScarlettAcceptanceWindow {
     }
     public static void ControlKey(ushort key) {
         Send(new Input[] { Key(0x11, false), Key(key, false), Key(key, true), Key(0x11, true) });
+    }
+    public static void Click(int x, int y) {
+        int left = GetSystemMetrics(76), top = GetSystemMetrics(77);
+        int width = GetSystemMetrics(78), height = GetSystemMetrics(79);
+        if (width < 2 || height < 2 || x < left || y < top ||
+            (long)x >= (long)left + width || (long)y >= (long)top + height)
+            throw new InvalidOperationException("Synthetic click outside desktop bounds");
+        Input move = new Input();
+        move.value.mouse.x = (int)(((long)x - left) * 65535 / (width - 1));
+        move.value.mouse.y = (int)(((long)y - top) * 65535 / (height - 1));
+        move.value.mouse.flags = 0xC001;
+        Input down = new Input(); down.value.mouse.flags = 2;
+        Input up = new Input(); up.value.mouse.flags = 4;
+        Send(new Input[] { move, down, up });
     }
     public static void SelectAllAndClear() {
         Send(new Input[] { Key(0x11, false), Key(0x41, false), Key(0x41, true), Key(0x11, true),
@@ -439,10 +454,44 @@ function Check-Preferences {
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-preferences-ui.json')
 }
 
-function Input-Advanced([string]$Name, [string]$NextName, [IntPtr]$Handle) {
+function Click-Control([System.Windows.Automation.AutomationElement]$Control) {
+    $handle = $application.MainWindowHandle
+    [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
+    [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
+    $scroll = $null
+    if ($Control.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) {
+        $scroll.ScrollIntoView()
+    }
+    $Control.SetFocus()
+    Wait-Check {
+        return [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+    } 10 'Installed control did not acquire foreground input'
+    $click = @{ point = [System.Windows.Point]::new(0.0, 0.0) }
+    try {
+        Wait-Check {
+            $point = [System.Windows.Point]::new(0.0, 0.0)
+            if (-not $Control.TryGetClickablePoint([ref]$point)) { return $false }
+            $click.point = $point
+            return $true
+        } 10 'Installed control did not become visible for native click'
+    } catch {
+        $originalFailure = $_
+        $diagnostic = @{ controlEnabled = $Control.Current.IsEnabled; controlFocused = $Control.Current.HasKeyboardFocus
+            controlOffscreen = $Control.Current.IsOffscreen; scrollSupported = $null -ne $scroll
+            foregroundOwned = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle; realProviderJobs = 0 }
+        New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+        $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-click-input-failure.json')
+        Write-Output ($diagnostic | ConvertTo-Json -Compress)
+        throw $originalFailure
+    }
+    [ScarlettAcceptanceWindow]::Click([int]$click.point.X, [int]$click.point.Y)
+}
+
+function Input-Advanced([string]$Name, [string]$NextName, [IntPtr]$Handle, [hashtable]$Diagnostic = $null) {
     $source = Find-Input $Name
-    if ($null -eq $source -or $source.Current.HasKeyboardFocus -or
-        [ScarlettAcceptanceWindow]::GetForegroundWindow() -ne $Handle) { return $false }
+    $sourcePresent = $null -ne $source
+    $sourceFocused = $sourcePresent -and $source.Current.HasKeyboardFocus
+    $foregroundOwned = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $Handle
     $condition = [System.Windows.Automation.AndCondition]::new(
         [System.Windows.Automation.PropertyCondition]::new(
             [System.Windows.Automation.AutomationElement]::NameProperty, $NextName),
@@ -452,13 +501,47 @@ function Input-Advanced([string]$Name, [string]$NextName, [IntPtr]$Handle) {
     $matches = $script:window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
     $focusedCount = 0
     $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
+    if ($null -ne $Diagnostic) {
+        $Diagnostic.sourcePresent = $sourcePresent
+        $Diagnostic.sourceFocused = $sourceFocused
+        $Diagnostic.sourceOffscreen = $sourcePresent -and $source.Current.IsOffscreen
+        $Diagnostic.foregroundOwned = $foregroundOwned
+        $Diagnostic.successorPresent = $matches.Count -gt 0
+        $Diagnostic.successorEnabled = $false
+        $Diagnostic.successorFocused = $false
+        $Diagnostic.successorSameProcess = $false
+        $Diagnostic.successorActualFocusMatches = $false
+    }
     foreach ($match in $matches) {
-        if ($match.Current.IsEnabled -and $match.Current.HasKeyboardFocus -and
-            $match.Current.ProcessId -eq $source.Current.ProcessId -and
-            $null -ne $focused -and [System.Windows.Automation.Automation]::Compare($match, $focused)) { $focusedCount++ }
+        $enabled = $match.Current.IsEnabled
+        $hasFocus = $match.Current.HasKeyboardFocus
+        $sameProcess = $sourcePresent -and $match.Current.ProcessId -eq $source.Current.ProcessId
+        $actualFocusMatches = $null -ne $focused -and [System.Windows.Automation.Automation]::Compare($match, $focused)
+        if ($null -ne $Diagnostic) {
+            $Diagnostic.successorEnabled = $Diagnostic.successorEnabled -or $enabled
+            $Diagnostic.successorFocused = $Diagnostic.successorFocused -or $hasFocus
+            $Diagnostic.successorSameProcess = $Diagnostic.successorSameProcess -or ($hasFocus -and $sameProcess)
+            $Diagnostic.successorActualFocusMatches = $Diagnostic.successorActualFocusMatches -or $actualFocusMatches
+        }
+        if ($enabled -and $hasFocus -and $sameProcess -and $actualFocusMatches) { $focusedCount++ }
     }
     # Concurrent jobs appears in both forms; require the actually focused one.
-    return $focusedCount -eq 1
+    if ($null -ne $Diagnostic) { $Diagnostic.successorUniqueFocused = $focusedCount -eq 1 }
+    return $sourcePresent -and -not $sourceFocused -and $foregroundOwned -and $focusedCount -eq 1
+}
+
+function Wait-InputAdvanced([string]$Name, [string]$NextName, [IntPtr]$Handle, [bool]$Clearing, [string]$Failure) {
+    try { Wait-Check { Input-Advanced $Name $NextName $Handle } 10 $Failure }
+    catch {
+        $originalFailure = $_
+        $diagnostic = @{ clearAcknowledgmentFailed = $Clearing; textAcknowledgmentFailed = -not $Clearing
+            realProviderJobs = 0 }
+        try { Input-Advanced $Name $NextName $Handle $diagnostic | Out-Null } catch { }
+        New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+        $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-input-focus-failure.json')
+        Write-Output ($diagnostic | ConvertTo-Json -Compress)
+        throw $originalFailure
+    }
 }
 
 function Set-Text([string]$Name, [string]$Value, [string]$NextName) {
@@ -472,17 +555,13 @@ function Set-Text([string]$Name, [string]$Value, [string]$NextName) {
     $control = Find-Input $Name
     if (-not $control -or -not $control.Current.IsEnabled) { throw "Text input unavailable: $Name" }
     $handle = $application.MainWindowHandle
-    [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
-    [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
-    $scroll = $null
-    if ($control.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) { $scroll.ScrollIntoView() }
-    $control.SetFocus()
+    Click-Control $control
     Wait-Check {
         return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
     } 10 'Synthetic input did not acquire keyboard focus'
     [ScarlettAcceptanceWindow]::SelectAllClearAndTab()
     # An initially empty value is not evidence that queued clear events ran.
-    Wait-Check { Input-Advanced $Name $NextName $handle } 10 'Synthetic clear input was not acknowledged by successor focus'
+    Wait-InputAdvanced $Name $NextName $handle $true 'Synthetic clear input was not acknowledged by successor focus'
     if (-not $control.Current.IsPassword) {
         Wait-Check {
             $current = Find-Input $Name
@@ -492,12 +571,12 @@ function Set-Text([string]$Name, [string]$Value, [string]$NextName) {
         } 10 'Synthetic input did not clear before typing'
     }
     $control = Find-Input $Name
-    $control.SetFocus()
+    Click-Control $control
     Wait-Check {
         return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
     } 10 'Synthetic input did not reacquire keyboard focus'
     [ScarlettAcceptanceWindow]::UnicodeTextAndTab($Value)
-    Wait-Check { Input-Advanced $Name $NextName $handle } 10 'Synthetic text input was not acknowledged by successor focus'
+    Wait-InputAdvanced $Name $NextName $handle $false 'Synthetic text input was not acknowledged by successor focus'
     # Masked cookie fields may refuse value readback. Exact persistence is
     # checked against the synthetic fixture after the Connect action.
     if (-not $control.Current.IsPassword) {
