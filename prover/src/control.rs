@@ -6,14 +6,16 @@ use rustls::{
 };
 use std::{
     fs::OpenOptions,
-    io::Read,
+    io::{self, IoSlice, Read},
+    pin::Pin,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
-    sync::Arc,
+    sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}},
+    task::{Context as TaskContext, Poll},
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -21,6 +23,80 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 pub trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
 pub type Socket = Box<dyn Transport>;
+
+// These supplier-reported counters are operational telemetry only. They count
+// successful TCP payload reads/writes below outer TLS, including its handshake
+// and records; they exclude IP/TCP headers, acknowledgements and retransmissions.
+// Saturation never changes transport behavior, billing, or proof eligibility.
+const MAX_METERED_BYTES: u64 = 1 << 40;
+
+#[derive(Clone, Default)]
+pub struct Traffic {
+    sent: Arc<AtomicU64>,
+    received: Arc<AtomicU64>,
+    saturated: Arc<AtomicBool>,
+}
+
+#[derive(serde::Serialize)]
+pub struct TrafficSnapshot {
+    pub verifier_sent_bytes: u64,
+    pub verifier_received_bytes: u64,
+    pub verifier_transport_layer: &'static str,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub verifier_bytes_saturated: bool,
+}
+
+impl Traffic {
+    fn add(&self, counter: &AtomicU64, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        let previous = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| Some(old.saturating_add(bytes).min(MAX_METERED_BYTES))).unwrap();
+        if bytes > MAX_METERED_BYTES - previous {
+            self.saturated.store(true, Ordering::Relaxed);
+        }
+    }
+    pub fn snapshot(&self) -> TrafficSnapshot {
+        TrafficSnapshot {
+            verifier_sent_bytes: self.sent.load(Ordering::Relaxed),
+            verifier_received_bytes: self.received.load(Ordering::Relaxed),
+            verifier_transport_layer: "tcp_payload",
+            verifier_bytes_saturated: self.saturated.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct Metered<S> {
+    inner: S,
+    traffic: Traffic,
+}
+impl<S: AsyncRead + Unpin> AsyncRead for Metered<S> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let previous = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = result {
+            self.traffic.add(&self.traffic.received, buf.filled().len() - previous);
+        }
+        result
+    }
+}
+impl<S: AsyncWrite + Unpin> AsyncWrite for Metered<S> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(bytes)) = result { self.traffic.add(&self.traffic.sent, bytes); }
+        result
+    }
+    fn poll_write_vectored(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(bytes)) = result { self.traffic.add(&self.traffic.sent, bytes); }
+        result
+    }
+    fn is_write_vectored(&self) -> bool { self.inner.is_write_vectored() }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
 
 // This exception exists only for the unpaid loopback/Docker fixtures. A DNS
 // name cannot resolve into eligibility for a plaintext connection.
@@ -66,7 +142,7 @@ fn client(ca: Option<&str>) -> Result<TlsConnector> {
         .with_no_client_auth();
     Ok(TlsConnector::from(Arc::new(config)))
 }
-pub async fn connect(address: &str, ca: Option<&str>, plaintext_fixture: bool) -> Result<Socket> {
+pub async fn connect(address: &str, ca: Option<&str>, plaintext_fixture: bool) -> Result<(Socket, Traffic)> {
     if plaintext_fixture && (!fixture_address(address) || ca.is_some()) {
         bail!("plaintext is restricted to explicit unpaid fixtures");
     }
@@ -85,11 +161,13 @@ pub async fn connect(address: &str, ca: Option<&str>, plaintext_fixture: bool) -
     tokio::time::timeout(Duration::from_secs(10), async {
         let socket = TcpStream::connect(address).await.context("verifier unreachable")?;
         socket.set_nodelay(true)?;
+        let traffic = Traffic::default();
+        let socket = Metered { inner: socket, traffic: traffic.clone() };
         if let Some(connector) = connector {
             let name = ServerName::try_from(host).context("invalid verifier TLS name")?;
-            Ok(Box::new(connector.connect(name, socket).await.context("verifier TLS verification failed")?) as Socket)
+            Ok((Box::new(connector.connect(name, socket).await.context("verifier TLS verification failed")?) as Socket, traffic))
         } else {
-            Ok(Box::new(socket) as Socket)
+            Ok((Box::new(socket) as Socket, traffic))
         }
     })
     .await
@@ -178,9 +256,12 @@ mod tests {
         let dir = Temp::new();
         let (cert, key, ca) = certificate(&dir, false);
         let (port, server) = endpoint(acceptor(&cert, &key).unwrap()).await;
-        let mut socket = connect(&format!("localhost:{port}"), Some(&ca), false).await.unwrap();
+        let (mut socket, traffic) = connect(&format!("localhost:{port}"), Some(&ca), false).await.unwrap();
+        let handshake = traffic.snapshot();
+        assert!(handshake.verifier_sent_bytes > 5 && handshake.verifier_received_bytes > 5);
         socket.write_all(b"token").await.unwrap();
         assert!(server.await.unwrap());
+        assert!(traffic.snapshot().verifier_sent_bytes > handshake.verifier_sent_bytes + 5);
     }
     #[tokio::test]
     async fn wrong_hostname_untrusted_root_and_expired_certificate_reject_before_token() {
@@ -209,9 +290,10 @@ mod tests {
             socket.read_exact(&mut bytes).await.unwrap();
             assert_eq!(&bytes, b"token");
         });
-        let mut socket = connect(&address, None, true).await.unwrap();
+        let (mut socket, traffic) = connect(&address, None, true).await.unwrap();
         socket.write_all(b"token").await.unwrap();
         server.await.unwrap();
+        assert_eq!(traffic.snapshot().verifier_sent_bytes, 5);
     }
     #[test]
     fn tls_files_reject_relative_paths_empty_ca_public_keys_symlinks_and_fifos() {
@@ -229,5 +311,63 @@ mod tests {
         let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
         assert!(pem(&fifo, false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod traffic_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn duplex_counts_only_accepted_partial_reads_and_writes() {
+        let (socket, mut peer) = tokio::io::duplex(3);
+        let vectored = socket.is_write_vectored();
+        let traffic = Traffic::default();
+        let mut socket = Metered { inner: socket, traffic: traffic.clone() };
+        assert_eq!(socket.is_write_vectored(), vectored);
+        assert_eq!(socket.write(b"abcdef").await.unwrap(), 3);
+        assert_eq!(traffic.snapshot().verifier_sent_bytes, 3);
+        assert!(tokio::time::timeout(Duration::from_millis(5), socket.write(b"ignored")).await.is_err());
+        assert_eq!(traffic.snapshot().verifier_sent_bytes, 3);
+        let mut taken = [0; 3];
+        peer.read_exact(&mut taken).await.unwrap();
+        assert_eq!(&taken, b"abc");
+        assert_eq!(socket.write_vectored(&[IoSlice::new(b"def"), IoSlice::new(b"ghi")]).await.unwrap(), 3);
+        peer.read_exact(&mut taken).await.unwrap();
+        assert_eq!(&taken, b"def");
+        assert_eq!(traffic.snapshot().verifier_sent_bytes, 6);
+        peer.write_all(b"xyz").await.unwrap();
+        let mut bytes = [0; 8];
+        let mut read = ReadBuf::new(&mut bytes);
+        read.put_slice(b"!");
+        std::future::poll_fn(|cx| Pin::new(&mut socket).poll_read(cx, &mut read)).await.unwrap();
+        assert_eq!(read.filled(), b"!xyz");
+        assert_eq!(traffic.snapshot().verifier_received_bytes, 3);
+        assert!(tokio::time::timeout(Duration::from_millis(5), socket.read(&mut bytes)).await.is_err());
+        assert_eq!(traffic.snapshot().verifier_received_bytes, 3);
+        drop(peer);
+        assert!(socket.write(b"not accepted").await.is_err());
+        assert_eq!(socket.read(&mut bytes).await.unwrap(), 0);
+        socket.flush().await.unwrap();
+        socket.shutdown().await.unwrap();
+        assert_eq!(serde_json::to_value(traffic.snapshot()).unwrap(), serde_json::json!({
+            "verifier_sent_bytes":6, "verifier_received_bytes":3, "verifier_transport_layer":"tcp_payload"
+        }));
+    }
+
+    #[test]
+    fn byte_counters_saturate_without_wrapping_and_mark_incomplete_telemetry() {
+        let traffic = Traffic::default();
+        traffic.add(&traffic.sent, MAX_METERED_BYTES as usize);
+        assert!(!traffic.snapshot().verifier_bytes_saturated);
+        traffic.add(&traffic.sent, 1);
+        traffic.add(&traffic.sent, usize::MAX);
+        traffic.add(&traffic.received, usize::MAX);
+        let snapshot = traffic.snapshot();
+        assert_eq!(snapshot.verifier_sent_bytes, MAX_METERED_BYTES);
+        assert_eq!(snapshot.verifier_received_bytes, MAX_METERED_BYTES);
+        assert!(snapshot.verifier_bytes_saturated);
+        assert_eq!(serde_json::to_value(snapshot).unwrap()["verifier_bytes_saturated"], true);
     }
 }

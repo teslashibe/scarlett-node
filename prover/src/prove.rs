@@ -37,6 +37,9 @@ pub struct Request {
 
 #[derive(Serialize)]
 pub struct Summary {
+    /// Untrusted operational TCP payload counters, never billing or proof evidence.
+    #[serde(flatten)]
+    pub verifier_transport: crate::control::TrafficSnapshot,
     pub status: &'static str,
     pub codex_ms: u128,
     pub sent_bytes: usize,
@@ -125,7 +128,7 @@ pub async fn run(request: Request) -> Result<Summary> {
     };
     let creds = load_creds()?;
 
-    let mut socket = crate::control::connect(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture).await?;
+    let (mut socket, traffic) = crate::control::connect(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture).await?;
     socket.write_all(format!("{}\n", request.token).as_bytes()).await?;
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();
@@ -196,12 +199,12 @@ pub async fn run(request: Request) -> Result<Summary> {
         }
         let config = builder.build()?;
         prover.prove(&config).await?;
-        anyhow::Ok((prover, Summary { status: "proof_sent", codex_ms, sent_bytes: sent.len(), received_bytes: received.len() }))
+        anyhow::Ok((prover, codex_ms, sent.len(), received.len()))
     };
-    let (prover, summary) = session.step(work).await?;
+    let (prover, codex_ms, sent_bytes, received_bytes) = session.step(work).await?;
     session.finish(async { Ok(prover.close().await?) }, || handle.close()).await?;
 
-    Ok(summary)
+    Ok(Summary { status: "proof_sent", codex_ms, sent_bytes, received_bytes, verifier_transport: traffic.snapshot() })
 }
 
 /// The task driving a prover's TLSNotary session. tlsn's handle waits
