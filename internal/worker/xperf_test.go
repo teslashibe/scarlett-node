@@ -1730,7 +1730,7 @@ func TestXPerfBatchUsesTwoPinnedRequestsAndOneHelperMeasurement(t *testing.T) {
 	}
 	m := xperfMeasurement(c, 1, time.Now(), observations, 1, "")
 	if m.HelperMS != 10 || m.UserCPUSeconds != 2 || m.VerifierSent != 123 || m.TranscriptSent != uint64(sent) || m.BodyBytes != 22 || m.Timings["commit"] != 5 || !m.TransportComplete {
-		 t.Fatal("shared connection resource costs counted twice or per-read bytes lost")
+		t.Fatal("shared connection resource costs counted twice or per-read bytes lost")
 	}
 	makeReceipt := func() xperfReceipt {
 		records := make([]map[string]any, 2)
