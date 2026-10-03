@@ -18,6 +18,9 @@ export SCARLETT_CODEXPERF_OUTPUT
 python3 - "$SCARLETT_CODEXPERF_OUTPUT" <<'PY'
 import hashlib, json, os, pathlib, re, subprocess, sys
 output = pathlib.Path(sys.argv[1])
+strategy = os.environ.get("SCARLETT_CODEXPERF_CLOSE_STRATEGY", "normal") or "normal"
+if strategy not in ("normal", "tls_after_completed"):
+    raise SystemExit("invalid close strategy")
 revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
 if not re.fullmatch(r"[0-9a-f]{40}", revision):
     raise SystemExit("invalid source revision")
@@ -30,6 +33,7 @@ manifest = {"schema": 1, "source_revision": revision,
             "tracked_source_diff_sha256": hashlib.sha256(diff).hexdigest(),
             "source_modified": bool(diff), "helper_sha256": digest.hexdigest(),
             "funding": "none", "concurrency": 1, "proof_mode": "proxy",
+            "close_strategy": strategy,
             "reasoning": "low", "service_tier_request": "omitted",
             "native_helper_owns_login_loading": True,
             "byte_counter_source": "supplier_operational_telemetry"}

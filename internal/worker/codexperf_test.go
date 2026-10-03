@@ -30,13 +30,19 @@ const codexperfPrompt = "Reply exactly scarlettperf"
 const codexperfOutput = "scarlettperf"
 
 type codexperfConfig struct {
-	control    xperfConfig
-	serverName string
-	samples    int
+	control       xperfConfig
+	serverName    string
+	closeStrategy string
+	samples       int
 }
 
 func codexperfConfiguration() (codexperfConfig, error) {
 	c := codexperfConfig{control: xperfConfig{prover: os.Getenv("SCARLETT_PROVER"), verifier: os.Getenv("SCARLETT_VERIFIER"), ca: os.Getenv("SCARLETT_VERIFIER_CA_FILE"), api: os.Getenv("SCARLETT_VERIFIER_API"), output: os.Getenv("SCARLETT_CODEXPERF_OUTPUT")}, serverName: os.Getenv("SCARLETT_VERIFIER_SERVER_NAME"), samples: 1}
+	var err error
+	c.closeStrategy, err = codexperfCloseStrategy(os.Getenv("SCARLETT_CODEXPERF_CLOSE_STRATEGY"))
+	if err != nil {
+		return c, err
+	}
 	if v := os.Getenv("SCARLETT_CODEXPERF_SAMPLES"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 || n > 30 {
@@ -89,6 +95,11 @@ func codexperfRegistration(job string, now time.Time) (map[string]any, xperfBind
 
 func codexperfProverInput(c codexperfConfig, token string) ([]byte, error) {
 	p := map[string]any{"verifier": c.control.verifier, "token": token, "payload": codexperfPayload()}
+	strategy, err := codexperfCloseStrategy(c.closeStrategy)
+	if err != nil {
+		return nil, err
+	}
+	p["close_strategy"] = strategy
 	if c.control.ca != "" {
 		p["verifier_ca_file"] = c.control.ca
 	}
@@ -100,7 +111,33 @@ func codexperfProverInput(c codexperfConfig, token string) ([]byte, error) {
 
 type codexperfSummary struct {
 	xperfSummary
-	CodexMS *uint64 `json:"codex_ms"`
+	CodexMS       *uint64 `json:"codex_ms"`
+	CloseStrategy string  `json:"close_strategy"`
+}
+
+func codexperfCloseStrategy(v string) (string, error) {
+	if v == "" {
+		return "normal", nil
+	}
+	if v != "normal" && v != "tls_after_completed" {
+		return "", errors.New("invalid_close_strategy")
+	}
+	return v, nil
+}
+
+func codexperfCheckCloseStrategy(requested, reported string) error {
+	strategy, err := codexperfCloseStrategy(requested)
+	if err != nil {
+		return err
+	}
+	// Prior baseline helpers omitted this field and implemented only normal.
+	if reported == "" && strategy == "normal" {
+		return nil
+	}
+	if reported != strategy {
+		return errors.New("helper_close_strategy_mismatch")
+	}
+	return nil
 }
 
 type codexperfObserved struct {
@@ -153,6 +190,9 @@ func codexperfProve(ctx context.Context, c codexperfConfig, token, diagnostic st
 	}
 	if json.Unmarshal(stdout.Bytes(), &o.summary) != nil || o.summary.Status != "proof_sent" || o.summary.Mode != "proxy" || o.summary.CodexMS == nil || *o.summary.CodexMS > 300000 || o.summary.DurationMS == 0 || o.summary.DurationMS > 300000 || o.summary.SentBytes > 1<<40 || o.summary.ReceivedBytes > 1<<40 {
 		return o, errors.New("helper_summary_invalid")
+	}
+	if err := codexperfCheckCloseStrategy(c.closeStrategy, o.summary.CloseStrategy); err != nil {
+		return o, err
 	}
 	for _, phase := range codexperfPhases {
 		if n, ok := o.summary.Timings[phase]; !ok || n > 300000 {
@@ -239,6 +279,7 @@ type codexperfMetric struct {
 	Schema             int               `json:"schema"`
 	Sample             int               `json:"sample"`
 	Mode               string            `json:"mode"`
+	CloseStrategy      string            `json:"close_strategy"`
 	Workload           string            `json:"workload"`
 	Reasoning          string            `json:"reasoning"`
 	ServiceTierOmitted bool              `json:"service_tier_omitted"`
@@ -269,9 +310,13 @@ type codexperfMetric struct {
 	Timings            map[string]uint64 `json:"timings_ms"`
 }
 
-func codexperfMeasurement(sample int, started time.Time, o codexperfObserved, r codexperfReceipt, receiptMS int64, failure string) codexperfMetric {
+func codexperfMeasurement(sample int, started time.Time, o codexperfObserved, r codexperfReceipt, receiptMS int64, failure, closeStrategy string) codexperfMetric {
 	now := time.Now()
 	m := codexperfMetric{Schema: 1, Sample: sample, Mode: "proxy", Workload: "codex_trivial", Reasoning: "low", ServiceTierOmitted: true, Status: "verified", Verified: failure == "", StartNS: started.UnixNano(), FinishNS: now.UnixNano(), DurationMS: now.Sub(started).Milliseconds(), ReceiptWaitMS: receiptMS, HelperMS: o.helperMS, UserCPUSeconds: o.userCPUSeconds, SystemCPUSeconds: o.systemCPUSeconds, PeakRSSBytes: o.peakRSSBytes, Timings: make(map[string]uint64)}
+	m.CloseStrategy, _ = codexperfCloseStrategy(closeStrategy)
+	if m.CloseStrategy == "" {
+		m.CloseStrategy, m.Status, m.Verified = "normal", "invalid_close_strategy", false
+	}
 	if failure != "" {
 		m.Status = codexperfFailureLabel(failure)
 	}
@@ -301,7 +346,7 @@ func codexperfMeasurement(sample int, started time.Time, o codexperfObserved, r 
 
 func codexperfFailureLabel(failure string) string {
 	switch failure {
-	case "control_request_invalid", "random_source_failed", "control_unavailable", "control_rejected", "control_response_invalid", "control_token_invalid", "private_diagnostic_write_failed", "helper_timeout", "helper_failed", "helper_summary_invalid", "helper_timings_invalid", "provider_rate_limited", "provider_auth_failed", "provider_model_unavailable", "provider_unsupported_request", "receipt_timeout", "receipt_binding_mismatch", "receipt_not_accepted", "receipt_proof_mode_mismatch", "receipt_model_mismatch", "receipt_output_mismatch", "receipt_usage_invalid", "receipt_transcript_mismatch":
+	case "control_request_invalid", "random_source_failed", "control_unavailable", "control_rejected", "control_response_invalid", "control_token_invalid", "private_diagnostic_write_failed", "helper_timeout", "helper_failed", "helper_summary_invalid", "helper_timings_invalid", "helper_close_strategy_mismatch", "invalid_close_strategy", "provider_rate_limited", "provider_auth_failed", "provider_model_unavailable", "provider_unsupported_request", "receipt_timeout", "receipt_binding_mismatch", "receipt_not_accepted", "receipt_proof_mode_mismatch", "receipt_model_mismatch", "receipt_output_mismatch", "receipt_usage_invalid", "receipt_transcript_mismatch":
 		return failure
 	default:
 		return "experiment_failed"
@@ -331,7 +376,7 @@ func TestCodexPerformance(t *testing.T) {
 	for sample := 1; sample <= c.samples; sample++ {
 		started := time.Now()
 		o, r, receiptMS, failure := codexperfSample(ctx, c, sample, control)
-		if err := enc.Encode(codexperfMeasurement(sample, started, o, r, receiptMS, failure)); err != nil {
+		if err := enc.Encode(codexperfMeasurement(sample, started, o, r, receiptMS, failure, c.closeStrategy)); err != nil {
 			t.Fatal("metrics_write_failed")
 		}
 		if err := metrics.Sync(); err != nil {
@@ -434,7 +479,7 @@ func TestCodexPerfRejectsInvalidReceiptsAndUnknownUsage(t *testing.T) {
 		}
 	}
 	r := makeReceipt()
-	m := codexperfMeasurement(1, time.Now(), codexperfObserved{}, r, 0, "")
+	m := codexperfMeasurement(1, time.Now(), codexperfObserved{}, r, 0, "", "normal")
 	if m.CachedReported || m.CachedTokens != nil || m.TranscriptVerified {
 		t.Fatal("missing cached usage or receipt counters became zero/verified evidence")
 	}
@@ -444,7 +489,7 @@ func TestCodexPerfSanitizedMetricsAndErrorClassification(t *testing.T) {
 	n := uint64(200)
 	o := codexperfObserved{summary: codexperfSummary{xperfSummary: xperfSummary{Status: "proof_sent", Mode: "proxy", VerifierSent: &n, VerifierReceived: &n, TransportLayer: "tcp_payload", Response: "PRIVATE_RESPONSE", Timings: map[string]uint64{"PRIVATE_PHASE": 1, "prove": 10}}}}
 	r := codexperfReceipt{Output: "PRIVATE_OUTPUT", Model: "PRIVATE_MODEL"}
-	raw, _ := json.Marshal(codexperfMeasurement(1, time.Now(), o, r, 0, "PRIVATE_ERROR"))
+	raw, _ := json.Marshal(codexperfMeasurement(1, time.Now(), o, r, 0, "PRIVATE_ERROR", "normal"))
 	if bytes.Contains(raw, []byte("PRIVATE")) {
 		t.Fatal("private provider content leaked into metrics")
 	}
@@ -452,8 +497,37 @@ func TestCodexPerfSanitizedMetricsAndErrorClassification(t *testing.T) {
 		t.Fatal("provider error escaped finite classification")
 	}
 	o.summary.VerifierReceived = nil
-	if codexperfMeasurement(1, time.Now(), o, r, 0, "helper_failed").TransportComplete {
+	if codexperfMeasurement(1, time.Now(), o, r, 0, "helper_failed", "normal").TransportComplete {
 		t.Fatal("missing transport counter became measured zero")
+	}
+}
+
+func TestCodexPerfCloseStrategyConfigAndSummaryBinding(t *testing.T) {
+	for _, pair := range [][2]string{{"", ""}, {"normal", ""}, {"normal", "normal"}, {"tls_after_completed", "tls_after_completed"}} {
+		if codexperfCheckCloseStrategy(pair[0], pair[1]) != nil {
+			t.Fatal("supported strategy or old normal baseline rejected")
+		}
+	}
+	for _, pair := range [][2]string{{"tls_after_completed", ""}, {"tls_after_completed", "normal"}, {"normal", "tls_after_completed"}, {"normal", "PRIVATE_STRATEGY"}, {"PRIVATE_STRATEGY", "PRIVATE_STRATEGY"}} {
+		if codexperfCheckCloseStrategy(pair[0], pair[1]) == nil {
+			t.Fatal("mismatched shutdown strategy accepted")
+		}
+	}
+	input, err := codexperfProverInput(codexperfConfig{closeStrategy: "tls_after_completed"}, strings.Repeat("ab", 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v map[string]any
+	if json.Unmarshal(input, &v) != nil || v["close_strategy"] != "tls_after_completed" {
+		t.Fatal("candidate strategy not sent to native helper")
+	}
+	metric := codexperfMeasurement(1, time.Now(), codexperfObserved{}, codexperfReceipt{}, 0, "helper_failed", "tls_after_completed")
+	if metric.CloseStrategy != "tls_after_completed" {
+		t.Fatal("failed candidate mixed into normal baseline")
+	}
+	t.Setenv("SCARLETT_CODEXPERF_CLOSE_STRATEGY", "PRIVATE_STRATEGY")
+	if _, err := codexperfConfiguration(); err == nil || err.Error() != "invalid_close_strategy" {
+		t.Fatal("invalid config accepted or leaked")
 	}
 }
 

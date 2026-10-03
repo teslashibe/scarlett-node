@@ -24,11 +24,24 @@ def number(row, key, maximum=1e18):
 
 
 def summarize(rows):
+    groups = {}
     for row in rows:
         if row.get("schema") != 1 or row.get("mode") != "proxy" or row.get("workload") != "codex_trivial" or row.get("reasoning") != "low" or row.get("service_tier_omitted") is not True or not isinstance(row.get("verified"), bool):
             raise ValueError("invalid experiment labels")
         if row["verified"] and (row.get("status") != "verified" or row.get("model_matches") is not True or row.get("output_matches") is not True):
             raise ValueError("invalid verified result")
+        # Older pinned baseline runners did not emit this field and used normal.
+        strategy = row.get("close_strategy", "normal")
+        if strategy not in ("normal", "tls_after_completed"):
+            raise ValueError("invalid close strategy")
+        groups.setdefault(strategy, []).append(row)
+    if len(groups) <= 1:
+        strategy = next(iter(groups), "normal")
+        return summarize_strategy(rows, strategy)
+    return {"schema": 1, "comparison_dimension": "close_strategy", "groups": [summarize_strategy(values, strategy) for strategy, values in sorted(groups.items())]}
+
+
+def summarize_strategy(rows, strategy):
     good = [r for r in rows if r["verified"]]
     metered = [r for r in good if r.get("verifier_telemetry_complete") is True]
     cached = [r for r in good if r.get("cached_input_tokens_reported") is True]
@@ -37,6 +50,7 @@ def summarize(rows):
             raise ValueError("cached usage exceeds total input usage")
     wall_seconds = (max(number(r, "finish_unix_ns", 1e20) for r in rows) - min(number(r, "start_unix_ns", 1e20) for r in rows)) / 1e9 if rows else 0
     return {"schema": 1, "mode": "proxy", "workload": "codex_trivial", "reasoning": "low", "service_tier_request": "omitted",
+            "close_strategy": strategy,
             "quantile_method": "nearest_rank", "attempted_jobs": len(rows), "verified_jobs": len(good), "failed_jobs": len(rows) - len(good),
             "successful_samples_below_30": len(good) < 30,
             "verified_p50_ms": percentile([number(r, "duration_ms") for r in good], .5),
@@ -79,12 +93,23 @@ def self_test():
     assert report["verified_jobs"] == 1 and report["failed_jobs"] == 1 and report["verified_p95_ms"] == 100
     assert report["verified_jobs_per_second"] == 5 and report["cached_usage_reported_jobs"] == 0 and report["cached_input_tokens_p50"] is None
     assert "PRIVATE" not in json.dumps(report)
+    assert report["close_strategy"] == "normal"
+    mixed = summarize([good, dict(good, close_strategy="tls_after_completed", duration_ms=50)])
+    assert len(mixed["groups"]) == 2
+    assert mixed["groups"][0]["close_strategy"] == "normal" and mixed["groups"][0]["verified_p95_ms"] == 100
+    assert mixed["groups"][1]["close_strategy"] == "tls_after_completed" and mixed["groups"][1]["verified_p95_ms"] == 50
     try:
         summarize([dict(good, cached_input_tokens_reported=True, cached_input_tokens=21)])
     except ValueError:
         pass
     else:
         raise AssertionError("invalid cached usage accepted")
+    try:
+        summarize([dict(good, close_strategy="PRIVATE_STRATEGY")])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown private strategy accepted")
     print('{"offline_codex_report_tests_passed":true}')
 
 

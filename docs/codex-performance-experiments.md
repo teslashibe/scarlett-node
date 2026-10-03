@@ -20,6 +20,8 @@ scripts/codexperf.sh
 
 Start with one compatibility sample. `SCARLETT_CODEXPERF_SAMPLES` permits 1–30 serial jobs. Set `SCARLETT_VERIFIER_SERVER_NAME` when the proof socket uses an IP or localhost tunnel with a certificate for another hostname. A custom CA is optional for a publicly trusted verifier certificate. The control API requires HTTPS or localhost HTTP reached through a protected tunnel; environment HTTP proxies and cross-origin redirects are disabled.
 
+`SCARLETT_CODEXPERF_CLOSE_STRATEGY` selects `normal` by default or the experimental `tls_after_completed` shutdown. The candidate closes the underlying TLS write pipe after a fully parsed `response.completed`, bounds shutdown, and still awaits TLSNotary finalization, server EOF and independent receipt verification. It changes no provider request or verification requirement. Use a matching helper that reports its chosen `close_strategy`; a missing field is accepted only for older normal baseline helpers. The requested strategy is recorded in the manifest and every metrics row.
+
 Each job receives a cryptographically random synthetic ID, a fresh single-use verifier token, an exact payload hash, a fence and a five-minute absolute expiry. The harness invokes `scarlett-prover prove` once, then independently retrieves its authenticated receipt. It counts a sample as verified only after acceptance, exact binding/model/output checks and validation of actual input/output token usage. Missing cached token details remain unknown; a reported cached subset must not exceed total input usage.
 
 The runner stops at the first failure, including recognized provider quota, authentication and model errors. It never repeats unclear provider execution. Adversarial helper mode must be disabled. It does not contact X or modify production dispatch, earning, login state or databases.
@@ -38,7 +40,7 @@ Helper byte counters are supplier operational telemetry. Verifier counters count
 scripts/codexperf-report.py /absolute/private/runs/codex-proxy-001/metrics.jsonl
 ```
 
-The summary reports actual successes/failures and nearest-rank p50/p95. It flags fewer than 30 successful samples. Achieved throughput covers the recorded serial window including gaps and failures; measure concurrent and sustained capacity separately. Normal requested speed does not establish a provider-reported service tier.
+The summary reports actual successes/failures and nearest-rank p50/p95. It flags fewer than 30 successful samples. It groups normal and candidate shutdown measurements separately; older metrics without a strategy are normal baseline samples. A single-strategy report retains the flat summary format, while mixed inputs return a `groups` comparison. Achieved throughput covers the recorded serial window including gaps and failures; measure concurrent and sustained capacity separately. Normal requested speed does not establish a provider-reported service tier.
 
 ## Offline checks
 
