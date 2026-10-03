@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -144,6 +145,36 @@ func TestVerifierTLSConfiguration(t *testing.T) {
 	c.VerifierCA = filepath.Join(t.TempDir(), "public-test-ca.pem")
 	if c.Validate() == nil {
 		t.Fatal("mixed fixture plaintext and CA accepted")
+	}
+}
+
+// Relay is on unless the operator sets SCARLETT_X_RELAY=0; anything else,
+// including the old opt-in value and an unset variable, leaves it on.
+func TestKeyedRelayDefaultsOnWithExplicitOptOut(t *testing.T) {
+	t.Setenv("SCARLETT_COORDINATOR", "https://example.org")
+	t.Setenv("SCARLETT_PROFILE", "synthetic")
+	t.Setenv("SCARLETT_EXECUTOR", ExecutorServices)
+	t.Setenv("SCARLETT_SERVICES", "x_read")
+	t.Setenv("SCARLETT_VERIFIER", "127.0.0.1:7047")
+	t.Setenv("SCARLETT_PROVER", "scarlett-prover")
+	t.Setenv("SCARLETT_X_SESSION", filepath.Join(t.TempDir(), "synthetic-x.json"))
+	for _, tc := range []struct {
+		value string
+		set   bool
+		relay bool
+	}{{"", false, true}, {"1", true, true}, {"0", true, false}, {"yes", true, true}, {"", true, true}} {
+		if tc.set {
+			t.Setenv("SCARLETT_X_RELAY", tc.value)
+		} else {
+			os.Unsetenv("SCARLETT_X_RELAY")
+		}
+		c, err := Load()
+		if err != nil {
+			t.Fatalf("SCARLETT_X_RELAY=%q set=%v: %v", tc.value, tc.set, err)
+		}
+		if c.XRelay != tc.relay {
+			t.Fatalf("SCARLETT_X_RELAY=%q set=%v: relay %v, want %v", tc.value, tc.set, c.XRelay, tc.relay)
+		}
 	}
 }
 
