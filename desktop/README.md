@@ -50,11 +50,43 @@ Closing the main window drains and quits by default. Operators can enable backgr
 
 Windows runtime operations require private NTFS storage and the bundled native helpers. Native tests validate ACLs, locking, process trees and owner-pipe shutdown; installed Windows GUI acceptance remains required before publishing its installer.
 
+Windows release signing uses an existing current-user code-signing identity and
+the trusted Microsoft SDK SignTool. No certificate or key is imported by the
+release helper. Set `SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT` to the reviewed public
+certificate thumbprint, `SCARLETT_WINDOWS_SIGNTOOL` to the absolute SDK executable
+and `SCARLETT_WINDOWS_TIMESTAMP_URL` to the approved HTTPS RFC3161 endpoint on a
+disposable native Windows release runner. Keep hardware-provider credentials and
+key access on that runner.
+
+After preparing the complete native runtime, build the release executable with
+`npm run tauri -- build --no-bundle --config src-tauri/tauri.complete.generated.json`.
+Then run `python scripts/sign-windows-bundle.py <absolute-desktop-checkout> <new-absolute-evidence.json>`.
+The helper validates the original inventory, signs Scarlett executables and
+the pinned NSIS packaging components,
+retains unsigned sidecar hashes and preserves provider bytes. It packages NSIS
+with Tauri's binary patching disabled, verifies trusted publisher/timestamp
+signatures and tests that exact installer with isolated local state. Evidence is
+written only after installed payload, lifecycle, preferences and browser tests
+pass. Real account login, signed upgrade/downgrade and publication remain
+separate gates; contract tests and unsigned rejection do not prove real signing.
+
+The Tauri callback permits exactly its five copied x86 NSIS plugin DLL paths.
+Generated x86 uninstallers must match NSIS 3.11's `nst<hex>.tmp` filename inside
+a fresh `target/release/nsis-signing-temp` directory. Only the packaging child
+receives that directory as TMP/TEMP and explicit callback context; it is removed
+on completion or failure. System temporary files, links, unexpected DLLs and
+other architectures are rejected. Provider resource callbacks verify exact paths,
+sizes and hashes against the finalized component inventory and preserve the
+original bytes and signing status; they add no Scarlett publisher signature.
+
+The signing options follow [Microsoft's SignTool reference](https://learn.microsoft.com/en-us/windows/win32/seccrypto/signtool)
+and [Tauri's custom Windows signing support](https://v2.tauri.app/distribute/sign/windows/#custom-sign-command).
+
 Tests use synthetic credentials and disposable temporary directories/fake executables. Launching the app does not itself start provider work: Start remains explicit. Real account/canary testing and production validation belong to the release owner.
 
 ## Complete runtime package
 
-The complete bundle contains the desktop shell, native Go node, Rust proof helper, `open-agent-api` v0.1.29, Codex CLI 0.159.2 and Claude CLI 2.1.286. Users do not need a development toolchain to run these packaged binaries. The desktop starts and stops the local model API through its native supervisor. The node's verified network services remain Codex and X; packaging Claude does not add a verified Claude network service.
+The complete bundle contains the desktop shell, native Go node, Rust proof helper, `open-agent-api` v0.1.30, Codex CLI 0.159.2 and Claude CLI 2.1.286. Users do not need a development toolchain to run these packaged binaries. The desktop starts and stops the local model API through its native supervisor. The node's verified network services remain Codex and X; packaging Claude does not add a verified Claude network service.
 
 Build on the target OS and architecture. Prepare the three reviewed native binaries and the official unpacked native provider packages, then run:
 
@@ -83,6 +115,8 @@ This checks packaged bytes, native CLI versions and the bundled model API's loop
 Claude's native package and license are kept intact. Each user must authenticate with their own supported credentials. Commercial use through a separate application must follow the [provider's terms](https://code.claude.com/docs/en/legal-and-compliance); do not route subscription credentials on behalf of other users.
 
 ## Local model API controls
+
+Local API models expose their reviewed effort levels and normal/Fast modes. Codex Fast requests priority; Claude Fast supports Opus 5.5, Opus 5 and Opus 4.8, subject to provider access and credits, and may fall back to standard execution. Listings do not establish account entitlement or measured speed. Ultra is deferred from this launch. Verified Codex network jobs keep base model IDs, low effort and the default tier; Claude runs through the local API only.
 
 The complete bundle can start and stop its bundled model API from the desktop. It binds only `127.0.0.1` on an operator-selected port (default 8088), requires a generated 256-bit bearer, and reports Ready only after health succeeds, unauthenticated model access returns 401 and authenticated access returns 200. Show local API key explicitly reveals the private bearer; it clears on window blur or page exit. The file is private to the current user (mode 0600 on Unix; current-user/SYSTEM ACL on Windows), and symlink or shared-file reads fail closed. The bearer is never included in status, logs or process arguments.
 
@@ -132,4 +166,91 @@ The native complete-bundle workflow installs its testing NSIS package into a cle
 
 Passing this check establishes the tested installer and UI lifecycle. It does not establish signature trust, remote provider login or verified paid network execution; those remain release requirements.
 
+The Windows acceptance also builds an installation-only next-patch version of
+the same runtime source. In its disposable profile it retains two synthetic X
+accounts, a synthetic node identity, an uncertain journal record, preferences
+and the private local API bearer across installation of the next version and
+reinstallation of the original version. Each replaced app must reopen without
+starting work, retain the durable bytes, start its protected API and drain on
+Quit. Evidence is recorded only after these assertions pass. This tests the
+installation lifecycle for that version pair; signed installers, historical
+schema compatibility and the Mac upgrade/downgrade UI remain separate checks.
+
 Installed Windows import acceptance uses new synthetic Chrome/Firefox stores below RUNNER_TEMP and redirects only browser roots for the test app. It exercises profile-specific consent and reset, Firefox import, the protected Chrome paste fallback, masked paste, unchanged stores and native private account persistence. It makes no provider requests. Account ID fields have distinct X/Codex labels for assistive technology. This acceptance is a release gate; test configuration is not a browser import mode for operators.
+
+## Windows release signature acceptance
+
+Verify the final signed setup and its installed complete payload on a clean native
+Windows machine before selecting a stable download. Supply the reviewed publisher
+certificate's public thumbprint; private keys and certificate passwords are not
+inputs to this read-only checker. Do not install a test certificate or add trust
+roots to make a release pass.
+
+```powershell
+& desktop/scripts/check-windows-signatures.ps1 `
+  -Installer 'C:\release\Scarlett-Node-setup.exe' `
+  -InstalledDirectory 'C:\acceptance\Scarlett Node' `
+  -ExpectedPublisherThumbprint $ReviewedCertificateThumbprint `
+  -EvidenceFile 'C:\evidence\windows-signatures.json'
+```
+
+The setup, desktop, node, proof helper and local model API must each have a
+Windows-trusted embedded Authenticode signature matching that certificate and a
+trusted timestamp. Unsigned, altered, untrusted, catalog-only, self-signed,
+untimestamped or unexpected-publisher files fail. Read hashes before and after
+signature validation to reject changes during the check. Local file paths cannot
+use alternate streams or traverse reparse points. A new outcome/digest file is
+written only after all signature checks; existing evidence is never overwritten.
+Native tool failures disclose no raw certificate details or local paths.
+
+Run the complete installed payload/hash/protected-API checker and installed UI
+acceptance separately. These signature checks do not establish that an arbitrary
+installed directory came from the supplied setup, validate every provider byte,
+or prove login, upgrades, paid jobs or SmartScreen reputation. The native CI gate
+tests signature-record rejection and rejects the actual unsigned Go executable
+without creating signing certificates or modifying trust stores. Genuine signed
+installer acceptance and the Windows signing integration remain release work.
+The checker uses [Windows Authenticode validation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/get-authenticodesignature).
+
+## Mac release signing
+
+After reviewing the exact release source and native components, build the complete
+release app with `npm run tauri build -- --bundles app --no-sign --config
+src-tauri/tauri.complete.generated.json`. Omit `--debug`. Keep the original unsigned
+build as provenance and sign a separate copy. The provider archives must already
+have passed their pinned archive checks during complete-bundle preparation.
+
+Configure an existing `APPLE_SIGNING_IDENTITY` that starts with `Developer ID
+Application: `, its ten-character `SCARLETT_APPLE_TEAM_ID`, and an existing
+`SCARLETT_NOTARY_KEYCHAIN_PROFILE`. Store notarization credentials through Apple's
+Keychain tooling, outside the repository and chat. The signing script does not
+create certificates, import credentials or alter Keychain settings.
+
+```sh
+python3 desktop/scripts/sign-macos-bundle.py \
+  "/absolute/release-copy/Scarlett Node.app" \
+  "/absolute/new-output/Scarlett-Node.dmg"
+```
+
+The script refuses a changed component inventory, altered input bytes, links,
+another product identity or an already finalized signing manifest. It verifies
+every bundled native provider object's existing Developer ID signature and
+hardened runtime, preserving those exact bytes and notices. It signs Scarlett's
+three sidecars and desktop executable, verifies their team and hardened runtime,
+records both input and signed sidecar digests, then seals the outer app. A generic
+hash refresh cannot turn an altered vendor binary into an accepted release.
+
+The packaged integrity and protected local API check must pass before notarization.
+Both the app and resulting drag-to-Applications DMG require an Accepted notarization
+response and a valid stapled ticket. The app must pass Gatekeeper assessment;
+the DMG signature must match the configured team. Only then is a neighboring
+`.evidence.json` written with artifact digests and notarization IDs. A failed or
+partly signed app must be rebuilt from its reviewed inputs, rather than signed
+again in place. Tool failures expose no raw signing or Keychain output.
+
+This is a Mac release preparation step, not automatic publication. It requires
+real signing credentials and does not replace downloaded-installer UI, remote
+account, upgrade/downgrade or paid-loop acceptance. Stable download publication
+still uses the infrastructure release process after those checks. Windows
+Authenticode signing remains a separate native release requirement. Platform
+setup follows [Tauri's signing guide](https://v2.tauri.app/distribute/sign/macos/).

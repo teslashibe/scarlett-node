@@ -3,7 +3,9 @@ param(
     [Parameter(Mandatory = $true)][string]$Installer,
     [Parameter(Mandatory = $true)][string]$EvidenceDirectory,
     [switch]$Preferences,
-    [string]$BrowserFixture = ''
+    [string]$BrowserFixture = '',
+    [string]$UpgradeFixture = '',
+    [string]$UpgradeInstaller = ''
 )
 $ErrorActionPreference = 'Stop'
 $script:apiPort = 8088
@@ -19,6 +21,7 @@ public static class ScarlettAcceptanceWindow {
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
+    [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
     [StructLayout(LayoutKind.Sequential)] private struct KeyboardInput {
         public ushort key, scan; public uint flags, time; public UIntPtr extra;
     }
@@ -51,8 +54,40 @@ public static class ScarlettAcceptanceWindow {
         if (SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Input))) != (uint)inputs.Length)
             throw new InvalidOperationException("Native input stream rejected events");
     }
+    public static void UnicodeTextAndTab(string text) {
+        // Disposable ASCII fixtures only. One stream preserves text/Tab order.
+        if (String.IsNullOrEmpty(text) || text.Length > 512)
+            throw new InvalidOperationException("Synthetic text exceeds its bound");
+        Input[] inputs = new Input[text.Length * 2 + 2];
+        for (int i = 0; i < text.Length; i++) {
+            char c = text[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-'))
+                throw new InvalidOperationException("Synthetic text contains unsupported characters");
+            Input down = new Input(); down.type = 1;
+            down.value.keyboard.scan = c; down.value.keyboard.flags = 4u;
+            Input up = down; up.value.keyboard.flags = 6u;
+            inputs[i * 2] = down; inputs[i * 2 + 1] = up;
+        }
+        inputs[inputs.Length - 2] = Key(0x09, false);
+        inputs[inputs.Length - 1] = Key(0x09, true);
+        Send(inputs);
+    }
     public static void ControlKey(ushort key) {
         Send(new Input[] { Key(0x11, false), Key(key, false), Key(key, true), Key(0x11, true) });
+    }
+    public static void Click(int x, int y) {
+        int left = GetSystemMetrics(76), top = GetSystemMetrics(77);
+        int width = GetSystemMetrics(78), height = GetSystemMetrics(79);
+        if (width < 2 || height < 2 || x < left || y < top ||
+            (long)x >= (long)left + width || (long)y >= (long)top + height)
+            throw new InvalidOperationException("Synthetic click outside desktop bounds");
+        Input move = new Input();
+        move.value.mouse.x = (int)(((long)x - left) * 65535 / (width - 1));
+        move.value.mouse.y = (int)(((long)y - top) * 65535 / (height - 1));
+        move.value.mouse.flags = 0xC001;
+        Input down = new Input(); down.value.mouse.flags = 2;
+        Input up = new Input(); up.value.mouse.flags = 4;
+        Send(new Input[] { move, down, up });
     }
     public static void SelectAllAndClear() {
         Send(new Input[] { Key(0x11, false), Key(0x41, false), Key(0x41, true), Key(0x11, true),
@@ -238,7 +273,7 @@ function Check-QuitShortcut([string]$Failure) {
 
 function Verify-KeyboardDelivery {
     # UIA Invoke/SetFocus can succeed without an interactive input desktop.
-    # Prove SendKeys reaches a harmless empty field before blaming a shortcut.
+    # Prove native text delivery reaches a harmless empty field before blaming a shortcut.
     Write-Output "Installed keyboard probe: interactive=$([Environment]::UserInteractive), session=$([System.Diagnostics.Process]::GetCurrentProcess().SessionId)"
     $target = $null
     foreach ($name in @('Local Codex account ID', 'Local account ID')) {
@@ -263,9 +298,13 @@ function Verify-KeyboardDelivery {
     Wait-Check {
         return $target.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
     } 10 'Keyboard probe did not acquire foreground and field focus'
-    [System.Windows.Forms.SendKeys]::SendWait('keyboard-probe')
+    [ScarlettAcceptanceWindow]::UnicodeTextAndTab('keyboard-probe')
+    Wait-Check { Input-Advanced $name 'Concurrent jobs' $handle } 10 'Keyboard probe text was not acknowledged by successor focus'
     Wait-Check { $value.Current.Value -ceq 'keyboard-probe' } 10 'CI keyboard injection did not reach the editable control'
-    [ScarlettAcceptanceWindow]::SelectAllAndClear()
+    $target.SetFocus()
+    Wait-Check { $target.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle } 10 'Keyboard probe did not reacquire field focus'
+    [ScarlettAcceptanceWindow]::SelectAllClearAndTab()
+    Wait-Check { Input-Advanced $name 'Concurrent jobs' $handle } 10 'Keyboard probe clear was not acknowledged by successor focus'
     Wait-Check { $value.Current.Value -ceq '' } 10 'Native control-key input did not clear the disposable field'
     Write-Output 'Installed acceptance: text and native control-key delivery verified'
 }
@@ -334,7 +373,29 @@ function Set-Checkbox([string]$Name, [bool]$Enabled) {
 function Saved-Preferences([int]$Port, [bool]$Background) {
     $path = Join-Path $state 'preferences.json'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
-    $saved = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
+    $stream = $null
+    $reader = $null
+    try {
+        # Observe one complete file without blocking the helper's atomic rename.
+        $sharing = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+        $stream = [System.IO.FileStream]::new($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $sharing)
+        $reader = [System.IO.StreamReader]::new($stream)
+        $saved = $reader.ReadToEnd() | ConvertFrom-Json
+    } catch {
+        $failure = $_.Exception
+        while (($failure -is [System.Management.Automation.MethodInvocationException] -or
+            $failure -is [System.Reflection.TargetInvocationException]) -and $null -ne $failure.InnerException) {
+            $failure = $failure.InnerException
+        }
+        # HRESULT_FROM_WIN32 for sharing/lock violations (32/33) alone defers
+        # observation; the bounded wait still requires exact persisted values.
+        if ($failure -is [System.IO.IOException] -and
+            $failure.HResult -in @(-2147024864, -2147024863)) { return $false }
+        throw
+    } finally {
+        try { if ($null -ne $reader) { $reader.Dispose() } }
+        finally { if ($null -ne $stream) { $stream.Dispose() } }
+    }
     return $saved.schema -eq 1 -and $saved.local_api_port -eq $Port -and $saved.background -eq $Background
 }
 function Close-Window {
@@ -415,52 +476,114 @@ function Check-Preferences {
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-preferences-ui.json')
 }
 
-function Set-Text([string]$Name, [string]$Value, [string]$NextName = '') {
-    # Use the same text delivery already proved by the per-window probe.
-    # WebView2 can advertise ValuePattern while SetValue fails to commit.
-    # Only disposable fixtures call this helper, never real credentials.
-    if ($Value -notmatch '^[a-z0-9-]+$' -or $Value.Length -gt 512) { throw 'Synthetic input contains unsupported characters' }
-    Wait-Check { (Find-Input $Name).Current.IsEnabled } 15 "Text input did not become ready: $Name"
-    $control = Find-Input $Name
-    if (-not $control -or -not $control.Current.IsEnabled) { throw "Text input unavailable: $Name" }
+function Click-Control([System.Windows.Automation.AutomationElement]$Control) {
     $handle = $application.MainWindowHandle
     [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
     [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
     $scroll = $null
-    if ($control.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) { $scroll.ScrollIntoView() }
-    $control.SetFocus()
+    if ($Control.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) {
+        $scroll.ScrollIntoView()
+    }
+    $Control.SetFocus()
+    Wait-Check {
+        return [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+    } 10 'Installed control did not acquire foreground input'
+    $click = @{ point = [System.Windows.Point]::new(0.0, 0.0) }
+    try {
+        Wait-Check {
+            $point = [System.Windows.Point]::new(0.0, 0.0)
+            if (-not $Control.TryGetClickablePoint([ref]$point)) { return $false }
+            $click.point = $point
+            return $true
+        } 10 'Installed control did not become visible for native click'
+    } catch {
+        $originalFailure = $_
+        $diagnostic = @{ controlEnabled = $Control.Current.IsEnabled; controlFocused = $Control.Current.HasKeyboardFocus
+            controlOffscreen = $Control.Current.IsOffscreen; scrollSupported = $null -ne $scroll
+            foregroundOwned = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle; realProviderJobs = 0 }
+        New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+        $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-click-input-failure.json')
+        Write-Output ($diagnostic | ConvertTo-Json -Compress)
+        throw $originalFailure
+    }
+    [ScarlettAcceptanceWindow]::Click([int]$click.point.X, [int]$click.point.Y)
+}
+
+function Input-Advanced([string]$Name, [string]$NextName, [IntPtr]$Handle, [hashtable]$Diagnostic = $null) {
+    $source = Find-Input $Name
+    $sourcePresent = $null -ne $source
+    $sourceFocused = $sourcePresent -and $source.Current.HasKeyboardFocus
+    $foregroundOwned = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $Handle
+    $condition = [System.Windows.Automation.AndCondition]::new(
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::NameProperty, $NextName),
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::IsKeyboardFocusableProperty, $true)
+    )
+    $matches = $script:window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    $focusedCount = 0
+    $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
+    if ($null -ne $Diagnostic) {
+        $Diagnostic.sourcePresent = $sourcePresent
+        $Diagnostic.sourceFocused = $sourceFocused
+        $Diagnostic.sourceOffscreen = $sourcePresent -and $source.Current.IsOffscreen
+        $Diagnostic.foregroundOwned = $foregroundOwned
+        $Diagnostic.successorPresent = $matches.Count -gt 0
+        $Diagnostic.successorEnabled = $false
+        $Diagnostic.successorFocused = $false
+        $Diagnostic.successorSameProcess = $false
+        $Diagnostic.successorActualFocusMatches = $false
+    }
+    foreach ($match in $matches) {
+        $enabled = $match.Current.IsEnabled
+        $hasFocus = $match.Current.HasKeyboardFocus
+        $sameProcess = $sourcePresent -and $match.Current.ProcessId -eq $source.Current.ProcessId
+        $actualFocusMatches = $null -ne $focused -and [System.Windows.Automation.Automation]::Compare($match, $focused)
+        if ($null -ne $Diagnostic) {
+            $Diagnostic.successorEnabled = $Diagnostic.successorEnabled -or $enabled
+            $Diagnostic.successorFocused = $Diagnostic.successorFocused -or $hasFocus
+            $Diagnostic.successorSameProcess = $Diagnostic.successorSameProcess -or ($hasFocus -and $sameProcess)
+            $Diagnostic.successorActualFocusMatches = $Diagnostic.successorActualFocusMatches -or $actualFocusMatches
+        }
+        if ($enabled -and $hasFocus -and $sameProcess -and $actualFocusMatches) { $focusedCount++ }
+    }
+    # Concurrent jobs appears in both forms; require the actually focused one.
+    if ($null -ne $Diagnostic) { $Diagnostic.successorUniqueFocused = $focusedCount -eq 1 }
+    return $sourcePresent -and -not $sourceFocused -and $foregroundOwned -and $focusedCount -eq 1
+}
+
+function Wait-InputAdvanced([string]$Name, [string]$NextName, [IntPtr]$Handle, [bool]$Clearing, [string]$Failure) {
+    try { Wait-Check { Input-Advanced $Name $NextName $Handle } 10 $Failure }
+    catch {
+        $originalFailure = $_
+        $diagnostic = @{ clearAcknowledgmentFailed = $Clearing; textAcknowledgmentFailed = -not $Clearing
+            realProviderJobs = 0 }
+        try { Input-Advanced $Name $NextName $Handle $diagnostic | Out-Null } catch { }
+        New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+        $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-input-focus-failure.json')
+        Write-Output ($diagnostic | ConvertTo-Json -Compress)
+        throw $originalFailure
+    }
+}
+
+function Set-Text([string]$Name, [string]$Value, [string]$NextName) {
+    # All inputs are disposable fixtures, never real credentials. Use one native
+    # text/Tab stream and acknowledge focus changes instead of SendKeys timing.
+    if ($Value -notmatch '^[a-z0-9-]+$' -or $Value.Length -gt 512) { throw 'Synthetic input contains unsupported characters' }
+    if (-not (($Name -eq 'Local X account ID' -and $NextName -eq 'Concurrent jobs') -or
+        ($Name -eq 'auth_token' -and $NextName -eq 'ct0') -or
+        ($Name -eq 'ct0' -and $NextName -eq 'Connect X'))) { throw 'Synthetic input requires its reviewed successor control' }
+    Wait-Check { (Find-Input $Name).Current.IsEnabled } 15 "Text input did not become ready: $Name"
+    $control = Find-Input $Name
+    if (-not $control -or -not $control.Current.IsEnabled) { throw "Text input unavailable: $Name" }
+    $handle = $application.MainWindowHandle
+    Click-Control $control
     Wait-Check {
         return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
     } 10 'Synthetic input did not acquire keyboard focus'
-    if ($control.Current.IsPassword) {
-        if (-not (($Name -eq 'auth_token' -and $NextName -eq 'ct0') -or
-            ($Name -eq 'ct0' -and $NextName -eq 'Connect X'))) { throw 'Masked input requires its reviewed successor control' }
-        # SendWait can return before another process handles input. Tab focus
-        # acknowledges the clear and text queues without reading a password.
-        [ScarlettAcceptanceWindow]::SelectAllClearAndTab()
-        Wait-Check {
-            $next = Find-Input $NextName
-            return $null -ne $next -and $next.Current.HasKeyboardFocus -and
-                [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
-        } 10 'Masked clear input was not acknowledged by successor focus'
-        $control = Find-Input $Name
-        $control.SetFocus()
-        Wait-Check {
-            return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
-        } 10 'Masked input did not reacquire keyboard focus'
-        [System.Windows.Forms.SendKeys]::SendWait($Value + '{TAB}')
-        Wait-Check {
-            $next = Find-Input $NextName
-            return $null -ne $next -and $next.Current.HasKeyboardFocus -and
-                [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
-        } 10 'Masked text input was not acknowledged by successor focus'
-        return
-    }
-    if ($NextName) { throw 'Ordinary input cannot use a masked successor' }
-    [ScarlettAcceptanceWindow]::SelectAllAndClear()
-    # Native keyboard events can still be queued when SendInput returns.
-    # Observe the ordinary field's empty value before sending the next text,
-    # as the per-window keyboard probe already does. Never read secret fields.
+    [ScarlettAcceptanceWindow]::SelectAllClearAndTab()
+    # An initially empty value is not evidence that queued clear events ran.
+    Wait-InputAdvanced $Name $NextName $handle $true 'Synthetic clear input was not acknowledged by successor focus'
     if (-not $control.Current.IsPassword) {
         Wait-Check {
             $current = Find-Input $Name
@@ -469,7 +592,13 @@ function Set-Text([string]$Name, [string]$Value, [string]$NextName = '') {
                 $pattern.Current.Value -ceq ''
         } 10 'Synthetic input did not clear before typing'
     }
-    [System.Windows.Forms.SendKeys]::SendWait($Value)
+    $control = Find-Input $Name
+    Click-Control $control
+    Wait-Check {
+        return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+    } 10 'Synthetic input did not reacquire keyboard focus'
+    [ScarlettAcceptanceWindow]::UnicodeTextAndTab($Value)
+    Wait-InputAdvanced $Name $NextName $handle $false 'Synthetic text input was not acknowledged by successor focus'
     # Masked cookie fields may refuse value readback. Exact persistence is
     # checked against the synthetic fixture after the Connect action.
     if (-not $control.Current.IsPassword) {
@@ -590,7 +719,8 @@ function Check-BrowserImport {
         Select-Browser 2 'Firefox'
         Wait-Check { Checkbox-Is 'Import only X session cookies from this profile' $false } 10 'Changing profile retained consent'
         Wait-Check { -not (Find-Button 'Import X account').Current.IsEnabled } 10 'Profile change allowed import without new consent'
-        Set-Text 'Local X account ID' 'browser-firefox'
+        Verify-KeyboardDelivery
+        Set-Text 'Local X account ID' 'browser-firefox' 'Concurrent jobs'
         Set-Checkbox 'Import only X session cookies from this profile' $true
         Click-Button 'Import X account'
         try {
@@ -623,7 +753,7 @@ function Check-BrowserImport {
         Wait-Check { Checkbox-Is 'Import only X session cookies from this profile' $false } 10 'Successful import retained consent'
         Wait-Check { UI-Contains 'access not verified' } 15 'Imported account claimed verified access'
         Select-Browser 1 'Chrome'
-        Set-Text 'Local X account ID' 'protected-chrome'
+        Set-Text 'Local X account ID' 'protected-chrome' 'Concurrent jobs'
         Set-Checkbox 'Import only X session cookies from this profile' $true
         Click-Button 'Import X account'
         Wait-Check { UI-Contains 'The browser or OS protected this profile' } 20 'Protected Chrome did not show the paste fallback'
@@ -631,7 +761,7 @@ function Check-BrowserImport {
         foreach ($name in @('auth_token', 'ct0')) {
             if (-not (Find-Input $name).Current.IsPassword) { throw 'Cookie paste field was not masked' }
         }
-        Set-Text 'Local X account ID' 'browser-paste'
+        Set-Text 'Local X account ID' 'browser-paste' 'Concurrent jobs'
         Set-Text 'auth_token' $script:fixture.authToken 'ct0'
         Set-Text 'ct0' $script:fixture.csrf 'Connect X'
         Click-Button 'Connect X'
@@ -697,6 +827,141 @@ function Check-BrowserImport {
     }
 }
 
+function Write-SyntheticPrivateJSON([string]$Path, $Value) {
+    if (Test-Path -LiteralPath $Path) { throw 'Synthetic identity/journal fixture would overwrite existing state' }
+    # The installed helper deliberately accepts only a file named bearer.
+    # Create that file in a fresh private sibling directory, replace its
+    # test-only bytes, then move it on the same volume to retain its ACL.
+    # Capture helper output privately; never log or use it as a credential.
+    $staging = $Path + '.fixture-private'
+    if (Test-Path -LiteralPath $staging) { throw 'Synthetic fixture staging directory already exists' }
+    $privateOutput = & (Join-Path $install 'scarlett-node.exe') desktop private-dir $staging | Out-String
+    $privateOutput = $null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not create private fixture staging directory' }
+    $temporaryFile = Join-Path $staging 'bearer'
+    $privateOutput = & (Join-Path $install 'scarlett-node.exe') desktop bearer $temporaryFile | Out-String
+    $privateOutput = $null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not create private installation fixture' }
+    [System.IO.File]::WriteAllText($temporaryFile, ($Value | ConvertTo-Json -Compress), [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::Move($temporaryFile, $Path)
+    Remove-Item -LiteralPath $staging -Recurse
+}
+function Durable-Hashes {
+    $files = @('identity.json', 'accounts.json', 'preferences.json', 'local-api/bearer') | ForEach-Object {
+        Get-Item -LiteralPath (Join-Path $script:importState $_)
+    }
+    $files += @(Get-ChildItem -LiteralPath (Join-Path $script:importState 'accounts') -Recurse -File)
+    $files += @(Get-ChildItem -LiteralPath (Join-Path $script:importState 'attempts') -Filter '*.json' -File)
+    if ($files.Count -gt 256) { throw 'Installation fixture exceeded its file bound' }
+    $hashes = @{}
+    foreach ($file in $files) {
+        if (($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $file.Length -gt 16MB) {
+            throw 'Unexpected private installation fixture file'
+        }
+        $hashes[$file.FullName] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+    }
+    return $hashes
+}
+function Check-InstallationRoundTrip {
+    if (-not $BrowserFixture -or -not $script:importState -or
+        @(([System.IO.File]::ReadAllText((Join-Path $script:importState 'accounts.json')) | ConvertFrom-Json).accounts).Count -ne 2) {
+        throw 'Installation acceptance requires its own two synthetic X accounts'
+    }
+    $temporary = [System.IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
+    foreach ($path in @($UpgradeFixture, $UpgradeInstaller)) {
+        if (-not [System.IO.Path]::GetFullPath($path).StartsWith($temporary, [StringComparison]::OrdinalIgnoreCase) -and
+            -not [System.IO.Path]::GetFullPath($path).StartsWith([System.IO.Path]::GetFullPath($env:GITHUB_WORKSPACE) + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Installation fixtures must remain in the disposable runner'
+        }
+    }
+    $fixture = [System.IO.File]::ReadAllText($UpgradeFixture) | ConvertFrom-Json
+    if (-not $fixture.syntheticOnly -or -not $fixture.sameRuntimeSource -or $fixture.signedInstaller -or
+        $fixture.baselineVersion -notmatch '^\d+\.\d+\.\d+$' -or $fixture.upgradeVersion -notmatch '^\d+\.\d+\.\d+$' -or
+        $fixture.baselineVersion -ceq $fixture.upgradeVersion -or
+        [System.IO.Path]::GetFullPath($fixture.baselineInstaller) -cne [System.IO.Path]::GetFullPath($Installer) -or
+        (Get-FileHash -LiteralPath $Installer -Algorithm SHA256).Hash.ToLowerInvariant() -cne $fixture.baselineSha256) {
+        throw 'Installation round-trip metadata does not match its testing installers'
+    }
+    $browser = [System.IO.File]::ReadAllText($BrowserFixture) | ConvertFrom-Json
+    $roamingBefore, $localBefore, $stateBefore = $env:APPDATA, $env:LOCALAPPDATA, $script:state
+    try {
+        $env:APPDATA, $env:LOCALAPPDATA = $browser.roaming, $browser.local
+        $script:state = $script:importState
+        Write-SyntheticPrivateJSON (Join-Path $script:importState 'identity.json') @{
+            node_id = 'synthetic-installer-node'; supplier_pubkey = 'synthetic-local-wallet'
+            credential = 'synthetic-installation-credential-never-used-remotely'
+        }
+        $journal = Join-Path $script:importState 'attempts'
+        $privateOutput = & (Join-Path $install 'scarlett-node.exe') desktop private-dir $journal | Out-String
+        $privateOutput = $null
+        if ($LASTEXITCODE -ne 0) { throw 'Could not create private journal fixture directory' }
+        $job, $attempt, $fence = 'synthetic-upgrade-job', 'synthetic-upgrade-attempt', 'synthetic-upgrade-fence'
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $digest = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($job + [char]0 + $attempt + [char]0 + $fence)) }
+        finally { $sha.Dispose() }
+        $name = [BitConverter]::ToString($digest).Replace('-', '').ToLowerInvariant() + '.json'
+        Write-SyntheticPrivateJSON (Join-Path $journal $name) @{
+            job_id = $job; attempt = $attempt; fence = $fence; fingerprint = ('a' * 64)
+            deadline = [DateTime]::UtcNow.AddHours(2).ToString('o'); updated_at = [DateTime]::UtcNow.ToString('o')
+            state = 'started'; provider_account_id = 'browser-firefox'; provider_service = 'x_read'
+        }
+        Start-App
+        $version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($executable).ProductVersion
+        if ($version -notin @($fixture.baselineVersion, ($fixture.baselineVersion + '.0'))) { throw 'Baseline executable has the wrong product version' }
+        Wait-Check { $null -eq (Find-Button 'Pair node') } 15 'Baseline app did not recognize its private synthetic identity'
+        Set-Number 'Saved local API port' 18088
+        Click-Button 'Save device preferences'
+        Wait-Check { Saved-Preferences 18088 $false } 15 'Baseline app did not retain its test port'
+        Click-Button 'Start local API'
+        Wait-Check { (Api-Status '/health') -eq 200 } 30 'Baseline private API did not start'
+        Click-Button 'Quit Scarlett'
+        if (-not $application.WaitForExit(135000)) { throw 'Baseline app did not drain before installation' }
+        Wait-Check { (Api-Status '/health') -eq 0 } 30 'Baseline app left API running before installation'
+        $before = Durable-Hashes
+        foreach ($candidate in @(@{ path = $UpgradeInstaller; version = $fixture.upgradeVersion; direction = 'upgrade' },
+                                  @{ path = $Installer; version = $fixture.baselineVersion; direction = 'downgrade' })) {
+            if ((Api-Status '/health') -ne 0) { throw 'Installation began while local API was running' }
+            $setup = Start-Process -FilePath $candidate.path -ArgumentList '/S', "/D=$install" -PassThru
+            if (-not $setup.WaitForExit(120000)) { $setup.Kill(); throw 'Installation round trip timed out' }
+            if ($setup.ExitCode -ne 0) { throw 'Installation round trip failed' }
+            $version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($executable).ProductVersion
+            if ($version -notin @($candidate.version, ($candidate.version + '.0'))) { throw 'Installed executable has the wrong product version' }
+            & $script:pythonExe desktop/scripts/check-complete-bundle.py $install $install
+            if ($LASTEXITCODE -ne 0) { throw 'Replaced installation failed complete component validation' }
+            $after = Durable-Hashes
+            if ($after.Count -ne $before.Count) { throw 'Installation changed private account/identity/journal files' }
+            foreach ($path in $before.Keys) { if ($after[$path] -cne $before[$path]) { throw 'Installation changed private retained bytes' } }
+            Start-App
+            Wait-Check { $null -eq (Find-Button 'Pair node') } 15 'Installed app lost its synthetic node identity'
+            Wait-Check { UI-Contains 'browser-firefox' } 15 'Installed app lost the connected X account'
+            if ((Api-Status '/health') -ne 0 -or -not (Saved-Preferences 18088 $false)) { throw 'Opening replaced app started API or lost saved preferences' }
+            Click-Button 'Start local API'
+            Wait-Check { (Api-Status '/health') -eq 200 } 30 'Replaced app could not start the retained local API'
+            $key = [System.IO.File]::ReadAllText((Join-Path $script:importState 'local-api/bearer'))
+            if ((Api-Status '/v1/models' $key) -ne 200) { throw 'Replaced app refused its retained private API bearer' }
+            $key = $null
+            Click-Button 'Quit Scarlett'
+            if (-not $application.WaitForExit(135000)) { throw 'Replaced app did not drain and quit' }
+            Wait-Check { (Api-Status '/health') -eq 0 } 30 'Replaced app left local API running'
+            $after = Durable-Hashes
+            if ($after.Count -ne $before.Count) { throw 'Replaced app changed durable file inventory' }
+            foreach ($path in $before.Keys) { if ($after[$path] -cne $before[$path]) { throw 'Replaced app changed private durable state' } }
+            Write-Output "Installed round trip: $($candidate.direction) retained private state and protected API"
+        }
+        @{
+            baselineVersion = $fixture.baselineVersion; upgradeVersion = $fixture.upgradeVersion
+            upgrade = 'passed'; downgrade = 'passed'; privateIdentity = 'passed'; XAccounts = 'passed'
+            uncertainJournalBytes = 'passed'; preferences = 'passed'; APIBearer = 'passed'; protectedAPI = 'passed'
+            sameRuntimeSource = $true; signedInstaller = $false; historicalSchemaCompatibility = 'not tested'
+            realProviderJobs = 0
+        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-installation-round-trip.json')
+    } finally {
+        $key = $null
+        $env:APPDATA, $env:LOCALAPPDATA = $roamingBefore, $localBefore
+        $script:state = $stateBefore
+    }
+}
+
 $install = Join-Path $env:RUNNER_TEMP 'Scarlett Installed UI Acceptance'
 $state = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'ai.scarlett.node'
 if ((Test-Path $install) -or (Test-Path $state)) {
@@ -715,6 +980,13 @@ foreach ($file in @($executable, (Join-Path $install 'scarlett-node.exe'),
 python desktop/scripts/check-complete-bundle.py $install $install
 if ($LASTEXITCODE -ne 0) { throw 'Installed component integrity or API payload validation failed' }
 
+# Keep one absolute interpreter for installation validation after PATH cleanup.
+# Application discovery can return several paths; the call operator needs one.
+$script:pythonExe = Get-Command python -CommandType Application | Select-Object -First 1 -ExpandProperty Path
+if (-not [System.IO.Path]::IsPathRooted($script:pythonExe) -or
+    -not (Test-Path -LiteralPath $script:pythonExe -PathType Leaf)) {
+    throw 'Installation validation requires one existing absolute Python executable'
+}
 $previousPath = $env:PATH
 $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
 $application = $null
@@ -754,10 +1026,14 @@ try {
         installedNSIS = 'passed'; completePayload = 'passed'; nativeWindow = 'passed'
         uiStartStop = 'passed'; bearerProtection = 'passed'; developerPathCleared = $true
         unexpectedDesktopExit = 'passed'; uiQuit = 'passed'; quitInputFocus = 'verified'; realProviderJobs = 0
-        signedInstaller = $false; remoteAccountLoginTested = $false
+        signedInstaller = 'separate signature acceptance required'; remoteAccountLoginTested = $false
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-installed-ui.json')
     if ($Preferences) { Check-Preferences }
     if ($BrowserFixture) { Check-BrowserImport }
+    if ($UpgradeFixture -or $UpgradeInstaller) {
+        if (-not $UpgradeFixture -or -not $UpgradeInstaller) { throw 'Both installation fixture and upgrade installer are required' }
+        Check-InstallationRoundTrip
+    }
 } catch {
     # Record source line numbers for failures hidden by the workflow wrapper,
     # without publishing stack paths, UI values or native exception messages.
