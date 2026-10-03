@@ -8,6 +8,15 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows') {
     throw 'Installed UI acceptance requires a disposable Windows CI runner'
 }
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public static class ScarlettAcceptanceWindow {
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+}
+'@
 
 function Wait-Check([scriptblock]$Check, [int]$Seconds, [string]$Failure) {
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
@@ -93,6 +102,28 @@ function Start-App {
         return $null -ne $button -and $button.Current.IsEnabled
     } 30 'Installed desktop API controls did not become available'
 }
+function Focus-QuitShortcut {
+    # UIA Invoke can operate a background window. SendKeys instead targets the
+    # foreground input stream, so prove both the native host and WebView focus.
+    $application.Refresh()
+    $handle = $application.MainWindowHandle
+    if ($handle -eq [IntPtr]::Zero) { throw 'Quit shortcut has no native window handle' }
+    [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
+    [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
+    Wait-Check {
+        return [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+    } 10 'Installed desktop did not acquire foreground input for Quit'
+    $target = Find-Button 'Stop local API'
+    if (-not $target -or -not $target.Current.IsEnabled) { throw 'Quit focus control unavailable' }
+    $target.SetFocus()
+    Wait-Check {
+        $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
+        return $null -ne $focused -and $focused.Current.ProcessId -eq $target.Current.ProcessId -and
+            $target.Current.HasKeyboardFocus -and
+            [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+    } 10 'Installed desktop control did not acquire keyboard focus for Quit'
+    Write-Output 'Installed acceptance: foreground and WebView keyboard focus verified'
+}
 
 $install = Join-Path $env:RUNNER_TEMP 'scarlett-installed-ui-acceptance'
 $state = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'ai.scarlett.node'
@@ -126,12 +157,14 @@ try {
     if ($key -notmatch '^[0-9a-f]{64}$' -or (Api-Status '/v1/models' $key) -ne 200) {
         throw 'Installed API bearer validation failed'
     }
+    Write-Output 'Installed acceptance: Start and bearer protection passed'
     $key = $null
     Click-Button 'Stop local API'
     Wait-Check { (Api-Status '/health') -eq 0 } 30 'Installed UI Stop left the API running'
     Wait-Check { (Find-Button 'Start local API').Current.IsEnabled } 10 'Start did not recover after Stop'
     Click-Button 'Start local API'
     Wait-Check { (Api-Status '/health') -eq 200 } 30 'Installed UI restart did not become ready'
+    Write-Output 'Installed acceptance: Stop and immediate restart passed'
     # Kill only the exact desktop process launched above; EOF must stop its API
     $application.Kill()
     if (-not $application.WaitForExit(10000)) { throw 'Owned desktop did not exit' }
@@ -139,7 +172,8 @@ try {
     Start-App
     Click-Button 'Start local API'
     Wait-Check { (Api-Status '/health') -eq 200 } 30 'Desktop recovery did not start the API'
-    $window.SetFocus()
+    Write-Output 'Installed acceptance: unexpected exit and recovery passed'
+    Focus-QuitShortcut
     [System.Windows.Forms.SendKeys]::SendWait('^q')
     if (-not $application.WaitForExit(135000)) { throw 'Installed desktop Quit did not exit' }
     Wait-Check { (Api-Status '/health') -eq 0 } 30 'Installed desktop Quit left the API running'
@@ -147,7 +181,7 @@ try {
     @{
         installedNSIS = 'passed'; completePayload = 'passed'; nativeWindow = 'passed'
         uiStartStop = 'passed'; bearerProtection = 'passed'; developerPathCleared = $true
-        unexpectedDesktopExit = 'passed'; uiQuit = 'passed'; realProviderJobs = 0
+        unexpectedDesktopExit = 'passed'; uiQuit = 'passed'; quitInputFocus = 'verified'; realProviderJobs = 0
         signedInstaller = $false; remoteAccountLoginTested = $false
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-installed-ui.json')
 } finally {
