@@ -59,6 +59,7 @@ public static class ScarlettAcceptanceWindow {
     public static void ControlKey(ushort key) {
         Send(new Input[] { Key(0x11, false), Key(key, false), Key(key, true), Key(0x11, true) });
     }
+    public static void PressKey(ushort key) { Send(new Input[] { Key(key, false), Key(key, true) }); }
     private static Input[] ClearInputs() {
         return new Input[] { Key(0x11, false), Key(0x41, false), Key(0x41, true), Key(0x11, true),
             Key(0x08, false), Key(0x08, true) };
@@ -129,6 +130,19 @@ function Find-Button([string]$Name) {
     )
     return $script:window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
 }
+function Focus-Control([System.Windows.Automation.AutomationElement]$Control) {
+    $handle = $application.MainWindowHandle
+    [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
+    [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
+    $scroll = $null
+    if ($Control.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) {
+        $scroll.ScrollIntoView()
+    }
+    $Control.SetFocus()
+    Wait-Check {
+        return $Control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+    } 10 'Installed control did not acquire keyboard focus'
+}
 function Click-Button([string]$Name) {
     Wait-Check {
         $control = Find-Button $Name
@@ -136,15 +150,10 @@ function Click-Button([string]$Name) {
     } 30 "UI control did not become available: $Name"
     $button = Find-Button $Name
     if (-not $button -or -not $button.Current.IsEnabled) { throw "UI control unavailable: $Name" }
-    $scroll = $null
-    if ($button.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) {
-        $scroll.ScrollIntoView()
-    }
-    $invoke = $null
-    if (-not $button.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invoke)) {
-        throw "UI invocation unavailable: $Name"
-    }
-    $invoke.Invoke()
+    Focus-Control $button
+    # Drive the browser's ordinary keyboard action rather than mixing UIA
+    # invocation with queued native input from the preceding control.
+    [ScarlettAcceptanceWindow]::PressKey(0x20)
 }
 function Wait-AppWindow {
     Wait-Check {
@@ -337,11 +346,8 @@ function Check-DefaultCheckbox([string]$Name, [string]$Failure) {
 function Set-Checkbox([string]$Name, [bool]$Enabled) {
     Wait-Check { (Find-Input $Name).Current.IsEnabled } 15 "Checkbox unavailable: $Name"
     if (Checkbox-Is $Name $Enabled) { return }
-    $pattern = $null
-    if (-not (Find-Input $Name).TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
-        throw "Checkbox toggle pattern unavailable: $Name"
-    }
-    $pattern.Toggle()
+    Focus-Control (Find-Input $Name)
+    [ScarlettAcceptanceWindow]::PressKey(0x20)
     Wait-Check { Checkbox-Is $Name $Enabled } 15 "Checkbox did not update: $Name"
 }
 function Saved-Preferences([int]$Port, [bool]$Background) {
@@ -349,6 +355,22 @@ function Saved-Preferences([int]$Port, [bool]$Background) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
     $saved = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
     return $saved.schema -eq 1 -and $saved.local_api_port -eq $Port -and $saved.background -eq $Background
+}
+function Check-SavedPreferences([int]$Port, [bool]$Background, [string]$Failure) {
+    try { Wait-Check { Saved-Preferences $Port $Background } 15 $Failure }
+    catch {
+        $originalFailure = $_
+        $path = Join-Path $state 'preferences.json'
+        $saved = $null
+        try { $saved = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json } catch { }
+        $diagnostic = @{ readable = $null -ne $saved; schemaMatches = $saved.schema -eq 1
+            portMatches = $saved.local_api_port -eq $Port; backgroundMatches = $saved.background -eq $Background
+            expectedBackground = $Background; realProviderJobs = 0 }
+        New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+        $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-preferences-save-failure.json')
+        Write-Output ($diagnostic | ConvertTo-Json -Compress)
+        throw $originalFailure
+    }
 }
 function Close-Window {
     $pattern = $null
@@ -369,7 +391,7 @@ function Check-Preferences {
     Check-DefaultCheckbox 'Open Scarlett when I log in' 'Start at login was not opt-in'
     Set-Number 'Saved local API port' 18088
     Click-Button 'Save device preferences'
-    Wait-Check { Saved-Preferences 18088 $false } 15 'Device preferences were not saved privately'
+    Check-SavedPreferences 18088 $false 'Device preferences were not saved privately'
     $script:apiPort = 18088
     if ((Api-Status '/health') -ne 0) { throw 'Preferences test port is already occupied' }
     Click-Button 'Start local API'
@@ -402,7 +424,7 @@ function Check-Preferences {
 
     Set-Checkbox 'Keep running when the window closes' $true
     Click-Button 'Save device preferences'
-    Wait-Check { Saved-Preferences 18088 $true } 15 'Background preference did not save'
+    Check-SavedPreferences 18088 $true 'Background preference did not save'
     Click-Button 'Start local API'
     Wait-Check { (Api-Status '/health') -eq 200 } 30 'Background test API did not start'
     $originalProcess = $application.Id
@@ -416,7 +438,7 @@ function Check-Preferences {
     if ($application.Id -ne $originalProcess -or (Api-Status '/health') -ne 200) { throw 'Reopening did not retain the same background app and API' }
     Set-Checkbox 'Keep running when the window closes' $false
     Click-Button 'Save device preferences'
-    Wait-Check { Saved-Preferences 18088 $false } 15 'Background mode did not restore off'
+    Check-SavedPreferences 18088 $false 'Background mode did not restore off'
     Close-Window
     if (-not $application.WaitForExit(135000)) { throw 'Restored default close did not exit' }
     Wait-Check { (Api-Status '/health') -eq 0 } 30 'Restored default close left API running'
@@ -435,15 +457,8 @@ function Set-Text([string]$Name, [string]$Value) {
     Wait-Check { (Find-Input $Name).Current.IsEnabled } 15 "Text input did not become ready: $Name"
     $control = Find-Input $Name
     if (-not $control -or -not $control.Current.IsEnabled) { throw "Text input unavailable: $Name" }
+    Focus-Control $control
     $handle = $application.MainWindowHandle
-    [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
-    [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
-    $scroll = $null
-    if ($control.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) { $scroll.ScrollIntoView() }
-    $control.SetFocus()
-    Wait-Check {
-        return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
-    } 10 'Synthetic input did not acquire keyboard focus'
     # Queue selection, clearing and Unicode text in one ordered native input
     # batch. An already-empty field cannot acknowledge queued clearing, and
     # mixing SendInput with SendKeys can lose text despite successful focus.
