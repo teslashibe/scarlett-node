@@ -58,6 +58,10 @@ public static class ScarlettAcceptanceWindow {
         Send(new Input[] { Key(0x11, false), Key(0x41, false), Key(0x41, true), Key(0x11, true),
             Key(0x08, false), Key(0x08, true) });
     }
+    public static void SelectAllClearAndTab() {
+        Send(new Input[] { Key(0x11, false), Key(0x41, false), Key(0x41, true), Key(0x11, true),
+            Key(0x08, false), Key(0x08, true), Key(0x09, false), Key(0x09, true) });
+    }
 }
 '@
 
@@ -411,7 +415,7 @@ function Check-Preferences {
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-preferences-ui.json')
 }
 
-function Set-Text([string]$Name, [string]$Value) {
+function Set-Text([string]$Name, [string]$Value, [string]$NextName = '') {
     # Use the same text delivery already proved by the per-window probe.
     # WebView2 can advertise ValuePattern while SetValue fails to commit.
     # Only disposable fixtures call this helper, never real credentials.
@@ -428,7 +432,43 @@ function Set-Text([string]$Name, [string]$Value) {
     Wait-Check {
         return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
     } 10 'Synthetic input did not acquire keyboard focus'
+    if ($control.Current.IsPassword) {
+        if (-not (($Name -eq 'auth_token' -and $NextName -eq 'ct0') -or
+            ($Name -eq 'ct0' -and $NextName -eq 'Connect X'))) { throw 'Masked input requires its reviewed successor control' }
+        # SendWait can return before another process handles input. Tab focus
+        # acknowledges the clear and text queues without reading a password.
+        [ScarlettAcceptanceWindow]::SelectAllClearAndTab()
+        Wait-Check {
+            $next = Find-Input $NextName
+            return $null -ne $next -and $next.Current.HasKeyboardFocus -and
+                [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+        } 10 'Masked clear input was not acknowledged by successor focus'
+        $control = Find-Input $Name
+        $control.SetFocus()
+        Wait-Check {
+            return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+        } 10 'Masked input did not reacquire keyboard focus'
+        [System.Windows.Forms.SendKeys]::SendWait($Value + '{TAB}')
+        Wait-Check {
+            $next = Find-Input $NextName
+            return $null -ne $next -and $next.Current.HasKeyboardFocus -and
+                [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+        } 10 'Masked text input was not acknowledged by successor focus'
+        return
+    }
+    if ($NextName) { throw 'Ordinary input cannot use a masked successor' }
     [ScarlettAcceptanceWindow]::SelectAllAndClear()
+    # Native keyboard events can still be queued when SendInput returns.
+    # Observe the ordinary field's empty value before sending the next text,
+    # as the per-window keyboard probe already does. Never read secret fields.
+    if (-not $control.Current.IsPassword) {
+        Wait-Check {
+            $current = Find-Input $Name
+            $pattern = $null
+            return $null -ne $current -and $current.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern) -and
+                $pattern.Current.Value -ceq ''
+        } 10 'Synthetic input did not clear before typing'
+    }
     [System.Windows.Forms.SendKeys]::SendWait($Value)
     # Masked cookie fields may refuse value readback. Exact persistence is
     # checked against the synthetic fixture after the Connect action.
@@ -592,10 +632,32 @@ function Check-BrowserImport {
             if (-not (Find-Input $name).Current.IsPassword) { throw 'Cookie paste field was not masked' }
         }
         Set-Text 'Local X account ID' 'browser-paste'
-        Set-Text 'auth_token' $script:fixture.authToken
-        Set-Text 'ct0' $script:fixture.csrf
+        Set-Text 'auth_token' $script:fixture.authToken 'ct0'
+        Set-Text 'ct0' $script:fixture.csrf 'Connect X'
         Click-Button 'Connect X'
-        Wait-Check { @(Imported-Accounts).Count -eq 2 } 20 'Installed masked paste did not persist'
+        try { Wait-Check { @(Imported-Accounts).Count -eq 2 } 20 'Installed masked paste did not persist' }
+        catch {
+            $errorClasses = @{
+                invalidInput = (UI-Contains 'Check the account ID, capacity and cookie values')
+                commandFailed = (UI-Contains 'The node could not complete that action')
+                commandTimeout = (UI-Contains 'The action timed out')
+                privateStorage = (UI-Contains 'Scarlett could not open its private local storage')
+            }
+            $focus = @{}
+            foreach ($name in @('auth_token', 'ct0', 'Connect X')) {
+                $target = Find-Input $name
+                $focus[$name] = $null -ne $target -and $target.Current.HasKeyboardFocus
+            }
+            $connect = Find-Button 'Connect X'
+            $failure = @{ accountCount = @(Imported-Accounts).Count
+                connectEnabled = $null -ne $connect -and $connect.Current.IsEnabled
+                successNoticeVisible = (UI-Contains 'X account connected locally')
+                foregroundOwned = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $application.MainWindowHandle
+                focus = $focus; errorClasses = $errorClasses; realProviderJobs = 0 }
+            $failure | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-masked-input-failure.json')
+            Write-Output ($failure | ConvertTo-Json -Depth 3 -Compress)
+            throw
+        }
         foreach ($record in (Imported-Accounts)) {
             if ($record.service -ne 'x_read' -or $record.id -notin @('browser-firefox', 'browser-paste')) { throw 'Unexpected imported account' }
             $credentialRoot = [System.IO.Path]::GetFullPath((Join-Path $script:importState 'accounts')).TrimEnd('\') + '\'
