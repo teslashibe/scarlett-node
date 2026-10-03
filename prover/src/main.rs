@@ -6,10 +6,13 @@
 //! `scarlett-prover fake-openai <addr> <ca-out>` is for impersonation tests.
 
 mod control;
+#[cfg(unix)]
 mod fake;
 mod policy;
 mod prove;
+#[cfg(unix)]
 mod verifier;
+#[cfg(unix)]
 mod verifier_store;
 mod xpolicy;
 mod xprove;
@@ -35,8 +38,12 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string(&summary)?);
             Ok(())
         }
+        #[cfg(unix)]
         ["verifier"] => verifier::run().await,
+        #[cfg(unix)]
         ["fake-openai", listen, ca_out] => fake::run(listen, ca_out).await,
+        #[cfg(not(unix))]
+        ["verifier"] | ["fake-openai", ..] => bail!("this platform supports the proof client only"),
         _ => bail!("usage: scarlett-prover prove | prove-x | verifier | fake-openai <addr> <ca-out>"),
     }
 }

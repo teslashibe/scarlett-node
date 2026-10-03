@@ -1,0 +1,28 @@
+name: windows-runtime-primitives
+on:
+  pull_request:
+    paths: ['internal/localfs/**', 'internal/worker/x.go', 'prover/**', '.github/workflows/windows-runtime.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-windows:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # This checks the first native primitives; the complete node port is not
+      # yet enabled or advertised. No provider credentials or live jobs run.
+      - run: go test -race ./internal/localfs
+      - run: go vet ./internal/localfs
+      - run: rustup toolchain install
+        working-directory: prover
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: prover
+      - run: cargo test --locked
+        working-directory: prover
