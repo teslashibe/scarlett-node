@@ -14,6 +14,16 @@ use serde_json::{Map, Value};
 use crate::policy::find;
 
 pub const HOST: &str = "x.com";
+pub const PROXY_EXPERIMENT_POLICY: &str = "x-proxy-experimental-v1";
+
+/// Experiment mode is part of the immutable registered job, not supplier choice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofMode {
+    #[default]
+    Mpc,
+    Proxy,
+}
 const GRAPHQL: &str = "/i/api/graphql/";
 /// Cookies whose values the supplier may hide, with the longest value allowed.
 /// Their names, the other cookies and the rest of the request stay revealed.
@@ -82,6 +92,19 @@ struct Job {
     exchanges: Vec<Spec>,
     #[serde(default)]
     max_attempts: Option<usize>,
+    #[serde(default)]
+    proof_mode: ProofMode,
+    #[serde(default)]
+    proof_policy: Option<String>,
+}
+
+pub fn proof_mode(job: &Value) -> Result<ProofMode> {
+    let job: Job = serde_json::from_value(job.clone()).context("invalid x.read job")?;
+    match (job.proof_mode, job.proof_policy.as_deref()) {
+        (ProofMode::Mpc, None) => Ok(ProofMode::Mpc),
+        (ProofMode::Proxy, Some(PROXY_EXPERIMENT_POLICY)) => Ok(ProofMode::Proxy),
+        _ => bail!("X proof mode and policy do not match"),
+    }
 }
 
 /// A proven X read as the verifier parsed it from the transcript.
@@ -99,6 +122,7 @@ pub struct Exchange {
 /// An X job payload: `{"type":"x.read","exchanges":[Spec...],"max_attempts":n}`.
 /// Returns the pinned exchanges and how many proofs the session allows.
 pub fn validate_job(job: &Value) -> Result<(Vec<Spec>, usize)> {
+    proof_mode(job)?;
     let job: Job = serde_json::from_value(job.clone()).context("invalid x.read job")?;
     if job.kind != "x.read" {
         bail!("job payload must be an x.read");
@@ -878,6 +902,22 @@ mod tests {
         ] {
             assert!(validate_job(&bad).is_err(), "{bad} was accepted");
         }
+    }
+
+    #[test]
+    fn experiment_proof_mode_requires_its_own_policy() {
+        let mut job = json!({"type":"x.read", "exchanges":[spec("Viewer", json!({}))], "max_attempts":1});
+        assert_eq!(proof_mode(&job).unwrap(), ProofMode::Mpc);
+        job["proof_mode"] = json!("proxy");
+        assert!(validate_job(&job).is_err());
+        job["proof_policy"] = json!(PROXY_EXPERIMENT_POLICY);
+        assert_eq!(proof_mode(&job).unwrap(), ProofMode::Proxy);
+        assert!(validate_job(&job).is_ok());
+        job["proof_mode"] = json!("mpc");
+        assert!(validate_job(&job).is_err());
+        job["proof_mode"] = json!("proxy");
+        job["proof_policy"] = json!("x-mpc-production");
+        assert!(validate_job(&job).is_err());
     }
 
     #[test]

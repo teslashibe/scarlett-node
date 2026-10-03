@@ -47,7 +47,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 use crate::{
     policy::{self, Verified},
     verifier_store::{self, Record, Store},
-    xpolicy::{self, Exchange, Spec},
+    xpolicy::{self, Exchange, Spec, ProofMode},
     xprove::{MAX_RECV, MAX_SENT},
 };
 
@@ -60,6 +60,7 @@ struct Config {
     limits: verifier_store::Limits,
     concurrency: usize,
     slots: Arc<tokio::sync::Semaphore>,
+    x_proxy_experiment: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -319,6 +320,7 @@ mod durable_tests {
                 limits: verifier_store::Limits::default(),
                 concurrency: 64,
                 slots: Arc::new(tokio::sync::Semaphore::new(64)),
+                x_proxy_experiment: false,
             },
             Mutex::new(Sessions::restore(store, records).unwrap()),
         ))
@@ -337,6 +339,31 @@ mod durable_tests {
             ttl_seconds: None,
             payload: json!({"type":"response.create","model":"synthetic-model"}),
         }
+    }
+    #[tokio::test]
+    async fn x_proxy_registration_is_explicitly_gated_and_bound_to_receipt() {
+        let dir = Temp::new();
+        let mut s = shared(&dir.0);
+        let expires = now_ms() + 30_000;
+        let mut r = request(expires);
+        let lease: Value = serde_json::from_str(include_str!("../../api/fixtures/lease-x.json")).unwrap();
+        r.payload = lease["x_payload"].clone();
+        r.payload["proof_mode"] = json!("proxy");
+        r.payload["proof_policy"] = json!(xpolicy::PROXY_EXPERIMENT_POLICY);
+        let expected_hash = verifier_store::hash(&serde_json::to_vec(&r.payload).unwrap());
+        assert_eq!(create(State(s.clone()), headers(), Json(r)).await.0, StatusCode::BAD_REQUEST);
+        assert!(s.1.lock().unwrap().by_job.is_empty());
+        Arc::get_mut(&mut s).unwrap().0.x_proxy_experiment = true;
+        let mut r = request(expires);
+        r.payload = lease["x_payload"].clone();
+        r.payload["proof_mode"] = json!("proxy");
+        r.payload["proof_policy"] = json!(xpolicy::PROXY_EXPERIMENT_POLICY);
+        assert_eq!(create(State(s.clone()), headers(), Json(r)).await.0, StatusCode::CREATED);
+        let (code, Json(receipt)) = status(State(s), headers(), Path(("synthetic".into(), "1".into()))).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(receipt["proof_mode"], "proxy");
+        assert_eq!(receipt["proof_policy"], xpolicy::PROXY_EXPERIMENT_POLICY);
+        assert_eq!(receipt["request_sha256"], expected_hash);
     }
     #[tokio::test]
     async fn registration_acknowledgement_is_idempotent_and_binds_fence_payload_expiry() {
@@ -680,12 +707,16 @@ pub async fn run() -> Result<()> {
         max_total_bytes: bounded_env("SCARLETT_VERIFIER_MAX_TOTAL_BYTES", 256 << 20, 1 << 20, 1 << 40)?,
     }.validate()?;
     let concurrency = bounded_env("SCARLETT_VERIFIER_CONCURRENCY", 64, 1, 256)? as usize;
+    let x_proxy_experiment = bounded_env("SCARLETT_VERIFIER_X_PROXY_EXPERIMENT", 0, 0, 1)? == 1;
     let sessions = if let Ok(dir) = env::var("SCARLETT_VERIFIER_STATE_DIR") {
         let (store, records) = Store::open_with_limits(std::path::Path::new(&dir), limits)?;
         Sessions::restore(store, records)?
     } else {
         Sessions::default()
     };
+    if !x_proxy_experiment && sessions.by_job.values().any(|entry| entry.payload["type"] == "x.read" && xpolicy::proof_mode(&entry.payload).ok() == Some(ProofMode::Proxy)) {
+        bail!("experimental X Proxy receipts require the experiment verifier");
+    }
     if !api.parse::<std::net::SocketAddr>().is_ok_and(|a| a.ip().is_loopback()) {
         bail!("verifier API must bind loopback");
     }
@@ -697,7 +728,7 @@ pub async fn run() -> Result<()> {
         (None, None) if plaintext && listen.parse::<std::net::SocketAddr>().is_ok_and(|a| a.ip().is_loopback()) => None,
         _ => bail!("verifier needs a TLS certificate/key or an explicit loopback plaintext fixture"),
     };
-    let shared: Shared = Arc::new((Config { key, upstream, session_limit: Duration::from_secs(limit), limits, concurrency, slots: Arc::new(tokio::sync::Semaphore::new(concurrency)) }, Mutex::new(sessions)));
+    let shared: Shared = Arc::new((Config { key, upstream, session_limit: Duration::from_secs(limit), limits, concurrency, slots: Arc::new(tokio::sync::Semaphore::new(concurrency)), x_proxy_experiment }, Mutex::new(sessions)));
     let cleanup = shared.clone();
     tokio::spawn(async move {
         loop {
@@ -778,6 +809,9 @@ async fn create(State(shared): State<Shared>, headers: HeaderMap, Json(request):
         return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"verifier state unavailable"})));
     }
     let durable = sessions.store.is_some();
+    if request.payload["type"] == "x.read" && xpolicy::proof_mode(&request.payload).ok() == Some(ProofMode::Proxy) && !config.x_proxy_experiment {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"X Proxy experiments are disabled"})));
+    }
     if durable && (request.fence.is_none() || request.expires_at_ms.is_none()) {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"durable sessions require a fence and absolute expiry"})));
     }
@@ -872,12 +906,16 @@ async fn status(
     response["fence"] = entry.fence.clone().into();
     response["expires_at_ms"] = entry.expires_ms.into();
     response["request_sha256"] = verifier_store::hash(&serde_json::to_vec(&entry.payload).unwrap_or_default()).into();
+    if entry.payload["type"] == "x.read" && xpolicy::proof_mode(&entry.payload).ok() == Some(ProofMode::Proxy) {
+        response["proof_mode"] = "proxy".into();
+        response["proof_policy"] = xpolicy::PROXY_EXPERIMENT_POLICY.into();
+    }
     (StatusCode::OK, Json(response))
 }
 
 enum Job {
     Codex(Value),
-    X(Arc<Vec<Spec>>),
+    X(Arc<Vec<Spec>>, ProofMode),
 }
 
 async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()> {
@@ -910,6 +948,8 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
                 Job::Codex(entry.payload.clone())
             }
             Kind::X(specs) => {
+                let mode = xpolicy::proof_mode(&entry.payload)?;
+                if mode == ProofMode::Proxy && !config.x_proxy_experiment { bail!("X Proxy experiments are disabled"); }
                 let Status::XRead { remaining_attempts, complete, .. } = &mut entry.status else {
                     bail!("session is in an unexpected state")
                 };
@@ -922,7 +962,7 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
                 if *remaining_attempts == 0 {
                     s.by_token.remove(token);
                 }
-                Job::X(specs.clone())
+                Job::X(specs.clone(), mode)
             }
         };
         entry.in_flight += 1;
@@ -961,8 +1001,8 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
                 s.commit(&key)?;
             }
         }
-        Job::X(specs) => {
-            let outcome = match tokio::time::timeout(limit, verify_x(socket)).await {
+        Job::X(specs, mode) => {
+            let outcome = match tokio::time::timeout(limit, verify_x(socket, mode)).await {
                 // Parse the response before taking the lock that every session shares.
                 Ok(Ok((exchange, sent_bytes, received_bytes))) => Ok((xpolicy::outcome(&exchange), exchange, sent_bytes, received_bytes)),
                 Ok(Err(_)) => Err("proof_rejected".into()),
@@ -1036,11 +1076,14 @@ async fn verify(socket: crate::control::Socket, job: &Value, upstream: &str) -> 
 }
 
 /// Returns the verified exchange and the transcript's sent and received sizes.
-async fn verify_x(socket: crate::control::Socket) -> Result<(Exchange, usize, usize)> {
-    let (server_name, transcript) = prove_session(socket, None).await?;
+async fn verify_x(socket: crate::control::Socket, mode: ProofMode) -> Result<(Exchange, usize, usize)> {
+    // Proxy's destination is fixed here, never accepted from supplier input.
+    let upstream = (mode == ProofMode::Proxy).then_some("x.com:443");
+    let (server_name, transcript) = prove_session(socket, upstream).await?;
     let sent_hidden: Vec<_> = transcript.sent_unauthed().iter().collect();
     let received_hidden: Vec<_> = transcript.received_unauthed().iter().collect();
     let (sent, received) = (transcript.sent_unsafe(), transcript.received_unsafe());
+    if sent.len() > MAX_SENT || received.len() > MAX_RECV { bail!("X transcript exceeds its limits"); }
     let exchange = xpolicy::check(&server_name, sent, &sent_hidden, received, &received_hidden)?;
     Ok((exchange, sent.len(), received.len()))
 }
