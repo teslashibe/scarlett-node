@@ -51,7 +51,21 @@ The harness initializes x-go once before measuring samples. Its public transacti
 
 Proxy samples require a separate verifier started with `SCARLETT_VERIFIER_X_PROXY_EXPERIMENT=1`. Their control payload includes `proof_mode: "proxy"` and `proof_policy: "x-proxy-experimental-v1"`; changing only the helper setting cannot downgrade a production MPC job. MPC allocation and preparation options are rejected on Proxy samples.
 
-The two-page workload uses one proven connection per page. The preparation hold measures a known job whose verifier session already exists. It does not demonstrate a production pool of generic prepared sessions. The numeric response-ready event measures a protocol stage; provisional buyer delivery needs a separate API experiment.
+The two-page workload uses one proven connection per page. The preparation hold measures a known job whose verifier session already exists. It does not demonstrate a production pool of generic prepared sessions. The numeric response-ready event measures a protocol stage. The separate buyer experiment below checks actual provisional HTTP delivery.
+
+## Buyer REST/MCP and provisional delivery
+
+Build the public node bridge independently of the private application:
+
+```sh
+go test -c -tags xperf -o /absolute/private/node-buyer-xperf.test ./internal/worker
+```
+
+The application's `networkperf` tests supply a newly funded synthetic `node-v1` acceptance through a private `0600` file, then invoke `TestBuyerBoundXPerformance` with `SCARLETT_BUYER_XPERF=1`, `SCARLETT_BUYER_X_LEASE_FILE`, `SCARLETT_BUYER_X_OUTPUT` and the locally configured helper, verifier, CA and X session. The bridge validates the acceptance and runs the existing X worker with minimal headers, a 32 KiB receive ceiling and three sent/online receive records. It keeps the exact accepted request, uses MPC and does not register a replacement job. The application independently reconciles the verifier receipt and tests its REST/MCP result and prepaid settlement. All users and money are synthetic in a fresh disposable database.
+
+For the provisional experiment, the application provides a loopback `SCARLETT_BUYER_PROVISIONAL_API` ending in `/experimental/provisional` and a private `SCARLETT_BUYER_PROVISIONAL_KEY_FILE`. The bridge opts into the helper's `provisional_response` field and reads its private stdout pipe. A single decoded response body arrives in a `response_provisional` event marked `state: unverified`, `verified: false` and `settled: false`. HTTP headers are excluded. The normal helper output remains a single final summary when this option is omitted; the option is refused for batched reads.
+
+The application experiment checks the job, attempt, fence, request hash, deadline and reserved balance before storing a preview. Its authenticated buyer HTTP endpoint must deliver that preview while the actual verifier receipt remains incomplete. Final REST/MCP results remain unavailable until reconciliation and settlement. The preview body must match the eventual independent receipt, and the preview endpoint withdraws it when the job leaves its leased state. These endpoints exist only in tagged local tests and do not enable production provisional delivery. The bridge never retries uncertain provider work. Reports contain fixed labels and numeric timing, byte and charge observations; provider bodies and raw diagnostics stay private.
 
 ## Two independent reads in one connection
 

@@ -62,6 +62,10 @@ pub struct Request {
     pub prepare_hold_ms: u64,
     #[serde(default)]
     pub response_ready_event: bool,
+    /// Opt-in private pipe delivery for an isolated buyer experiment. This is
+    /// explicitly unverified data and never substitutes for the final proof.
+    #[serde(default)]
+    pub provisional_response: bool,
     /// Explicit isolated pipeline; the registered verifier policy owns eligibility.
     #[serde(default)]
     pub batch_reads: usize,
@@ -108,6 +112,9 @@ fn validate_experiment(request: &Request) -> Result<()> {
     if request.batch_reads != 0 && (request.batch_reads != xpolicy::BATCH_READS || request.proof_mode != ProofMode::Mpc) {
         bail!("batch_reads requires exactly two MPC reads");
     }
+    if request.provisional_response && request.batch_reads != 0 {
+        bail!("provisional delivery requires one independent read");
+    }
     if request.prepare_hold_ms > 30_000 {
         bail!("prepare_hold_ms exceeds 30000");
     }
@@ -123,6 +130,18 @@ fn validate_experiment(request: &Request) -> Result<()> {
         bail!("MPC tuning options are not valid in Proxy mode");
     }
     Ok(())
+}
+
+fn provisional_response(response: &[u8], elapsed_ms: u128) -> Result<Option<serde_json::Value>> {
+    let (status, body) = xpolicy::response_body(response)?;
+    if status != 200 { return Ok(None); }
+    let parsed: serde_json::Value = serde_json::from_str(&body)?;
+    if parsed.get("data").and_then(|data| data.as_object()).is_none_or(|data| data.is_empty()) {
+        return Ok(None);
+    }
+    // Only the decoded body crosses this optional pipe. Headers can contain
+    // cookies, and the received bytes have not yet been proven to the verifier.
+    Ok(Some(serde_json::json!({"phase":"response_provisional", "state":"unverified", "verified":false, "settled":false, "http_status":status, "body":body, "elapsed_ms":elapsed_ms})))
 }
 
 async fn batch_handshake(socket: &mut crate::control::Socket) -> Result<()> {
@@ -218,6 +237,13 @@ pub async fn run(request: Request) -> Result<Summary> {
         if !complete(&response) { bail!("X response framing incomplete"); }
         if request.response_ready_event {
             eprintln!("{}", serde_json::json!({"phase":"response_ready", "elapsed_ms":started.elapsed().as_millis()}));
+        }
+        if request.provisional_response {
+            if let Some(event) = provisional_response(&response, started.elapsed().as_millis())? {
+                use std::io::Write;
+                println!("{event}");
+                std::io::stdout().flush()?;
+            }
         }
         // tlsn finalizes only once the server stream ends, and X may hold the
         // connection open indefinitely, so end it here.
@@ -334,6 +360,24 @@ fn reveal_requests(sent: &[u8], batch: bool) -> Result<Vec<Range<usize>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provisional_data_is_unverified_and_excludes_headers() {
+        let body = r#"{"data":{"fixture":"synthetic"}}"#;
+        let raw = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nSet-Cookie: PRIVATE_SESSION\r\n\r\n{body}", body.len());
+        let event = provisional_response(raw.as_bytes(), 123).unwrap().unwrap();
+        assert_eq!(event["state"], "unverified");
+        assert_eq!(event["verified"], false);
+        assert_eq!(event["settled"], false);
+        assert_eq!(event["elapsed_ms"], 123);
+        assert_eq!(event["body"], body);
+        assert!(!event.to_string().contains("PRIVATE_SESSION"));
+        assert!(provisional_response(b"HTTP/1.1 429 Rate Limited\r\nContent-Length: 2\r\n\r\n{}", 1).unwrap().is_none());
+        assert!(provisional_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}", 1).unwrap().is_none());
+        assert!(provisional_response(b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n{}", 1).is_err());
+        let value = serde_json::json!({"verifier":"localhost:1", "token":"a".repeat(64), "request":"", "batch_reads":2, "provisional_response":true});
+        assert!(validate_experiment(&serde_json::from_value(value).unwrap()).is_err());
+    }
 
     #[tokio::test]
     async fn batch_handshake_requires_the_exact_policy_acknowledgement() {
