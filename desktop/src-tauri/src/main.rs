@@ -2,6 +2,8 @@
 mod local_api;
 mod node;
 mod preferences;
+#[cfg(windows)]
+mod windows_autostart;
 use local_api::LocalApi;
 use node::{Error, Node};
 use preferences::{Data as PreferenceData, Preferences};
@@ -131,6 +133,18 @@ async fn set_desktop_autostart(
         manager.disable()
     }
     .map_err(|_| Error::AutostartUnavailable)?;
+    #[cfg(windows)]
+    if enabled {
+        let quoted = std::env::current_exe()
+            .map_err(|_| Error::AutostartUnavailable)
+            .and_then(|exe| {
+                windows_autostart::quote_registered_command(&app.package_info().name, &exe)
+            });
+        if let Err(error) = quoted {
+            let _ = manager.disable();
+            return Err(error);
+        }
+    }
     if manager
         .is_enabled()
         .map_err(|_| Error::AutostartUnavailable)?

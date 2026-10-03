@@ -120,6 +120,14 @@ jobs:
               "$GITHUB_WORKSPACE/desktop/src-tauri/target/debug" \
               "$GITHUB_WORKSPACE/desktop/src-tauri/target/debug"
           fi
+      - name: Validate installed Windows desktop and preferences without login
+        if: runner.os == 'Windows'
+        timeout-minutes: 12
+        shell: powershell
+        run: |
+          $installers = @(Get-ChildItem -LiteralPath desktop/src-tauri/target/debug/bundle/nsis -Filter '*.exe')
+          if ($installers.Count -ne 1) { throw 'Expected one native testing installer' }
+          & desktop/scripts/check-windows-install.ps1 -Installer $installers[0].FullName -EvidenceDirectory "$env:RUNNER_TEMP/scarlett-installed-evidence" -Preferences
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-testing-${{ matrix.platform }}
@@ -127,4 +135,5 @@ jobs:
             desktop/src-tauri/target/debug/bundle/dmg/*.dmg
             desktop/src-tauri/target/debug/bundle/nsis/*.exe
             desktop/src-tauri/runtime/COMPONENTS.json
+            ${{ runner.temp }}/scarlett-installed-evidence/*.json
           if-no-files-found: error
