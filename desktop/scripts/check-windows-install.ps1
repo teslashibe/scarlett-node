@@ -38,6 +38,11 @@ public static class ScarlettAcceptanceWindow {
         input.value.keyboard.key = key; input.value.keyboard.flags = up ? 2u : 0u;
         return input;
     }
+    private static Input Character(char value, bool up) {
+        Input input = new Input(); input.type = 1;
+        input.value.keyboard.scan = value; input.value.keyboard.flags = 4u | (up ? 2u : 0u);
+        return input;
+    }
     public static bool ModifiersReleased() {
         foreach (int key in new int[] { 0x10, 0x11, 0x12, 0x5B, 0x5C })
             if ((GetAsyncKeyState(key) & 0x8000) != 0) return false;
@@ -54,9 +59,21 @@ public static class ScarlettAcceptanceWindow {
     public static void ControlKey(ushort key) {
         Send(new Input[] { Key(0x11, false), Key(key, false), Key(key, true), Key(0x11, true) });
     }
-    public static void SelectAllAndClear() {
-        Send(new Input[] { Key(0x11, false), Key(0x41, false), Key(0x41, true), Key(0x11, true),
-            Key(0x08, false), Key(0x08, true) });
+    private static Input[] ClearInputs() {
+        return new Input[] { Key(0x11, false), Key(0x41, false), Key(0x41, true), Key(0x11, true),
+            Key(0x08, false), Key(0x08, true) };
+    }
+    public static void SelectAllAndClear() { Send(ClearInputs()); }
+    public static void ReplaceText(string value) {
+        if (String.IsNullOrEmpty(value) || value.Length > 512)
+            throw new InvalidOperationException("Synthetic text length outside its bound");
+        Input[] inputs = new Input[6 + value.Length * 2];
+        Array.Copy(ClearInputs(), inputs, 6);
+        for (int index = 0; index < value.Length; index++) {
+            inputs[6 + index * 2] = Character(value[index], false);
+            inputs[7 + index * 2] = Character(value[index], true);
+        }
+        Send(inputs);
     }
 }
 '@
@@ -412,7 +429,6 @@ function Check-Preferences {
 }
 
 function Set-Text([string]$Name, [string]$Value) {
-    # Use the same text delivery already proved by the per-window probe.
     # WebView2 can advertise ValuePattern while SetValue fails to commit.
     # Only disposable fixtures call this helper, never real credentials.
     if ($Value -notmatch '^[a-z0-9-]+$' -or $Value.Length -gt 512) { throw 'Synthetic input contains unsupported characters' }
@@ -428,19 +444,10 @@ function Set-Text([string]$Name, [string]$Value) {
     Wait-Check {
         return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
     } 10 'Synthetic input did not acquire keyboard focus'
-    [ScarlettAcceptanceWindow]::SelectAllAndClear()
-    # Native keyboard events can still be queued when SendInput returns.
-    # Observe the ordinary field's empty value before sending the next text,
-    # as the per-window keyboard probe already does. Never read secret fields.
-    if (-not $control.Current.IsPassword) {
-        Wait-Check {
-            $current = Find-Input $Name
-            $pattern = $null
-            return $null -ne $current -and $current.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern) -and
-                $pattern.Current.Value -ceq ''
-        } 10 'Synthetic input did not clear before typing'
-    }
-    [System.Windows.Forms.SendKeys]::SendWait($Value)
+    # Queue selection, clearing and Unicode text in one ordered native input
+    # batch. An already-empty field cannot acknowledge queued clearing, and
+    # mixing SendInput with SendKeys can lose text despite successful focus.
+    [ScarlettAcceptanceWindow]::ReplaceText($Value)
     # Masked cookie fields may refuse value readback. Exact persistence is
     # checked against the synthetic fixture after the Connect action.
     if (-not $control.Current.IsPassword) {
