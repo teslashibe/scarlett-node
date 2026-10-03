@@ -11,6 +11,8 @@
     "allow-connect-codex",
     "allow-remove-account",
     "allow-cancel-login",
+    "allow-control-local-api",
+    "allow-local-api-key",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

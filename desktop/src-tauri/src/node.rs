@@ -106,6 +106,9 @@ pub enum Error {
     NotPaired,
     LoginBusy,
     LoginFailed,
+    ApiUnavailable,
+    ApiNotReady,
+    ModeConflict,
     #[cfg(unix)]
     PrivateStorageUnavailable,
     #[cfg(windows)]
@@ -121,6 +124,7 @@ pub struct Account {
 }
 #[derive(Clone, Serialize, Default)]
 pub struct Snapshot {
+    pub local_api: crate::local_api::Snapshot,
     pub runtime_available: bool,
     pub accounts_available: bool,
     pub helper_available: bool,
@@ -168,7 +172,7 @@ fn valid_selection(service: &str, id: &str, concurrency: u8) -> Result<()> {
     }
     Ok(())
 }
-fn private_dir(path: &Path) -> Result<()> {
+pub(crate) fn private_dir(path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         let _ = path;
@@ -195,7 +199,7 @@ fn private_dir(path: &Path) -> Result<()> {
         }
     }
 }
-fn regular(path: &Path) -> bool {
+pub(crate) fn regular(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
 }
 fn account_projection(raw: &[u8]) -> Result<Vec<Account>> {

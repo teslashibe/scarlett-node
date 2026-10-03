@@ -90,6 +90,12 @@ jobs:
           npm --prefix desktop run build
           cargo +1.95 test --locked --manifest-path desktop/src-tauri/Cargo.toml
           cargo +1.95 clippy --locked --all-targets --manifest-path desktop/src-tauri/Cargo.toml -- -D warnings
+      - name: Validate native desktop API supervision without account login
+        if: runner.os == 'macOS'
+        env:
+          SCARLETT_NATIVE_API_TEST: ${{ runner.temp }}/scarlett-runtime/open-agent-api
+          SCARLETT_NATIVE_RESOURCE_TEST: ${{ github.workspace }}/desktop/src-tauri/runtime
+        run: cargo +1.95 test --locked --manifest-path desktop/src-tauri/Cargo.toml local_api::tests::native_api_supervisor_uses_disposable_profiles_and_stops -- --ignored
       - name: Build installer for testing
         working-directory: desktop
         run: npm run tauri build -- --debug --config src-tauri/tauri.complete.generated.json

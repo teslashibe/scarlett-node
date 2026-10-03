@@ -9,6 +9,8 @@ fn main() {
             "connect_codex",
             "remove_account",
             "cancel_login",
+            "control_local_api",
+            "local_api_key",
         ]),
     ))
     .expect("desktop build configuration");
