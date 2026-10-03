@@ -113,8 +113,17 @@ function Focus-QuitShortcut {
     Wait-Check {
         return [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
     } 10 'Installed desktop did not acquire foreground input for Quit'
+    # API readiness precedes the renderer's status refresh; wait for its actual
+    # control readiness rather than treating a temporarily busy UI as failure.
+    Wait-Check {
+        $control = Find-Button 'Stop local API'
+        return $null -ne $control -and $control.Current.IsEnabled
+    } 20 'Quit focus control did not become available'
     $target = Find-Button 'Stop local API'
-    if (-not $target -or -not $target.Current.IsEnabled) { throw 'Quit focus control unavailable' }
+    $scroll = $null
+    if ($target.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) {
+        $scroll.ScrollIntoView()
+    }
     $target.SetFocus()
     Wait-Check {
         $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
