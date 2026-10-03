@@ -62,6 +62,9 @@ pub struct Request {
     pub prepare_hold_ms: u64,
     #[serde(default)]
     pub response_ready_event: bool,
+    /// Explicit isolated pipeline; the registered verifier policy owns eligibility.
+    #[serde(default)]
+    pub batch_reads: usize,
 }
 
 #[derive(Default, Serialize)]
@@ -90,9 +93,21 @@ pub struct Summary {
     pub proof_mode: ProofMode,
     pub timings_ms: Timings,
     pub execution_ms: u128,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub batch_exchanges: Vec<BatchExchange>,
+}
+
+#[derive(Serialize)]
+pub struct BatchExchange {
+    pub response: String,
+    pub sent_bytes: usize,
+    pub received_bytes: usize,
 }
 
 fn validate_experiment(request: &Request) -> Result<()> {
+    if request.batch_reads != 0 && (request.batch_reads != xpolicy::BATCH_READS || request.proof_mode != ProofMode::Mpc) {
+        bail!("batch_reads requires exactly two MPC reads");
+    }
     if request.prepare_hold_ms > 30_000 {
         bail!("prepare_hold_ms exceeds 30000");
     }
@@ -110,12 +125,32 @@ fn validate_experiment(request: &Request) -> Result<()> {
     Ok(())
 }
 
+async fn batch_handshake(socket: &mut crate::control::Socket) -> Result<()> {
+    socket.write_all(xpolicy::BATCH_PREFACE).await?;
+    let mut ack = vec![0; xpolicy::BATCH_ACK.len()];
+    tokio::time::timeout(Duration::from_secs(10), tokio::io::AsyncReadExt::read_exact(socket, &mut ack)).await.context("batch acknowledgement timed out")??;
+    if ack != xpolicy::BATCH_ACK { bail!("verifier did not acknowledge the batch policy"); }
+    Ok(())
+}
+
 pub async fn run(request: Request) -> Result<Summary> {
     validate_experiment(&request)?;
     let raw = STANDARD.decode(request.request.as_bytes()).context("request is not base64")?;
     if raw.len() > MAX_SENT || !raw.starts_with(b"GET /i/api/graphql/") {
         bail!("request must be an X GraphQL GET of at most {MAX_SENT} bytes");
     }
+    let request_ranges = if request.batch_reads == xpolicy::BATCH_READS {
+        let ranges = xpolicy::batch_request_ranges(&raw)?;
+        // Validate both reads before opening any provider connection. The
+        // fixture response is used only for local request policy parsing.
+        for range in &ranges {
+            xpolicy::check(HOST, &raw[range.clone()], &[], b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}", &[])?;
+        }
+        ranges
+    } else {
+        vec![0..raw.len()]
+    };
+    let complete = |response: &[u8]| if request.batch_reads != 0 { xpolicy::batch_response_ranges(response).is_ok() } else { xpolicy::response_complete(response) };
     if request.token.len() != 64 || !request.token.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("verifier token must be 64 hex characters");
     }
@@ -125,6 +160,7 @@ pub async fn run(request: Request) -> Result<Summary> {
 
     let (mut socket, traffic) = crate::control::connect_named(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture, request.verifier_server_name.as_deref()).await?;
     socket.write_all(format!("{}\n", request.token).as_bytes()).await?;
+    if request.batch_reads != 0 { batch_handshake(&mut socket).await?; }
     timings.control_connect = started.elapsed().as_millis();
     let (driver, mut handle) = Session::new(socket.compat()).split();
     let mut session = Driver::new(tokio::spawn(driver));
@@ -166,7 +202,7 @@ pub async fn run(request: Request) -> Result<Summary> {
         let phase = Instant::now();
         tokio::time::timeout(std::time::Duration::from_secs(120), async {
             let mut chunk = [0u8; 16 << 10];
-            while !xpolicy::response_complete(&response) {
+            while !complete(&response) {
                 let n = tls.read(&mut chunk).await?;
                 if n == 0 {
                     break;
@@ -179,7 +215,7 @@ pub async fn run(request: Request) -> Result<Summary> {
         .await
         .context("timed out waiting for X")??;
         timings.response_read = phase.elapsed().as_millis();
-        if !xpolicy::response_complete(&response) { bail!("X response framing incomplete"); }
+        if !complete(&response) { bail!("X response framing incomplete"); }
         if request.response_ready_event {
             eprintln!("{}", serde_json::json!({"phase":"response_ready", "elapsed_ms":started.elapsed().as_millis()}));
         }
@@ -195,7 +231,7 @@ pub async fn run(request: Request) -> Result<Summary> {
         let received_bytes = prover.transcript().received().len();
         let mut builder = ProveConfig::builder(prover.transcript());
         builder.server_identity();
-        for range in reveal(&sent)? {
+        for range in reveal_requests(&sent, request.batch_reads != 0)? {
             builder.reveal_sent(&range)?;
         }
         builder.reveal_recv(&(0..received_bytes))?;
@@ -210,6 +246,11 @@ pub async fn run(request: Request) -> Result<Summary> {
     timings.finalize = phase.elapsed().as_millis();
     timings.total = started.elapsed().as_millis();
 
+    let batch_exchanges = if request.batch_reads != 0 {
+        let responses = xpolicy::batch_response_ranges(&response)?;
+        request_ranges.into_iter().zip(responses).map(|(sent, recv)| BatchExchange { response: STANDARD.encode(&response[recv.clone()]), sent_bytes: sent.len(), received_bytes: recv.len() }).collect()
+    } else { Vec::new() };
+
     Ok(Summary {
         verifier_transport: traffic.snapshot(),
         status: "proof_sent",
@@ -220,6 +261,7 @@ pub async fn run(request: Request) -> Result<Summary> {
         proof_mode: request.proof_mode,
         timings_ms: timings,
         execution_ms: execution_started.elapsed().as_millis(),
+        batch_exchanges,
     })
 }
 
@@ -280,9 +322,36 @@ fn reveal(sent: &[u8]) -> Result<Vec<Range<usize>>> {
     Ok(ranges.into_iter().filter(|r| !r.is_empty()).collect())
 }
 
+fn reveal_requests(sent: &[u8], batch: bool) -> Result<Vec<Range<usize>>> {
+    if !batch { return reveal(sent); }
+    let mut ranges = Vec::new();
+    for request in xpolicy::batch_request_ranges(sent)? {
+        ranges.extend(reveal(&sent[request.clone()])?.into_iter().map(|r| r.start + request.start..r.end + request.start));
+    }
+    Ok(ranges)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn batch_handshake_requires_the_exact_policy_acknowledgement() {
+        for valid in [true,false] {
+            let (socket,mut peer)=tokio::io::duplex(128);
+            let mut socket: crate::control::Socket=Box::new(socket);
+            let server=tokio::spawn(async move {
+                let mut preface=vec![0;xpolicy::BATCH_PREFACE.len()];
+                tokio::io::AsyncReadExt::read_exact(&mut peer,&mut preface).await.unwrap();
+                assert_eq!(preface,xpolicy::BATCH_PREFACE);
+                let mut ack=xpolicy::BATCH_ACK.to_vec();
+                if !valid { ack[0]=b'!'; }
+                peer.write_all(&ack).await.unwrap();
+            });
+            assert_eq!(batch_handshake(&mut socket).await.is_ok(),valid);
+            server.await.unwrap();
+        }
+    }
 
     #[test]
     fn tuning_is_bounded_and_mpc_only() {
@@ -315,5 +384,21 @@ mod tests {
         assert_eq!(shown, "GET /i/api/graphql/q/Viewer HTTP/1.1\r\nHost: x.com\r\nX-Csrf-Token: \r\nCookie: auth_token=; ct0=; twid=u%3D1; kdt=\r\n\r\n");
         let long = format!("GET / HTTP/1.1\r\nCookie: auth_token={}\r\n\r\n", "a".repeat(65));
         assert!(reveal(long.as_bytes()).is_err(), "an overlong secret was hidden");
+    }
+
+    #[test]
+    fn batch_redaction_never_reveals_request_two_secrets() {
+        let first = b"GET /i/api/graphql/q/Viewer?variables=%7B%7D&features=%7B%7D HTTP/1.1\r\nHost: x.com\r\nConnection: keep-alive\r\nX-Csrf-Token: FIRST_CSRF\r\nCookie: auth_token=FIRST_AUTH; ct0=FIRST_CSRF; kdt=FIRST_KDT\r\n\r\n";
+        let second = b"GET /i/api/graphql/q/TweetResultByRestId?variables=%7B%22tweetId%22%3A%2220%22%7D&features=%7B%7D HTTP/1.1\r\nHost: x.com\r\nConnection: close\r\nX-Csrf-Token: SECOND_CSRF\r\nCookie: auth_token=SECOND_AUTH; ct0=SECOND_CSRF; kdt=SECOND_KDT\r\n\r\n";
+        let sent = [first.as_slice(), second.as_slice()].concat();
+        let ranges = reveal_requests(&sent, true).unwrap();
+        let shown: Vec<u8> = ranges.iter().flat_map(|r| sent[r.clone()].to_vec()).collect();
+        assert!(!String::from_utf8(shown).unwrap().contains("FIRST_"));
+        let shown: Vec<u8> = ranges.iter().flat_map(|r| sent[r.clone()].to_vec()).collect();
+        assert!(!String::from_utf8(shown).unwrap().contains("SECOND_"));
+        let mut blank = sent.clone();
+        let hidden: Vec<_> = (0..sent.len()).filter(|i| !ranges.iter().any(|r| r.contains(i))).map(|i| { blank[i] = 0; i..i+1 }).collect();
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n{\"data\":{}}";
+        assert!(xpolicy::check_batch(HOST, &blank, &hidden, &[response.as_slice(),response.as_slice()].concat(), &[]).is_ok());
     }
 }

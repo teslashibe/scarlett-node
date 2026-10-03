@@ -56,8 +56,11 @@ def outcome_interval(successes, attempts):
 def summarize(rows):
     groups = {}
     for row in rows:
-        if row.get("schema") != 1 or row.get("mode") not in ("mpc", "proxy") or row.get("headers") not in ("normal", "minimal") or row.get("workload") not in ("search", "empty", "profile", "post", "pagination") or not isinstance(row.get("verified"), bool):
+        if row.get("schema") != 1 or row.get("mode") not in ("mpc", "proxy") or row.get("headers") not in ("normal", "minimal") or row.get("workload") not in ("search", "empty", "profile", "post", "pagination", "batch") or not isinstance(row.get("verified"), bool):
             raise ValueError("invalid experiment labels")
+        batch = number(dict(row, batch_reads=row.get("batch_reads", 0)), "batch_reads", 2)
+        if batch not in (0, 2) or (row["workload"] == "batch") != (batch == 2) or batch == 2 and row["mode"] != "mpc":
+            raise ValueError("invalid batch variant")
         profile = row.get("network_profile", "direct")
         if profile not in PROFILES or option(row, "simulated_one_way_delay_ms", PROFILES[profile], 80) != PROFILES[profile]:
             raise ValueError("invalid simulated topology")
@@ -77,7 +80,7 @@ def summarize(rows):
         key = (row["mode"], row["headers"], row["workload"],
                number(row, "max_recv", 256 << 10), number(row, "max_sent_records", 32),
                number(row, "max_recv_records_online", 32), number(row, "prepare_hold_ms", 30000),
-               concurrency, account_capacity, receipt_capacity, sustained, profile, bandwidth)
+               concurrency, account_capacity, receipt_capacity, sustained, profile, bandwidth, batch)
         groups.setdefault(key, []).append(row)
     result = []
     for key, values in sorted(groups.items()):
@@ -104,7 +107,7 @@ def summarize(rows):
             observed_peak = max(observed_peak, window_peak)
             sustained_passed.append(key[10] >= 60 and elapsed >= key[10] and len(window) >= 30 and all(v["verified"] and v.get("status") == "verified" for v in window) and not any(v.get("__run_stopped", False) for v in window))
         metered = [v for v in good if v.get("verifier_telemetry_complete") is True]
-        row = dict(zip(("mode", "headers", "workload", "max_recv", "max_sent_records", "max_recv_records_online", "prepare_hold_ms", "concurrency", "account_capacity", "receipt_capacity", "sustained_seconds", "network_profile", "bandwidth_bytes_second"), key))
+        row = dict(zip(("mode", "headers", "workload", "max_recv", "max_sent_records", "max_recv_records_online", "prepare_hold_ms", "concurrency", "account_capacity", "receipt_capacity", "sustained_seconds", "network_profile", "bandwidth_bytes_second", "batch_reads"), key))
         row.update({"attempted_jobs": len(values), "verified_jobs": len(good), "failed_jobs": len(values) - len(good),
                     "successful_samples_below_30": len(good) < 30,
                     "verified_fraction_wilson_95_interval": outcome_interval(len(good), len(values)),
@@ -184,6 +187,9 @@ def self_test():
             pass
         else:
             raise AssertionError("unsupported capacity or topology was accepted")
+    batch = dict(base, workload="batch", batch_reads=2, exchanges=2)
+    batch_group = summarize([batch])["groups"][0]
+    assert batch_group["batch_reads"] == 2 and batch_group["verified_reads_per_second"] == 20
     print('{"offline_report_tests_passed":true}')
 
 

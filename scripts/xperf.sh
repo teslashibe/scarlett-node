@@ -46,6 +46,9 @@ def option(name, default, minimum, maximum):
 concurrency = option("SCARLETT_XPERF_CONCURRENCY", 1, 1, 4)
 if concurrency not in (1, 2, 4):
     raise SystemExit("invalid experiment concurrency")
+batch_reads = option("SCARLETT_XPERF_BATCH_READS", 0, 0, 2)
+if batch_reads not in (0, 2):
+    raise SystemExit("invalid experiment batch size")
 sustained = option("SCARLETT_XPERF_SUSTAINED_SECONDS", 0, 0, 3600)
 if sustained and sustained < 60:
     raise SystemExit("sustained window must be at least 60 seconds")
@@ -57,6 +60,7 @@ manifest = {"schema": 1, "source_revision": revision,
             "source_modified": bool(diff), "helper_sha256": digest.hexdigest(),
             "bootstrap": "unproven_once_outside_samples", "funding": "none",
             "production_policy": "unchanged", "concurrency": concurrency,
+            "batch_reads": batch_reads,
             "account_capacity": option("SCARLETT_XPERF_ACCOUNT_CAPACITY", 1, 1, 4),
             "receipt_capacity": option("SCARLETT_XPERF_RECEIPT_CAPACITY", 1, 1, 4),
             "min_gap_ms": option("SCARLETT_XPERF_MIN_GAP_MS", 1000, 0, 60000),

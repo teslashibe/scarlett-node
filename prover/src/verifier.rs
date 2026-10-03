@@ -61,6 +61,7 @@ struct Config {
     concurrency: usize,
     slots: Arc<tokio::sync::Semaphore>,
     x_proxy_experiment: bool,
+    x_batch_experiment: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -116,6 +117,7 @@ struct Entry {
     status: Status,
     expires_ms: u64,
     fence: String,
+    /// Logical attempts reserved before execution; a batch connection owns two.
     in_flight: usize,
 }
 
@@ -186,6 +188,60 @@ fn validate_receipt(kind: &Kind, status: &Status, in_flight: usize) -> Result<()
         _ => bail!("receipt status does not match the job"),
     }
 }
+
+fn validate_batch_receipt(payload: &Value, status: &Status, in_flight: usize) -> Result<()> {
+    if !xpolicy::batch(payload) { return Ok(()); }
+    let Status::XRead { remaining_attempts, exchanges, rejections, .. } = status else {
+        if matches!(status, Status::Expired) && in_flight == 0 { return Ok(()); }
+        bail!("invalid batch receipt state");
+    };
+    match (*remaining_attempts, in_flight, exchanges.len() + rejections.len()) {
+        (2, 0, 0) | (0, 2, 0) | (0, 0, 2) => Ok(()),
+        _ => bail!("invalid batch logical attempt reservation"),
+    }
+}
+
+fn reserve_x(entry: &mut Entry, batch: bool) -> Result<usize> {
+    let reads = if batch { xpolicy::BATCH_READS } else { 1 };
+    let Status::XRead { remaining_attempts, complete, .. } = &mut entry.status else { bail!("session is in an unexpected state"); };
+    if *complete || *remaining_attempts < reads || batch && entry.in_flight != 0 { bail!("x.read session has no attempts left"); }
+    *remaining_attempts -= reads;
+    entry.in_flight += reads;
+    Ok(reads)
+}
+
+/// Atomic completion of exactly the two reserved reads. Transcript failure
+/// rejects both; HTTP failures or exact-request mismatches remain per read.
+fn finish_x_batch(entry: &mut Entry, specs: &[Spec], result: Result<Vec<(Exchange, usize, usize)>, String>, duration_ms: u64) -> Result<()> {
+    validate_batch_receipt(&entry.payload, &entry.status, entry.in_flight)?;
+    if entry.in_flight != xpolicy::BATCH_READS { bail!("batch reservation missing"); }
+    let Status::XRead { complete, pending, exchanges, rejections, .. } = &mut entry.status else { bail!("batch status missing"); };
+    let outcomes = match result {
+        Ok(values) if values.len() == xpolicy::BATCH_READS => values.into_iter().map(Ok).collect(),
+        Ok(_) => vec![Err("proof_rejected".into()); xpolicy::BATCH_READS],
+        Err(reason) => vec![Err(reason); xpolicy::BATCH_READS],
+    };
+    for (expected, value) in outcomes.into_iter().enumerate() {
+        let matched = value.and_then(|(exchange, sent_bytes, received_bytes)| {
+            let (fulfilled, cursors) = xpolicy::outcome(&exchange);
+            let done: Vec<_> = exchanges.iter().filter(|r| r.fulfilled).map(|r| (r.index, &r.exchange, r.cursors.as_slice())).collect();
+            let index = xpolicy::assign(specs, &done, &exchange).map_err(|_| "exchange_mismatch".to_owned())?;
+            if index != expected { return Err("exchange_mismatch".into()); }
+            Ok(XRecord { index, fulfilled, exchange, cursors, sent_bytes, received_bytes, duration_ms })
+        });
+        match matched {
+            Ok(record) => {
+                if record.fulfilled { pending.retain(|&i| i != record.index); }
+                exchanges.push(record);
+            }
+            Err(reason) => rejections.push(reason),
+        }
+    }
+    *complete = pending.is_empty();
+    entry.in_flight = 0;
+    validate_receipt(&entry.kind, &entry.status, 0)?;
+    validate_batch_receipt(&entry.payload, &entry.status, 0)
+}
 impl Sessions {
     fn restore(store: Store, records: Vec<Record>) -> Result<Self> {
         let mut s = Self { store: Some(store), ..Self::default() };
@@ -194,16 +250,25 @@ impl Sessions {
             if r.expires_ms > now.saturating_add(MAX_TTL.as_millis() as u64) {
                 bail!("verifier receipt expiry exceeds the session bound");
             }
-            if r.in_flight == 0 && r.status["reason"] != "execution_uncertain" && now > r.expires_ms.saturating_add(verifier_store::RETENTION_MS) {
+            if r.in_flight == 0 && r.status["reason"] != "execution_uncertain" && !r.status["rejections"].as_array().is_some_and(|v| v.iter().any(|reason| reason == "execution_uncertain")) && now > r.expires_ms.saturating_add(verifier_store::RETENTION_MS) {
                 s.store.as_mut().unwrap().remove(&r.job_id, &r.attempt)?;
                 continue;
             }
             let (kind, _) = kind(&r.payload, true)?;
             let mut status: Status = serde_json::from_value(r.status)?;
             validate_receipt(&kind, &status, r.in_flight)?;
+            validate_batch_receipt(&r.payload, &status, r.in_flight)?;
             let mut token = r.token;
             if r.in_flight > 0 || matches!(status, Status::Running) {
-                status = Status::Rejected { reason: "execution_uncertain".into() };
+                if xpolicy::batch(&r.payload) {
+                    let Status::XRead { rejections, .. } = &mut status else { bail!("invalid batch recovery state"); };
+                    // Each reserved read stays spent. No proof result exists after
+                    // an interrupted connection, so neither read can be fulfilled.
+                    rejections.extend((0..r.in_flight).map(|_| "execution_uncertain".into()));
+                    validate_receipt(&kind, &status, 0)?;
+                } else {
+                    status = Status::Rejected { reason: "execution_uncertain".into() };
+                }
                 token = None;
             }
             if let Status::XRead { exchanges, .. } = &mut status {
@@ -273,7 +338,7 @@ impl Sessions {
         let stale: Vec<_> = self
             .by_job
             .iter()
-            .filter(|(_, e)| e.in_flight == 0 && !matches!(&e.status, Status::Rejected { reason } if reason == "execution_uncertain") && now > e.expires_ms.saturating_add(retention))
+            .filter(|(_, e)| e.in_flight == 0 && !matches!(&e.status, Status::Rejected { reason } if reason == "execution_uncertain") && !matches!(&e.status, Status::XRead { rejections, .. } if rejections.iter().any(|r| r == "execution_uncertain")) && now > e.expires_ms.saturating_add(retention))
             .map(|(k, _)| k.clone())
             .collect();
         for key in stale {
@@ -321,6 +386,7 @@ mod durable_tests {
                 concurrency: 64,
                 slots: Arc::new(tokio::sync::Semaphore::new(64)),
                 x_proxy_experiment: false,
+                x_batch_experiment: false,
             },
             Mutex::new(Sessions::restore(store, records).unwrap()),
         ))
@@ -338,6 +404,201 @@ mod durable_tests {
             expires_at_ms: Some(expires),
             ttl_seconds: None,
             payload: json!({"type":"response.create","model":"synthetic-model"}),
+        }
+    }
+    fn batch_request(expires: u64) -> CreateRequest {
+        let mut r = request(expires);
+        r.payload = json!({"type":"x.read", "proof_mode":"mpc", "proof_policy":xpolicy::BATCH_EXPERIMENT_POLICY, "max_attempts":2, "exchanges":[
+            {"operation":"UserByScreenName","query_id":"fixture_profile","variables":{"screen_name":"jack"},"features":{}},
+            {"operation":"TweetResultByRestId","query_id":"fixture_post","variables":{"tweetId":"20"},"features":{}}
+        ]});
+        r
+    }
+    fn batch_values(specs: &[Spec]) -> Vec<(Exchange, usize, usize)> {
+        specs.iter().map(|s| (Exchange { operation:s.operation.clone(), query_id:s.query_id.clone(), variables:s.variables.clone(), features:Some(s.features.clone()), field_toggles:s.field_toggles.clone(), http_status:200, body:"{\"data\":{\"synthetic\":true}}".into() }, 100, 100)).collect()
+    }
+    #[test]
+    fn batch_receipt_rejects_a_half_reserved_connection() {
+        let payload=batch_request(now_ms()+30_000).payload;
+        let (kind,mut status)=kind(&payload,true).unwrap();
+        let Status::XRead { remaining_attempts,.. }=&mut status else { panic!("X required") };
+        *remaining_attempts=1;
+        // The ordinary conserved count alone cannot bind one connection to two reads.
+        validate_receipt(&kind,&status,1).unwrap();
+        assert!(validate_batch_receipt(&payload,&status,1).is_err());
+    }
+    #[tokio::test]
+    async fn batch_requires_server_flag_and_durable_store() {
+        let dir = Temp::new();
+        let mut s = shared(&dir.0);
+        assert_eq!(create(State(s.clone()), headers(), Json(batch_request(now_ms()+30_000))).await.0, StatusCode::BAD_REQUEST);
+        Arc::get_mut(&mut s).unwrap().0.x_batch_experiment = true;
+        assert_eq!(create(State(s.clone()), headers(), Json(batch_request(now_ms()+30_000))).await.0, StatusCode::CREATED);
+        let (_, Json(view)) = status(State(s.clone()), headers(), Path(("synthetic".into(),"1".into()))).await;
+        assert_eq!(view["proof_mode"], "mpc");
+        assert_eq!(view["proof_policy"], xpolicy::BATCH_EXPERIMENT_POLICY);
+        assert_eq!(view["remaining_attempts"], 2);
+        assert!(s.1.lock().unwrap().by_token.len() == 1);
+        // Even an enabled experimental flag cannot make volatile accounting eligible.
+        let volatile_dir = Temp::new();
+        let mut volatile = shared(&volatile_dir.0);
+        Arc::get_mut(&mut volatile).unwrap().0.x_batch_experiment = true;
+        volatile.1.lock().unwrap().store = None;
+        assert_eq!(create(State(volatile), headers(), Json(batch_request(now_ms()+30_000))).await.0, StatusCode::BAD_REQUEST);
+    }
+    #[tokio::test]
+    async fn batch_reserves_both_reads_before_execution_and_crash_spends_both() {
+        let dir = Temp::new();
+        let mut s = shared(&dir.0);
+        Arc::get_mut(&mut s).unwrap().0.x_batch_experiment = true;
+        let (_, Json(created)) = create(State(s.clone()), headers(), Json(batch_request(now_ms()+30_000))).await;
+        let token = created["token"].as_str().unwrap().to_owned();
+        let key = job_key("synthetic","1");
+        {
+            let mut sessions = s.1.lock().unwrap();
+            let entry = sessions.by_job.get_mut(&key).unwrap();
+            assert_eq!(reserve_x(entry, true).unwrap(),2);
+            assert!(reserve_x(entry, true).is_err(), "concurrent batch reused reservation");
+            validate_receipt(&entry.kind, &entry.status, 2).unwrap();
+            sessions.by_token.remove(&token);
+            sessions.commit(&key).unwrap();
+        }
+        drop(s);
+        let s = shared(&dir.0);
+        {
+            let sessions = s.1.lock().unwrap();
+            assert!(sessions.by_token.is_empty());
+            let entry = &sessions.by_job[&key];
+            validate_receipt(&entry.kind, &entry.status, 0).unwrap();
+            assert!(matches!(&entry.status, Status::XRead { complete:false, remaining_attempts:0, rejections, exchanges, .. } if rejections == &["execution_uncertain","execution_uncertain"] && exchanges.is_empty()));
+        }
+        {
+            let mut sessions=s.1.lock().unwrap();
+            let entry=sessions.by_job.get_mut(&key).unwrap();
+            entry.expires=Instant::now();
+            entry.expires_ms=now_ms()-verifier_store::RETENTION_MS-1;
+            sessions.commit(&key).unwrap();
+            sessions.purge().unwrap();
+            assert_eq!(sessions.by_job.len(),1,"uncertain batch receipt was discarded");
+        }
+        let (_,Json(view))=status(State(s.clone()),headers(),Path(("synthetic".into(),"1".into()))).await;
+        assert_eq!(view["rejections"],json!(["execution_uncertain","execution_uncertain"]));
+        drop(s);
+        let mut s = shared(&dir.0);
+        Arc::get_mut(&mut s).unwrap().0.x_batch_experiment = true;
+        assert!(s.1.lock().unwrap().by_token.is_empty(), "second restart restored spent token");
+        assert_eq!(create(State(s), headers(), Json(batch_request(now_ms()+30_000))).await.0, StatusCode::CONFLICT);
+    }
+    #[tokio::test]
+    async fn batch_conserves_partial_http_failure_mismatch_and_protocol_failure() {
+        for failure in ["none","http","mismatch","protocol","truncated"] {
+            let dir = Temp::new();
+            let mut s = shared(&dir.0);
+            Arc::get_mut(&mut s).unwrap().0.x_batch_experiment = true;
+            assert_eq!(create(State(s.clone()), headers(), Json(batch_request(now_ms()+30_000))).await.0, StatusCode::CREATED);
+            let key = job_key("synthetic","1");
+            {
+                let mut sessions = s.1.lock().unwrap();
+                let entry = sessions.by_job.get_mut(&key).unwrap();
+                let Kind::X(specs) = &entry.kind else { panic!("expected X"); };
+                let specs = specs.clone();
+                reserve_x(entry,true).unwrap();
+                sessions.by_token.clear();
+                sessions.commit(&key).unwrap();
+                let mut values = batch_values(&specs);
+                if failure == "http" { values[1].0.http_status=429; }
+                if failure == "mismatch" { values[1].0.variables["tweetId"]=json!("21"); }
+                if failure == "truncated" { values.pop(); }
+                let result = if failure == "protocol" { Err("proof_rejected".into()) } else { Ok(values) };
+                let entry = sessions.by_job.get_mut(&key).unwrap();
+                finish_x_batch(entry,&specs,result,1).unwrap();
+                let Status::XRead { complete, remaining_attempts, exchanges,rejections,.. } = &entry.status else { panic!("expected X status"); };
+                assert_eq!(*remaining_attempts,0);
+                assert_eq!(exchanges.len()+rejections.len(),2);
+                assert_eq!(*complete,failure == "none");
+                if failure == "http" { assert_eq!(exchanges.len(),2); assert!(!exchanges[1].fulfilled); }
+                if failure == "mismatch" { assert_eq!(exchanges.len(),1); assert_eq!(rejections.len(),1); }
+                if failure == "protocol" || failure == "truncated" { assert_eq!(rejections.len(),2); }
+                sessions.commit(&key).unwrap();
+            }
+            drop(s);
+            let s=shared(&dir.0);
+            let sessions=s.1.lock().unwrap();
+            let entry=&sessions.by_job[&key];
+            validate_receipt(&entry.kind,&entry.status,0).unwrap();
+            validate_batch_receipt(&entry.payload,&entry.status,0).unwrap();
+            assert!(sessions.by_token.is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn batch_connection_failure_spends_two_and_token_replay_fails() {
+        use tokio::io::AsyncWriteExt;
+        let dir=Temp::new();
+        let mut s=shared(&dir.0);
+        Arc::get_mut(&mut s).unwrap().0.x_batch_experiment=true;
+        Arc::get_mut(&mut s).unwrap().0.session_limit=Duration::from_secs(1);
+        let (_,Json(created))=create(State(s.clone()),headers(),Json(batch_request(now_ms()+30_000))).await;
+        let token=created["token"].as_str().unwrap();
+        let (socket,mut peer)=tokio::io::duplex(128);
+        peer.write_all(format!("{token}\n").as_bytes()).await.unwrap();
+        peer.write_all(xpolicy::BATCH_PREFACE).await.unwrap();
+        let task=tokio::spawn(handle(s.clone(),Box::new(socket)));
+        let mut ack=vec![0;xpolicy::BATCH_ACK.len()];
+        tokio::time::timeout(Duration::from_secs(5),peer.read_exact(&mut ack)).await.unwrap().unwrap();
+        assert_eq!(ack,xpolicy::BATCH_ACK);
+        // Acknowledgement follows the durable reservation, before crypto starts.
+        let name=format!("{}.json",verifier_store::hash(b"synthetic\n1"));
+        let stored:Record=serde_json::from_slice(&fs::read(dir.0.join(name)).unwrap()).unwrap();
+        assert_eq!(stored.in_flight,2);
+        assert_eq!(stored.status["remaining_attempts"],0);
+        assert!(stored.token.is_none());
+        let (_,Json(capacity))=capacity(State(s.clone()),headers()).await;
+        assert_eq!(capacity["in_flight_proofs"],1);
+        assert_eq!(capacity["in_flight_attempts"],2);
+        drop(peer);
+        task.await.unwrap().unwrap();
+        let (_,Json(view))=status(State(s.clone()),headers(),Path(("synthetic".into(),"1".into()))).await;
+        assert_eq!(view["remaining_attempts"],0);
+        let rejected=view["rejections"].as_array().unwrap();
+        assert_eq!(rejected.len(),2);
+        assert_eq!(rejected[0],rejected[1]);
+        assert!(rejected[0]=="proof_rejected" || rejected[0]=="session_timeout");
+        assert_eq!(view["complete"],false);
+        let (socket,mut peer)=tokio::io::duplex(128);
+        peer.write_all(format!("{token}\n").as_bytes()).await.unwrap();
+        assert!(handle(s,Box::new(socket)).await.is_err());
+    }
+    #[tokio::test]
+    async fn failed_batch_reservation_never_acknowledges_and_storage_failure_hides_success() {
+        use tokio::io::AsyncWriteExt;
+        for fail_at_reservation in [true,false] {
+            let dir=Temp::new();
+            let mut s=shared(&dir.0);
+            Arc::get_mut(&mut s).unwrap().0.x_batch_experiment=true;
+            let (_,Json(created))=create(State(s.clone()),headers(),Json(batch_request(now_ms()+30_000))).await;
+            let key=job_key("synthetic","1");
+            if fail_at_reservation {
+                fs::rename(&dir.0,dir.0.with_extension("moved")).unwrap();
+                let (socket,mut peer)=tokio::io::duplex(128);
+                peer.write_all(format!("{}\n",created["token"].as_str().unwrap()).as_bytes()).await.unwrap();
+                peer.write_all(xpolicy::BATCH_PREFACE).await.unwrap();
+                assert!(handle(s.clone(),Box::new(socket)).await.is_err());
+                let mut ack=[0;1];
+                assert_eq!(peer.read(&mut ack).await.unwrap(),0,"failed reservation acknowledged provider eligibility");
+            } else {
+                let mut sessions=s.1.lock().unwrap();
+                reserve_x(sessions.by_job.get_mut(&key).unwrap(),true).unwrap();
+                sessions.by_token.clear();
+                sessions.commit(&key).unwrap();
+                let entry=sessions.by_job.get_mut(&key).unwrap();
+                let Kind::X(specs)=&entry.kind else {panic!("X required")};
+                let specs=specs.clone();
+                finish_x_batch(entry,&specs,Ok(batch_values(&specs)),1).unwrap();
+                fs::rename(&dir.0,dir.0.with_extension("moved")).unwrap();
+                assert!(sessions.commit(&key).is_err());
+            }
+            assert_eq!(status(State(s.clone()),headers(),Path(("synthetic".into(),"1".into()))).await.0,StatusCode::SERVICE_UNAVAILABLE);
+            fs::rename(dir.0.with_extension("moved"),&dir.0).unwrap();
         }
     }
     #[tokio::test]
@@ -708,6 +969,7 @@ pub async fn run() -> Result<()> {
     }.validate()?;
     let concurrency = bounded_env("SCARLETT_VERIFIER_CONCURRENCY", 64, 1, 256)? as usize;
     let x_proxy_experiment = bounded_env("SCARLETT_VERIFIER_X_PROXY_EXPERIMENT", 0, 0, 1)? == 1;
+    let x_batch_experiment = bounded_env("SCARLETT_VERIFIER_X_BATCH_EXPERIMENT", 0, 0, 1)? == 1;
     let sessions = if let Ok(dir) = env::var("SCARLETT_VERIFIER_STATE_DIR") {
         let (store, records) = Store::open_with_limits(std::path::Path::new(&dir), limits)?;
         Sessions::restore(store, records)?
@@ -716,6 +978,9 @@ pub async fn run() -> Result<()> {
     };
     if !x_proxy_experiment && sessions.by_job.values().any(|entry| entry.payload["type"] == "x.read" && xpolicy::proof_mode(&entry.payload).ok() == Some(ProofMode::Proxy)) {
         bail!("experimental X Proxy receipts require the experiment verifier");
+    }
+    if !x_batch_experiment && sessions.by_job.values().any(|entry| xpolicy::batch(&entry.payload)) {
+        bail!("experimental X batch receipts require the experiment verifier");
     }
     if !api.parse::<std::net::SocketAddr>().is_ok_and(|a| a.ip().is_loopback()) {
         bail!("verifier API must bind loopback");
@@ -728,7 +993,7 @@ pub async fn run() -> Result<()> {
         (None, None) if plaintext && listen.parse::<std::net::SocketAddr>().is_ok_and(|a| a.ip().is_loopback()) => None,
         _ => bail!("verifier needs a TLS certificate/key or an explicit loopback plaintext fixture"),
     };
-    let shared: Shared = Arc::new((Config { key, upstream, session_limit: Duration::from_secs(limit), limits, concurrency, slots: Arc::new(tokio::sync::Semaphore::new(concurrency)), x_proxy_experiment }, Mutex::new(sessions)));
+    let shared: Shared = Arc::new((Config { key, upstream, session_limit: Duration::from_secs(limit), limits, concurrency, slots: Arc::new(tokio::sync::Semaphore::new(concurrency)), x_proxy_experiment, x_batch_experiment }, Mutex::new(sessions)));
     let cleanup = shared.clone();
     tokio::spawn(async move {
         loop {
@@ -812,6 +1077,9 @@ async fn create(State(shared): State<Shared>, headers: HeaderMap, Json(request):
     if request.payload["type"] == "x.read" && xpolicy::proof_mode(&request.payload).ok() == Some(ProofMode::Proxy) && !config.x_proxy_experiment {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"X Proxy experiments are disabled"})));
     }
+    if xpolicy::batch(&request.payload) && (!config.x_batch_experiment || !durable) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"X batch experiments require an enabled durable verifier"})));
+    }
     if durable && (request.fence.is_none() || request.expires_at_ms.is_none()) {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"durable sessions require a fence and absolute expiry"})));
     }
@@ -874,7 +1142,8 @@ async fn capacity(State(shared): State<Shared>, headers: HeaderMap) -> (StatusCo
         "healthy": !sessions.failed, "durable": sessions.store.is_some(), "concurrency":shared.0.concurrency,
         "records":sessions.by_job.len(), "storage":storage, "limits":shared.0.limits,
         "active_connections":shared.0.concurrency - shared.0.slots.available_permits(),
-        "in_flight_proofs":sessions.by_job.values().map(|entry| entry.in_flight).sum::<usize>(),
+        "in_flight_proofs":sessions.by_job.values().map(|entry| if xpolicy::batch(&entry.payload) { entry.in_flight / xpolicy::BATCH_READS } else { entry.in_flight }).sum::<usize>(),
+        "in_flight_attempts":sessions.by_job.values().map(|entry| entry.in_flight).sum::<usize>(),
         "pending_sessions":sessions.by_token.values().filter(|key| sessions.by_job.get(*key).is_some_and(|entry| entry.expires_ms > now_ms())).count()
     })))
 }
@@ -896,7 +1165,8 @@ async fn status(
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown session"})));
     };
     let status = match entry.status {
-        Status::Pending | Status::XRead { complete: false, .. } if Instant::now() >= entry.expires => Status::Expired,
+        Status::Pending if Instant::now() >= entry.expires => Status::Expired,
+        Status::XRead { complete: false, remaining_attempts, .. } if Instant::now() >= entry.expires && (!xpolicy::batch(&entry.payload) || remaining_attempts > 0) => Status::Expired,
         ref other => other.clone(),
     };
     let mut response = serde_json::to_value(status).unwrap_or_default();
@@ -910,12 +1180,16 @@ async fn status(
         response["proof_mode"] = "proxy".into();
         response["proof_policy"] = xpolicy::PROXY_EXPERIMENT_POLICY.into();
     }
+    if xpolicy::batch(&entry.payload) {
+        response["proof_mode"] = "mpc".into();
+        response["proof_policy"] = xpolicy::BATCH_EXPERIMENT_POLICY.into();
+    }
     (StatusCode::OK, Json(response))
 }
 
 enum Job {
     Codex(Value),
-    X(Arc<Vec<Spec>>, ProofMode),
+    X(Arc<Vec<Spec>>, ProofMode, bool),
 }
 
 async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()> {
@@ -933,6 +1207,7 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
             bail!("verifier state unavailable");
         }
         let key = s.by_token.get(token).cloned().context("unknown or used session token")?;
+        let durable = s.store.is_some();
         let entry = s.by_job.get_mut(&key).context("session expired")?;
         if Instant::now() >= entry.expires {
             s.by_token.remove(token);
@@ -945,27 +1220,22 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
                 // Codex tokens are single use: removing it here blocks replays and parallel attempts.
                 s.by_token.remove(token);
                 entry.status = Status::Running;
+                entry.in_flight += 1;
                 Job::Codex(entry.payload.clone())
             }
             Kind::X(specs) => {
                 let mode = xpolicy::proof_mode(&entry.payload)?;
                 if mode == ProofMode::Proxy && !config.x_proxy_experiment { bail!("X Proxy experiments are disabled"); }
-                let Status::XRead { remaining_attempts, complete, .. } = &mut entry.status else {
-                    bail!("session is in an unexpected state")
-                };
-                if *remaining_attempts == 0 || *complete {
-                    s.by_token.remove(token);
-                    bail!("x.read session has no attempts left");
-                }
-                // Each connection spends one attempt; the token dies with the last one.
-                *remaining_attempts -= 1;
-                if *remaining_attempts == 0 {
+                let batch = xpolicy::batch(&entry.payload);
+                if batch && (!config.x_batch_experiment || !durable) { bail!("X batch experiments are disabled"); }
+                let specs = specs.clone();
+                reserve_x(entry, batch)?;
+                if matches!(entry.status, Status::XRead { remaining_attempts: 0, .. }) {
                     s.by_token.remove(token);
                 }
-                Job::X(specs.clone(), mode)
+                Job::X(specs, mode, batch)
             }
         };
-        entry.in_flight += 1;
         let expires = entry.expires;
         // A durable spent token/attempt must exist before any provider session.
         s.commit(&key)?;
@@ -1001,7 +1271,22 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
                 s.commit(&key)?;
             }
         }
-        Job::X(specs, mode) => {
+        Job::X(specs, mode, batch) => {
+            if batch {
+                let result = match tokio::time::timeout(limit, verify_x_batch(socket)).await {
+                    Ok(Ok(values)) => Ok(values),
+                    Ok(Err(_)) => Err("proof_rejected".into()),
+                    Err(_) => Err("session_timeout".into()),
+                };
+                let mut s = sessions.lock().unwrap();
+                if s.failed { bail!("verifier state unavailable"); }
+                let entry = s.by_job.get_mut(&key).context("batch session missing")?;
+                let result = if Instant::now() >= entry.expires { Err("session_expired".into()) } else { result };
+                finish_x_batch(entry, &specs, result, started.elapsed().as_millis() as u64)?;
+                s.by_token.retain(|_, value| value != &key);
+                s.commit(&key)?;
+                return Ok(());
+            }
             let outcome = match tokio::time::timeout(limit, verify_x(socket, mode)).await {
                 // Parse the response before taking the lock that every session shares.
                 Ok(Ok((exchange, sent_bytes, received_bytes))) => Ok((xpolicy::outcome(&exchange), exchange, sent_bytes, received_bytes)),
@@ -1086,6 +1371,20 @@ async fn verify_x(socket: crate::control::Socket, mode: ProofMode) -> Result<(Ex
     if sent.len() > MAX_SENT || received.len() > MAX_RECV { bail!("X transcript exceeds its limits"); }
     let exchange = xpolicy::check(&server_name, sent, &sent_hidden, received, &received_hidden)?;
     Ok((exchange, sent.len(), received.len()))
+}
+
+async fn verify_x_batch(socket: crate::control::Socket) -> Result<Vec<(Exchange, usize, usize)>> {
+    let mut socket = socket;
+    let mut preface = vec![0; xpolicy::BATCH_PREFACE.len()];
+    socket.read_exact(&mut preface).await?;
+    if preface != xpolicy::BATCH_PREFACE { bail!("missing experimental batch preface"); }
+    tokio::io::AsyncWriteExt::write_all(&mut socket, xpolicy::BATCH_ACK).await?;
+    let (server_name, transcript) = prove_session(socket, None).await?;
+    let sent_hidden: Vec<_> = transcript.sent_unauthed().iter().collect();
+    let received_hidden: Vec<_> = transcript.received_unauthed().iter().collect();
+    let (sent, received) = (transcript.sent_unsafe(), transcript.received_unsafe());
+    if sent.len() > MAX_SENT || received.len() > MAX_RECV { bail!("X batch transcript exceeds its limits"); }
+    xpolicy::check_batch(&server_name, sent, &sent_hidden, received, &received_hidden)
 }
 
 /// Runs one TLSNotary session: proxy mode through `upstream` when given, else
