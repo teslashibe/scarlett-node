@@ -156,10 +156,10 @@ function Click-Control([System.Windows.Automation.AutomationElement]$Control) {
     Wait-Check {
         return [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
     } 10 'Installed control did not acquire foreground input'
-    $click = @{ point = [System.Windows.Point]::new() }
+    $click = @{ point = [System.Windows.Point]::new(0.0, 0.0) }
     try {
         Wait-Check {
-            $point = [System.Windows.Point]::new()
+            $point = [System.Windows.Point]::new(0.0, 0.0)
             if (-not $Control.TryGetClickablePoint([ref]$point)) { return $false }
             $click.point = $point
             return $true
