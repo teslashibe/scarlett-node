@@ -34,14 +34,19 @@ def summarize(rows):
         strategy = row.get("close_strategy", "normal")
         if strategy not in ("normal", "tls_after_completed"):
             raise ValueError("invalid close strategy")
-        groups.setdefault(strategy, []).append(row)
+        model = row.get("model", "gpt-6.1-sol")
+        cohort = row.get("account_cohort", "account-1")
+        if model not in ("gpt-6.1-sol", "gpt-5.6-luna") or cohort not in ("account-1", "account-2"):
+            raise ValueError("invalid model or account cohort")
+        groups.setdefault((strategy, model, cohort), []).append(row)
     if len(groups) <= 1:
-        strategy = next(iter(groups), "normal")
-        return summarize_strategy(rows, strategy)
-    return {"schema": 1, "comparison_dimension": "close_strategy", "groups": [summarize_strategy(values, strategy) for strategy, values in sorted(groups.items())]}
+        key = next(iter(groups), ("normal", "gpt-6.1-sol", "account-1"))
+        return summarize_strategy(rows, *key)
+    return {"schema": 1, "comparison_dimensions": ["close_strategy", "model", "account_cohort"],
+            "groups": [summarize_strategy(values, *key) for key, values in sorted(groups.items())]}
 
 
-def summarize_strategy(rows, strategy):
+def summarize_strategy(rows, strategy, model, cohort):
     good = [r for r in rows if r["verified"]]
     metered = [r for r in good if r.get("verifier_telemetry_complete") is True]
     cached = [r for r in good if r.get("cached_input_tokens_reported") is True]
@@ -51,6 +56,7 @@ def summarize_strategy(rows, strategy):
     wall_seconds = (max(number(r, "finish_unix_ns", 1e20) for r in rows) - min(number(r, "start_unix_ns", 1e20) for r in rows)) / 1e9 if rows else 0
     return {"schema": 1, "mode": "proxy", "workload": "codex_trivial", "reasoning": "low", "service_tier_request": "omitted",
             "close_strategy": strategy,
+            "model": model, "account_cohort": cohort,
             "quantile_method": "nearest_rank", "attempted_jobs": len(rows), "verified_jobs": len(good), "failed_jobs": len(rows) - len(good),
             "successful_samples_below_30": len(good) < 30,
             "verified_p50_ms": percentile([number(r, "duration_ms") for r in good], .5),
@@ -94,6 +100,9 @@ def self_test():
     assert report["verified_jobs_per_second"] == 5 and report["cached_usage_reported_jobs"] == 0 and report["cached_input_tokens_p50"] is None
     assert "PRIVATE" not in json.dumps(report)
     assert report["close_strategy"] == "normal"
+    assert report["model"] == "gpt-6.1-sol" and report["account_cohort"] == "account-1"
+    different_model = summarize([good, dict(good, model="gpt-5.6-luna", account_cohort="account-2")])
+    assert len(different_model["groups"]) == 2
     mixed = summarize([good, dict(good, close_strategy="tls_after_completed", duration_ms=50)])
     assert len(mixed["groups"]) == 2
     assert mixed["groups"][0]["close_strategy"] == "normal" and mixed["groups"][0]["verified_p95_ms"] == 100

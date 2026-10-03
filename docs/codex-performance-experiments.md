@@ -1,6 +1,8 @@
 # Codex proof performance experiments
 
-This serial baseline runs one fixed synthetic request through the native helper's TLSNotary Proxy path. It asks `gpt-6.1-sol` to reply exactly `scarlettperf`, uses low reasoning and verbosity, and omits `service_tier` for normal requested speed. It enables no tools and creates no funding, payment, ARR or points evidence.
+This serial baseline runs one fixed synthetic request through the native helper's TLSNotary Proxy path. It asks `gpt-5.6-luna` to reply exactly `scarlettperf`, uses low reasoning and verbosity, and omits `service_tier` for normal requested speed. It enables no tools and creates no funding, payment, ARR or points evidence.
+
+The first baseline used `gpt-6.1-sol` on the earlier local login. Following the user's account change, fresh experiments use the inexpensive Luna model exposed by the new login's CLI catalog. Every new metric and manifest records the model and synthetic cohort `account-2`; this label contains no real account identifier. Reports keep earlier unlabeled metrics in `gpt-6.1-sol` / `account-1`, and separate model/account cohorts. Compare shutdown settings on the same model and account. The [official model page](https://developers.openai.com/api/docs/models/gpt-5.6-luna) describes Luna as a model for cost-sensitive workloads; published API list prices do not establish charges for this Codex subscription path.
 
 ## Run a controlled sample
 

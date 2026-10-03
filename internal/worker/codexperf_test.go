@@ -25,7 +25,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const codexperfModel = "gpt-6.1-sol"
+const codexperfModel = "gpt-5.6-luna"
+
+// A synthetic cohort label distinguishes the explicitly replaced local login.
+// It never contains the provider account ID, email or login contents.
+const codexperfCohort = "account-2"
 const codexperfPrompt = "Reply exactly scarlettperf"
 const codexperfOutput = "scarlettperf"
 
@@ -279,6 +283,8 @@ type codexperfMetric struct {
 	Schema             int               `json:"schema"`
 	Sample             int               `json:"sample"`
 	Mode               string            `json:"mode"`
+	Model              string            `json:"model"`
+	Cohort             string            `json:"account_cohort"`
 	CloseStrategy      string            `json:"close_strategy"`
 	Workload           string            `json:"workload"`
 	Reasoning          string            `json:"reasoning"`
@@ -313,6 +319,7 @@ type codexperfMetric struct {
 func codexperfMeasurement(sample int, started time.Time, o codexperfObserved, r codexperfReceipt, receiptMS int64, failure, closeStrategy string) codexperfMetric {
 	now := time.Now()
 	m := codexperfMetric{Schema: 1, Sample: sample, Mode: "proxy", Workload: "codex_trivial", Reasoning: "low", ServiceTierOmitted: true, Status: "verified", Verified: failure == "", StartNS: started.UnixNano(), FinishNS: now.UnixNano(), DurationMS: now.Sub(started).Milliseconds(), ReceiptWaitMS: receiptMS, HelperMS: o.helperMS, UserCPUSeconds: o.userCPUSeconds, SystemCPUSeconds: o.systemCPUSeconds, PeakRSSBytes: o.peakRSSBytes, Timings: make(map[string]uint64)}
+	m.Model, m.Cohort = codexperfModel, codexperfCohort
 	m.CloseStrategy, _ = codexperfCloseStrategy(closeStrategy)
 	if m.CloseStrategy == "" {
 		m.CloseStrategy, m.Status, m.Verified = "normal", "invalid_close_strategy", false

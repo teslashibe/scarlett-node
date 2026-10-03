@@ -34,6 +34,7 @@ manifest = {"schema": 1, "source_revision": revision,
             "source_modified": bool(diff), "helper_sha256": digest.hexdigest(),
             "funding": "none", "concurrency": 1, "proof_mode": "proxy",
             "close_strategy": strategy,
+            "model": "gpt-5.6-luna", "account_cohort": "account-2",
             "reasoning": "low", "service_tier_request": "omitted",
             "native_helper_owns_login_loading": True,
             "byte_counter_source": "supplier_operational_telemetry"}
