@@ -165,8 +165,15 @@ where
                             bail!("server handshake is too large");
                         }
                         // One record at a time, so nothing past the handshake is ever inside the TLS library.
-                        conn.read_tls(&mut io::Cursor::new(&record))?;
-                        conn.process_new_packets().context("TLS handshake with the server failed")?;
+                        // The library takes a bounded amount per call, so a large
+                        // record needs several.
+                        let mut cursor = io::Cursor::new(&record);
+                        while (cursor.position() as usize) < record.len() {
+                            if conn.read_tls(&mut cursor)? == 0 {
+                                bail!("TLS library refused handshake bytes");
+                            }
+                            conn.process_new_packets().context("TLS handshake with the server failed")?;
+                        }
                         flush_handshake(conn, &mut writer, &mut to_server).await?;
                         if !conn.is_handshaking() {
                             keys = Some(traffic_keys(tls.take().expect("handshake just completed"))?);
@@ -189,6 +196,12 @@ where
                                 wire::send(&mut writer, wire::PLAIN, chunk).await?;
                             }
                             received.extend_from_slice(&data);
+                            // X closes right behind a `Connection: close` response, and
+                            // that alert can share a frame with the last data record.
+                            // Stop at the response's own end rather than reading on.
+                            if xpolicy::response_complete(&received) {
+                                break;
+                            }
                         }
                         // Session tickets are the only post-handshake message a plain read expects.
                         (record::HANDSHAKE, message) if message.first() == Some(&4) => {}

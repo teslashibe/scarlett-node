@@ -1078,7 +1078,9 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
             let proof = async {
                 match mode {
                     ProofMode::Mpc => verify_x(socket).await,
-                    ProofMode::Relay => relay_x(socket, config.relay_tls.clone(), &specs, &fulfilled).await,
+                    // The cause names only public job fields and protocol steps, never
+                    // a hidden value, and is the one place a failed session can be diagnosed.
+                    ProofMode::Relay => relay_x(socket, config.relay_tls.clone(), &specs, &fulfilled).await.inspect_err(|e| println!("verifier: job {job_id} relay session failed: {e:#}")),
                 }
             };
             let outcome = match tokio::time::timeout(limit, proof).await {

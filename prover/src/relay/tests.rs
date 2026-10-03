@@ -46,13 +46,22 @@ pub(crate) struct Server {
 }
 
 /// A TLS server for x.com under a private CA that answers one request.
-pub(crate) async fn server(response: Vec<u8>, mut config: impl FnMut(&mut rustls::ServerConfig) + Send + 'static) -> Server {
+pub(crate) async fn server(response: Vec<u8>, config: impl FnMut(&mut rustls::ServerConfig) + Send + 'static) -> Server {
+    server_closing(response, config, false).await
+}
+
+/// As `server`; with `close` it ends the TLS session right after the response.
+async fn server_closing(response: Vec<u8>, mut config: impl FnMut(&mut rustls::ServerConfig) + Send + 'static, close: bool) -> Server {
     let ca_key = KeyPair::generate().unwrap();
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca = ca_params.self_signed(&ca_key).unwrap();
     let leaf_key = KeyPair::generate().unwrap();
-    let leaf = CertificateParams::new(vec![xpolicy::HOST.to_owned()]).unwrap().signed_by(&leaf_key, &ca, &ca_key).unwrap();
+    // Many names make the certificate record larger than the TLS library takes
+    // in one read, as X's real chain is.
+    let names = std::iter::once(xpolicy::HOST.to_owned()).chain((0..160).map(|i| format!("alternate-name-{i:03}.fixture.example"))).collect::<Vec<_>>();
+    let leaf = CertificateParams::new(names).unwrap().signed_by(&leaf_key, &ca, &ca_key).unwrap();
+    assert!(leaf.der().len() > 5000);
     let mut roots = RootCertStore::empty();
     roots.add(ca.der().clone()).unwrap();
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
@@ -83,7 +92,11 @@ pub(crate) async fn server(response: Vec<u8>, mut config: impl FnMut(&mut rustls
                 *record.lock().unwrap() = Some(request);
                 let _ = tls.write_all(&response).await;
                 let _ = tls.flush().await;
-                // Like X, keep the connection open after the response.
+                if close {
+                    let _ = tls.shutdown().await;
+                    return;
+                }
+                // X sometimes keeps the connection open after the response.
                 let _ = tls.read(&mut chunk).await;
             });
         }
@@ -244,6 +257,45 @@ async fn honest_session_proves_the_read_and_the_verifier_never_sees_a_secret() {
     for secret in [AUTH.as_bytes(), csrf().as_bytes(), &AUTH.as_bytes()[..8], &csrf().as_bytes()[..8]] {
         assert!(!seen.windows(secret.len()).any(|w| w == secret), "a secret reached the verifier");
     }
+}
+
+#[tokio::test]
+async fn a_close_that_arrives_with_the_last_data_record_still_completes() {
+    // X answers `Connection: close` with the response and its closing alert
+    // back to back. Deliver both in one read, as a real network often does.
+    let server = server_closing(response(), |_| {}, true).await;
+    let tcp = TcpStream::connect(server.addr).await.unwrap();
+    let (mut request_seen, mut held) = (false, Vec::new());
+    let to_server = path(tcp, move |from_node, index, record| {
+        if from_node {
+            request_seen |= index >= 3;
+            return Verdict::Pass;
+        }
+        if !request_seen {
+            return Verdict::Pass;
+        }
+        if held.is_empty() {
+            held = record.to_vec();
+            return Verdict::Replace(Vec::new());
+        }
+        Verdict::Replace([std::mem::take(&mut held), record.to_vec()].concat())
+    });
+    let (node_end, verifier_end) = link(|_, _, _| Verdict::Pass);
+    let (response_at_node, outcome) = run(server.roots.clone(), node_end, verifier_end, to_server).await;
+    assert_eq!(outcome.unwrap().received, response());
+    assert_eq!(response_at_node.unwrap(), response());
+}
+
+#[tokio::test]
+async fn a_close_before_the_response_is_whole_is_rejected() {
+    // The same closing alert, but the response claims more body than it carries.
+    let mut short = response();
+    short.truncate(short.len() - 5);
+    let server = server_closing(short, |_| {}, true).await;
+    let tcp = TcpStream::connect(server.addr).await.unwrap();
+    let (node_end, verifier_end) = link(|_, _, _| Verdict::Pass);
+    let (response_at_node, outcome) = run(server.roots.clone(), node_end, verifier_end, tcp).await;
+    assert!(outcome.is_err() && response_at_node.is_err());
 }
 
 #[tokio::test]
@@ -536,4 +588,33 @@ fn split_tag_inputs_are_bound_to_the_request_layout() {
     assert!(tag::node_record(&material, &[2..3], b"xy", &[[0; 16]; 8]).is_err());
     assert!(tag::node_record(&material, &[2..4], b"xy", &[[0; 16]; 8]).is_err());
     assert!(tag::node_record(&material, &[9..10], b"x", &[[0; 16]; 8]).is_err());
+}
+
+/// Not run by default: one unauthenticated relay session against the real
+/// x.com, with placeholder values where a session's would go. It shows that
+/// X's own TLS stack accepts the jointly sealed record. X answers with an
+/// error status, which is the expected result.
+#[tokio::test]
+#[ignore]
+async fn live_x_accepts_the_jointly_sealed_record() {
+    let csrf = "0f".repeat(80);
+    let raw = format!(
+        "GET /i/api/graphql/qid_1/UserByScreenName?features=%7B%7D&variables=%7B%22screen_name%22%3A%22x%22%7D HTTP/1.1\r\nHost: x.com\r\nAccept-Encoding: gzip\r\nX-Csrf-Token: {csrf}\r\nCookie: auth_token={}; ct0={csrf}\r\nConnection: close\r\n\r\n",
+        "0".repeat(40)
+    )
+    .into_bytes();
+    let (node_end, verifier_end) = tokio::io::duplex(1 << 20);
+    let config = verifier::tls_config(verifier::mozilla_roots().unwrap()).unwrap();
+    let tcp = TcpStream::connect((xpolicy::HOST, 443)).await.unwrap();
+    let started = std::time::Instant::now();
+    let node = tokio::spawn(async move { node::session(node_end, tcp, &raw).await });
+    let outcome = within(verifier::run(verifier_end, config, xpolicy::HOST, verifier::authorize_x)).await;
+    let response = within(node).await.unwrap();
+    match (&outcome, &response) {
+        (Ok(outcome), Ok(_)) => {
+            let head = String::from_utf8_lossy(&outcome.received[..outcome.received.len().min(200)]).replace("\r\n", " | ");
+            println!("verified {} response bytes in {:?}: {head}", outcome.received.len(), started.elapsed());
+        }
+        _ => panic!("verifier: {:?}\nsupplier: {:?}", outcome.as_ref().err(), response.as_ref().err()),
+    }
 }
