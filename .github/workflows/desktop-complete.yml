@@ -1,0 +1,116 @@
+name: desktop complete bundle
+on:
+  pull_request:
+    paths:
+      - 'desktop/**'
+      - '**.go'
+      - 'go.*'
+      - 'prover/**'
+      - 'third_party/**'
+      - '.github/workflows/desktop-complete.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            platform: darwin-arm64
+          - runner: macos-15-intel
+            platform: darwin-x64
+          - runner: windows-2025
+            platform: win32-x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.95 --profile minimal --component rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            prover
+            desktop/src-tauri
+      - name: Native node checks
+        run: |
+          go test -race ./...
+          go vet ./...
+          go build ./...
+      - name: Build reviewed native components
+        run: |
+          mkdir -p "$RUNNER_TEMP/scarlett-runtime"
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
+          go build -trimpath -o "$RUNNER_TEMP/scarlett-runtime/scarlett-node$suffix" .
+          GOBIN="$RUNNER_TEMP/scarlett-runtime" go install github.com/teslashibe/open-agent-api/cmd/open-agent-api@v0.1.28
+          cargo +1.95 build --release --locked --manifest-path prover/Cargo.toml
+      - name: Download and verify pinned official provider binaries
+        env:
+          NATIVE_PLATFORM: ${{ matrix.platform }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/scarlett-runtime/codex" "$RUNNER_TEMP/scarlett-runtime/claude"
+          cd "$RUNNER_TEMP/scarlett-runtime/codex"
+          npm pack "@openai/codex@0.159.2-$NATIVE_PLATFORM" --ignore-scripts --json > pack.json
+          archive=$(node -p 'JSON.parse(require("node:fs").readFileSync("pack.json","utf8"))[0].filename')
+          node "$GITHUB_WORKSPACE/desktop/scripts/verify-provider-archive.mjs" "@openai/codex@0.159.2-$NATIVE_PLATFORM" "$archive"
+          tar -xzf "$archive"
+          cd "$RUNNER_TEMP/scarlett-runtime/claude"
+          npm pack "@anthropic-ai/claude-code-$NATIVE_PLATFORM@2.1.286" --ignore-scripts --json > pack.json
+          archive=$(node -p 'JSON.parse(require("node:fs").readFileSync("pack.json","utf8"))[0].filename')
+          node "$GITHUB_WORKSPACE/desktop/scripts/verify-provider-archive.mjs" "@anthropic-ai/claude-code-$NATIVE_PLATFORM@2.1.286" "$archive"
+          tar -xzf "$archive"
+      - name: Prepare the complete native runtime
+        run: |
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
+          node desktop/scripts/prepare-complete-bundle.mjs \
+            "$RUNNER_TEMP/scarlett-runtime/scarlett-node$suffix" \
+            "$GITHUB_WORKSPACE/prover/target/release/scarlett-prover$suffix" \
+            "$RUNNER_TEMP/scarlett-runtime/open-agent-api$suffix" \
+            "$RUNNER_TEMP/scarlett-runtime/codex/package" \
+            "$RUNNER_TEMP/scarlett-runtime/claude/package"
+      - name: Desktop tests and native checks
+        run: |
+          npm --prefix desktop ci --ignore-scripts
+          npm --prefix desktop test
+          npm --prefix desktop run build
+          cargo +1.95 test --locked --manifest-path desktop/src-tauri/Cargo.toml
+          cargo +1.95 clippy --locked --all-targets --manifest-path desktop/src-tauri/Cargo.toml -- -D warnings
+      - name: Build installer for testing
+        working-directory: desktop
+        run: npm run tauri build -- --debug --config src-tauri/tauri.complete.generated.json
+      - name: Validate native packaged components and protected local API
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            app="$GITHUB_WORKSPACE/desktop/src-tauri/target/debug/bundle/macos/Scarlett Node.app/Contents"
+            python3 desktop/scripts/check-complete-bundle.py "$app/MacOS" "$app/Resources"
+          else
+            # The NSIS installer is built, but this check uses the same payload
+            # directory. Installed Windows UI/private-storage acceptance is a
+            # separate release gate and is never inferred from this check.
+            python desktop/scripts/check-complete-bundle.py \
+              "$GITHUB_WORKSPACE/desktop/src-tauri/target/debug" \
+              "$GITHUB_WORKSPACE/desktop/src-tauri/target/debug"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-testing-${{ matrix.platform }}
+          path: |
+            desktop/src-tauri/target/debug/bundle/dmg/*.dmg
+            desktop/src-tauri/target/debug/bundle/nsis/*.exe
+            desktop/src-tauri/runtime/COMPONENTS.json
+          if-no-files-found: error

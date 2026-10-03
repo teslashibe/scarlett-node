@@ -13,14 +13,24 @@
     "windows": [],
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; frame-src 'none'; form-action 'none'",
-      "capabilities": ["main"],
+      "capabilities": [
+        "main"
+      ],
       "devCsp": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost ws://127.0.0.1:1420; object-src 'none'; base-uri 'none'; frame-src 'none'; form-action 'none'"
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["app"],
-    "externalBin": ["binaries/scarlett-node", "binaries/scarlett-prover"],
-    "icon": ["icons/icon.png"]
+    "targets": [
+      "app"
+    ],
+    "externalBin": [
+      "binaries/scarlett-node",
+      "binaries/scarlett-prover"
+    ],
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.ico"
+    ]
   }
 }
