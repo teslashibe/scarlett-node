@@ -456,3 +456,112 @@ func TestTypedLegacyToManagedTransitionRetainsSelectedLegacySlot(t *testing.T) {
 	p.finishAccount(selected, "")
 	assertTypedHeartbeatInFlight(t, p, "codex", "auth_required", 0)
 }
+
+func TestConcurrentTransientFailurePreservesProviderQuotaCooldown(t *testing.T) {
+	for _, service := range []string{"codex", "x_read"} {
+		for _, transient := range []string{"prover_error", "x_request_failed"} {
+			t.Run(service+"/"+transient, func(t *testing.T) {
+				p := multiPool(t)
+				f, err := loadAccounts(p.config.AccountsFile)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, account := range f.Accounts {
+					if account.Service == service {
+						account.Concurrency = 2
+						f.Accounts = []providerAccount{account}
+						break
+					}
+				}
+				saveAccountFixture(t, p, f)
+				older, ok := p.acquireAccount(service)
+				if !ok {
+					t.Fatal("missing older attempt")
+				}
+				limited, ok := p.acquireAccount(service)
+				if !ok {
+					t.Fatal("missing quota-limited attempt")
+				}
+				quotaCode := "capacity_unavailable"
+				if service == "x_read" {
+					limited.config.AccountCooldown(2 * time.Hour)
+					quotaCode = "x_rate_limited"
+				}
+				p.finishAccount(limited, quotaCode)
+				reset := limited.account.entry.restUntil
+				p.finishAccount(older, transient)
+				status := p.accountStatus()
+				if len(status) != 1 || status[0].State != "exhausted" || status[0].LastError != quotaCode || !status[0].RestUntil.Equal(reset) {
+					t.Fatalf("older failure replaced authoritative quota state: %+v; expected reset %v", status, reset)
+				}
+				assertTypedHeartbeatInFlight(t, p, service, "exhausted", 0)
+				if _, ok := p.acquireAccount(service); ok {
+					t.Fatal("quota-blocked account accepted work")
+				}
+				restarted := newServicePool(p.config)
+				status = restarted.accountStatus()
+				if len(status) != 1 || status[0].State != "exhausted" || !status[0].RestUntil.Equal(reset) {
+					t.Fatalf("restart lost authoritative reset: %+v", status)
+				}
+				if _, ok := restarted.acquireAccount(service); ok {
+					t.Fatal("restart resumed quota-blocked work")
+				}
+			})
+		}
+	}
+}
+
+func TestQuotaExpiryDoesNotRepairAuthoritativeAuthentication(t *testing.T) {
+	for _, outOfPolicy := range []bool{false, true} {
+		t.Run(map[bool]string{false: "authentication-error", true: "out-of-policy-reset"}[outOfPolicy], func(t *testing.T) {
+			p := multiPool(t)
+			f, err := loadAccounts(p.config.AccountsFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.Accounts = []providerAccount{f.Accounts[0]}
+			f.Accounts[0].Concurrency = 2
+			saveAccountFixture(t, p, f)
+			l, ok := p.acquireAccount("codex")
+			if !ok {
+				t.Fatal("missing account")
+			}
+			older, ok := p.acquireAccount("codex")
+			if !ok {
+				t.Fatal("missing concurrent attempt")
+			}
+			p.finishAccount(l, "capacity_unavailable")
+			reset := l.account.entry.restUntil
+			if outOfPolicy {
+				older.config.AccountCooldown(31 * 24 * time.Hour)
+				p.finishAccount(older, "x_rate_limited")
+			} else {
+				p.finishAccount(older, "auth_required")
+			}
+			refreshAccount(l.account, reset.Add(time.Second), false)
+			if l.account.entry.state != "auth_required" || l.account.entry.lastError != "auth_required" || !l.account.entry.restUntil.IsZero() {
+				t.Fatalf("quota expiry repaired authentication: %+v", l.account.entry)
+			}
+			p.mu.Lock()
+			p.saveHealth()
+			p.mu.Unlock()
+			restarted := newServicePool(p.config)
+			status := restarted.accountStatus()
+			if len(status) != 1 || status[0].State != "auth_required" || status[0].LastError != "auth_required" {
+				t.Fatalf("restart repaired authentication: %+v", status)
+			}
+			if _, ok := restarted.acquireAccount("codex"); ok {
+				t.Fatal("authentication-blocked account accepted work")
+			}
+			// An actual credential change after expiry can repair authentication.
+			path := filepath.Join(l.config.CodexHome, "auth.json")
+			if err := os.WriteFile(path, []byte(`{"synthetic_replacement":true,"revision":2}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			refreshAccount(l.account, reset.Add(2*time.Second), false)
+			if l.account.entry.state != "configured" {
+				t.Fatal("credential change did not restore configuration")
+			}
+		})
+	}
+}

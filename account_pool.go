@@ -286,7 +286,10 @@ func refreshAccount(a *pooledAccount, now time.Time, helperMissing bool) {
 	}
 	if !s.restUntil.IsZero() && !now.Before(s.restUntil) {
 		s.restUntil = time.Time{}
-		s.state, s.lastError = "configured", ""
+		// A quota timer cannot repair an independent authentication failure.
+		if s.state != "auth_required" {
+			s.state, s.lastError = "configured", ""
+		}
 	}
 	if helperMissing {
 		s.helperMissing = true
@@ -366,6 +369,12 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 		p.saveHealth()
 		return
 	}
+	// An older transient result cannot shorten an authoritative quota reset or
+	// replace its exhausted state, including when another attempt finishes later.
+	if (code == "prover_error" || code == "x_request_failed") && s.state == "exhausted" && time.Now().Before(s.restUntil) {
+		p.saveHealth()
+		return
+	}
 	s.lastError = code
 	switch code {
 	case "":
@@ -381,7 +390,9 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 		}
 	case "prover_error", "x_request_failed":
 		s.state = "unreachable"
-		s.restUntil = time.Now().Add(capacityRest)
+		if until := time.Now().Add(capacityRest); until.After(s.restUntil) {
+			s.restUntil = until
+		}
 	}
 	p.saveHealth()
 }
