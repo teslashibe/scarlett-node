@@ -1,0 +1,152 @@
+diff --git a/crates/ot/src/rcot/shared.rs b/crates/ot/src/rcot/shared.rs
+index c2d2ee0..99f1a70 100644
+--- a/crates/ot/src/rcot/shared.rs
++++ b/crates/ot/src/rcot/shared.rs
+@@ -15,6 +15,107 @@ mod tests {
+ 
+     use super::*;
+ 
++    // A completed clone can flush its COT corrections again before a peer
++    // has been repolled to reclaim the previous round's filled RCOT buffer.
++    // That reflush must complete without opening a new shared setup barrier.
++    async fn assert_completed_peer_buffers_do_not_require_setup(check_sender: bool) {
++        use futures::poll;
++        use mpz_common::{Flush, context::test_st_context};
++        use mpz_ot_core::{
++            rcot::{RCOTReceiver, RCOTSender},
++            test::assert_cot,
++        };
++        use std::pin::pin;
++
++        let mut rng = StdRng::seed_from_u64(7);
++        let delta = Block::random(&mut rng);
++        let (ideal_send, ideal_recv) = ideal_rcot(Block::random(&mut rng), delta);
++        let mut sender_waiter = SharedRCOTSender::new(ideal_send);
++        let mut sender_leader = sender_waiter.clone();
++        let mut receiver_waiter = SharedRCOTReceiver::new(ideal_recv);
++        let mut receiver_leader = receiver_waiter.clone();
++        let count = 128;
++        sender_waiter.alloc(count).unwrap();
++        sender_leader.alloc(count).unwrap();
++        receiver_waiter.alloc(count).unwrap();
++        receiver_leader.alloc(count).unwrap();
++        let output_sender_waiter = sender_waiter.queue_send_rcot(count).unwrap();
++        let output_sender_leader = sender_leader.queue_send_rcot(count).unwrap();
++        let output_receiver_waiter = receiver_waiter.queue_recv_rcot(count).unwrap();
++        let output_receiver_leader = receiver_leader.queue_recv_rcot(count).unwrap();
++        let (mut ctx_sender_waiter, mut ctx_receiver_waiter) = test_st_context(8);
++        let (mut ctx_sender_leader, mut ctx_receiver_leader) = test_st_context(8);
++        {
++            let mut waiter_sender_flush = pin!(sender_waiter.flush(&mut ctx_sender_waiter));
++            let mut waiter_receiver_flush = pin!(receiver_waiter.flush(&mut ctx_receiver_waiter));
++            assert!(poll!(&mut waiter_sender_flush).is_pending());
++            assert!(poll!(&mut waiter_receiver_flush).is_pending());
++            let (sender_result, receiver_result) = futures::join!(
++                sender_leader.flush(&mut ctx_sender_leader),
++                receiver_leader.flush(&mut ctx_receiver_leader)
++            );
++            sender_result.unwrap();
++            receiver_result.unwrap();
++            // The waiting clones are deliberately not repolled yet, so their
++            // already filled buffers are still retained by shared state.
++            if check_sender {
++                let result = poll!(sender_leader.flush(&mut ctx_sender_leader));
++                assert!(
++                    result.map(|result| result.unwrap()).is_ready(),
++                    "completed peer buffers opened another sender setup barrier"
++                );
++            } else {
++                let result = poll!(receiver_leader.flush(&mut ctx_receiver_leader));
++                assert!(
++                    result.map(|result| result.unwrap()).is_ready(),
++                    "completed peer buffers opened another receiver setup barrier"
++                );
++            }
++            assert!(
++                poll!(&mut waiter_sender_flush)
++                    .map(|result| result.unwrap())
++                    .is_ready(),
++                "sender waiter must receive its completed setup"
++            );
++            assert!(
++                poll!(&mut waiter_receiver_flush)
++                    .map(|result| result.unwrap())
++                    .is_ready(),
++                "receiver waiter must receive its completed setup"
++            );
++        }
++        for (sender_output, receiver_output) in [
++            (
++                output_sender_waiter.await.unwrap(),
++                output_receiver_waiter.await.unwrap(),
++            ),
++            (
++                output_sender_leader.await.unwrap(),
++                output_receiver_leader.await.unwrap(),
++            ),
++        ] {
++            assert_eq!(sender_output.id, receiver_output.id);
++            assert_eq!(sender_output.keys.len(), count);
++            assert_eq!(receiver_output.msgs.len(), count);
++            assert_cot(
++                delta,
++                &receiver_output.choices,
++                &sender_output.keys,
++                &receiver_output.msgs,
++            );
++        }
++    }
++
++    #[tokio::test]
++    async fn test_completed_sender_peer_buffers_do_not_start_new_setup() {
++        assert_completed_peer_buffers_do_not_require_setup(true).await;
++    }
++
++    #[tokio::test]
++    async fn test_completed_receiver_peer_buffers_do_not_start_new_setup() {
++        assert_completed_peer_buffers_do_not_require_setup(false).await;
++    }
++
+     #[tokio::test]
+     async fn test_shared_rcot() {
+         let mut rng = StdRng::seed_from_u64(0);
+diff --git a/crates/ot/src/rcot/shared/receiver.rs b/crates/ot/src/rcot/shared/receiver.rs
+index c4a9719..aa6683b 100644
+--- a/crates/ot/src/rcot/shared/receiver.rs
++++ b/crates/ot/src/rcot/shared/receiver.rs
+@@ -202,7 +202,14 @@ where
+     type Error = SharedRCOTReceiverError;
+ 
+     fn wants_flush(&self) -> bool {
+-        !self.state.lock().unwrap().buffers.is_empty()
++        // A peer may not have reclaimed its completed output yet. Filled
++        // buffers do not require another shared setup generation.
++        self.state
++            .lock()
++            .unwrap()
++            .buffers
++            .values()
++            .any(|buffer| buffer.macs.len() < buffer.count)
+     }
+ 
+     async fn flush(&mut self, ctx: &mut Context) -> Result<(), Self::Error> {
+diff --git a/crates/ot/src/rcot/shared/sender.rs b/crates/ot/src/rcot/shared/sender.rs
+index c4629a8..5b24dd4 100644
+--- a/crates/ot/src/rcot/shared/sender.rs
++++ b/crates/ot/src/rcot/shared/sender.rs
+@@ -199,7 +199,14 @@ where
+     type Error = SharedRCOTSenderError;
+ 
+     fn wants_flush(&self) -> bool {
+-        !self.state.lock().unwrap().buffers.is_empty()
++        // A peer may not have reclaimed its completed output yet. Filled
++        // buffers do not require another shared setup generation.
++        self.state
++            .lock()
++            .unwrap()
++            .buffers
++            .values()
++            .any(|buffer| buffer.keys.len() < buffer.count)
+     }
+ 
+     async fn flush(&mut self, ctx: &mut Context) -> Result<(), Self::Error> {

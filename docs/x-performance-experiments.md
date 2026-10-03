@@ -162,3 +162,35 @@ scripts/xperf-report.py --self-test
 ```
 
 These checks perform no provider calls. They cover exact request capture, private file permissions, credential-free control payloads and measurements, candidate transport preservation, experimental policy binding, receipt rejection, concurrent job capture, account cooldown/backpressure and numeric report generation. Relay checks cover deterministic delay/serialization scheduling, valid-CA TLS hostname checks, byte order, half-close, connection limits and recovery. Relay fixtures use disposable synthetic certificates and loopback data only. Live calls require both the `xperf` build tag and `SCARLETT_XPERF=1`.
+
+
+## Reproduce the shared OT candidate
+
+The shared OT patch fixes a setup generation being requested again while a peer still holds its completed output buffer. It includes two delayed-reclamation regressions and changes only that pending-work check in the sender and receiver. The original dependency graph remains pinned in `prover/Cargo.toml` and `Cargo.lock`; this build recipe creates a separate experiment project.
+
+Use Python 3.12 or later, Git and Rust 1.95.0. Commit the node checkout before running the recipe. Fetch the public MPZ source into a separate directory, then choose a new private output directory:
+
+```sh
+git clone --no-checkout https://github.com/privacy-ethereum/mpz \
+  /absolute/private/mpz-source
+python3 scripts/xperf-build-helper.py \
+  --mpz-source /absolute/private/mpz-source \
+  --output /absolute/private/shared-ot-candidate
+```
+
+The script reads exact upstream commit `6ebfe619490c3155a589fc6a3be83b0976de19dc` from that checkout without modifying it. It verifies the published patch SHA256, copies the node helper and its two test fixtures, applies same-version path overrides for all 24 MPZ packages, and requires the lockfile to be otherwise identical. The TLSN pin stays `bb4cdc32ae2e80296a27143a348d4bc1769fd09e`.
+
+Each metadata, test and release-build stage records its actual terminal status before further interpretation. Logs remain private. The final manifest records source/dependency/patch/lock/binary hashes and checks the release compiler flags. The helper is at `shared-ot-candidate/target/release/scarlett-prover`. Use that same helper for the supplier and isolated verifier. No provider credentials are loaded, no provider calls are made, and no tracked dependencies or production policy are changed.
+
+Add `--offline` only when the pinned host dependencies are cached. `--target-dir` can reuse an isolated Cargo compilation cache; the helper then lives under that cache's `release` directory, and release fingerprints must still have empty compiler flags. `--prepare-only` checks the patch and lockfile without compiling or running tests; it cannot establish a successful build. Every invocation requires a fresh output directory, so a failed stage keeps its evidence. A differently located build can have a different binary hash; retain its own manifest rather than copying a historical hash.
+
+The verifier supervises the transport during early protocol work and fails an early disconnect immediately. After receiving the complete final proof request, a clean transport EOF allows at most one second for already queued cryptographic verification to finish. Invalid proofs, driver errors and the original outer session/job deadline still fail. Six lifecycle cases cover this distinction; they do not replace the full native and buyer proof tests.
+
+
+## Completed buyer validation
+
+The [pinned buyer results](../experiments/buyer-performance-results-2026-10-03.json) retain the completed 33-job early-delivery campaign and corrected two-page job at their exact source and binary hashes. The 30 reused searches had verified buyer p50/p95 of 3.946/4.713 seconds and provisional HTTP p50/p95 of 2.485/3.123 seconds. Both empty cases charged $0. Receipt-outage reconstruction, REST/MCP equality, preview withdrawal, buyer isolation and repeated settlement passed. The campaign took 713.227 seconds including per-job admission and drain, excluding its separate preflight reset wait; achieved throughput was 0.04627 verified jobs/second on one X account.
+
+The corrected two-page case verified 40 distinct resources and one synthetic $0.10 charge using two fresh proof connections. It retained both observations, summed phases/CPU/traffic and recorded the largest child RSS. Whole buyer completion was 37.706 seconds, including cold client initialization and quota pacing; summed helper time was 7.789 seconds. Verifier traffic was 125.851 MB for the job. This one case does not estimate pagination p95 or establish a shared-connection cursor chain. Earlier overwritten pagination telemetry remains withdrawn.
+
+These are separate cohorts from the earlier 63-job client comparison and 150-job native matrix. The current reused-search median verifier traffic is 60.438 MB, so the tenfold bandwidth-reduction target remains unmet under MPC. The 33-job result verifies this combination at its pins; it does not establish fleet reliability. X Proxy has a distinct policy and exposes verifier egress to X. All buyer funding here was synthetic credit in isolated databases, with no paid ARR or points.
