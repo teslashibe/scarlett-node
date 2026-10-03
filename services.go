@@ -7,6 +7,7 @@ import (
 
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
+	"github.com/teslashibe/scarlett-node/internal/worker"
 )
 
 type serviceEntry struct {
@@ -66,8 +67,14 @@ func (p *servicePool) health() []coordinator.ServiceHealth {
 			}
 			// Only an opted-in node says so, and a node that has not opted
 			// in sends exactly the heartbeat it sent before the field existed.
+			// A node that has halted relay after catching its verifier keeps
+			// advertising MPC so the coordinator keeps sending it that work.
 			if kind == "x_read" && p.config.XRelay {
-				h.ProofModes = []string{"mpc", "relay"}
+				if worker.RelayHalted() {
+					h.ProofModes = []string{"mpc"}
+				} else {
+					h.ProofModes = []string{"mpc", "relay"}
+				}
 			}
 		}
 		out = append(out, h)

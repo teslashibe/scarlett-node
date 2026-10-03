@@ -5,11 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -77,10 +80,58 @@ func (p xPlan) relay(c config.Config) (relay, ok bool) {
 		return false, true
 	case p.ProofMode == "relay" && p.ProofPolicy == xRelayPolicy:
 		// The operator must have opted in: this mode changes who could read
-		// the session cookie, so a coordinator cannot select it alone.
-		return true, c.XRelay
+		// the session cookie, so a coordinator cannot select it alone. A node
+		// that has caught its verifier misusing the session serves no more
+		// relay until an operator restarts it.
+		return true, c.XRelay && !RelayHalted()
 	}
 	return false, false
+}
+
+// relayMisuseMarker is how a caught verifier misuse arrives from the relay
+// helper's stderr. It must match relay::node::MISUSE in prover/src/relay/node.rs.
+const relayMisuseMarker = "verifier misused this node's X session"
+
+// relayHalt latches the first time this node catches its verifier sealing
+// something other than the node's own request. It is a node-wide stop, not a
+// per-account one: every account routes through the single operator-run
+// verifier, so a misuse implicates the verifier, not the account. The node
+// keeps serving MPC-TLS and offers no more keyed relay until an operator
+// restarts it and investigates — deliberately sticky, because this is a trust
+// break the operator should see, not a transient error to retry past.
+var relayHalt struct {
+	sync.Mutex
+	halted bool
+	reason string
+	at     time.Time
+}
+
+// HaltRelay stops this node from offering or accepting keyed-relay work and
+// prints one alert line. Safe to call repeatedly; only the first halts and alerts.
+func HaltRelay(reason string) {
+	relayHalt.Lock()
+	first := !relayHalt.halted
+	relayHalt.halted, relayHalt.reason, relayHalt.at = true, reason, time.Now()
+	relayHalt.Unlock()
+	if first {
+		fmt.Fprintf(os.Stderr, "ALERT keyed relay halted: %s — this node will serve no more relay jobs until restarted; investigate the verifier before re-enabling SCARLETT_X_RELAY\n", reason)
+	}
+}
+
+// RelayHalted reports whether a caught verifier misuse has stopped relay on
+// this node. MPC-TLS X reads are unaffected.
+func RelayHalted() bool {
+	relayHalt.Lock()
+	defer relayHalt.Unlock()
+	return relayHalt.halted
+}
+
+// ResetRelayHaltForTests clears the latch. There is deliberately no runtime
+// reset: a halted node stays halted until an operator restarts it.
+func ResetRelayHaltForTests() {
+	relayHalt.Lock()
+	relayHalt.halted, relayHalt.reason, relayHalt.at = false, "", time.Time{}
+	relayHalt.Unlock()
 }
 
 func privateJSON(path string, out any) error {
@@ -429,6 +480,13 @@ func xFailure(ctx context.Context, e error) string {
 	}
 	if errors.Is(e, errUnprovenXCall) {
 		return "invalid_lease"
+	}
+	// The relay helper caught the verifier sealing something other than this
+	// node's own request. The request has already gone out; what the node can
+	// still do is refuse to be used that way again and make the operator look.
+	if e != nil && strings.Contains(e.Error(), relayMisuseMarker) {
+		HaltRelay(relayMisuseMarker)
+		return "relay_misuse"
 	}
 	if errors.Is(e, x.ErrRateLimited) {
 		return "x_rate_limited"

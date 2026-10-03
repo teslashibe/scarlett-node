@@ -387,6 +387,13 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 		if s.state != "auth_required" && s.restUntil.IsZero() {
 			s.state = "ready"
 		}
+	case "relay_misuse":
+		// The verifier misbehaved, not this account. Keep the account ready
+		// for MPC-TLS work; the node-wide halt (worker.HaltRelay) is what
+		// stops relay, and the code stays in lastError so status shows why.
+		if s.state != "auth_required" && s.restUntil.IsZero() {
+			s.state = "ready"
+		}
 	case "auth_required":
 		s.state = "auth_required"
 	case "x_rate_limited", "capacity_unavailable":
