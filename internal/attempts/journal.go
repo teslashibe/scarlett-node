@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"github.com/teslashibe/scarlett-node/internal/localfs"
 )
 
 const maxRecords = 1024
@@ -81,29 +81,19 @@ func OpenWithLimits(dir string, limits Limits) (*Journal, error) {
 	if err := limits.Validate(); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if _, err := os.Lstat(dir); err == nil {
+		if err = localfs.CheckDir(dir); err != nil {
+			return nil, err
+		}
+	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
-	info, err := os.Lstat(dir)
+	if err := localfs.EnsureDir(dir); err != nil {
+		return nil, err
+	}
+	f, err := localfs.LockPrivate(filepath.Join(dir, ".lock"))
 	if err != nil {
 		return nil, err
-	}
-	if !info.IsDir() || info.Mode().Perm()&0077 != 0 {
-		return nil, errors.New("attempt directory must be private (0700)")
-	}
-	name := filepath.Join(dir, ".lock")
-	if info, err := os.Lstat(name); err == nil && (!info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0) {
-		return nil, errors.New("invalid journal lock")
-	} else if err != nil && !os.IsNotExist(err) {
-		return nil, err
-	}
-	f, err := os.OpenFile(name, os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW, 0600)
-	if err != nil {
-		return nil, err
-	}
-	if err = unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		f.Close()
-		return nil, errors.New("another node process owns the attempt journal")
 	}
 	j := &Journal{dir: dir, lock: f, limits: limits}
 	// The exclusive lock makes abandoned atomic-write files safe to remove.
@@ -173,14 +163,7 @@ func valid(r Record) bool {
 }
 func (j *Journal) read(name string) (Record, error) {
 	var r Record
-	info, err := os.Lstat(name)
-	if err != nil {
-		return r, err
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > int64(j.limits.MaxRecordBytes) {
-		return r, errors.New("invalid attempt record file")
-	}
-	f, err := os.OpenFile(name, os.O_RDONLY|unix.O_NOFOLLOW, 0)
+	f, err := localfs.OpenPrivate(name)
 	if err != nil {
 		return r, err
 	}
@@ -232,31 +215,7 @@ func (j *Journal) write(r Record) error {
 	if reserved > j.limits.MaxTotalBytes {
 		return errors.New("attempt journal storage full")
 	}
-	f, err := os.CreateTemp(j.dir, ".write-")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name())
-	if _, err = f.Write(data); err != nil {
-		f.Close()
-		return err
-	}
-	if err = f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err = f.Close(); err != nil {
-		return err
-	}
-	if err = os.Rename(f.Name(), filepath.Join(j.dir, key(r)+".json")); err != nil {
-		return err
-	}
-	d, err := os.Open(j.dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
+	return localfs.WriteAtomic(filepath.Join(j.dir, key(r)+".json"), data, true)
 }
 func (j *Journal) records() ([]Record, error) {
 	if j.lock == nil {
@@ -443,10 +402,5 @@ func (j *Journal) Purge(now time.Time) error {
 			}
 		}
 	}
-	d, err := os.Open(j.dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
+	return localfs.SyncDir(j.dir)
 }

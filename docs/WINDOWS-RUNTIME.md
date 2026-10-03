@@ -1,9 +1,9 @@
 # Native Windows runtime work
 
-This first ND2 slice adds private file and process-lock primitives, connects X
-session reads to them, and separates the Rust supplier proof client from the
-Unix-only verifier server and receipt store. It does not advertise or package a
-working Windows node.
+The native Go node uses Windows private storage and locks for its identity,
+account registry, lifecycle controls and attempt journal. The Rust supplier
+proof client is separated from the Unix verifier server and receipt store.
+This runtime change does not establish a tested Windows desktop installer.
 
 Windows opens use non-inheritable handles with `FILE_FLAG_OPEN_REPARSE_POINT`,
 check the actual opened file and its owner, and require a protected DACL granting
@@ -22,31 +22,38 @@ request binding and telemetry. Windows cannot run the verifier or fake server.
 An explicitly configured public CA file must be absolute, regular, bounded and
 not a reparse point; no private verifier key is read on Windows.
 
+## State and process contracts
+
+Private directories are created with protected, inheritable current-user and
+LocalSystem permissions. Existing broad permissions are rejected. Local state
+requires NTFS and rejects reparse ancestors. A flushed private temporary file
+is published through a same-volume write-through rename; identity publication
+claims its destination exclusively and never replaces an existing identity.
+Windows has no Unix directory-fsync equivalent here. A power loss may restore
+a removed terminal-history file or drain marker; neither permits replay of
+started provider work.
+
+Per-user state defaults to LocalAppData/Scarlett/node. Native helper discovery
+uses the sibling scarlett-prover.exe. Paths with spaces and Unicode remain
+valid. Helper processes start suspended, enter a non-inheritable Windows Job
+Object before execution, and cannot break away. Closing that job after a
+cancellation or node crash terminates descendants. Journals retain uncertain
+attempts for coordinator reconciliation; local restart never repeats started
+provider work merely because a process died.
+
 ## Validation and remaining work
 
-Mac Go build, vet and full race tests pass; the pinned Rust suite passes 47 tests
-with one synthetic benchmark ignored. The new Go Windows test binary
-cross-compiles, including Windows ACL tests. The local Rust Windows MSVC check
-reaches the dependency build and stops because `ml64.exe` and the Windows SDK
-are unavailable. This establishes a native build prerequisite, not a working
-Windows proof client locally. Hosted Windows Server 2022 built the proof client
-with MSVC and passed all 27 Rust tests, plus the Go filesystem race tests and
-vet checks. The native CI job checks only this first filesystem/client slice
-and uses no provider credentials. It does not verify a complete Windows node
-or live provider proof.
+Local Mac Go race tests, build and vet passed, and the complete Windows x64
+node cross-build and Windows-target vet passed. The full native Windows CI
+runs the built node through synthetic TLS/coordinator crash recovery and
+persistent drain/resume, private filesystem and account-pool tests, helper
+process-tree cancellation/crash tests, and the locked Rust proof-client suite.
+Cross-compilation does not prove installed Windows behavior. Native CI results
+must be read back for the exact PR head before merging or packaging.
 
-Complete the node port after the provider-account pool companion is reconciled:
-
-- Wire the helpers into account locks, account credential checks, local lifecycle
-  reads and the attempt journal without changing scheduler or receipt semantics
-- Add protected directory/temp creation, atomic identity publication and durable
-  replacement on NTFS; test interrupted writes and recovery instead of treating
-  Unix directory sync as a portable contract
-- Resolve per-user Windows data paths and `.exe` siblings, preserving spaces and
-  Unicode paths
-- Bound helper/login process trees with native Windows process controls and test
-  graceful stop, forced termination and no replay of started attempts
-- Run full native Go build/vet/race and locked Rust tests before packaging
+Windows 11 non-admin desktop behavior, provider login, live Codex/X proof
+acceptance, signed installers and updates remain separate release gates. Test
+inputs contain no real provider credentials and make no live provider calls.
 
 ## Native acceptance inputs
 

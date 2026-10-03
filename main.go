@@ -16,6 +16,7 @@ import (
 	"github.com/teslashibe/scarlett-node/internal/attempts"
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
+	"github.com/teslashibe/scarlett-node/internal/localfs"
 	"github.com/teslashibe/scarlett-node/internal/worker"
 )
 
@@ -89,21 +90,10 @@ func pair(c config.Config) error {
 }
 func loadIdentity(c config.Config) (identity, error) {
 	var id identity
-	info, err := os.Lstat(c.StateDir)
-	if err != nil {
+	if err := localfs.CheckDir(c.StateDir); err != nil {
 		return id, err
 	}
-	if !info.IsDir() || info.Mode().Perm()&0077 != 0 {
-		return id, errors.New("state directory permissions must be 0700")
-	}
-	info, err = os.Lstat(identityPath(c))
-	if err != nil {
-		return id, err
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
-		return id, errors.New("identity file must be regular and private (0600)")
-	}
-	f, err := os.Open(identityPath(c))
+	f, err := localfs.OpenPrivate(identityPath(c))
 	if err != nil {
 		return id, err
 	}

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/teslashibe/scarlett-node/internal/config"
+	"github.com/teslashibe/scarlett-node/internal/localfs"
 	"github.com/teslashibe/scarlett-node/internal/worker"
 )
 
@@ -263,10 +264,15 @@ func refreshAccount(a *pooledAccount, now time.Time, helperMissing bool) {
 	if a.spec.Service == "codex" {
 		path = filepath.Join(path, "auth.json")
 	}
-	info, e := os.Lstat(path)
+	f, e := localfs.OpenPrivate(path)
+	var info os.FileInfo
+	if e == nil {
+		info, e = f.Stat()
+		f.Close()
+	}
 	stamp := "unavailable"
 	configured := false
-	if e == nil && info.Mode().IsRegular() && info.Mode().Perm()&0077 == 0 && info.Size() > 0 && info.Size() <= 65536 {
+	if e == nil && info.Size() > 0 && info.Size() <= 65536 {
 		stamp = fmt.Sprintf("%d:%d:%d", info.ModTime().UnixNano(), info.Size(), info.Mode().Perm())
 		configured = true
 	}

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/teslashibe/scarlett-node/internal/process"
 	"io"
 	"net/http"
 	"os/exec"
@@ -63,7 +64,7 @@ func (t XTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	var stdout, stderr limitedBuffer
 	stdout.max, stderr.max = 4<<20, 4096
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
+	if err := process.Run(cmd); err != nil {
 		return nil, fmt.Errorf("prover: %v: %s", err, strings.TrimSpace(stderr.String()))
 	}
 	var summary struct {

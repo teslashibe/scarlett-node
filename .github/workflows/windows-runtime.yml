@@ -1,7 +1,6 @@
-name: windows-runtime-primitives
+name: windows-runtime
 on:
   pull_request:
-    paths: ['internal/localfs/**', 'internal/worker/x.go', 'prover/**', '.github/workflows/windows-runtime.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -15,10 +14,14 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      # This checks the first native primitives; the complete node port is not
-      # yet enabled or advertised. No provider credentials or live jobs run.
-      - run: go test -race ./internal/localfs
-      - run: go vet ./internal/localfs
+      # Real provider acceptance and installer signing remain separate gates.
+      # Native synthetic tests never contain provider credentials or live jobs.
+      - run: go build ./...
+      - run: go build -o "$env:RUNNER_TEMP/scarlett-node.exe" .
+      - run: go vet ./...
+      - run: go test -race ./...
+        env:
+          SCARLETT_TEST_NODE_BINARY: ${{ runner.temp }}/scarlett-node.exe
       - run: rustup toolchain install
         working-directory: prover
       - uses: Swatinem/rust-cache@v2

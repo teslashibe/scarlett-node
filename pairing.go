@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/teslashibe/scarlett-node/internal/config"
+	"github.com/teslashibe/scarlett-node/internal/localfs"
 	"golang.org/x/term"
 )
 
@@ -45,51 +46,16 @@ func readProtectedPairCode(input *os.File) (string, error) {
 	return validatePairCode(string(b))
 }
 
-func prepareStateDir(path string) error {
-	if err := os.MkdirAll(path, 0700); err != nil {
-		return err
-	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
-	if !info.IsDir() {
-		return errors.New("state directory must be a directory, not a symlink")
-	}
-	return os.Chmod(path, 0700)
-}
+func prepareStateDir(path string) error { return localfs.EnsureDir(path) }
 
-// A synced temporary inode becomes the identity using an exclusive hard link.
-// Readers see the whole file or no file, and concurrent pairing cannot replace
-// an existing identity. Credential bytes never appear in a temporary filename.
+// A complete synced private file claims the identity name exclusively. Pairing
+// never overwrites an existing identity, including concurrent pairing calls.
 func saveIdentity(c config.Config, id identity) error {
 	data, err := json.Marshal(id)
 	if err != nil {
 		return err
 	}
-	f, err := os.CreateTemp(c.StateDir, ".identity-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name())
-	if _, err = f.Write(data); err == nil {
-		err = f.Sync()
-	}
-	if closeErr := f.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	if err = os.Link(f.Name(), identityPath(c)); err != nil {
-		return err
-	}
-	dir, err := os.Open(c.StateDir)
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	return dir.Sync()
+	return localfs.WriteAtomic(identityPath(c), data, false)
 }
 
 func validIdentityField(value string, max int) bool {

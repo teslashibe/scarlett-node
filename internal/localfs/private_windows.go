@@ -34,7 +34,7 @@ func parentHandles(path string) ([]windows.Handle, error) {
 			closeHandles(handles)
 			return nil, err
 		}
-		handle, err := windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES, windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+		handle, err := windows.CreateFile(name, windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL, windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
 		if err != nil {
 			closeHandles(handles)
 			return nil, err
@@ -79,7 +79,11 @@ func privateFile(path string, create bool) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	h, err := windows.CreateFile(name, access, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, &sa, disposition, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	share := uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE)
+	if !create {
+		share |= windows.FILE_SHARE_DELETE
+	}
+	h, err := windows.CreateFile(name, access, share, &sa, disposition, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: path, Err: err}
 	}
@@ -97,6 +101,10 @@ func validatePrivate(h windows.Handle, user *windows.SID) error {
 	if err != nil || kind != windows.FILE_TYPE_DISK || windows.GetFileInformationByHandle(h, &info) != nil || info.FileAttributes&(windows.FILE_ATTRIBUTE_REPARSE_POINT|windows.FILE_ATTRIBUTE_DIRECTORY) != 0 {
 		return errors.New("private file must be regular without a reparse point")
 	}
+	return validateACL(h, user)
+}
+
+func validateACL(h windows.Handle, user *windows.SID) error {
 	sd, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		return err
@@ -131,11 +139,23 @@ func validatePrivate(h windows.Handle, user *windows.SID) error {
 }
 
 func LockPrivate(path string) (*os.File, error) {
+	return lockPrivate(path, true)
+}
+
+func LockPrivateWait(path string) (*os.File, error) {
+	return lockPrivate(path, false)
+}
+
+func lockPrivate(path string, nonblocking bool) (*os.File, error) {
 	f, err := privateFile(path, true)
 	if err != nil {
 		return nil, err
 	}
-	if err = windows.LockFileEx(windows.Handle(f.Fd()), windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, new(windows.Overlapped)); err != nil {
+	flags := uint32(windows.LOCKFILE_EXCLUSIVE_LOCK)
+	if nonblocking {
+		flags |= windows.LOCKFILE_FAIL_IMMEDIATELY
+	}
+	if err = windows.LockFileEx(windows.Handle(f.Fd()), flags, 0, 1, 0, new(windows.Overlapped)); err != nil {
 		f.Close()
 		return nil, errors.New("another process owns the private lock")
 	}

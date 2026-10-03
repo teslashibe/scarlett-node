@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"github.com/teslashibe/scarlett-node/internal/localfs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,7 +12,7 @@ import (
 )
 
 func TestAccountCLIConnectAddListRemovePrivateAndNoCredentialOverwrite(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateTestDir(t)
 	t.Setenv("SCARLETT_STATE_DIR", dir)
 	t.Setenv("SCARLETT_ACCOUNTS_FILE", "")
 	var out bytes.Buffer
@@ -45,8 +46,11 @@ func TestAccountCLIConnectAddListRemovePrivateAndNoCredentialOverwrite(t *testin
 		if a.Service == "codex" {
 			path = filepath.Join(path, "auth.json")
 		}
-		info, e := os.Stat(path)
-		if e != nil || info.Mode().Perm()&0077 != 0 {
+		f, e := localfs.OpenPrivate(path)
+		if e == nil {
+			f.Close()
+		}
+		if e != nil {
 			t.Fatal("credentials not private", e)
 		}
 	}
@@ -67,11 +71,11 @@ func TestAccountCLIConnectAddListRemovePrivateAndNoCredentialOverwrite(t *testin
 	}
 }
 func TestAccountCLIRejectsSymlinkAndOversizedSecretInput(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateTestDir(t)
 	t.Setenv("SCARLETT_STATE_DIR", dir)
 	t.Setenv("SCARLETT_ACCOUNTS_FILE", "")
 	target := filepath.Join(dir, "target")
-	os.WriteFile(target, []byte(`{"version":1,"accounts":[]}`), 0600)
+	writePrivateFixture(target, []byte(`{"version":1,"accounts":[]}`), 0600)
 	os.Symlink(target, filepath.Join(dir, "accounts.json"))
 	var out bytes.Buffer
 	if e := accountsCommand([]string{"list"}, strings.NewReader(""), &out); e == nil {
@@ -87,7 +91,7 @@ func TestNativeBinaryAccountCLIUsesPrivateStdin(t *testing.T) {
 	if binary == "" {
 		t.Skip("set SCARLETT_TEST_NODE_BINARY for native CLI coverage")
 	}
-	dir := t.TempDir()
+	dir := privateTestDir(t)
 	cmd := exec.Command(binary, "accounts", "connect", "x_read", "native", "1")
 	cmd.Env = append(os.Environ(), "SCARLETT_STATE_DIR="+dir, "SCARLETT_ACCOUNTS_FILE=")
 	cmd.Stdin = strings.NewReader(`{"auth_token":"synthetic-native-auth","ct0":"synthetic-native-csrf"}`)

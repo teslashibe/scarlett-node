@@ -19,10 +19,10 @@ func TestOrigins(t *testing.T) {
 		}
 	}
 
-	for _, ca := range []string{"relative.pem", "/tmp/synthetic-ca.pem"} {
+	for _, ca := range []string{"relative.pem", filepath.Join(t.TempDir(), "synthetic-ca.pem")} {
 		copy := c
 		copy.CoordinatorCA = ca
-		if (copy.Validate() == nil) != (ca == "/tmp/synthetic-ca.pem") {
+		if (copy.Validate() == nil) != filepath.IsAbs(ca) {
 			t.Fatal("coordinator CA path validation wrong")
 		}
 	}
@@ -92,12 +92,12 @@ func TestCodexTLSN(t *testing.T) {
 }
 
 func TestIndependentProvenServices(t *testing.T) {
-	c := Config{Coordinator: "https://example.org", Executor: ExecutorServices, Services: []string{"x_read"}, XSession: "/tmp/synthetic-x.json", Verifier: "127.0.0.1:7047", Prover: "scarlett-prover", Profile: "p", StateDir: filepath.Join(t.TempDir(), "state"), InferenceTimeout: time.Second, MaxInputBytes: 1024, MaxOutputTokens: 128, CodexConcurrency: 1, XConcurrency: 1}
+	c := Config{Coordinator: "https://example.org", Executor: ExecutorServices, Services: []string{"x_read"}, XSession: filepath.Join(t.TempDir(), "synthetic-x.json"), Verifier: "127.0.0.1:7047", Prover: "scarlett-prover", Profile: "p", StateDir: filepath.Join(t.TempDir(), "state"), InferenceTimeout: time.Second, MaxInputBytes: 1024, MaxOutputTokens: 128, CodexConcurrency: 1, XConcurrency: 1}
 	if e := c.Validate(); e != nil {
 		t.Fatal("X-only requires unused gateway or Codex", e)
 	}
 	c.Services = []string{"codex", "x_read"}
-	c.CodexHome = "/tmp/synthetic-codex"
+	c.CodexHome = filepath.Join(t.TempDir(), "synthetic-codex")
 	if e := c.Validate(); e != nil {
 		t.Fatal(e)
 	}

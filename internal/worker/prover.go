@@ -12,6 +12,7 @@ import (
 
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
+	"github.com/teslashibe/scarlett-node/internal/process"
 )
 
 // Prover runs a Codex job through scarlett-prover, which proves OpenAI's
@@ -54,7 +55,7 @@ func (p Prover) Run(ctx context.Context, l coordinator.Lease) (code, detail stri
 	var stdout, stderr limitedBuffer
 	stdout.max, stderr.max = 4096, 4096
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
+	if err := process.Run(cmd); err != nil {
 		if ctx.Err() != nil {
 			return "expired", "prover timed out"
 		}

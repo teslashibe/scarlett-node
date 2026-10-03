@@ -16,14 +16,16 @@ import (
 
 func poolFixture(t *testing.T, selected ...string) *servicePool {
 	t.Helper()
-	dir := t.TempDir()
+	dir := privateTestDir(t)
 	home := filepath.Join(dir, "codex")
-	os.Mkdir(home, 0700)
-	os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"synthetic_fixture":true}`), 0600)
+	privateFixtureMkdir(home, 0700)
+	writePrivateFixture(filepath.Join(home, "auth.json"), []byte(`{"synthetic_fixture":true}`), 0600)
 	session := filepath.Join(dir, "session.json")
-	os.WriteFile(session, []byte(`{"auth_token":"synthetic-auth","ct0":"synthetic-csrf"}`), 0600)
-	helper := filepath.Join(dir, "synthetic-prover")
-	os.WriteFile(helper, []byte("#!/bin/sh\nexit 1\n"), 0700)
+	writePrivateFixture(session, []byte(`{"auth_token":"synthetic-auth","ct0":"synthetic-csrf"}`), 0600)
+	helper := fixtureHelperPath(dir)
+	if e := installFixtureHelper(helper); e != nil {
+		t.Fatal(e)
+	}
 	return newServicePool(config.Config{Services: selected, CodexHome: home, XSession: session, Prover: helper, CodexConcurrency: 2, XConcurrency: 1, MaxInputBytes: 32768, MaxOutputTokens: 2048})
 }
 
@@ -40,13 +42,13 @@ func TestMissingProofHelperNeverAdvertisesConfiguredCapacity(t *testing.T) {
 			t.Fatal("helper unavailable not reported")
 		}
 	}
-	if e := os.WriteFile(p.config.Prover, []byte("#!/bin/sh\nexit 1\n"), 0600); e != nil {
+	if e := makeHelperUnusable(p.config.Prover); e != nil {
 		t.Fatal(e)
 	}
 	if p.acquire("codex") {
 		t.Fatal("nonexecutable helper accepted")
 	}
-	if e := os.Chmod(p.config.Prover, 0700); e != nil {
+	if e := restoreFixtureHelper(p.config.Prover); e != nil {
 		t.Fatal(e)
 	}
 	if !p.acquire("codex") || !p.acquire("x_read") {
@@ -89,7 +91,7 @@ func TestServicesIndependentCapacityQuotaAndAuthentication(t *testing.T) {
 		t.Fatal("authentication blocked wrong service")
 	}
 	p.finish("codex", "")
-	if e := os.WriteFile(p.config.XSession, []byte(`{"auth_token":"new-synthetic-session","ct0":"synthetic-csrf"}`), 0600); e != nil {
+	if e := writePrivateFixture(p.config.XSession, []byte(`{"auth_token":"new-synthetic-session","ct0":"synthetic-csrf"}`), 0600); e != nil {
 		t.Fatal(e)
 	}
 	if !p.acquire("x_read") {
