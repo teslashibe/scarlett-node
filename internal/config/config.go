@@ -45,6 +45,10 @@ type Config struct {
 	// the local Open Agent API baseline of 20 in-flight requests per account.
 	Concurrency      int
 	Services         []string
+	AccountsFile     string
+	AccountsRequired bool
+	AccountCooldown  func(time.Duration) // private provider quota observation
+	LocalAccountID   string              // private attempt identity; never sent to the coordinator
 	XSession         string
 	CodexConcurrency int
 	XConcurrency     int
@@ -119,6 +123,11 @@ func Load() (Config, error) {
 	}
 	if c.Executor == ExecutorServices {
 		c.XSession = os.Getenv("SCARLETT_X_SESSION")
+		c.AccountsFile = os.Getenv("SCARLETT_ACCOUNTS_FILE")
+		c.AccountsRequired = c.AccountsFile != ""
+		if c.AccountsFile == "" {
+			c.AccountsFile = filepath.Join(c.StateDir, "accounts.json")
+		}
 		c.Services = strings.Split(os.Getenv("SCARLETT_SERVICES"), ",")
 		c.CodexConcurrency, c.XConcurrency = 1, 1
 		for name, destination := range map[string]*int{"SCARLETT_CODEX_CONCURRENCY": &c.CodexConcurrency, "SCARLETT_X_CONCURRENCY": &c.XConcurrency} {
@@ -242,7 +251,10 @@ func (c Config) Validate() error {
 			}
 			seen[kind] = true
 		}
-		if seen["codex"] && !filepath.IsAbs(c.CodexHome) || seen["x_read"] && !filepath.IsAbs(c.XSession) {
+		if c.AccountsRequired && c.AccountsFile == "" || !filepath.IsAbs(c.AccountsFile) && c.AccountsFile != "" {
+			return errors.New("accounts file must be absolute")
+		}
+		if c.AccountsFile == "" && (seen["codex"] && !filepath.IsAbs(c.CodexHome) || seen["x_read"] && !filepath.IsAbs(c.XSession)) {
 			return errors.New("services need absolute local credential paths")
 		}
 	}

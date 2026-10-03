@@ -342,7 +342,7 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 	}
 	client, e := session.NewClient(ctx, x.WithHTTPClient(&http.Client{Transport: transport, Timeout: w.Config.InferenceTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}), x.WithRetry(1, time.Millisecond), x.WithQueryIDs(ids), x.WithMinRequestGap(time.Second))
 	if e != nil {
-		return xFailure(ctx, e)
+		return w.failure(ctx, e)
 	}
 	transport.bootstrap = false
 	request := l.XRequest
@@ -368,7 +368,7 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 		}
 	}
 	if e != nil {
-		return xFailure(ctx, e)
+		return w.failure(ctx, e)
 	}
 	if transport.next != len(plan.Exchanges) {
 		return "x_incomplete"
@@ -390,4 +390,14 @@ func xFailure(ctx context.Context, e error) string {
 		return "auth_required"
 	}
 	return "x_request_failed"
+}
+
+// Only a typed rate-limit observation affects scheduling. Raw provider errors
+// and response headers never enter local status or coordinator reports.
+func (w X) failure(ctx context.Context, e error) string {
+	var limited *x.RateLimitError
+	if errors.As(e, &limited) && w.Config.AccountCooldown != nil {
+		w.Config.AccountCooldown(limited.Wait)
+	}
+	return xFailure(ctx, e)
 }
