@@ -273,7 +273,11 @@ func TestDesktopCodexProfileAdmitsCLIAndGatewayWrittenLogins(t *testing.T) {
 	if healthKind(t, p, "codex").State != "auth_required" {
 		t.Fatal("expired renewal was not observed")
 	}
-	replaceCodexAuthLikeGateway(t, auth, freshSyntheticCodexAuth())
+	// open-agent-api persists expires_at with a renewal. The larger file also
+	// changes the refresh stamp when both writes share one coarse NTFS
+	// timestamp tick, so the repair never depends on clock granularity.
+	renewed := time.Now().Add(365 * 24 * time.Hour).Unix()
+	replaceCodexAuthLikeGateway(t, auth, syntheticCodexClaims(fmt.Sprintf(`{"exp":%d}`, renewed), renewed))
 	if h := healthKind(t, p, "codex"); h.State != "configured" || h.Capacity != 1 || !codexAdmissionValid(home, codexAdmissionWindow(time.Now())) {
 		t.Fatal("renewed login did not restore the desktop account", h.State)
 	}
