@@ -42,6 +42,7 @@ jobs:
         run: rustup toolchain install 1.95 --profile minimal --component rustfmt,clippy
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-on-failure: true
           workspaces: |
             prover
             desktop/src-tauri

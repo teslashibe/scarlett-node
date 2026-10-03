@@ -108,6 +108,8 @@ pub enum Error {
     LoginFailed,
     ApiUnavailable,
     ApiNotReady,
+    ApiPortInUse,
+    ApiProcessExited,
     ModeConflict,
     PrivateStorageUnavailable,
 }

@@ -48,7 +48,9 @@ export const errorMessage = (code: unknown): string =>
     login_busy: "Finish or cancel the current Codex login first",
     login_failed: "Codex login did not complete. You can reconnect",
     api_unavailable: "The local model API is unavailable in this build",
-    api_not_ready: "The local API could not start securely. Check whether the port is already in use",
+    api_not_ready: "The local API did not become ready securely. Check its status before trying again",
+    api_port_in_use: "The local port is unavailable. Choose another port or stop the service using it",
+    api_process_exited: "The local API stopped before becoming ready. Check the bundled installation",
     mode_conflict: "Stop the other service before switching between network jobs and the local API",
     private_storage_unavailable:
       "Scarlett could not open its private local storage",
