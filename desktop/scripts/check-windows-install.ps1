@@ -442,13 +442,22 @@ function Check-BrowserImport {
 
 function Write-SyntheticPrivateJSON([string]$Path, $Value) {
     if (Test-Path -LiteralPath $Path) { throw 'Synthetic identity/journal fixture would overwrite existing state' }
-    # Reuse the installed helper's private atomic creator, then replace its
-    # test-only bytes without changing the Windows ACL. Capture its bearer
-    # output privately; it is never logged or used as a provider credential.
-    $privateOutput = & (Join-Path $install 'scarlett-node.exe') desktop bearer $Path | Out-String
+    # The installed helper deliberately accepts only a file named bearer.
+    # Create that file in a fresh private sibling directory, replace its
+    # test-only bytes, then move it on the same volume to retain its ACL.
+    # Capture helper output privately; never log or use it as a credential.
+    $staging = $Path + '.fixture-private'
+    if (Test-Path -LiteralPath $staging) { throw 'Synthetic fixture staging directory already exists' }
+    $privateOutput = & (Join-Path $install 'scarlett-node.exe') desktop private-dir $staging | Out-String
+    $privateOutput = $null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not create private fixture staging directory' }
+    $temporaryFile = Join-Path $staging 'bearer'
+    $privateOutput = & (Join-Path $install 'scarlett-node.exe') desktop bearer $temporaryFile | Out-String
     $privateOutput = $null
     if ($LASTEXITCODE -ne 0) { throw 'Could not create private installation fixture' }
-    [System.IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Compress), [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText($temporaryFile, ($Value | ConvertTo-Json -Compress), [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::Move($temporaryFile, $Path)
+    Remove-Item -LiteralPath $staging -Recurse
 }
 function Durable-Hashes {
     $files = @('identity.json', 'accounts.json', 'preferences.json', 'local-api/bearer') | ForEach-Object {
