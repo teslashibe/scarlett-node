@@ -336,8 +336,15 @@ mod tests {
     #[test]
     fn status_projects_only_known_subscription_access_and_never_identity() {
         let good = br#"{"configDirectory":"/private/scarlett/claude","loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max","email":"private@example.invalid","orgId":"private-org"}"#;
-        let expected = Path::new("/private/scarlett/claude");
-        assert!(subscription_status(good, expected));
+        let expected = if cfg!(windows) {
+            Path::new(r"C:\Scarlett\claude")
+        } else {
+            Path::new("/private/scarlett/claude")
+        };
+        let mut value: Value = serde_json::from_slice(good).unwrap();
+        value["configDirectory"] = Value::String(expected.to_str().unwrap().into());
+        let good = serde_json::to_vec(&value).unwrap();
+        assert!(subscription_status(&good, expected));
         for raw in [
             "{}",
             "not-json",
@@ -361,7 +368,7 @@ mod tests {
             );
         }
         assert!(!subscription_status(&vec![b' '; 8193], expected));
-        let mut mismatched: Value = serde_json::from_slice(good).unwrap();
+        let mut mismatched: Value = serde_json::from_slice(&good).unwrap();
         mismatched["configDirectory"] = Value::String("/host/.claude".into());
         assert!(!subscription_status(
             &serde_json::to_vec(&mismatched).unwrap(),
