@@ -14,7 +14,7 @@ export type AccountHealth = {
   last_error_code?: string;
 };
 export type Snapshot = {
-  local_api?: { available: boolean; running: boolean; ready: boolean; base_url?: string | null; claude_enabled: boolean };
+  local_api?: { available: boolean; running: boolean; ready: boolean; base_url?: string | null; claude_enabled: boolean; claude?: { available: boolean; connected: boolean; pending: boolean; error?: string | null } };
   runtime_available: boolean;
   accounts_available: boolean;
   helper_available: boolean;
@@ -47,8 +47,10 @@ export const errorMessage = (code: unknown): string =>
       "The action timed out. Check its status before trying again",
     already_running: "This app is already running the node",
     not_paired: "Pair this node first",
-    login_busy: "Finish or cancel the current Codex login first",
+    login_busy: "Finish or cancel the current provider login first",
     login_failed: "Codex login did not complete. You can reconnect",
+    claude_unavailable: "The bundled Claude runtime is missing or failed its integrity check",
+    claude_login_failed: "Claude login did not complete. Reconnect using your subscription",
     api_unavailable: "The local model API is unavailable in this build",
     api_not_ready: "The local API did not become ready securely. Check its status before trying again",
     api_port_in_use: "The local port is unavailable. Choose another port or stop the service using it",

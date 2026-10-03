@@ -17,6 +17,7 @@
     "allow-remove-account",
     "allow-cancel-login",
     "allow-control-local-api",
+    "allow-control-claude",
     "allow-local-api-key",
     "allow-desktop-preferences",
     "allow-save-desktop-preferences",
