@@ -56,6 +56,9 @@ pub struct Request {
 
 #[derive(Serialize)]
 pub struct Summary {
+    /// Untrusted operational TCP payload counters, never billing or proof evidence.
+    #[serde(flatten)]
+    pub verifier_transport: crate::control::TrafficSnapshot,
     pub status: &'static str,
     /// Base64 of X's complete HTTP response as received over the proven session.
     pub response: String,
@@ -75,7 +78,7 @@ pub async fn run(request: Request) -> Result<Summary> {
     let max_recv = request.max_recv.unwrap_or(MAX_RECV).min(MAX_RECV);
     let started = Instant::now();
 
-    let mut socket = crate::control::connect(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture).await?;
+    let (mut socket, traffic) = crate::control::connect(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture).await?;
     socket.write_all(format!("{}\n", request.token).as_bytes()).await?;
     let (driver, mut handle) = Session::new(socket.compat()).split();
     let mut session = Driver::new(tokio::spawn(driver));
@@ -131,6 +134,7 @@ pub async fn run(request: Request) -> Result<Summary> {
     session.finish(async { Ok(prover.close().await?) }, || handle.close()).await?;
 
     Ok(Summary {
+        verifier_transport: traffic.snapshot(),
         status: "proof_sent",
         response: STANDARD.encode(&response),
         sent_bytes,
