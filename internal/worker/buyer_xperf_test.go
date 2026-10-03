@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -26,39 +27,85 @@ import (
 // The application supplies an exact funded node-v1 acceptance through a private
 // local file. This bridge runs the existing X worker; it never imports the app,
 // constructs a replacement plan, registers a second job or retries provider work.
+type buyerXPerfArgs struct {
+	LeaseFile          string `json:"lease_file"`
+	Output             string `json:"output"`
+	ProvisionalAPI     string `json:"provisional_api,omitempty"`
+	ProvisionalKeyFile string `json:"provisional_key_file,omitempty"`
+	Reuse              bool   `json:"reuse,omitempty"`
+}
+
 func TestBuyerBoundXPerformance(t *testing.T) {
 	if os.Getenv("SCARLETT_BUYER_XPERF") != "1" {
 		t.Skip("live buyer X experiment not enabled")
 	}
+	args := buyerXPerfArgs{LeaseFile: os.Getenv("SCARLETT_BUYER_X_LEASE_FILE"), Output: os.Getenv("SCARLETT_BUYER_X_OUTPUT"), ProvisionalAPI: os.Getenv("SCARLETT_BUYER_PROVISIONAL_API"), ProvisionalKeyFile: os.Getenv("SCARLETT_BUYER_PROVISIONAL_KEY_FILE")}
+	if err := runBuyerXPerf(args, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// This tagged experiment keeps client metadata in one process. Private parent
+// pipes carry only local paths; each command owns a fresh exact funded lease.
+func TestBuyerContinuousXPerformance(t *testing.T) {
+	if os.Getenv("SCARLETT_BUYER_X_CONTINUOUS") != "1" {
+		t.Skip("continuous buyer X experiment not enabled")
+	}
+	pool := newXPerfClientPool(time.Hour)
+	encoder := json.NewEncoder(os.Stdout)
+	if encoder.Encode(map[string]any{"phase": "buyer_bridge_ready"}) != nil {
+		t.Fatal("private bridge pipe unavailable")
+	}
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 4096), 16384)
+	for scanner.Scan() {
+		var args buyerXPerfArgs
+		if decodeBuyerXPerf(scanner.Bytes(), &args) != nil {
+			t.Fatal("invalid private bridge command")
+		}
+		err := runBuyerXPerf(args, pool)
+		if encoder.Encode(map[string]any{"phase": "buyer_bridge_done", "ok": err == nil}) != nil {
+			t.Fatal("private bridge reply unavailable")
+		}
+		if err != nil {
+			t.Fatal(err)
+		} // No retry after uncertain provider work.
+	}
+	if scanner.Err() != nil {
+		t.Fatal("private bridge command exceeded its bound")
+	}
+}
+
+func runBuyerXPerf(args buyerXPerfArgs, pool *xPerfClientPool) error {
 	c := xperfConfig{session: os.Getenv("SCARLETT_X_SESSION"), prover: os.Getenv("SCARLETT_PROVER"), verifier: os.Getenv("SCARLETT_VERIFIER"), ca: os.Getenv("SCARLETT_VERIFIER_CA_FILE"), mode: "mpc", headers: "minimal", maxRecv: 32768, sentRecords: 3, recvRecords: 3, responseReady: true}
 	host, _, err := net.SplitHostPort(c.verifier)
 	if err != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() || !filepath.IsAbs(c.prover) || !filepath.IsAbs(c.ca) {
-		t.Fatal("explicit native helper and authenticated loopback verifier required")
+		return errors.New("explicit native helper and authenticated loopback verifier required")
 	}
-	raw, err := xperfPrivateRead(os.Getenv("SCARLETT_BUYER_X_LEASE_FILE"), 144<<10)
+	raw, err := xperfPrivateRead(args.LeaseFile, 144<<10)
 	var accepted coordinator.LeaseAcceptance
 	if err != nil || decodeBuyerXPerf(raw, &accepted) != nil || accepted.Version != coordinator.Version || accepted.State != "leased" || accepted.FundingAuthority != "production_receipt" || !accepted.Lease.AcceptanceRequired {
-		t.Fatal("private funded acceptance invalid")
+		return errors.New("private funded acceptance invalid")
 	}
 	l := accepted.Lease
 	local := config.Config{Profile: os.Getenv("SCARLETT_PROFILE"), XSession: c.session, Prover: c.prover, Verifier: c.verifier, VerifierCA: c.ca, MaxInputBytes: 32768, InferenceTimeout: 90 * time.Second}
 	plan, deadline, failure := validateXLease(local, l)
 	if failure != "" || l.RequestSHA256 == "" || len(plan.Exchanges) != 1 {
-		t.Fatal("buyer experiment requires one exact valid leased read")
+		return errors.New("buyer experiment requires one exact valid leased read")
 	}
-	dir := os.Getenv("SCARLETT_BUYER_X_OUTPUT")
+	dir := args.Output
 	if xperfPrivateDirectory(dir) != nil {
-		t.Fatal("private experiment directory required")
+		return errors.New("private experiment directory required")
 	}
 	transport := &buyerXPerfTransport{config: c, lease: l, output: dir}
-	if origin := os.Getenv("SCARLETT_BUYER_PROVISIONAL_API"); origin != "" {
+	if origin := args.ProvisionalAPI; origin != "" {
 		u, err := url.Parse(origin)
 		if err != nil || u.Scheme != "http" || net.ParseIP(u.Hostname()) == nil || !net.ParseIP(u.Hostname()).IsLoopback() || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "/experimental/provisional" {
-			t.Fatal("provisional destination must be the local experimental endpoint")
+			return errors.New("provisional destination must be the local experimental endpoint")
 		}
-		key, err := xperfPrivateRead(os.Getenv("SCARLETT_BUYER_PROVISIONAL_KEY_FILE"), 4096)
+		key, err := xperfPrivateRead(args.ProvisionalKeyFile, 4096)
 		if err != nil || len(strings.TrimSpace(string(key))) < 16 {
-			t.Fatal("private provisional callback key required")
+			return errors.New("private provisional callback key required")
 		}
 		transport.provisionalOrigin, transport.provisionalKey = origin, strings.TrimSpace(string(key))
 	}
@@ -70,26 +117,34 @@ func TestBuyerBoundXPerformance(t *testing.T) {
 	started := time.Now()
 	bootstrap := &buyerXPerfBootstrap{base: base, started: started}
 	transport.started = started
-	if failure := (X{Config: local, Base: bootstrap, Proof: transport}).Run(ctx, l); failure != "" {
-		t.Fatal("bound X worker failed; uncertain provider work was not retried", failure)
+	worker := X{Config: local, Base: bootstrap, Proof: transport}
+	if args.Reuse {
+		if pool == nil {
+			return errors.New("reusable client pool unavailable")
+		}
+		worker.clientFactory = pool.factory(local.Profile)
+	}
+	if failure := worker.Run(ctx, l); failure != "" {
+		return errors.New("bound X worker failed; uncertain provider work was not retried")
 	}
 	if len(transport.observed) != 1 {
-		t.Fatal("bound worker did not prove exactly one exchange")
+		return errors.New("bound worker did not prove exactly one exchange")
 	}
 	o := transport.observed[0]
 	if o.summary.VerifierSent == nil || o.summary.VerifierReceived == nil || o.summary.TransportLayer != "tcp_payload" || o.summary.TransportSaturated {
-		t.Fatal("helper traffic telemetry incomplete")
+		return errors.New("helper traffic telemetry incomplete")
 	}
 	f, err := os.OpenFile(filepath.Join(dir, "node-report.json"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
-		t.Fatal("report must be new")
+		return errors.New("report must be new")
 	}
 	defer f.Close()
-	if err := json.NewEncoder(f).Encode(map[string]any{"schema": 1, "service": "x_read", "mode": "mpc", "headers": "minimal", "max_recv": 32768, "max_sent_records": 3, "max_recv_records_online": 3, "proven_exchanges": 1, "worker_ms": time.Since(started).Milliseconds(), "helper_ms": o.helperMS, "response_ready_ms": o.provisionalMS, "provisional_callback": transport.provisionalOrigin != "", "verifier_tcp_payload_bytes": *o.summary.VerifierSent + *o.summary.VerifierReceived, "final_proof_sent": true, "provider_work_not_retried": true, "bootstrap": bootstrap.report(transport.proofStarted)}); err != nil {
-		t.Fatal("report write failed")
+	if err := json.NewEncoder(f).Encode(map[string]any{"schema": 1, "service": "x_read", "mode": "mpc", "headers": "minimal", "max_recv": 32768, "max_sent_records": 3, "max_recv_records_online": 3, "proven_exchanges": 1, "worker_ms": time.Since(started).Milliseconds(), "helper_ms": o.helperMS, "response_ready_ms": o.provisionalMS, "provisional_callback": transport.provisionalOrigin != "", "verifier_tcp_payload_bytes": *o.summary.VerifierSent + *o.summary.VerifierReceived, "final_proof_sent": true, "provider_work_not_retried": true, "bootstrap": bootstrap.report(transport.proofStarted), "client_reuse_enabled": args.Reuse, "quota_limit": o.rateLimit, "quota_remaining": o.rateRemaining, "quota_reset": o.rateReset}); err != nil {
+		return errors.New("report write failed")
 	}
-}
 
+	return nil
+}
 func decodeBuyerXPerf(raw []byte, out any) error {
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.DisallowUnknownFields()
@@ -136,7 +191,13 @@ func (t *buyerXPerfTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	if err != nil {
 		return nil, err
 	}
-	return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body)), Request: req}, nil
+	headers := make(http.Header)
+	for name, value := range map[string]*uint64{"X-Rate-Limit-Limit": o.rateLimit, "X-Rate-Limit-Remaining": o.rateRemaining, "X-Rate-Limit-Reset": o.rateReset} {
+		if value != nil {
+			headers.Set(name, strconv.FormatUint(*value, 10))
+		}
+	}
+	return &http.Response{StatusCode: 200, Header: headers, Body: io.NopCloser(bytes.NewReader(body)), Request: req}, nil
 }
 
 type buyerXPerfProvisional struct {

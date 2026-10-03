@@ -24,7 +24,18 @@ type X struct {
 	Config config.Config
 	Base   http.RoundTripper
 	Proof  http.RoundTripper
+	// An isolated experiment may supply a context-routed client factory. The
+	// production worker keeps the existing per-job constructor by default.
+	clientFactory xClientFactory
 }
+
+type xClientFactory func(context.Context, x.Session, *xBoundTransport, map[string]string, time.Duration) (*x.Client, error)
+type xAttemptTransportKey struct{}
+
+func newXClient(ctx context.Context, session x.Session, transport http.RoundTripper, ids map[string]string, timeout time.Duration) (*x.Client, error) {
+	return session.NewClient(ctx, x.WithHTTPClient(&http.Client{Transport: transport, Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}), x.WithRetry(1, time.Millisecond), x.WithQueryIDs(ids), x.WithMinRequestGap(time.Second))
+}
+
 type xSpec struct {
 	Operation    string         `json:"operation"`
 	QueryID      string         `json:"query_id"`
@@ -340,7 +351,13 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 		}
 		ids[s.Operation] = s.QueryID
 	}
-	client, e := session.NewClient(ctx, x.WithHTTPClient(&http.Client{Transport: transport, Timeout: w.Config.InferenceTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}), x.WithRetry(1, time.Millisecond), x.WithQueryIDs(ids), x.WithMinRequestGap(time.Second))
+	var client *x.Client
+	if w.clientFactory == nil {
+		client, e = newXClient(ctx, session, transport, ids, w.Config.InferenceTimeout)
+	} else {
+		ctx = context.WithValue(ctx, xAttemptTransportKey{}, transport)
+		client, e = w.clientFactory(ctx, session, transport, ids, w.Config.InferenceTimeout)
+	}
 	if e != nil {
 		return w.failure(ctx, e)
 	}
