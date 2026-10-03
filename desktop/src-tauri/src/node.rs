@@ -106,6 +106,8 @@ pub enum Error {
     NotPaired,
     LoginBusy,
     LoginFailed,
+    ClaudeUnavailable,
+    ClaudeLoginFailed,
     ApiUnavailable,
     ApiNotReady,
     ApiPortInUse,

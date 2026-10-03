@@ -21,7 +21,7 @@ app.innerHTML = `<header><span class="brand">SCARLETT <small>Node</small></span>
 <section aria-labelledby="accounts-heading"><div class="section-head"><h2 id="accounts-heading">Connected accounts</h2><span id="account-note" class="muted"></span></div><div id="accounts"></div><div class="account-forms">
 <form id="codex-form"><h3>Connect Codex</h3><p>Your browser handles login. Scarlett keeps a separate private profile on this device</p><label>Local Codex account ID<input id="codex-id" autocomplete="off" pattern="[a-z0-9_-]{1,32}" maxlength="32" placeholder="work-codex" required></label><label>Concurrent jobs<input id="codex-capacity" type="number" min="1" max="32" value="1" required></label><button type="submit">Connect Codex</button><button id="cancel-login" type="button" class="quiet" hidden>Cancel login</button><p id="codex-note" class="muted"></p></form>
 <form id="x-form"><h3>Connect X</h3><p>Import from a browser profile or paste these two cookies. They stay on this device; the node uses X for read-only work</p><label>Local X account ID<input id="x-id" autocomplete="off" pattern="[a-z0-9_-]{1,32}" maxlength="32" placeholder="personal-x" required></label><label>Concurrent jobs<input id="x-capacity" type="number" min="1" max="32" value="1" required></label><label>Browser profile<select id="x-profile" disabled><option value="">Loading browser profiles</option></select></label><label class="check"><input id="x-consent" type="checkbox">Import only X session cookies from this profile</label><button id="x-import" type="button" disabled>Import X account</button><p class="muted">Close the selected browser before importing. The OS may ask for permission; protected stores can use cookie paste</p><label>auth_token<input id="x-token" type="password" autocomplete="off" spellcheck="false" maxlength="64" required></label><label>ct0<input id="x-ct0" type="password" autocomplete="off" spellcheck="false" maxlength="160" required></label><button type="submit">Connect X</button><p id="x-import-note" class="muted"></p></form></div></section>
-<section aria-labelledby="local-api-heading"><h2 id="local-api-heading">Local model API</h2><p>Connect your tools to this device using an OpenAI-compatible API. It uses the Codex accounts connected above. Stop network jobs before starting the local API</p><p id="api-status" class="muted"></p><label>Local port<input id="api-port" type="number" min="1024" max="65535" value="8088"></label><label>Claude API key (optional)<input id="claude-key" type="password" autocomplete="off" spellcheck="false" maxlength="512"></label><p class="muted">Claude uses your own Anthropic API key. The key stays in the running service and is cleared when it stops</p><div class="actions"><button id="api-start" type="button">Start local API</button><button id="api-stop" type="button" class="quiet">Stop local API</button><button id="api-show-key" type="button" class="quiet">Show local API key</button><button id="api-hide-key" type="button" class="quiet" hidden>Hide key</button></div><label id="api-key-label" hidden>Local API key<input id="api-key" type="password" readonly autocomplete="off" spellcheck="false"></label><p class="muted">Use the address above as your base URL and this private key as the bearer token. Restart the local API after adding Codex accounts</p></section>
+<section aria-labelledby="local-api-heading"><h2 id="local-api-heading">Local model API</h2><p>Connect your tools to this device using an OpenAI-compatible API. It uses the Codex accounts connected above. Stop network jobs before starting the local API</p><p id="api-status" class="muted"></p><label>Local port<input id="api-port" type="number" min="1024" max="65535" value="8088"></label><h3>Connect Claude</h3><p>Your browser handles subscription login. Claude keeps this app’s credentials on this device</p><p id="claude-status" class="muted"></p><div class="actions"><button id="claude-connect" type="button">Connect Claude subscription</button><button id="claude-cancel" type="button" class="quiet" hidden>Cancel Claude login</button><button id="claude-disconnect" type="button" class="quiet">Disconnect Claude</button></div><label>Claude billing<select id="claude-mode"><option value="subscription">Claude subscription</option><option value="api_key">Anthropic API key · separate usage billing</option></select></label><label id="claude-key-label" hidden>Anthropic API key<input id="claude-key" type="password" autocomplete="off" spellcheck="false" maxlength="512"></label><p class="muted">Subscription mode uses your connected claude.ai account. API key mode bills Anthropic API usage separately; the key is cleared when the service stops. Stop the local API before changing billing mode</p><div class="actions"><button id="api-start" type="button">Start local API</button><button id="api-stop" type="button" class="quiet">Stop local API</button><button id="api-show-key" type="button" class="quiet">Show local API key</button><button id="api-hide-key" type="button" class="quiet" hidden>Hide key</button></div><label id="api-key-label" hidden>Local API key<input id="api-key" type="password" readonly autocomplete="off" spellcheck="false"></label><p class="muted">Use the address above as your base URL and this private key as the bearer token. Restart the local API after adding Codex accounts</p></section>
 <section aria-labelledby="preferences-heading"><h2 id="preferences-heading">This device</h2><form id="preferences-form"><label class="check"><input id="background" type="checkbox">Keep running when the window closes</label><p class="muted">When off, closing the window drains accepted jobs and quits Scarlett. When on, use the menu bar or tray to reopen or quit</p><label>Saved local API port<input id="saved-api-port" type="number" min="1024" max="65535" required></label><button type="submit">Save device preferences</button></form><label class="check"><input id="autostart" type="checkbox" disabled>Open Scarlett when I log in</label><p class="muted">Opening Scarlett does not start network jobs or the local API. You choose when to start them</p></section>
 <footer><p>Suppliers earn points only. Local status does not confirm a points award</p><p>Choose what happens when the window closes in This device. Quit drains and stops the node</p><button id="settings" class="quiet">Manage node access ↗</button></footer></main>`;
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
@@ -64,7 +64,15 @@ function render(s: Snapshot) {
   $("api-stop").toggleAttribute("disabled", busy || !local?.running);
   $("api-show-key").toggleAttribute("disabled", busy || !local?.available);
   $("api-port").toggleAttribute("disabled", busy || !!local?.running);
-  $("claude-key").toggleAttribute("disabled", busy || !!local?.running);
+  const claude = local?.claude;
+  $("claude-status").textContent = claude?.pending ? "Finish Claude login in your browser" : claude?.connected ? "Claude subscription connected on this device" : claude?.error ? errorMessage(claude.error) : claude?.available ? "Claude subscription not connected" : "Claude login is unavailable in this build";
+  $("claude-connect").toggleAttribute("disabled", busy || !claude?.available || !!claude?.pending || !!claude?.connected);
+  $("claude-cancel").hidden = !claude?.pending;
+  $("claude-cancel").toggleAttribute("disabled", busy);
+  $("claude-disconnect").toggleAttribute("disabled", busy || !claude?.available || !!claude?.pending);
+  $("claude-mode").toggleAttribute("disabled", busy || !!local?.running || !!claude?.pending);
+  $("claude-key").toggleAttribute("disabled", busy || !!local?.running || !!claude?.pending);
+  $("api-start").toggleAttribute("disabled", busy || !local?.available || local.running || s.supervised || externalRuntime(s) || !!claude?.pending);
   $("status").textContent = statusText(s);
   $("runtime-note").textContent = !s.runtime_available
     ? "This build needs the packaged node and proof helper"
@@ -234,13 +242,24 @@ $("x-form").addEventListener("submit", (event) => {
     "X account connected locally",
   );
 });
+for (const action of ["connect", "cancel", "disconnect"] as const) {
+  $("claude-" + action).addEventListener("click", () => {
+    void act(() => api.claude(action), action === "connect" ? "Finish Claude login in your browser" : action === "cancel" ? "Claude login cancelled" : "Claude disconnected locally");
+  });
+}
+$("claude-mode").addEventListener("change", () => {
+  $<HTMLInputElement>("claude-key").value = "";
+  $("claude-key-label").hidden = $<HTMLSelectElement>("claude-mode").value !== "api_key";
+});
 $("api-start").addEventListener("click", () => {
   const key = $<HTMLInputElement>("claude-key");
   const value = key.value;
   key.value = "";
   const port = Number($<HTMLInputElement>("api-port").value);
   if (!Number.isInteger(port) || port < 1024 || port > 65535) { notice("Choose a local port between 1024 and 65535", true); return; }
-  void act(() => api.localApi("start", port, value), "Local API ready");
+  const mode = $<HTMLSelectElement>("claude-mode").value as "subscription" | "api_key";
+  if (mode === "api_key" && !value) { notice("Enter your Anthropic API key for API usage billing", true); return; }
+  void act(() => api.localApi("start", port, mode === "api_key" ? value : "", mode), "Local API ready");
 });
 $("api-stop").addEventListener("click", () => { void act(() => api.localApi("stop"), "Local API stopped"); });
 $("api-show-key").addEventListener("click", () => {

@@ -50,6 +50,38 @@ Closing the main window drains and quits by default. Operators can enable backgr
 
 Windows runtime operations require private NTFS storage and the bundled native helpers. Native tests validate ACLs, locking, process trees and owner-pipe shutdown; installed Windows GUI acceptance remains required before publishing its installer.
 
+Windows release signing uses an existing current-user code-signing identity and
+the trusted Microsoft SDK SignTool. No certificate or key is imported by the
+release helper. Set `SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT` to the reviewed public
+certificate thumbprint, `SCARLETT_WINDOWS_SIGNTOOL` to the absolute SDK executable
+and `SCARLETT_WINDOWS_TIMESTAMP_URL` to the approved HTTPS RFC3161 endpoint on a
+disposable native Windows release runner. Keep hardware-provider credentials and
+key access on that runner.
+
+After preparing the complete native runtime, build the release executable with
+`npm run tauri -- build --no-bundle --config src-tauri/tauri.complete.generated.json`.
+Then run `python scripts/sign-windows-bundle.py <absolute-desktop-checkout> <new-absolute-evidence.json>`.
+The helper validates the original inventory, signs Scarlett executables and
+the pinned NSIS packaging components,
+retains unsigned sidecar hashes and preserves provider bytes. It packages NSIS
+with Tauri's binary patching disabled, verifies trusted publisher/timestamp
+signatures and tests that exact installer with isolated local state. Evidence is
+written only after installed payload, lifecycle, preferences and browser tests
+pass. Real account login, signed upgrade/downgrade and publication remain
+separate gates; contract tests and unsigned rejection do not prove real signing.
+
+The Tauri callback permits exactly its five copied x86 NSIS plugin DLL paths.
+Generated x86 uninstallers must match NSIS 3.11's `nst<hex>.tmp` filename inside
+a fresh `target/release/nsis-signing-temp` directory. Only the packaging child
+receives that directory as TMP/TEMP and explicit callback context; it is removed
+on completion or failure. System temporary files, links, unexpected DLLs and
+other architectures are rejected. Provider resource callbacks verify exact paths,
+sizes and hashes against the finalized component inventory and preserve the
+original bytes and signing status; they add no Scarlett publisher signature.
+
+The signing options follow [Microsoft's SignTool reference](https://learn.microsoft.com/en-us/windows/win32/seccrypto/signtool)
+and [Tauri's custom Windows signing support](https://v2.tauri.app/distribute/sign/windows/#custom-sign-command).
+
 Tests use synthetic credentials and disposable temporary directories/fake executables. Launching the app does not itself start provider work: Start remains explicit. Real account/canary testing and production validation belong to the release owner.
 
 ## Complete runtime package
@@ -84,9 +116,15 @@ Claude's native package and license are kept intact. Each user must authenticate
 
 ## Local model API controls
 
+Local API models expose their reviewed effort levels and normal/Fast modes. Codex Fast requests priority; Claude Fast supports Opus 5.5, Opus 5 and Opus 4.8, subject to provider access and credits, and may fall back to standard execution. Listings do not establish account entitlement or measured speed. Ultra is deferred from this launch. Verified Codex network jobs keep base model IDs, low effort and the default tier; Claude runs through the local API only.
+
 The complete bundle can start and stop its bundled model API from the desktop. It binds only `127.0.0.1` on an operator-selected port (default 8088), requires a generated 256-bit bearer, and reports Ready only after health succeeds, unauthenticated model access returns 401 and authenticated access returns 200. Show local API key explicitly reveals the private bearer; it clears on window blur or page exit. The file is private to the current user (mode 0600 on Unix; current-user/SYSTEM ACL on Windows), and symlink or shared-file reads fail closed. The bearer is never included in status, logs or process arguments.
 
-Codex clients use only completed app-owned login profiles for registered account IDs, plus bundled profile/scaffold files. Unrelated environment credentials and host profiles are cleared. An optional personal Anthropic API key enables the bundled Claude provider; it stays only in that service's environment, is not saved to disk, and must be re-entered after stopping. Claude subscription OAuth is not imported into this API. Neither discovery nor readiness establishes provider entitlement.
+Codex clients use only completed app-owned login profiles for registered account IDs, plus bundled profile/scaffold files. Unrelated environment credentials and host profiles are cleared. Connect Claude subscription runs the fixed bundled CLI’s `auth login --claudeai`. Login, status, logout and inference share the app’s private `local-api/claude` directory through `CLAUDE_CONFIG_DIR`; the CLI manages its own per-directory credential storage. No global provider profile, credential or Keychain entry is copied or inspected by Scarlett. A successful known `claude.ai` status enables Claude when starting in subscription mode. Status exposes only connection/pending/error flags, never provider identity JSON. Cancellation and disconnect persist a private admission block, so an unfinished login or failed logout cannot reactivate after restart. Disconnect stops the local API before the official logout command.
+
+API key billing is a separate explicit choice. A personal Anthropic API key stays only in the running service’s environment, is not saved to disk, and must be re-entered after stopping. API-key mode uses a separate private `claude-api-key` directory so it cannot fall back to stored subscription credentials. Billing mode controls are disabled while the API runs. Neither discovery nor readiness establishes provider entitlement.
+
+Authentication metadata and model discovery do not guarantee current subscription entitlement or a successful provider request. The CLI remains responsible for credential expiry, refresh and provider authentication; malformed, unknown, unauthenticated or mismatched-directory statuses disable subscription activation. Claude CLI 2.1.286 reports configured credentials, not token expiry or live entitlement; expired credentials can still appear connected until the CLI refreshes or rejects them during an actual request. Scarlett does not read credential files to infer expiry.
 
 The app permits network execution or the local API at a time, serialized through one native control lock, so independent processes cannot silently exceed account capacity. Adding an account takes effect in the local API after restart; removing a Codex account first stops the API. Quit stops the API before draining the node. Windows private storage uses the Go node’s NTFS, current-user/SYSTEM ACL and reparse-point checks. Local API supervision uses the same native process-tree boundary as node helpers. Full installed Windows GUI acceptance remains a release gate.
 
@@ -139,6 +177,40 @@ installation lifecycle for that version pair; signed installers, historical
 schema compatibility and the Mac upgrade/downgrade UI remain separate checks.
 
 Installed Windows import acceptance uses new synthetic Chrome/Firefox stores below RUNNER_TEMP and redirects only browser roots for the test app. It exercises profile-specific consent and reset, Firefox import, the protected Chrome paste fallback, masked paste, unchanged stores and native private account persistence. It makes no provider requests. Account ID fields have distinct X/Codex labels for assistive technology. This acceptance is a release gate; test configuration is not a browser import mode for operators.
+
+## Windows release signature acceptance
+
+Verify the final signed setup and its installed complete payload on a clean native
+Windows machine before selecting a stable download. Supply the reviewed publisher
+certificate's public thumbprint; private keys and certificate passwords are not
+inputs to this read-only checker. Do not install a test certificate or add trust
+roots to make a release pass.
+
+```powershell
+& desktop/scripts/check-windows-signatures.ps1 `
+  -Installer 'C:\release\Scarlett-Node-setup.exe' `
+  -InstalledDirectory 'C:\acceptance\Scarlett Node' `
+  -ExpectedPublisherThumbprint $ReviewedCertificateThumbprint `
+  -EvidenceFile 'C:\evidence\windows-signatures.json'
+```
+
+The setup, desktop, node, proof helper and local model API must each have a
+Windows-trusted embedded Authenticode signature matching that certificate and a
+trusted timestamp. Unsigned, altered, untrusted, catalog-only, self-signed,
+untimestamped or unexpected-publisher files fail. Read hashes before and after
+signature validation to reject changes during the check. Local file paths cannot
+use alternate streams or traverse reparse points. A new outcome/digest file is
+written only after all signature checks; existing evidence is never overwritten.
+Native tool failures disclose no raw certificate details or local paths.
+
+Run the complete installed payload/hash/protected-API checker and installed UI
+acceptance separately. These signature checks do not establish that an arbitrary
+installed directory came from the supplied setup, validate every provider byte,
+or prove login, upgrades, paid jobs or SmartScreen reputation. The native CI gate
+tests signature-record rejection and rejects the actual unsigned Go executable
+without creating signing certificates or modifying trust stores. Genuine signed
+installer acceptance and the Windows signing integration remain release work.
+The checker uses [Windows Authenticode validation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/get-authenticodesignature).
 
 ## Mac release signing
 

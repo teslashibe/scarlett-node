@@ -373,7 +373,29 @@ function Set-Checkbox([string]$Name, [bool]$Enabled) {
 function Saved-Preferences([int]$Port, [bool]$Background) {
     $path = Join-Path $state 'preferences.json'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
-    $saved = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
+    $stream = $null
+    $reader = $null
+    try {
+        # Observe one complete file without blocking the helper's atomic rename.
+        $sharing = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+        $stream = [System.IO.FileStream]::new($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $sharing)
+        $reader = [System.IO.StreamReader]::new($stream)
+        $saved = $reader.ReadToEnd() | ConvertFrom-Json
+    } catch {
+        $failure = $_.Exception
+        while (($failure -is [System.Management.Automation.MethodInvocationException] -or
+            $failure -is [System.Reflection.TargetInvocationException]) -and $null -ne $failure.InnerException) {
+            $failure = $failure.InnerException
+        }
+        # HRESULT_FROM_WIN32 for sharing/lock violations (32/33) alone defers
+        # observation; the bounded wait still requires exact persisted values.
+        if ($failure -is [System.IO.IOException] -and
+            $failure.HResult -in @(-2147024864, -2147024863)) { return $false }
+        throw
+    } finally {
+        try { if ($null -ne $reader) { $reader.Dispose() } }
+        finally { if ($null -ne $stream) { $stream.Dispose() } }
+    }
     return $saved.schema -eq 1 -and $saved.local_api_port -eq $Port -and $saved.background -eq $Background
 }
 function Close-Window {
@@ -1004,7 +1026,7 @@ try {
         installedNSIS = 'passed'; completePayload = 'passed'; nativeWindow = 'passed'
         uiStartStop = 'passed'; bearerProtection = 'passed'; developerPathCleared = $true
         unexpectedDesktopExit = 'passed'; uiQuit = 'passed'; quitInputFocus = 'verified'; realProviderJobs = 0
-        signedInstaller = $false; remoteAccountLoginTested = $false
+        signedInstaller = 'separate signature acceptance required'; remoteAccountLoginTested = $false
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-installed-ui.json')
     if ($Preferences) { Check-Preferences }
     if ($BrowserFixture) { Check-BrowserImport }
