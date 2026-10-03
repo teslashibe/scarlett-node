@@ -17,19 +17,35 @@ function Wait-Check([scriptblock]$Check, [int]$Seconds, [string]$Failure) {
     } while ([DateTime]::UtcNow -lt $deadline)
     throw $Failure
 }
+function Response-Status($Response) {
+    try {
+        $stream = $Response.GetResponseStream()
+        if ($stream) {
+            $buffer = New-Object byte[] 8192
+            $received = 0
+            while (($count = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $received += $count
+                if ($received -gt 512 * 1024) { throw 'Local API status response exceeded its bound' }
+            }
+        }
+        return [int]$Response.StatusCode
+    } finally { $Response.Close() }
+}
 function Api-Status([string]$Path, [string]$Bearer = '') {
     $request = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:8088$Path")
     $request.Timeout = 2000
+    $request.ReadWriteTimeout = 2000
+    $request.KeepAlive = $false
     $request.AllowAutoRedirect = $false
     $request.Proxy = $null
     if ($Bearer) { $request.Headers['Authorization'] = "Bearer $Bearer" }
     try {
         $response = $request.GetResponse()
-        try { return [int]$response.StatusCode } finally { $response.Close() }
+        return Response-Status $response
     } catch [System.Net.WebException] {
         if ($_.Exception.Response) {
             $response = $_.Exception.Response
-            try { return [int]$response.StatusCode } finally { $response.Close() }
+            return Response-Status $response
         }
         return 0
     }
