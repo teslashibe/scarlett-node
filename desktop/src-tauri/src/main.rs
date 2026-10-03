@@ -149,6 +149,7 @@ fn main() {
         ])
         .setup(move |app| {
             let state = app.path().app_data_dir()?;
+            let resources = app.path().resource_dir()?;
             let exe = std::env::current_exe()?;
             let directory = exe.parent().ok_or("missing application directory")?;
             let suffix = if cfg!(windows) { ".exe" } else { "" };
@@ -158,7 +159,8 @@ fn main() {
                     directory.join(format!("scarlett-node{suffix}")),
                     directory.join(format!("scarlett-prover{suffix}")),
                 )
-                .map_err(|_| "invalid desktop endpoint configuration")?,
+                .map_err(|_| "invalid desktop endpoint configuration")?
+                .with_provider_runtime(&resources),
             ));
             let login_node = app.state::<Arc<Node>>().inner().clone();
             tauri::async_runtime::spawn(async move {

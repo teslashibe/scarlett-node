@@ -113,7 +113,7 @@ function render(s: Snapshot) {
   $("codex-note").textContent = s.login_pending
     ? "Finish login in your browser"
     : !s.codex_login_available
-      ? "Requires the reviewed Codex CLI 0.159.2"
+      ? "The bundled Codex runtime is missing or incompatible"
       : s.login_error
         ? errorMessage(s.login_error)
         : "Provider access is checked when it serves work";

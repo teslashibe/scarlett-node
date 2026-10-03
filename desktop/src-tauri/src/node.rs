@@ -143,6 +143,7 @@ pub struct Node {
     endpoints: Endpoints,
     binary: PathBuf,
     helper: PathBuf,
+    codex_binary: PathBuf,
     running: Mutex<Option<Child>>,
     login: Mutex<Option<Login>>,
     login_error: Mutex<Option<Error>>,
@@ -275,16 +276,29 @@ fn observation_projection(raw: &[u8]) -> Result<Value> {
 }
 impl Node {
     pub fn new(state: PathBuf, binary: PathBuf, helper: PathBuf) -> Self {
+        let codex_binary = binary
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(if cfg!(windows) { "codex.exe" } else { "codex" });
         Self {
             state,
             endpoints: Endpoints::default(),
             binary,
             helper,
+            codex_binary,
             running: Mutex::new(None),
             login: Mutex::new(None),
             login_error: Mutex::new(None),
             mutation: Mutex::new(()),
         }
+    }
+    pub fn with_provider_runtime(mut self, resource_root: &Path) -> Self {
+        self.codex_binary = resource_root
+            .join("runtime")
+            .join("codex")
+            .join("bin")
+            .join(if cfg!(windows) { "codex.exe" } else { "codex" });
+        self
     }
     pub fn from_environment(state: PathBuf, binary: PathBuf, helper: PathBuf) -> Result<Self> {
         let mut node = Self::new(state, binary, helper);
@@ -548,23 +562,26 @@ impl Node {
             {
                 return Err(Error::WindowsPending);
             }
-            // Node gives accepted work up to two minutes, within its lease.
-            if tokio::time::timeout(Duration::from_secs(125), child.wait())
-                .await
-                .is_err()
+            #[cfg(unix)]
             {
-                #[cfg(unix)]
+                // Node gives accepted work up to two minutes, within its lease.
+                if tokio::time::timeout(Duration::from_secs(125), child.wait())
+                    .await
+                    .is_err()
                 {
-                    if let Some(pid) = child.id() {
-                        unsafe {
-                            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                    #[cfg(unix)]
+                    {
+                        if let Some(pid) = child.id() {
+                            unsafe {
+                                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                            }
                         }
                     }
+                    child.kill().await.map_err(|_| Error::CommandFailed)?;
+                    return Err(Error::CommandTimeout);
                 }
-                child.kill().await.map_err(|_| Error::CommandFailed)?;
-                return Err(Error::CommandTimeout);
+                *running = None;
             }
-            *running = None;
         }
         Ok(())
     }
@@ -576,18 +593,7 @@ impl Node {
         Ok(())
     }
     async fn codex_cli(&self) -> Option<PathBuf> {
-        let mut candidates =
-            vec![
-                self.binary
-                    .parent()?
-                    .join(if cfg!(windows) { "codex.exe" } else { "codex" }),
-            ];
-        if let Some(path) = std::env::var_os("PATH") {
-            candidates.extend(
-                std::env::split_paths(&path)
-                    .map(|p| p.join(if cfg!(windows) { "codex.exe" } else { "codex" })),
-            );
-        }
+        let candidates = [&self.codex_binary];
         for p in candidates {
             let Ok(p) = p.canonicalize() else { continue };
             if !regular(&p) {
@@ -903,6 +909,33 @@ mod tests {
         let q = root.path().join("link");
         symlink(&p, &q).unwrap();
         assert_eq!(private_dir(&q), Err(Error::PrivateStorageUnavailable));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_login_uses_only_the_fixed_bundled_native_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let bundled = temp.path().join("resources/runtime/codex/bin/codex");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        // Even a compatible sibling outside the fixed resource layout is ignored.
+        let sibling = temp.path().join("codex");
+        std::fs::write(&sibling, "#!/bin/sh\nprintf 'codex-cli 0.159.2\\n'\n").unwrap();
+        std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let node = Node::new(
+            temp.path().join("state"),
+            temp.path().join("node"),
+            temp.path().join("helper"),
+        )
+        .with_provider_runtime(&temp.path().join("resources"));
+        assert!(node.codex_cli().await.is_none());
+        std::fs::write(&bundled, "#!/bin/sh\nprintf 'codex-cli 0.154.0\\n'\n").unwrap();
+        std::fs::set_permissions(&bundled, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(node.codex_cli().await.is_none());
+        std::fs::write(&bundled, "#!/bin/sh\nprintf 'codex-cli 0.159.2\\n'\n").unwrap();
+        assert_eq!(
+            node.codex_cli().await,
+            Some(bundled.canonicalize().unwrap())
+        );
     }
     #[cfg(unix)]
     #[tokio::test]

@@ -37,7 +37,7 @@ export const errorMessage = (code: unknown): string =>
     accounts_unavailable:
       "This node build does not support account management yet",
     cli_unavailable:
-      "Install the reviewed Codex CLI 0.159.2 to connect an account",
+      "The bundled Codex runtime is missing or incompatible",
     command_failed:
       "The node could not complete that action. For pairing, check the website before requesting another code",
     command_timeout:
