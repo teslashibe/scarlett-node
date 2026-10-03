@@ -518,7 +518,7 @@ try {
         installedNSIS = 'passed'; completePayload = 'passed'; nativeWindow = 'passed'
         uiStartStop = 'passed'; bearerProtection = 'passed'; developerPathCleared = $true
         unexpectedDesktopExit = 'passed'; uiQuit = 'passed'; quitInputFocus = 'verified'; realProviderJobs = 0
-        signedInstaller = $false; remoteAccountLoginTested = $false
+        signedInstaller = 'separate signature acceptance required'; remoteAccountLoginTested = $false
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-installed-ui.json')
     if ($Preferences) { Check-Preferences }
     if ($BrowserFixture) { Check-BrowserImport }

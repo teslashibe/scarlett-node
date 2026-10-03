@@ -50,6 +50,28 @@ Closing the main window hides it in the tray/menu bar. Explicit Quit requests dr
 
 Windows runtime operations require private NTFS storage and the bundled native helpers. Native tests validate ACLs, locking, process trees and owner-pipe shutdown; installed Windows GUI acceptance remains required before publishing its installer.
 
+Windows release signing uses an existing current-user code-signing identity and
+the trusted Microsoft SDK SignTool. No certificate or key is imported by the
+release helper. Set `SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT` to the reviewed public
+certificate thumbprint, `SCARLETT_WINDOWS_SIGNTOOL` to the absolute SDK executable
+and `SCARLETT_WINDOWS_TIMESTAMP_URL` to the approved HTTPS RFC3161 endpoint on a
+disposable native Windows release runner. Keep hardware-provider credentials and
+key access on that runner.
+
+After preparing the complete native runtime, build the release executable with
+`npm run tauri -- build --no-bundle --config src-tauri/tauri.complete.generated.json`.
+Then run `python scripts/sign-windows-bundle.py <absolute-desktop-checkout> <new-absolute-evidence.json>`.
+The helper validates the original inventory, signs only Scarlett executables,
+retains unsigned sidecar hashes and preserves provider bytes. It packages NSIS
+with Tauri's binary patching disabled, verifies trusted publisher/timestamp
+signatures and tests that exact installer with isolated local state. Evidence is
+written only after installed payload, lifecycle, preferences and browser tests
+pass. Real account login, signed upgrade/downgrade and publication remain
+separate gates; contract tests and unsigned rejection do not prove real signing.
+
+The signing options follow [Microsoft's SignTool reference](https://learn.microsoft.com/en-us/windows/win32/seccrypto/signtool)
+and [Tauri's custom Windows signing support](https://v2.tauri.app/distribute/sign/windows/#custom-sign-command).
+
 Tests use synthetic credentials and disposable temporary directories/fake executables. Launching the app does not itself start provider work: Start remains explicit. Real account/canary testing and production validation belong to the release owner.
 
 ## Complete runtime package

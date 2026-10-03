@@ -78,12 +78,14 @@ jobs:
         run: |
           $tokens = $null
           $errors = $null
-          foreach ($scriptName in @('check-windows-signatures.ps1', 'test-windows-signatures.ps1')) {
+          foreach ($scriptName in @('check-windows-signatures.ps1', 'test-windows-signatures.ps1', 'sign-windows-file.ps1')) {
             [System.Management.Automation.Language.Parser]::ParseFile(
               (Join-Path $env:GITHUB_WORKSPACE "desktop/scripts/$scriptName"), [ref]$tokens, [ref]$errors) | Out-Null
             if ($errors.Count -gt 0) { throw 'Windows signature acceptance script did not parse' }
           }
           & desktop/scripts/test-windows-signatures.ps1 -UnsignedNativeBinary "$env:RUNNER_TEMP/scarlett-runtime/scarlett-node.exe"
+      - name: Validate Windows signed-bundle provenance contracts
+        run: python -m unittest discover -s desktop/scripts -p 'test_windows_bundle_signing.py'
       - name: Download and verify pinned official provider binaries
         env:
           NATIVE_PLATFORM: ${{ matrix.platform }}

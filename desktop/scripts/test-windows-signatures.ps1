@@ -49,4 +49,24 @@ Copy-Item -LiteralPath $binary -Destination (Join-Path $fixtureRoot 'scarlett-no
 [System.IO.File]::WriteAllText((Join-Path $fixtureRoot 'runtime\COMPONENTS.json'), '{"syntheticOnly":true}', [System.Text.UTF8Encoding]::new($false))
 Require-Rejection { Write-WindowsSignatureEvidence $binary $fixtureRoot $publisher $evidence }
 if (Test-Path -LiteralPath $evidence) { throw 'Rejected signature wrote release evidence' }
+. (Join-Path $PSScriptRoot 'sign-windows-file.ps1')
+$signingRoot = Join-Path $fixtureRoot 'prepared'
+New-Item -ItemType Directory -Path (Join-Path $signingRoot 'binaries') | Out-Null
+$signingInput = Join-Path $signingRoot 'binaries\scarlett-node-x86_64-pc-windows-msvc.exe'
+Copy-Item -LiteralPath $binary -Destination $signingInput
+$signingBefore = (Get-FileHash -LiteralPath $signingInput -Algorithm SHA256).Hash
+$savedRoot, $savedPublisher, $savedTool = $env:SCARLETT_WINDOWS_SIGNING_ROOT, $env:SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT, $env:SCARLETT_WINDOWS_SIGNTOOL
+try {
+    $env:SCARLETT_WINDOWS_SIGNING_ROOT = $signingRoot
+    $env:SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT = $publisher
+    # A real unsigned Go executable cannot substitute for the trusted SDK tool.
+    # Reject it before opening any publisher key or invoking a signing command.
+    $env:SCARLETT_WINDOWS_SIGNTOOL = $binary
+    Require-Rejection { Sign-WindowsReleaseFile $signingInput }
+    if ((Get-FileHash -LiteralPath $signingInput -Algorithm SHA256).Hash -cne $signingBefore) {
+        throw 'Rejected signing-tool substitution changed the native executable'
+    }
+} finally {
+    $env:SCARLETT_WINDOWS_SIGNING_ROOT, $env:SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT, $env:SCARLETT_WINDOWS_SIGNTOOL = $savedRoot, $savedPublisher, $savedTool
+}
 Write-Output 'Signature record rejection contracts and actual native unsigned rejection passed; no release signature proven'
