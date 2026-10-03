@@ -152,11 +152,29 @@ function Click-Control([System.Windows.Automation.AutomationElement]$Control) {
     if ($Control.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) {
         $scroll.ScrollIntoView()
     }
+    $Control.SetFocus()
     Wait-Check {
         return [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
     } 10 'Installed control did not acquire foreground input'
-    $point = $Control.GetClickablePoint()
-    [ScarlettAcceptanceWindow]::Click([int]$point.X, [int]$point.Y)
+    $click = @{ point = [System.Windows.Point]::new() }
+    try {
+        Wait-Check {
+            $point = [System.Windows.Point]::new()
+            if (-not $Control.TryGetClickablePoint([ref]$point)) { return $false }
+            $click.point = $point
+            return $true
+        } 10 'Installed control did not become visible for native click'
+    } catch {
+        $originalFailure = $_
+        $diagnostic = @{ controlEnabled = $Control.Current.IsEnabled; controlFocused = $Control.Current.HasKeyboardFocus
+            controlOffscreen = $Control.Current.IsOffscreen; scrollSupported = $null -ne $scroll
+            foregroundOwned = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle; realProviderJobs = 0 }
+        New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+        $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-click-input-failure.json')
+        Write-Output ($diagnostic | ConvertTo-Json -Compress)
+        throw $originalFailure
+    }
+    [ScarlettAcceptanceWindow]::Click([int]$click.point.X, [int]$click.point.Y)
 }
 function Click-Button([string]$Name) {
     Wait-Check {
