@@ -102,7 +102,7 @@ For an explicitly selected local X browser profile, list metadata with
 selected browser first. The helper imports only its two X session cookies into
 private account storage, refuses overwrite or ambiguous sessions, and returns
 no credentials. Protected or unsupported stores can use cookie paste. See the
-[desktop browser support matrix](desktop/README.md#import-an-x-browser-account).
+[desktop browser support matrix](../desktop/README.md#import-an-x-browser-account).
 
 The CLI writes `SCARLETT_STATE_DIR/accounts.json`, or the absolute private path
 in `SCARLETT_ACCOUNTS_FILE`. Its bounded schema is:
@@ -155,7 +155,7 @@ provide no independently verified entitlement, billing or points evidence.
 
 SIGTERM and Ctrl-C stop polling and give accepted workers up to two minutes to finish and journal their receipts, within their existing lease deadlines. At that limit their contexts are cancelled. Started or unacknowledged work stays journaled for reconciliation and is never automatically rerun. A second process still cannot acquire the same journal. Use drain before stopping or upgrading if you want the coordinator to observe exhausted capacity first.
 
-**Native installation**: `scripts/package.sh VERSION` builds the node and the pinned Rust proof helper on a supported native platform, with file and archive checksums. The bundle's installer keeps versioned files, switches the active version atomically and preserves the node's identity/journal. It checks the platform and refuses corruption, different contents for an existing version or an unrelated executable. The helper resolves beside the node when available; a missing helper reports unreachable service capacity and cannot start provider work. See [installation instructions](packaging/INSTALL.md) for configuration, the optional Linux user-service template and upgrade/rollback steps. CI produces review artifacts; this change publishes no release. The Docker image also includes the helper and its matching runtime.
+**Native installation**: `scripts/package.sh VERSION` builds the node and the pinned Rust proof helper on a supported native platform, with file and archive checksums. The bundle's installer keeps versioned files, switches the active version atomically and preserves the node's identity/journal. It checks the platform and refuses corruption, different contents for an existing version or an unrelated executable. The helper resolves beside the node when available; a missing helper reports unreachable service capacity and cannot start provider work. See [installation instructions](../packaging/INSTALL.md) for configuration, the optional Linux user-service template and upgrade/rollback steps. CI produces review artifacts; this change publishes no release. The Docker image also includes the helper and its matching runtime.
 
 Current gaps against [issue #1](https://github.com/teslashibe/scarlett-node/issues/1): committed job identities are not cryptographically verified against the Solana program. Dynamic capacity and independent tokenization remain incomplete. The node emits no rewardable report for missing usage, model mismatch, invalid finish reason or expired lease. Usage constraints are checked after inference, rather than imposing an upstream spending ceiling. TLSNotary still needs an authorized provider login and coordinator-run verifier. The coordinator has not enabled paid dispatch or the reconciliation contract; typed services await the production coordinator companion. The unpaid Docker fixture remains separate from the points-only community product.
 
@@ -186,7 +186,7 @@ The `usd_micros` denomination leaves the public `node-v1` lease shape unchanged.
 The coordinator's production payment ingester and pricing policy remain separate dependencies. Acceptance refers to normalized payment evidence from that trusted owner; the node does not independently authenticate a checkout or turn the test-USDC prototype reader into real funding. `signed_job_id` carries the immutable community terms digest, including the buyer quote, and is not an on-chain signature. Suppliers earn points only.
 ## Public X request catalog
 
-[`api/x-request-catalog.json`](api/x-request-catalog.json) publishes the exact
+[`api/x-request-catalog.json`](../api/x-request-catalog.json) publishes the exact
 query IDs, shared feature flags and fixed variables emitted by the pinned
 `x-go` v1.13.0 runtime for search, profile, post and thread reads. Its example
 query, handle and post IDs are placeholders for bounded buyer input. The
