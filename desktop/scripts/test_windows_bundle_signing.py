@@ -114,6 +114,59 @@ class WindowsSigningContracts(unittest.TestCase):
         self.assertEqual(callback['cmd'], 'powershell.exe')
         self.assertEqual(callback['args'][-3:], [str(file), '-File', '%1'])
 
+    def test_nsis_temp_context_is_child_only_and_cleaned_after_packaging(self):
+        env = {'TMP': 'original-tmp', 'TEMP': 'original-temp', 'unrelated': 'preserved'}
+        original = dict(env)
+        directory = self.root / 'target/release/nsis-signing-temp'
+        with signing.nsis_signing_environment(self.root, env) as child:
+            self.assertTrue(directory.is_dir())
+            self.assertEqual(child['TMP'], str(directory))
+            self.assertEqual(child['TEMP'], str(directory))
+            self.assertEqual(child['SCARLETT_WINDOWS_NSIS_TEMP'], str(directory))
+            self.assertEqual(child['unrelated'], 'preserved')
+            self.assertEqual(env, original)
+            (directory / 'nstFFFF.tmp').write_bytes(b'synthetic generated uninstaller')
+        self.assertFalse(directory.exists())
+        self.assertEqual(env, original)
+
+    def test_nsis_temp_context_cleanup_on_packaging_failure(self):
+        directory = self.root / 'target/release/nsis-signing-temp'
+        with self.assertRaisesRegex(ValueError, 'synthetic packaging failure'):
+            with signing.nsis_signing_environment(self.root, {}):
+                (directory / 'nst1.tmp').write_bytes(b'synthetic uninstaller')
+                raise ValueError('synthetic packaging failure')
+        self.assertFalse(directory.exists())
+
+    def test_nsis_temp_context_refuses_existing_directory(self):
+        directory = self.root / 'target/release/nsis-signing-temp'
+        directory.mkdir()
+        retained = directory / 'retained.txt'
+        retained.write_bytes(b'not owned by this run')
+        with self.assertRaisesRegex(ValueError, 'already exists'):
+            with signing.nsis_signing_environment(self.root, {}):
+                self.fail('Existing directory became a signing context')
+        self.assertEqual(retained.read_bytes(), b'not owned by this run')
+
+    def test_nsis_temp_context_reparse_never_cleans_external_files(self):
+        directory = self.root / 'target/release/nsis-signing-temp'
+        outside = self.root / 'outside'
+        outside.mkdir()
+        retained = outside / 'nst1.tmp'
+        retained.write_bytes(b'external file')
+        try:
+            directory.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            self.skipTest('Native CI user lacks symlink creation privilege')
+        with self.assertRaisesRegex(ValueError, 'already exists'):
+            with signing.nsis_signing_environment(self.root, {}):
+                self.fail('Link became a signing context')
+        directory.unlink()
+        with self.assertRaisesRegex(ValueError, 'changed ownership'):
+            with signing.nsis_signing_environment(self.root, {}):
+                directory.rmdir()
+                directory.symlink_to(outside, target_is_directory=True)
+        self.assertEqual(retained.read_bytes(), b'external file')
+
 
 if __name__ == '__main__':
     unittest.main()

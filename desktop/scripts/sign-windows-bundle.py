@@ -6,12 +6,14 @@ identity. Provider binaries stay unchanged; no provider login or work occurs.
 """
 import argparse
 import copy
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -26,7 +28,9 @@ def digest(path):
 
 
 def regular(path):
-    if path.is_symlink() or not path.is_file() or any(p.is_symlink() for p in path.parents):
+    def reparse(entry):
+        return entry.is_symlink() or bool(getattr(entry.lstat(), 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    if reparse(path) or not path.is_file() or any(reparse(p) for p in path.parents):
         raise ValueError('Release inputs must be regular local files')
     return path
 
@@ -79,6 +83,30 @@ def finalize_metadata(root, original, publisher):
 def signing_config(script):
     return {'bundle': {'targets': ['nsis'], 'windows': {'signCommand': {
         'cmd': 'powershell.exe', 'args': ['-NoProfile', '-NonInteractive', '-File', str(script), '-File', '%1']}}}}
+
+
+@contextmanager
+def nsis_signing_environment(root, env):
+    # NSIS 3.11 uses GetTempPath/GetTempFileName("nst") for its uninstaller.
+    # Own a fresh directory inside the prepared build, only for this child.
+    directory = root / 'target/release/nsis-signing-temp'
+    parent = regular(root / 'target/release/scarlett-node-desktop.exe').parent
+    if len(str(directory)) > 246:
+        raise ValueError('NSIS temporary directory exceeds its GetTempFileName path bound')
+    if directory.exists() or directory.is_symlink():
+        raise ValueError('Isolated NSIS signing directory already exists')
+    directory.mkdir()
+    ownership = directory.stat()
+    try:
+        child = dict(env, TMP=str(directory), TEMP=str(directory),
+                     SCARLETT_WINDOWS_NSIS_TEMP=str(directory))
+        yield child
+    finally:
+        current = directory.lstat()
+        if directory.is_symlink() or getattr(current, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT or \
+                (current.st_dev, current.st_ino) != (ownership.st_dev, ownership.st_ino) or directory.parent != parent:
+            raise ValueError('Isolated NSIS signing directory changed ownership')
+        shutil.rmtree(directory)
 
 
 def run(arguments, cwd, env, seconds=180):
@@ -142,8 +170,9 @@ def main():
         configuration.write_text(json.dumps(signing_config(signer)))
         # Preserve signed bytes: Tauri's bundle-type patch otherwise invalidates
         # the main executable signature. Its callback preserves valid signatures.
-        run(['node.exe', str(cli), 'bundle', '--ci', '--bundles', 'nsis', '--no-binary-patching',
-             '--config', str(root / 'tauri.complete.generated.json'), '--config', str(configuration)], desktop, env, 600)
+        with nsis_signing_environment(root, env) as packaging_env:
+            run(['node.exe', str(cli), 'bundle', '--ci', '--bundles', 'nsis', '--no-binary-patching',
+                 '--config', str(root / 'tauri.complete.generated.json'), '--config', str(configuration)], desktop, packaging_env, 600)
     installers = list(setup_dir.glob('*.exe'))
     if len(installers) != 1:
         raise ValueError('Expected exactly one signed native release installer')

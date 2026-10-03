@@ -61,13 +61,23 @@ key access on that runner.
 After preparing the complete native runtime, build the release executable with
 `npm run tauri -- build --no-bundle --config src-tauri/tauri.complete.generated.json`.
 Then run `python scripts/sign-windows-bundle.py <absolute-desktop-checkout> <new-absolute-evidence.json>`.
-The helper validates the original inventory, signs only Scarlett executables,
+The helper validates the original inventory, signs Scarlett executables and
+the pinned NSIS packaging components,
 retains unsigned sidecar hashes and preserves provider bytes. It packages NSIS
 with Tauri's binary patching disabled, verifies trusted publisher/timestamp
 signatures and tests that exact installer with isolated local state. Evidence is
 written only after installed payload, lifecycle, preferences and browser tests
 pass. Real account login, signed upgrade/downgrade and publication remain
 separate gates; contract tests and unsigned rejection do not prove real signing.
+
+The Tauri callback permits exactly its five copied x86 NSIS plugin DLL paths.
+Generated x86 uninstallers must match NSIS 3.11's `nst<hex>.tmp` filename inside
+a fresh `target/release/nsis-signing-temp` directory. Only the packaging child
+receives that directory as TMP/TEMP and explicit callback context; it is removed
+on completion or failure. System temporary files, links, unexpected DLLs and
+other architectures are rejected. Provider resource callbacks verify exact paths,
+sizes and hashes against the finalized component inventory and preserve the
+original bytes and signing status; they add no Scarlett publisher signature.
 
 The signing options follow [Microsoft's SignTool reference](https://learn.microsoft.com/en-us/windows/win32/seccrypto/signtool)
 and [Tauri's custom Windows signing support](https://v2.tauri.app/distribute/sign/windows/#custom-sign-command).

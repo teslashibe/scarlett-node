@@ -3,10 +3,56 @@ param([string]$File = '')
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'check-windows-signatures.ps1')
 
-function Sign-WindowsReleaseFile([string]$Path) {
-    if ($env:OS -ne 'Windows_NT') { throw 'Signing requires native Windows' }
-    $publisher = $env:SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT
-    if ($publisher -notmatch '^[0-9a-fA-F]{40}$') { throw 'Reviewed publisher thumbprint required' }
+function Assert-NSISPortableExecutable([string]$Path, [bool]$DLL) {
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    $reader = $null
+    try {
+        $reader = [System.IO.BinaryReader]::new($stream)
+        if ($stream.Length -lt 64 -or $stream.Length -gt 64MB -or $reader.ReadUInt16() -ne 0x5a4d) {
+            throw 'NSIS signing target must be a bounded native PE file'
+        }
+        $stream.Position = 60
+        $offset = $reader.ReadUInt32()
+        if ($offset -lt 64 -or $offset -gt $stream.Length - 26) { throw 'Invalid NSIS PE header offset' }
+        $stream.Position = $offset
+        if ($reader.ReadUInt32() -ne 0x4550 -or $reader.ReadUInt16() -ne 0x14c) {
+            throw 'NSIS signing requires its pinned x86 PE architecture'
+        }
+        $sections = $reader.ReadUInt16()
+        $stream.Position = $offset + 20
+        $optionalBytes = $reader.ReadUInt16()
+        $characteristics = $reader.ReadUInt16()
+        if ($sections -lt 1 -or $sections -gt 96 -or $optionalBytes -lt 96 -or
+            $offset + 24 + $optionalBytes + 40 * $sections -gt $stream.Length -or
+            $reader.ReadUInt16() -ne 0x10b -or ($characteristics -band 2) -eq 0 -or
+            (($characteristics -band 0x2000) -ne 0) -ne $DLL) {
+            throw 'NSIS signing target has the wrong executable or DLL PE header'
+        }
+    } finally {
+        try { if ($null -ne $reader) { $reader.Dispose() } }
+        finally { $stream.Dispose() }
+    }
+}
+
+function Assert-PreservedProviderResource([string]$Path, [string]$Root, [string]$Relative) {
+    $manifest = Assert-RegularLocalFile ($Root + 'runtime\COMPONENTS.json')
+    $metadata = [System.IO.File]::ReadAllText($manifest) | ConvertFrom-Json
+    if ($metadata.schemaVersion -ne 1 -or $metadata.target -cne 'x86_64-pc-windows-msvc' -or
+        $metadata.codexVersion -cne '0.159.2' -or $metadata.claudeVersion -cne '2.1.286' -or
+        $metadata.modelApiVersion -cne '0.1.29' -or
+        $metadata.releaseSigning.vendorBytesPreserved -ne $true -or
+        $metadata.releaseSigning.publisherThumbprint -notmatch '^[0-9a-fA-F]{40}$' -or
+        $metadata.releaseSigning.publisherThumbprint -ine $env:SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT) {
+        throw 'Provider preservation requires the finalized pinned release inventory'
+    }
+    $entries = @($metadata.files | Where-Object { $_.path -ceq $Relative.Substring(8) })
+    if ($entries.Count -ne 1 -or (Get-Item -LiteralPath $Path).Length -ne $entries[0].bytes -or
+        (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ine $entries[0].sha256) {
+        throw 'Provider callback bytes differ from the exact pinned inventory'
+    }
+}
+
+function Resolve-WindowsSigningTarget([string]$Path, [ref]$PreservedProvider = $null) {
     $resolved = Assert-RegularLocalFile $Path
     if ($env:SCARLETT_WINDOWS_SIGNING_ROOT -notmatch '^[a-zA-Z]:[\\/]' -or
         $env:SCARLETT_WINDOWS_SIGNING_ROOT.Substring(2).Contains(':')) {
@@ -17,10 +63,58 @@ function Sign-WindowsReleaseFile([string]$Path) {
         throw 'Signing target escaped the prepared release'
     }
     $relative = $resolved.Substring($root.Length).Replace('\', '/')
+    if ($relative -match '^runtime/(codex|claude)/.+\.(exe|dll)$') {
+        Assert-PreservedProviderResource $resolved $root $relative
+        if ($null -ne $PreservedProvider) { $PreservedProvider.Value = $true }
+        return $resolved
+    }
+    # Tauri CLI 2.12.1 copies and signs exactly these five NSIS plugins before
+    # makensis. Permit the disposable copies, never the SDK/cache originals or
+    # provider runtime. Keep this list aligned with its NSIS_PLUGIN_FILES.
+    $nsisPlugins = @(
+        'target/release/nsis/x64/Plugins/x86-unicode/NSISdl.dll',
+        'target/release/nsis/x64/Plugins/x86-unicode/StartMenu.dll',
+        'target/release/nsis/x64/Plugins/x86-unicode/System.dll',
+        'target/release/nsis/x64/Plugins/x86-unicode/nsDialogs.dll',
+        'target/release/nsis/x64/Plugins/x86-unicode/additional/nsis_tauri_utils.dll'
+    )
+    $isPlugin = $relative -in $nsisPlugins
+    $isUninstaller = $false
+    if ($relative -match '^target/release/nsis-signing-temp/nst[0-9a-f]{1,4}\.tmp$') {
+        # NSIS 3.11 creates an x86 uninstaller with GetTempFileName("nst").
+        # Its context is propagated only to this packaging child; system TEMP
+        # and other directories under the build root never grant permission.
+        $temporary = $root + 'target\release\nsis-signing-temp'
+        foreach ($context in @($env:SCARLETT_WINDOWS_NSIS_TEMP, $env:TMP, $env:TEMP)) {
+            if (-not $context -or [System.IO.Path]::GetFullPath($context).TrimEnd('\') -ine $temporary) {
+                throw 'Generated uninstaller requires the isolated packaging context'
+            }
+        }
+        $directory = Get-Item -LiteralPath $temporary -Force
+        if (-not $directory.PSIsContainer) { throw 'Uninstaller context must be a regular directory' }
+        Assert-NoReparseParents $directory
+        $isUninstaller = $true
+    }
     $allowed = $relative -match '^binaries/(scarlett-node|scarlett-prover|open-agent-api)-x86_64-pc-windows-msvc\.exe$' -or
         $relative -ceq 'target/release/scarlett-node-desktop.exe' -or
-        $relative -match '^target/release/bundle/nsis/[^/]+\.exe$'
-    if (-not $allowed) { throw 'Only Scarlett executables and the release installer may be signed' }
+        $relative -match '^target/release/bundle/nsis/[^/]+\.exe$' -or $isPlugin -or $isUninstaller
+    if (-not $allowed) { throw 'Only reviewed Scarlett and NSIS packaging targets may be signed' }
+    if ($isPlugin -or $isUninstaller) { Assert-NSISPortableExecutable $resolved $isPlugin }
+    return $resolved
+}
+
+function Sign-WindowsReleaseFile([string]$Path) {
+    if ($env:OS -ne 'Windows_NT') { throw 'Signing requires native Windows' }
+    $publisher = $env:SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT
+    if ($publisher -notmatch '^[0-9a-fA-F]{40}$') { throw 'Reviewed publisher thumbprint required' }
+    $preservedProvider = $false
+    $resolved = Resolve-WindowsSigningTarget $Path ([ref]$preservedProvider)
+    if ($preservedProvider) {
+        # Tauri's resource callback accepts a successful preservation outcome.
+        # Hash-verified provider bytes keep their existing signing status.
+        Write-Output 'Pinned provider resource preserved; no publisher signature added'
+        return
+    }
     $tool = Assert-RegularLocalFile $env:SCARLETT_WINDOWS_SIGNTOOL
     $toolSignature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $tool
     if ([string]$toolSignature.Status -cne 'Valid' -or
