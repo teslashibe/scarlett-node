@@ -390,19 +390,38 @@ function Select-Browser([int]$Index, [string]$ExpectedBrowser) {
     # profile and must not race its change event.
     [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
     [System.Windows.Forms.SendKeys]::SendWait('{TAB}')
-    Wait-Check {
-        $selected = Find-Input 'Browser profile'
-        $value = $null
-        if ($selected.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$value)) {
-            return $value.Current.Value.Contains($ExpectedBrowser)
-        }
-        $selection = $null
-        if ($selected.TryGetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern, [ref]$selection)) {
-            $items = @($selection.Current.GetSelection())
-            return $items.Count -eq 1 -and $items[0].Current.Name.Contains($ExpectedBrowser)
-        }
-        throw 'Browser chooser did not expose its committed selection'
-    } 10 'Synthetic browser selection did not commit'
+    $readback = @{ controlPresent = $false; valuePattern = $false; valueMatches = $false
+        selectionPattern = $false; selectedItemCount = 0; selectedLabelMatches = $false }
+    try {
+        Wait-Check {
+            $selected = Find-Input 'Browser profile'
+            $readback.controlPresent = $null -ne $selected
+            if (-not $selected) { return $false }
+            $value = $null
+            $readback.valuePattern = $selected.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$value)
+            # WebView2 can expose ValuePattern with an empty/null value. Read the
+            # selection provider too rather than dereferencing a null string.
+            $readback.valueMatches = $readback.valuePattern -and ([string]$value.Current.Value).Contains($ExpectedBrowser)
+            if ($readback.valueMatches) { return $true }
+            $selection = $null
+            $readback.selectionPattern = $selected.TryGetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern, [ref]$selection)
+            if ($readback.selectionPattern) {
+                $items = @($selection.Current.GetSelection())
+                $readback.selectedItemCount = $items.Count
+                $readback.selectedLabelMatches = $items.Count -eq 1 -and $null -ne $items[0] -and
+                    ([string]$items[0].Current.Name).Contains($ExpectedBrowser)
+                return $readback.selectedLabelMatches
+            }
+            return $false
+        } 10 'Synthetic browser selection did not commit'
+    } catch {
+        # Fixed booleans/counts only: never publish browser names, opaque ids or
+        # any session values read through the accessibility provider.
+        New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+        $readback | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-browser-selection-failure.json')
+        Write-Output ($readback | ConvertTo-Json -Compress)
+        throw
+    }
 }
 function UI-Contains([string]$Text) {
     $elements = $script:window.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
@@ -560,6 +579,13 @@ try {
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-installed-ui.json')
     if ($Preferences) { Check-Preferences }
     if ($BrowserFixture) { Check-BrowserImport }
+} catch {
+    # Record source line numbers for failures hidden by the workflow wrapper,
+    # without publishing stack paths, UI values or native exception messages.
+    $lines = @([regex]::Matches([string]$_.ScriptStackTrace, 'check-windows-install\.ps1: line (\d+)') |
+        ForEach-Object { [int]$_.Groups[1].Value })
+    Write-Output (@{ acceptanceFailureLines = $lines; realProviderJobs = 0 } | ConvertTo-Json -Compress)
+    throw
 } finally {
     $key = $null
     $env:PATH = $previousPath
