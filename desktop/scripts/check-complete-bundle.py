@@ -17,6 +17,7 @@ binaries = Path(sys.argv[1]).resolve()
 runtime = Path(sys.argv[2]).resolve() / 'runtime'
 metadata = json.loads((runtime / 'COMPONENTS.json').read_text())
 assert metadata['schemaVersion'] == 1
+assert (runtime / 'browser-reader-NOTICES.txt').is_file(), 'Browser reader notices must accompany the node'
 suffix = '.exe' if os.name == 'nt' else ''
 expected_target = {'darwin': {'arm64': 'aarch64-apple-darwin', 'x86_64': 'x86_64-apple-darwin'}, 'win32': {'AMD64': 'x86_64-pc-windows-msvc'}}
 import platform

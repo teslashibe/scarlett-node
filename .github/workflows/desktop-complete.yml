@@ -9,10 +9,17 @@ on:
       - 'third_party/**'
       - '.github/workflows/desktop-complete.yml'
   workflow_dispatch:
+    inputs:
+      installer_run_id:
+        description: 'Optional completed same-runtime build to rerun only installed Windows acceptance'
+        required: false
+        default: ''
+        type: string
 permissions:
   contents: read
 jobs:
   native:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.installer_run_id == '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -40,6 +47,10 @@ jobs:
             (Join-Path $env:GITHUB_WORKSPACE 'desktop/scripts/check-windows-install.ps1'),
             [ref]$tokens, [ref]$parseErrors) | Out-Null
           if ($parseErrors.Count -gt 0) { throw 'Installed Windows acceptance script did not parse' }
+      - name: Compile native Windows acceptance input
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: '& desktop/scripts/check-windows-input.ps1'
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -134,14 +145,17 @@ jobs:
               "$GITHUB_WORKSPACE/desktop/src-tauri/target/debug" \
               "$GITHUB_WORKSPACE/desktop/src-tauri/target/debug"
           fi
-      - name: Validate installed Windows desktop and preferences without login
+      - name: Prepare isolated Windows browser stores
         if: runner.os == 'Windows'
-        timeout-minutes: 12
+        run: python desktop/scripts/prepare-browser-fixtures.py "$RUNNER_TEMP/scarlett-browser-fixtures"
+      - name: Validate installed Windows desktop, preferences and browser import without login
+        if: runner.os == 'Windows'
+        timeout-minutes: 15
         shell: powershell
         run: |
           $installers = @(Get-ChildItem -LiteralPath desktop/src-tauri/target/debug/bundle/nsis -Filter '*.exe')
           if ($installers.Count -ne 1) { throw 'Expected one native testing installer' }
-          & desktop/scripts/check-windows-install.ps1 -Installer $installers[0].FullName -EvidenceDirectory "$env:RUNNER_TEMP/scarlett-installed-evidence" -Preferences
+          & desktop/scripts/check-windows-install.ps1 -Installer $installers[0].FullName -EvidenceDirectory "$env:RUNNER_TEMP/scarlett-installed-evidence" -Preferences -BrowserFixture "$env:RUNNER_TEMP/scarlett-browser-fixtures/fixture.json"
       - uses: actions/upload-artifact@v4
         if: ${{ always() && steps.installer.conclusion == 'success' }}
         with:
@@ -150,5 +164,74 @@ jobs:
             desktop/src-tauri/target/debug/bundle/dmg/*.dmg
             desktop/src-tauri/target/debug/bundle/nsis/*.exe
             desktop/src-tauri/runtime/COMPONENTS.json
+            ${{ runner.temp }}/scarlett-installed-evidence/*.json
+          if-no-files-found: error
+  windows_ui_recheck:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.installer_run_id != '' }}
+    runs-on: windows-2025
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Require the same reviewed runtime source
+        shell: bash
+        env:
+          INSTALLER_RUN_ID: ${{ inputs.installer_run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import json, os, re, subprocess
+          from pathlib import Path
+          run_id = os.environ['INSTALLER_RUN_ID']
+          assert re.fullmatch('[0-9]+', run_id), 'Numeric native build run required'
+          repo = os.environ['GITHUB_REPOSITORY']
+          build = json.loads(subprocess.check_output(['gh', 'api', 'repos/' + repo + '/actions/runs/' + run_id], text=True))
+          assert build['head_repository']['full_name'] == repo and build['status'] == 'completed'
+          assert build['path'] == '.github/workflows/desktop-complete.yml'
+          source = build['head_sha']
+          assert re.fullmatch('[a-f0-9]{40}', source)
+          jobs = json.loads(subprocess.check_output(['gh', 'api', 'repos/' + repo + '/actions/runs/' + run_id + '/jobs'], text=True))['jobs']
+          native = [job for job in jobs if 'win32-x64' in job['name']]
+          assert len(native) == 1 and any(step['name'] == 'Build installer for testing' and step['conclusion'] == 'success' for step in native[0]['steps'])
+          changed = subprocess.check_output(['git', 'diff', '--name-only', source, 'HEAD'], text=True).splitlines()
+          allowed = {'desktop/scripts/check-windows-install.ps1', 'desktop/scripts/check-windows-input.ps1', '.github/workflows/desktop-complete.yml', 'desktop/README.md'}
+          assert set(changed) <= allowed, 'Runtime or packaging source changed; run the complete native build'
+          evidence = {'installerBuildRun': int(run_id), 'installerBuildSource': source, 'acceptanceSource': os.environ['GITHUB_SHA'], 'changedFiles': changed, 'runtimeSourceUnchanged': True, 'providerJobs': 0}
+          directory = Path(os.environ['RUNNER_TEMP']) / 'scarlett-recheck-source'
+          directory.mkdir()
+          (directory / 'source.json').write_text(json.dumps(evidence, indent=2))
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          name: desktop-testing-win32-x64
+          run-id: ${{ inputs.installer_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/scarlett-recheck-package
+      - name: Compile native Windows acceptance input
+        shell: powershell
+        run: '& desktop/scripts/check-windows-input.ps1'
+      - name: Parse and test the installed Windows app
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $env:GITHUB_WORKSPACE 'desktop/scripts/check-windows-install.ps1'), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) { throw 'Installed acceptance script did not parse' }
+          python desktop/scripts/prepare-browser-fixtures.py "$env:RUNNER_TEMP/scarlett-browser-fixtures"
+          if ($LASTEXITCODE -ne 0) { throw 'Synthetic browser fixture setup failed' }
+          $installers = @(Get-ChildItem -LiteralPath "$env:RUNNER_TEMP/scarlett-recheck-package" -Filter '*.exe' -Recurse)
+          if ($installers.Count -ne 1) { throw 'Expected exactly one previously built native installer' }
+          & desktop/scripts/check-windows-install.ps1 -Installer $installers[0].FullName -EvidenceDirectory "$env:RUNNER_TEMP/scarlett-installed-evidence" -Preferences -BrowserFixture "$env:RUNNER_TEMP/scarlett-browser-fixtures/fixture.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-windows-ui-recheck
+          path: |
+            ${{ runner.temp }}/scarlett-recheck-source/*.json
             ${{ runner.temp }}/scarlett-installed-evidence/*.json
           if-no-files-found: error

@@ -57,6 +57,8 @@ const moduleDir = module.slice('v0.1.29 '.length);
 const runtime = join(desktop, 'src-tauri', 'runtime');
 if (existsSync(runtime)) throw new Error('Generated runtime already exists; preserve it or remove only this generated directory before preparing a new build');
 mkdirSync(runtime, {recursive:true});
+// Keep the browser reader's dependency notices with the packaged Go binary.
+copyFileSync(join(desktop, '..', 'third_party', 'browserx', 'NOTICES.txt'), join(runtime, 'browser-reader-NOTICES.txt'));
 // Preserve the complete Codex vendor layout, including helper executables,
 // dylibs, package metadata and third-party notices needed by the native CLI.
 cpSync(vendor, join(runtime,'codex'), {recursive:true, dereference:false});

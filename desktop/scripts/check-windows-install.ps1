@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$Installer,
     [Parameter(Mandatory = $true)][string]$EvidenceDirectory,
-    [switch]$Preferences
+    [switch]$Preferences,
+    [string]$BrowserFixture = ''
 )
 $ErrorActionPreference = 'Stop'
 $script:apiPort = 8088
@@ -17,6 +18,46 @@ public static class ScarlettAcceptanceWindow {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
+    [StructLayout(LayoutKind.Sequential)] private struct KeyboardInput {
+        public ushort key, scan; public uint flags, time; public UIntPtr extra;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct MouseInput {
+        public int x, y; public uint data, flags, time; public UIntPtr extra;
+    }
+    [StructLayout(LayoutKind.Explicit)] private struct InputUnion {
+        [FieldOffset(0)] public KeyboardInput keyboard;
+        [FieldOffset(0)] public MouseInput mouse;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct Input {
+        public uint type; public InputUnion value;
+    }
+    [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint count, Input[] inputs, int size);
+    private static Input Key(ushort key, bool up) {
+        Input input = new Input(); input.type = 1;
+        input.value.keyboard.key = key; input.value.keyboard.flags = up ? 2u : 0u;
+        return input;
+    }
+    public static bool ModifiersReleased() {
+        foreach (int key in new int[] { 0x10, 0x11, 0x12, 0x5B, 0x5C })
+            if ((GetAsyncKeyState(key) & 0x8000) != 0) return false;
+        return true;
+    }
+    public static int InputSize() { return Marshal.SizeOf(typeof(Input)); }
+    private static void Send(Input[] inputs) {
+        if (InputSize() != (IntPtr.Size == 8 ? 40 : 28))
+            throw new InvalidOperationException("Native input layout mismatch");
+        if (!ModifiersReleased()) throw new InvalidOperationException("CI keyboard modifier was already pressed");
+        if (SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Input))) != (uint)inputs.Length)
+            throw new InvalidOperationException("Native input stream rejected events");
+    }
+    public static void ControlKey(ushort key) {
+        Send(new Input[] { Key(0x11, false), Key(key, false), Key(key, true), Key(0x11, true) });
+    }
+    public static void SelectAllAndClear() {
+        Send(new Input[] { Key(0x11, false), Key(0x41, false), Key(0x41, true), Key(0x11, true),
+            Key(0x08, false), Key(0x08, true) });
+    }
 }
 '@
 
@@ -117,6 +158,7 @@ function Start-App {
     Wait-AppWindow
 }
 function Focus-QuitShortcut {
+    Verify-KeyboardDelivery
     # UIA Invoke can operate a background window. SendKeys instead targets the
     # foreground input stream, so prove both the native host and WebView focus.
     $application.Refresh()
@@ -148,6 +190,48 @@ function Focus-QuitShortcut {
     Write-Output 'Installed acceptance: foreground and WebView keyboard focus verified'
 }
 
+function Check-QuitShortcut([string]$Failure) {
+    # Inject one native key-down/key-up sequence; no retry or button fallback
+    # can turn a failed shortcut into a pass.
+    [ScarlettAcceptanceWindow]::ControlKey(0x51)
+    if ($application.WaitForExit(135000)) { return }
+    # Keep the shortcut failure, but distinguish missed input from a native
+    # shutdown error. Capture only fixed classifications, never UI text or keys.
+    $shutdownError = $false
+    $focusMatches = $false
+    $foregroundMatches = $false
+    try {
+        $elements = $script:window.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+            [System.Windows.Automation.Condition]::TrueCondition)
+        foreach ($element in $elements) {
+            if ($element.Current.Name.StartsWith('Scarlett could not stop safely. ', [StringComparison]::Ordinal)) {
+                $shutdownError = $true
+            }
+        }
+        $target = Find-Button 'Stop local API'
+        $focusMatches = $null -ne $target -and $target.Current.HasKeyboardFocus
+        $application.Refresh()
+        $foregroundMatches = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $application.MainWindowHandle
+    } catch { }
+    $diagnostic = @{
+        shortcutExited = $false; shutdownErrorVisible = $shutdownError
+        stopControlKeyboardFocus = $focusMatches; foregroundOwnedWindow = $foregroundMatches
+        apiStatusBeforeButton = (Api-Status '/health'); quitButtonInvoked = $false
+        quitButtonExited = $false; realProviderJobs = 0
+    }
+    try {
+        Click-Button 'Quit Scarlett'
+        $diagnostic.quitButtonInvoked = $true
+        $diagnostic.quitButtonExited = $application.WaitForExit(135000)
+    } catch { }
+    $diagnostic.apiStatusAfterButton = Api-Status '/health'
+    New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+    $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-quit-failure.json')
+    Write-Output ($diagnostic | ConvertTo-Json -Compress)
+    # A successful button quit is diagnostic evidence, never a passing shortcut.
+    throw $Failure
+}
+
 function Verify-KeyboardDelivery {
     # UIA Invoke/SetFocus can succeed without an interactive input desktop.
     # Prove SendKeys reaches a harmless empty field before blaming a shortcut.
@@ -177,8 +261,9 @@ function Verify-KeyboardDelivery {
     } 10 'Keyboard probe did not acquire foreground and field focus'
     [System.Windows.Forms.SendKeys]::SendWait('keyboard-probe')
     Wait-Check { $value.Current.Value -ceq 'keyboard-probe' } 10 'CI keyboard injection did not reach the editable control'
-    $value.SetValue('')
-    Write-Output 'Installed acceptance: synthetic keyboard delivery verified'
+    [ScarlettAcceptanceWindow]::SelectAllAndClear()
+    Wait-Check { $value.Current.Value -ceq '' } 10 'Native control-key input did not clear the disposable field'
+    Write-Output 'Installed acceptance: text and native control-key delivery verified'
 }
 
 
@@ -212,6 +297,26 @@ function Checkbox-Is([string]$Name, [bool]$Enabled) {
     if ($Enabled) { $wanted = [System.Windows.Automation.ToggleState]::On }
     return $pattern.Current.ToggleState -eq $wanted
 }
+function Check-DefaultCheckbox([string]$Name, [string]$Failure) {
+    try { Wait-Check { Checkbox-Is $Name $false } 15 $Failure }
+    catch {
+        $control = Find-Input $Name
+        $pattern = $null
+        $hasToggle = $null -ne $control -and $control.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)
+        $runKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Run')
+        $runKeyExists = $null -ne $runKey
+        if ($runKey) { $runKey.Dispose() }
+        $diagnostic = @{ controlPresent = $null -ne $control; controlEnabled = $null -ne $control -and $control.Current.IsEnabled
+            toggleSupported = $hasToggle; toggleOff = $hasToggle -and $pattern.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::Off
+            runKeyExists = $runKeyExists; appRegistrationExists = $null -ne (Registered-Command)
+            autostartErrorVisible = (UI-Contains 'Scarlett could not update the login setting')
+            interactive = [Environment]::UserInteractive; realProviderJobs = 0 }
+        New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+        $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-preference-default-failure.json')
+        Write-Output ($diagnostic | ConvertTo-Json -Compress)
+        throw
+    }
+}
 function Set-Checkbox([string]$Name, [bool]$Enabled) {
     Wait-Check { (Find-Input $Name).Current.IsEnabled } 15 "Checkbox unavailable: $Name"
     if (Checkbox-Is $Name $Enabled) { return }
@@ -243,8 +348,8 @@ function Registered-Command {
 function Check-Preferences {
     if ($null -ne (Registered-Command)) { throw 'Clean runner already has a Scarlett login registration' }
     Start-App
-    if (-not (Checkbox-Is 'Keep running when the window closes' $false)) { throw 'Background mode was not opt-in' }
-    if (-not (Checkbox-Is 'Open Scarlett when I log in' $false)) { throw 'Start at login was not opt-in' }
+    Check-DefaultCheckbox 'Keep running when the window closes' 'Background mode was not opt-in'
+    Check-DefaultCheckbox 'Open Scarlett when I log in' 'Start at login was not opt-in'
     Set-Number 'Saved local API port' 18088
     Click-Button 'Save device preferences'
     Wait-Check { Saved-Preferences 18088 $false } 15 'Device preferences were not saved privately'
@@ -268,8 +373,7 @@ function Check-Preferences {
     Click-Button 'Start local API'
     Wait-Check { (Api-Status '/health') -eq 200 } 30 'Saved API port did not survive reopening'
     Focus-QuitShortcut
-    [System.Windows.Forms.SendKeys]::SendWait('^q')
-    if (-not $application.WaitForExit(135000)) { throw 'Preferences app Quit did not exit' }
+    Check-QuitShortcut 'Preferences app Quit did not exit'
     Wait-Check { (Api-Status '/health') -eq 0 } 30 'Preferences Quit left API running'
     Start-App
     if (-not (Checkbox-Is 'Open Scarlett when I log in' $true)) { throw 'Native login registration did not survive app reopening' }
@@ -305,6 +409,230 @@ function Check-Preferences {
         loginReadBack = 'passed'; loginDisable = 'passed'; actualOSLogin = 'not tested'
         realProviderJobs = 0; backgroundRestored = $false; loginRestored = $false
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-preferences-ui.json')
+}
+
+function Set-Text([string]$Name, [string]$Value) {
+    # Use the same text delivery already proved by the per-window probe.
+    # WebView2 can advertise ValuePattern while SetValue fails to commit.
+    # Only disposable fixtures call this helper, never real credentials.
+    if ($Value -notmatch '^[a-z0-9-]+$' -or $Value.Length -gt 512) { throw 'Synthetic input contains unsupported characters' }
+    Wait-Check { (Find-Input $Name).Current.IsEnabled } 15 "Text input did not become ready: $Name"
+    $control = Find-Input $Name
+    if (-not $control -or -not $control.Current.IsEnabled) { throw "Text input unavailable: $Name" }
+    $handle = $application.MainWindowHandle
+    [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
+    [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
+    $scroll = $null
+    if ($control.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) { $scroll.ScrollIntoView() }
+    $control.SetFocus()
+    Wait-Check {
+        return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+    } 10 'Synthetic input did not acquire keyboard focus'
+    [ScarlettAcceptanceWindow]::SelectAllAndClear()
+    [System.Windows.Forms.SendKeys]::SendWait($Value)
+    # Masked cookie fields may refuse value readback. Exact persistence is
+    # checked against the synthetic fixture after the Connect action.
+    if (-not $control.Current.IsPassword) {
+        try {
+            Wait-Check {
+                $current = Find-Input $Name
+                $pattern = $null
+                return $null -ne $current -and $current.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern) -and
+                    ([string]$pattern.Current.Value) -ceq $Value
+            } 10 'Synthetic text value did not commit'
+        } catch {
+            $current = Find-Input $Name
+            $pattern = $null
+            $available = $null -ne $current -and $current.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)
+            $observed = ''
+            if ($available -and -not $current.Current.IsPassword) { $observed = [string]$pattern.Current.Value }
+            $diagnostic = @{ controlPresent = $null -ne $current; controlFocused = $null -ne $current -and $current.Current.HasKeyboardFocus
+                foregroundOwned = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+                valuePatternAvailable = $available; expectedLength = $Value.Length; observedLength = $observed.Length
+                valueMatches = $observed -ceq $Value; realProviderJobs = 0 }
+            New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+            $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-text-input-failure.json')
+            Write-Output ($diagnostic | ConvertTo-Json -Compress)
+            $observed = $null
+            throw
+        }
+    }
+}
+function Select-Browser([int]$Index, [string]$ExpectedBrowser) {
+    if ($Index -notin @(1, 2) -or $ExpectedBrowser -notin @('Chrome', 'Firefox')) { throw 'Unexpected synthetic browser selection' }
+    Wait-Check { (Find-Input 'Browser profile').Current.IsEnabled } 15 'Browser chooser did not become ready'
+    $target = Find-Input 'Browser profile'
+    if (-not $target -or -not $target.Current.IsEnabled) { throw 'Browser chooser unavailable' }
+    $handle = $application.MainWindowHandle
+    [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
+    [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
+    $target.SetFocus()
+    Wait-Check {
+        return $target.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+    } 10 'Browser chooser did not acquire input focus'
+    [System.Windows.Forms.SendKeys]::SendWait('{HOME}')
+    # PowerShell variable names are case-insensitive; the loop counter must
+    # not overwrite the requested Index before sending its navigation keys.
+    for ($step = 0; $step -lt $Index; $step++) { [System.Windows.Forms.SendKeys]::SendWait('{DOWN}') }
+    # Commit the native select before clicking consent. Keyboard navigation can
+    # leave a preview choice in the popup; consent belongs to the committed
+    # profile and must not race its change event.
+    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+    [System.Windows.Forms.SendKeys]::SendWait('{TAB}')
+    $readback = @{ controlPresent = $false; valuePattern = $false; valueMatches = $false
+        selectionPattern = $false; selectedItemCount = 0; selectedLabelMatches = $false }
+    try {
+        Wait-Check {
+            $selected = Find-Input 'Browser profile'
+            $readback.controlPresent = $null -ne $selected
+            if (-not $selected) { return $false }
+            $value = $null
+            $readback.valuePattern = $selected.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$value)
+            # WebView2 can expose ValuePattern with an empty/null value. Read the
+            # selection provider too rather than dereferencing a null string.
+            $readback.valueMatches = $readback.valuePattern -and ([string]$value.Current.Value).Contains($ExpectedBrowser)
+            if ($readback.valueMatches) { return $true }
+            $selection = $null
+            $readback.selectionPattern = $selected.TryGetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern, [ref]$selection)
+            if ($readback.selectionPattern) {
+                $items = @($selection.Current.GetSelection())
+                $readback.selectedItemCount = $items.Count
+                $readback.selectedLabelMatches = $items.Count -eq 1 -and $null -ne $items[0] -and
+                    ([string]$items[0].Current.Name).Contains($ExpectedBrowser)
+                return $readback.selectedLabelMatches
+            }
+            return $false
+        } 10 'Synthetic browser selection did not commit'
+    } catch {
+        # Fixed booleans/counts only: never publish browser names, opaque ids or
+        # any session values read through the accessibility provider.
+        New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+        $readback | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-browser-selection-failure.json')
+        Write-Output ($readback | ConvertTo-Json -Compress)
+        throw
+    }
+}
+function UI-Contains([string]$Text) {
+    $elements = $script:window.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+    foreach ($element in $elements) { if (([string]$element.Current.Name).Contains($Text)) { return $true } }
+    return $false
+}
+function Imported-Accounts {
+    # Tauri resolves its native app-data directory; browser helpers use the
+    # explicitly redirected APPDATA roots. Accommodate either OS resolution.
+    $candidates = @($state, (Join-Path $script:fixture.roaming 'ai.scarlett.node')) | Select-Object -Unique
+    $registries = @($candidates | Where-Object { Test-Path -LiteralPath (Join-Path $_ 'accounts.json') -PathType Leaf })
+    if ($registries.Count -eq 0) { return @() }
+    if ($registries.Count -ne 1) { throw 'Browser acceptance has ambiguous account state' }
+    $script:importState = $registries[0]
+    return @(([System.IO.File]::ReadAllText((Join-Path $script:importState 'accounts.json')) | ConvertFrom-Json).accounts)
+}
+function Check-BrowserImport {
+    $root = [System.IO.Path]::GetFullPath((Split-Path -Parent $BrowserFixture))
+    $temporary = [System.IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
+    if (-not $root.StartsWith($temporary, [StringComparison]::OrdinalIgnoreCase)) { throw 'Browser fixtures must be below the disposable runner directory' }
+    $script:fixture = [System.IO.File]::ReadAllText($BrowserFixture) | ConvertFrom-Json
+    if (-not $script:fixture.syntheticOnly) { throw 'Browser acceptance requires synthetic fixtures' }
+    foreach ($path in @($script:fixture.roaming, $script:fixture.local) + @($script:fixture.stores | ForEach-Object { $_.path })) {
+        if (-not [System.IO.Path]::GetFullPath($path).StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Browser fixture escaped its isolated home' }
+    }
+    $roamingBefore, $localBefore = $env:APPDATA, $env:LOCALAPPDATA
+    try {
+        $env:APPDATA, $env:LOCALAPPDATA = $script:fixture.roaming, $script:fixture.local
+        Start-App
+        Wait-Check { (Find-Input 'Browser profile').Current.IsEnabled } 15 'Isolated browser profiles were not discovered'
+        if (@(Imported-Accounts).Count -ne 0) { throw 'Browser test encountered existing accounts' }
+        if (-not (Checkbox-Is 'Import only X session cookies from this profile' $false) -or (Find-Button 'Import X account').Current.IsEnabled) { throw 'Browser import did not require opt-in consent' }
+        # The two fixture profiles sort Chrome, then Firefox after the prompt.
+        Select-Browser 1 'Chrome'
+        Set-Checkbox 'Import only X session cookies from this profile' $true
+        Wait-Check { (Find-Button 'Import X account').Current.IsEnabled } 10 'Consent did not enable import'
+        Select-Browser 2 'Firefox'
+        Wait-Check { Checkbox-Is 'Import only X session cookies from this profile' $false } 10 'Changing profile retained consent'
+        Wait-Check { -not (Find-Button 'Import X account').Current.IsEnabled } 10 'Profile change allowed import without new consent'
+        Set-Text 'Local X account ID' 'browser-firefox'
+        Set-Checkbox 'Import only X session cookies from this profile' $true
+        Click-Button 'Import X account'
+        try {
+            # The native import contract permits 45 seconds, then the UI refresh
+            # runs. Observe that complete contract rather than timing out at 20.
+            Wait-Check { @(Imported-Accounts).Count -eq 1 } 55 'Installed Firefox UI import did not persist'
+        } catch {
+            $errors = @{
+                invalid_input = 'Check the account ID, capacity and cookie values'
+                command_failed = 'The node could not complete that action'
+                command_timeout = 'The action timed out'
+                private_storage = 'Scarlett could not open its private local storage'
+                browser_protected = 'The browser or OS protected this profile'
+                browser_busy = 'Close the selected browser, then try importing again'
+                browser_invalid = 'Scarlett could not read this cookie store safely'
+                browser_no_x_session = 'No complete X session was found in that profile'
+                browser_ambiguous = 'This profile contains multiple X sessions'
+                browser_unsupported = 'This browser format is not supported on this device'
+            }
+            $classifications = @{}
+            foreach ($classification in $errors.Keys) { $classifications[$classification] = UI-Contains $errors[$classification] }
+            $failure = @{ accountCount = @(Imported-Accounts).Count
+                importButtonEnabled = (Find-Button 'Import X account').Current.IsEnabled
+                successNoticeVisible = (UI-Contains 'X account imported on this device')
+                errorClasses = $classifications; realProviderJobs = 0 }
+            $failure | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-browser-import-failure.json')
+            Write-Output ($failure | ConvertTo-Json -Depth 3 -Compress)
+            throw
+        }
+        Wait-Check { Checkbox-Is 'Import only X session cookies from this profile' $false } 10 'Successful import retained consent'
+        Wait-Check { UI-Contains 'access not verified' } 15 'Imported account claimed verified access'
+        Select-Browser 1 'Chrome'
+        Set-Text 'Local X account ID' 'protected-chrome'
+        Set-Checkbox 'Import only X session cookies from this profile' $true
+        Click-Button 'Import X account'
+        Wait-Check { UI-Contains 'The browser or OS protected this profile' } 20 'Protected Chrome did not show the paste fallback'
+        if (@(Imported-Accounts).Count -ne 1) { throw 'Protected Chrome import added an account' }
+        foreach ($name in @('auth_token', 'ct0')) {
+            if (-not (Find-Input $name).Current.IsPassword) { throw 'Cookie paste field was not masked' }
+        }
+        Set-Text 'Local X account ID' 'browser-paste'
+        Set-Text 'auth_token' $script:fixture.authToken
+        Set-Text 'ct0' $script:fixture.csrf
+        Click-Button 'Connect X'
+        Wait-Check { @(Imported-Accounts).Count -eq 2 } 20 'Installed masked paste did not persist'
+        foreach ($record in (Imported-Accounts)) {
+            if ($record.service -ne 'x_read' -or $record.id -notin @('browser-firefox', 'browser-paste')) { throw 'Unexpected imported account' }
+            $credentialRoot = [System.IO.Path]::GetFullPath((Join-Path $script:importState 'accounts')).TrimEnd('\') + '\'
+            if (-not [System.IO.Path]::GetFullPath($record.path).StartsWith($credentialRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'Imported credential escaped disposable app state' }
+            $raw = [System.IO.File]::ReadAllText($record.path) | ConvertFrom-Json
+            if (@($raw.PSObject.Properties).Count -ne 2 -or $raw.auth_token -cne $script:fixture.authToken -or $raw.ct0 -cne $script:fixture.csrf) { throw 'Imported session differs from selected synthetic fields' }
+            $raw = $null
+        }
+        foreach ($store in $script:fixture.stores) {
+            if ((Get-FileHash -LiteralPath $store.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $store.sha256) { throw 'Import modified its browser store' }
+        }
+        # The installed helper checks native private ACLs before exposing its
+        # credential-free inventory. Never print cookie files or this output.
+        $stateBefore, $accountsBefore = $env:SCARLETT_STATE_DIR, $env:SCARLETT_ACCOUNTS_FILE
+        try {
+            $env:SCARLETT_STATE_DIR, $env:SCARLETT_ACCOUNTS_FILE = $script:importState, (Join-Path $script:importState 'accounts.json')
+            $inventory = & (Join-Path $install 'scarlett-node.exe') accounts list | Out-String
+            $inventoryExit = $LASTEXITCODE
+            $inventoryRecords = $inventory | ConvertFrom-Json
+            if ($inventoryExit -ne 0 -or @($inventoryRecords).Count -ne 2) { throw 'Installed helper refused private imported accounts' }
+            if ($inventory.Contains($script:fixture.authToken) -or $inventory.Contains($script:fixture.csrf) -or (UI-Contains $script:fixture.authToken) -or (UI-Contains $script:fixture.csrf)) { throw 'Import exposed fixture credentials in status' }
+            $inventory = $null
+            $inventoryRecords = $null
+        } finally { $env:SCARLETT_STATE_DIR, $env:SCARLETT_ACCOUNTS_FILE = $stateBefore, $accountsBefore }
+        Click-Button 'Quit Scarlett'
+        if (-not $application.WaitForExit(135000)) { throw 'Browser acceptance app did not quit' }
+        @{
+            redirectedBrowserRoots = 'passed'; profileConsent = 'passed'; consentReset = 'passed'
+            firefoxUIImport = 'passed'; protectedChromeFallback = 'passed'; maskedPaste = 'passed'
+            privatePersistence = 'passed'; unchangedBrowserStores = 'passed'; accessUnverified = $true
+            realBrowserAccountsTested = $false; realProviderJobs = 0
+        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-browser-import-ui.json')
+        Write-Output 'Installed browser acceptance: consent, Firefox import, protected Chrome and masked paste passed'
+    } finally {
+        $env:APPDATA, $env:LOCALAPPDATA = $roamingBefore, $localBefore
+        $script:fixture = $null
+    }
 }
 
 $install = Join-Path $env:RUNNER_TEMP 'Scarlett Installed UI Acceptance'
@@ -356,10 +684,8 @@ try {
     Click-Button 'Start local API'
     Wait-Check { (Api-Status '/health') -eq 200 } 30 'Desktop recovery did not start the API'
     Write-Output 'Installed acceptance: unexpected exit and recovery passed'
-    Verify-KeyboardDelivery
     Focus-QuitShortcut
-    [System.Windows.Forms.SendKeys]::SendWait('^q')
-    if (-not $application.WaitForExit(135000)) { throw 'Installed desktop Quit did not exit' }
+    Check-QuitShortcut 'Installed desktop Quit did not exit'
     Wait-Check { (Api-Status '/health') -eq 0 } 30 'Installed desktop Quit left the API running'
     New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
     @{
@@ -369,6 +695,14 @@ try {
         signedInstaller = $false; remoteAccountLoginTested = $false
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-installed-ui.json')
     if ($Preferences) { Check-Preferences }
+    if ($BrowserFixture) { Check-BrowserImport }
+} catch {
+    # Record source line numbers for failures hidden by the workflow wrapper,
+    # without publishing stack paths, UI values or native exception messages.
+    $lines = @([regex]::Matches([string]$_.ScriptStackTrace, 'check-windows-install\.ps1: line (\d+)') |
+        ForEach-Object { [int]$_.Groups[1].Value })
+    Write-Output (@{ acceptanceFailureLines = $lines; realProviderJobs = 0 } | ConvertTo-Json -Compress)
+    throw
 } finally {
     $key = $null
     $env:PATH = $previousPath

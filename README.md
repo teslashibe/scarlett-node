@@ -94,6 +94,14 @@ The helper does not refresh Codex tokens. Account IDs use 1–32 lowercase lette
 digits, underscores or hyphens; `legacy` is reserved. Two names cannot refer to
 the same credential path or inode.
 
+For an explicitly selected local X browser profile, list metadata with
+`scarlett-node accounts browser-profiles`, then run
+`scarlett-node accounts import-x PROFILE_ID ACCOUNT_ID CONCURRENCY`. Close the
+selected browser first. The helper imports only its two X session cookies into
+private account storage, refuses overwrite or ambiguous sessions, and returns
+no credentials. Protected or unsupported stores can use cookie paste. See the
+[desktop browser support matrix](desktop/README.md#import-an-x-browser-account).
+
 The CLI writes `SCARLETT_STATE_DIR/accounts.json`, or the absolute private path
 in `SCARLETT_ACCOUNTS_FILE`. Its bounded schema is:
 

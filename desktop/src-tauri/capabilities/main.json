@@ -11,6 +11,8 @@
     "allow-control-node",
     "allow-open-network",
     "allow-connect-x",
+    "allow-browser-profiles",
+    "allow-import-x-profile",
     "allow-connect-codex",
     "allow-remove-account",
     "allow-cancel-login",
