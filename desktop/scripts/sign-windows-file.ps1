@@ -52,7 +52,15 @@ function Assert-PreservedProviderResource([string]$Path, [string]$Root, [string]
     }
 }
 
-function Resolve-WindowsSigningTarget([string]$Path, [ref]$PreservedProvider = $null) {
+function Resolve-WindowsSigningTarget([string]$Path, $PreservedProvider = $null) {
+    # Windows PowerShell cannot bind an omitted [ref] parameter to null.
+    # Omission is allowed; an explicitly supplied flag must remain a reference.
+    if ($PSBoundParameters.ContainsKey('PreservedProvider')) {
+        if ($PreservedProvider -isnot [System.Management.Automation.PSReference]) {
+            throw 'Explicit preservation flag must be a PowerShell reference'
+        }
+        $PreservedProvider.Value = $false
+    }
     $resolved = Assert-RegularLocalFile $Path
     if ($env:SCARLETT_WINDOWS_SIGNING_ROOT -notmatch '^[a-zA-Z]:[\\/]' -or
         $env:SCARLETT_WINDOWS_SIGNING_ROOT.Substring(2).Contains(':')) {

@@ -76,6 +76,15 @@ $savedNSISTemp, $savedTMP, $savedTEMP = $env:SCARLETT_WINDOWS_NSIS_TEMP, $env:TM
 try {
     $env:SCARLETT_WINDOWS_SIGNING_ROOT = $signingRoot
     $env:SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT = $publisher
+    if ((Resolve-WindowsSigningTarget $signingInput) -cne [System.IO.Path]::GetFullPath($signingInput)) {
+        throw 'Ordinary target with omitted preservation flag was rejected'
+    }
+    $preserved = $true
+    Resolve-WindowsSigningTarget $signingInput ([ref]$preserved) | Out-Null
+    if ($preserved -ne $false) { throw 'Ordinary target incorrectly reported provider preservation' }
+    foreach ($invalid in @($null, 'not a reference', @{ Value = $false })) {
+        Require-Rejection { Resolve-WindowsSigningTarget $signingInput -PreservedProvider $invalid }
+    }
     foreach ($relative in @('binaries/scarlett-prover-x86_64-pc-windows-msvc.exe',
         'binaries/open-agent-api-x86_64-pc-windows-msvc.exe',
         'target/release/scarlett-node-desktop.exe', 'target/release/bundle/nsis/Scarlett setup.exe')) {
@@ -193,6 +202,9 @@ try {
     $metadata.files += @{ path = 'claude/provider.dll'; bytes = (Get-Item -LiteralPath $providerDLL).Length; sha256 = $providerDLLHash }
     $manifest = Join-Path $signingRoot 'runtime/COMPONENTS.json'
     $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifest
+    $preserved = $false
+    Resolve-WindowsSigningTarget $provider ([ref]$preserved) | Out-Null
+    if ($preserved -ne $true) { throw 'Exact provider target did not report preservation through its reference' }
     Sign-WindowsReleaseFile $provider | Out-Null
     Sign-WindowsReleaseFile $providerDLL | Out-Null
     if ((Get-FileHash -LiteralPath $provider -Algorithm SHA256).Hash -cne $providerHash) {
