@@ -183,7 +183,7 @@ try {
     Copy-Item -LiteralPath $binary -Destination $provider
     $providerHash = (Get-FileHash -LiteralPath $provider -Algorithm SHA256).Hash
     $metadata = @{ schemaVersion = 1; target = 'x86_64-pc-windows-msvc'; codexVersion = '0.159.2'
-        claudeVersion = '2.1.286'; modelApiVersion = '0.1.29'
+        claudeVersion = '2.1.286'; modelApiVersion = '0.1.30'
         releaseSigning = @{ publisherThumbprint = $publisher; vendorBytesPreserved = $true }
         files = @(@{ path = 'codex/bin/codex.exe'; bytes = (Get-Item -LiteralPath $provider).Length; sha256 = $providerHash }) }
     $providerDLL = Join-Path $signingRoot 'runtime/claude/provider.dll'
@@ -201,6 +201,11 @@ try {
     if ((Get-FileHash -LiteralPath $providerDLL -Algorithm SHA256).Hash -cne $providerDLLHash) {
         throw 'Provider DLL preservation callback changed the fixture'
     }
+    $metadata.modelApiVersion = '0.1.29'
+    $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifest
+    Require-Rejection { Resolve-WindowsSigningTarget $provider }
+    $metadata.modelApiVersion = '0.1.30'
+    $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifest
     $unknown = Join-Path $signingRoot 'runtime/codex/bin/unknown.exe'
     Copy-Item -LiteralPath $binary -Destination $unknown
     Require-Rejection { Resolve-WindowsSigningTarget $unknown }

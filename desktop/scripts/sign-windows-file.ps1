@@ -39,7 +39,7 @@ function Assert-PreservedProviderResource([string]$Path, [string]$Root, [string]
     $metadata = [System.IO.File]::ReadAllText($manifest) | ConvertFrom-Json
     if ($metadata.schemaVersion -ne 1 -or $metadata.target -cne 'x86_64-pc-windows-msvc' -or
         $metadata.codexVersion -cne '0.159.2' -or $metadata.claudeVersion -cne '2.1.286' -or
-        $metadata.modelApiVersion -cne '0.1.29' -or
+        $metadata.modelApiVersion -cne '0.1.30' -or
         $metadata.releaseSigning.vendorBytesPreserved -ne $true -or
         $metadata.releaseSigning.publisherThumbprint -notmatch '^[0-9a-fA-F]{40}$' -or
         $metadata.releaseSigning.publisherThumbprint -ine $env:SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT) {

@@ -45,7 +45,7 @@ def verify_inputs(root):
     metadata = json.loads(path.read_text())
     if metadata.get('schemaVersion') != 1 or metadata.get('target') != TARGET or metadata.get('releaseSigning'):
         raise ValueError('Expected an unsigned native Windows component manifest')
-    if [metadata.get(k) for k in ('codexVersion', 'claudeVersion', 'modelApiVersion')] != ['0.159.2', '2.1.286', '0.1.29']:
+    if [metadata.get(k) for k in ('codexVersion', 'claudeVersion', 'modelApiVersion')] != ['0.159.2', '2.1.286', '0.1.30']:
         raise ValueError('Expected the reviewed provider and model API versions')
     entries = metadata['files']
     expected = {p.relative_to(runtime).as_posix() for p in runtime.rglob('*') if p.is_file() and p != path}
