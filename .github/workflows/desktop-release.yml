@@ -116,6 +116,8 @@ jobs:
           }
           $pin = [string](python desktop/scripts/signing_identities.py get windows.sha1)
           if ($LASTEXITCODE -ne 0 -or $pin -cnotmatch '^[0-9a-f]{40}$') { throw 'Pinned Windows thumbprint unavailable' }
+          # Certificate store paths use the uppercase thumbprint Windows reports.
+          $pin = $pin.ToUpperInvariant()
           if (Test-Path -LiteralPath ('Cert:\CurrentUser\My\' + $pin)) { throw 'A Scarlett signing identity is already installed' }
           $folder = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP 'signing')
           $pfx = Join-Path $folder.FullName 'identity.pfx'
@@ -175,7 +177,9 @@ jobs:
           keychain="$RUNNER_TEMP/signing/release.keychain-db"
           if [[ -e "$keychain" ]]; then security delete-keychain "$keychain"; fi
           rm -rf "$RUNNER_TEMP/signing"
-          if security list-keychains -d user | grep -qF "$keychain"; then
+          # Read the list first: grep -q in a pipeline under pipefail can mask a match.
+          search_list=$(security list-keychains -d user)
+          if grep -qF -- "$keychain" <<< "$search_list"; then
             echo 'The signing keychain is still in the search list' >&2
             exit 1
           fi
@@ -185,7 +189,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $identities = [System.IO.File]::ReadAllText((Join-Path $env:GITHUB_WORKSPACE 'desktop/signing/identities.json')) | ConvertFrom-Json
-          $path = 'Cert:\CurrentUser\My\' + [string]$identities.windows.sha1
+          $path = 'Cert:\CurrentUser\My\' + ([string]$identities.windows.sha1).ToUpperInvariant()
           if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -DeleteKey }
           Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'signing') -Recurse -Force -ErrorAction SilentlyContinue
           if (Test-Path -LiteralPath $path) { throw 'The signing identity is still installed' }

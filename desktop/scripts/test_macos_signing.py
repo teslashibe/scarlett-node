@@ -400,8 +400,11 @@ class SelfSignedMacSigningTests(AppFixture):
     @unittest.skipUnless(shutil.which('openssl'), 'openssl creates the ephemeral rehearsal certificate')
     def test_rehearsal_identity_marks_every_record(self):
         folder = Path(self.temporary.name)
+        # The release extensions make a v3 certificate with LibreSSL (/usr/bin/openssl) as well as OpenSSL 3.
         subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', str(folder / 'key.pem'),
-                        '-out', str(folder / 'cert.pem'), '-subj', '/O=Scarlett Rehearsal/CN=Fixture', '-days', '1'],
+                        '-out', str(folder / 'cert.pem'), '-subj', '/O=Scarlett Rehearsal/CN=Fixture', '-days', '1',
+                        '-addext', 'basicConstraints=critical,CA:FALSE', '-addext', 'keyUsage=critical,digitalSignature',
+                        '-addext', 'extendedKeyUsage=critical,codeSigning'],
                        check=True, capture_output=True)
         (folder / 'key.pem').unlink()
         rehearsal = identities.rehearsal_identities(folder / 'cert.pem')
@@ -414,6 +417,48 @@ class SelfSignedMacSigningTests(AppFixture):
         self.assertIs(json.loads(self.evidence.read_text())['rehearsal'], True)
         self.assertIs(json.loads(self.manifest.read_text())['releaseSigning']['rehearsal'], True)
         self.assertEqual(hashlib.sha1(self.certificates[0]).hexdigest(), json.loads(self.evidence.read_text())['certificateSha1'])
+
+
+@unittest.skipUnless(sys.platform == 'darwin', 'the launch smoke runs only on a Mac')
+class SmokeEvidenceGateTests(unittest.TestCase):
+    """smoke-macos-dmg.sh refuses a disk image its evidence does not pin, before mounting or launching it."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        folder = Path(self.temporary.name)
+        self.dmg = folder / 'Scarlett-Node-0.1.0-darwin-arm64.dmg'
+        self.dmg.write_bytes(b'synthetic disk image, never mounted')
+        self.work = folder / 'smoke'
+        sha1 = identities.load({})['macos']['sha1']
+        self.evidence = {'signature': 'self-signed-stable', 'certificateSha1': sha1,
+                         'designatedRequirement': identities.designated_requirement('ai.scarlett.node', sha1),
+                         'sha256': signing.digest(self.dmg)}
+
+    def smoke(self, evidence):
+        if evidence is not None:
+            self.dmg.with_suffix('.evidence.json').write_text(json.dumps(evidence))
+        environment = {k: v for k, v in signing.os.environ.items() if not k.startswith('SCARLETT_')}
+        environment['GITHUB_ACTIONS'] = 'true'
+        result = subprocess.run(['/bin/bash', str(Path(__file__).with_name('smoke-macos-dmg.sh')), str(self.dmg), str(self.work)],
+                                capture_output=True, text=True, env=environment, timeout=60)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertFalse(self.work.exists(), 'nothing may be mounted or copied for a refused disk image')
+        return result.stderr
+
+    def test_missing_evidence_refused(self):
+        self.assertIn('no neighbouring signing evidence', self.smoke(None))
+
+    def test_changed_disk_image_refused(self):
+        self.assertIn('differs from its signing evidence', self.smoke(dict(self.evidence, sha256='0' * 64)))
+
+    def test_unpinned_or_other_scheme_refused(self):
+        other = 'f' * 40
+        for evidence in (dict(self.evidence, signature='developer-id-notarized'), dict(self.evidence, certificateSha1=other),
+                         dict(self.evidence, certificateSha1=self.evidence['certificateSha1'].upper()),
+                         dict(self.evidence, designatedRequirement=self.evidence['designatedRequirement'].replace('ai.scarlett.node', 'ai.other'))):
+            with self.subTest(evidence=evidence):
+                self.assertIn('one pinned self-signed certificate', self.smoke(evidence))
 
 
 if __name__ == '__main__':

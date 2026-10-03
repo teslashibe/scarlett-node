@@ -325,9 +325,11 @@ manual dispatch on `main`, with a `version` input that must equal
 `release-signing` environment on macos-15, macos-15-intel and windows-2025: it
 builds the runtime with the same `build-complete-runtime.sh` as PR CI, builds the
 unsigned app, imports the key (the secrets are visible to that step alone), signs,
-removes the key in an `always()` cleanup and, on Mac, launches the signed app
-from its DMG. The `assemble` job has no secrets. It runs `release-manifest.py`,
-which checks every evidence file and component manifest against
+removes the key in an `always()` cleanup and, on Mac, runs
+`smoke-macos-dmg.sh`: it checks the DMG digest against the signer's evidence,
+verifies the DMG and the packaged app and sidecars against their pinned designated
+requirements, then launches the app from the DMG. The `assemble` job has no
+secrets. It runs `release-manifest.py`, which checks every evidence file and component manifest against
 `identities.json` and the installer SHA-256, then writes `release/`
 (`manifest.json`, `provenance.json` and `Scarlett-Node-<version>-{darwin-arm64.dmg,
 darwin-amd64.dmg,windows-amd64.exe}`, the set the publisher accepts) beside

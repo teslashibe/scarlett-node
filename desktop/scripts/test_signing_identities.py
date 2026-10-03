@@ -28,8 +28,11 @@ def committed():
 
 def openssl_certificate(folder, subject='/O=Scarlett Rehearsal/CN=Scarlett Node Rehearsal macOS'):
     folder = Path(folder)
+    # The release extensions make a v3 certificate with LibreSSL (/usr/bin/openssl) as well as OpenSSL 3.
     subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', str(folder / 'key.pem'),
-                    '-out', str(folder / 'cert.pem'), '-subj', subject, '-days', '1'], check=True, capture_output=True)
+                    '-out', str(folder / 'cert.pem'), '-subj', subject, '-days', '1',
+                    '-addext', 'basicConstraints=critical,CA:FALSE', '-addext', 'keyUsage=critical,digitalSignature',
+                    '-addext', 'extendedKeyUsage=critical,codeSigning'], check=True, capture_output=True)
     (folder / 'key.pem').unlink()
     return folder / 'cert.pem'
 
@@ -67,6 +70,8 @@ class SigningIdentityTests(unittest.TestCase):
             path = identities.REPOSITORY / committed()[name]['certificate']
             output = subprocess.run(['openssl', 'x509', '-in', str(path), '-noout', '-subject', '-issuer', '-enddate',
                                      '-nameopt', 'RFC2253'], check=True, capture_output=True, text=True).stdout
+            # LibreSSL prints "subject= CN=..."; OpenSSL 3 prints "subject=CN=...".
+            output = output.replace('subject= ', 'subject=').replace('issuer= ', 'issuer=')
             details = identities.describe(identities.certificate_der(path))
             # RFC 2253 prints the most specific attribute first.
             reversed_subject = ','.join(reversed(details['subject'].split(', ')))
