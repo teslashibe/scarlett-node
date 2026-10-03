@@ -46,6 +46,7 @@ pub const MAX_SENT: usize = 16 << 10;
 pub struct Request {
     pub verifier: String,
     pub verifier_ca_file: Option<String>,
+    pub verifier_server_name: Option<String>,
     #[serde(default)]
     pub plaintext_fixture: bool,
     pub token: String,
@@ -122,7 +123,7 @@ pub async fn run(request: Request) -> Result<Summary> {
     let started = Instant::now();
     let mut timings = Timings::default();
 
-    let (mut socket, traffic) = crate::control::connect(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture).await?;
+    let (mut socket, traffic) = crate::control::connect_named(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture, request.verifier_server_name.as_deref()).await?;
     socket.write_all(format!("{}\n", request.token).as_bytes()).await?;
     timings.control_connect = started.elapsed().as_millis();
     let (driver, mut handle) = Session::new(socket.compat()).split();

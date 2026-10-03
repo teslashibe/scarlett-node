@@ -29,6 +29,7 @@ use crate::policy::{HOST, PATH, find, validate_job};
 pub struct Request {
     pub verifier: String,
     pub verifier_ca_file: Option<String>,
+    pub verifier_server_name: Option<String>,
     #[serde(default)]
     pub plaintext_fixture: bool,
     pub token: String,
@@ -41,9 +42,25 @@ pub struct Summary {
     #[serde(flatten)]
     pub verifier_transport: crate::control::TrafficSnapshot,
     pub status: &'static str,
+    pub proof_mode: &'static str,
+    pub duration_ms: u128,
     pub codex_ms: u128,
     pub sent_bytes: usize,
     pub received_bytes: usize,
+    pub timings_ms: Timings,
+}
+
+/// Local monotonic measurements for experiments, never authenticated usage.
+#[derive(Default, Serialize)]
+pub struct Timings {
+    pub control_connect: u128,
+    pub commit: u128,
+    pub websocket_handshake: u128,
+    pub response_read: u128,
+    pub tls_finish: u128,
+    pub prove: u128,
+    pub finalize: u128,
+    pub total: u128,
 }
 
 // Provider errors can contain prompts, authentication headers, and account IDs.
@@ -128,16 +145,21 @@ pub async fn run(request: Request) -> Result<Summary> {
     };
     let creds = load_creds()?;
 
-    let (mut socket, traffic) = crate::control::connect(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture).await?;
+    let started_total = Instant::now();
+    let mut timings = Timings::default();
+    let (mut socket, traffic) = crate::control::connect_named(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture, request.verifier_server_name.as_deref()).await?;
     socket.write_all(format!("{}\n", request.token).as_bytes()).await?;
+    timings.control_connect = started_total.elapsed().as_millis();
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();
     let mut session = Driver::new(tokio::spawn(driver));
     let work = async {
+        let phase = Instant::now();
         let prover = handle
             .new_prover(ProverConfig::builder().build()?)?
             .commit(ProxyTlsConfig::builder().server_name(DnsName::try_from(HOST)?).build()?)
             .await?;
+        timings.commit = phase.elapsed().as_millis();
         let (tls, prover) =
             prover.connect(TlsClientConfig::builder().server_name(ServerName::Dns(HOST.try_into()?)).root_store(roots).build()?)?;
         let prover_task = tokio::spawn(prover.into_future());
@@ -151,6 +173,8 @@ pub async fn run(request: Request) -> Result<Summary> {
         let (mut ws, _) = tokio_tungstenite::client_async(ws_request, tls.compat())
             .await
             .context("Codex WebSocket handshake failed")?;
+        timings.websocket_handshake = started.elapsed().as_millis();
+        let phase = Instant::now();
         ws.send(Message::text(payload.to_string())).await?;
         loop {
             let message = tokio::time::timeout(Duration::from_secs(240), ws.next())
@@ -165,13 +189,17 @@ pub async fn run(request: Request) -> Result<Summary> {
                 _ => {}
             }
         }
+        timings.response_read = phase.elapsed().as_millis();
         let codex_ms = started.elapsed().as_millis();
+        let phase = Instant::now();
         let _ = ws.close(None).await;
         while let Ok(Some(Ok(_))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await {}
         drop(ws);
 
         let mut prover =
             tokio::time::timeout(Duration::from_secs(30), prover_task).await.context("TLS connection did not close")???;
+        timings.tls_finish = phase.elapsed().as_millis();
+        let phase = Instant::now();
         let sent = prover.transcript().sent().to_vec();
         let received = prover.transcript().received().to_vec();
         let mut hide_sent = occurrences(&sent, creds.access_token.as_bytes());
@@ -199,12 +227,17 @@ pub async fn run(request: Request) -> Result<Summary> {
         }
         let config = builder.build()?;
         prover.prove(&config).await?;
+        timings.prove = phase.elapsed().as_millis();
         anyhow::Ok((prover, codex_ms, sent.len(), received.len()))
     };
     let (prover, codex_ms, sent_bytes, received_bytes) = session.step(work).await?;
+    let phase = Instant::now();
     session.finish(async { Ok(prover.close().await?) }, || handle.close()).await?;
+    timings.finalize = phase.elapsed().as_millis();
+    timings.total = started_total.elapsed().as_millis();
 
-    Ok(Summary { status: "proof_sent", codex_ms, sent_bytes, received_bytes, verifier_transport: traffic.snapshot() })
+    Ok(Summary { status: "proof_sent", proof_mode: "proxy", duration_ms: timings.total, codex_ms, sent_bytes, received_bytes,
+        timings_ms: timings, verifier_transport: traffic.snapshot() })
 }
 
 /// The task driving a prover's TLSNotary session. tlsn's handle waits
