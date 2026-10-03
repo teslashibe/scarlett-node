@@ -1,0 +1,17 @@
+{
+  "identifier": "main",
+  "description": "Local Scarlett window with fixed node commands",
+  "windows": ["main"],
+  "permissions": [
+    "allow-desktop-status",
+    "allow-pair-node",
+    "allow-control-node",
+    "allow-open-network",
+    "allow-connect-x",
+    "allow-connect-codex",
+    "allow-remove-account",
+    "allow-cancel-login",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

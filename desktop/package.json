@@ -1,0 +1,21 @@
+{
+  "name": "scarlett-node-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "test": "node --test tests/*.test.ts",
+    "tauri": "tauri",
+    "prepare:sidecars": "node scripts/prepare-sidecars.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.12.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.1",
+    "typescript": "7.0.2",
+    "vite": "8.3.2"
+  }
+}
