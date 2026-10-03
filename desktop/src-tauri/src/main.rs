@@ -249,6 +249,11 @@ fn main() {
             let exe = std::env::current_exe()?;
             let directory = exe.parent().ok_or("missing application directory")?;
             let suffix = if cfg!(windows) { ".exe" } else { "" };
+            node::private_dir_with_helper(
+                &state,
+                &directory.join(format!("scarlett-node{suffix}")),
+            )
+            .map_err(|_| "private desktop storage unavailable")?;
             app.manage(RuntimeControl(tokio::sync::Mutex::new(())));
             app.manage(Arc::new(LocalApi::new(
                 &state,

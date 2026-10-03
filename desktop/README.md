@@ -2,7 +2,7 @@
 
 Tauri 2 with bundled vanilla TypeScript. The native bridge delegates execution and account scheduling to the independently built Go node and its Rust proof helper. It does not embed the private Scarlett application.
 
-The desktop provides pairing, status, start/drain/resume/stop, a menu-bar/tray supervisor and account controls. Account management requires the native pool release; older node binaries show it as unavailable. Automatic Codex token refresh for the proof-only runtime, browser import, signed public installers, automatic updates and native Windows private-storage/process support remain separate release gates. The Mac development app is unsigned and is not a community release.
+The desktop provides pairing, status, start/drain/resume/stop, a menu-bar/tray supervisor and account controls. Account management requires the native pool release; older node binaries show it as unavailable. Automatic Codex token refresh for the proof-only runtime, browser import, signed public installers, automatic updates and full installed Windows GUI acceptance remain separate release gates. The Mac development app is unsigned and is not a community release.
 
 ## Build
 
@@ -46,15 +46,15 @@ Only the bundled main webview can invoke the explicit custom commands. Productio
 
 Pairing codes and X cookies are cleared from masked form inputs after submission, never used as process arguments/environment, and not persisted by the webview. Raw command stdout/stderr is not returned to JS or logged. The node receives an allowlisted environment with app-owned paths; unrelated credentials and fixture flags are not inherited. File-based credentials remain private local files, not encrypted vault storage. Optional vault support requires a compatible reader/refresh adapter before it can advertise capacity.
 
-Closing the main window hides it in the tray/menu bar. Explicit Quit requests drain and sends graceful termination to the supervised node, allowing the node's existing two-minute accepted-work window before a bounded forced stop. The journal remains the execution/recovery authority; the shell never retries provider work or reconstructs a receipt. Stop does not unpair/revoke a node. A second instance focuses the existing window and the node retains its journal lock.
+Closing the main window hides it in the tray/menu bar. Explicit Quit requests drain and closes the supervised node's owner pipe, allowing the node's existing two-minute accepted-work window before a bounded forced stop. The journal remains the execution/recovery authority; the shell never retries provider work or reconstructs a receipt. Stop does not unpair/revoke a node. A second instance focuses the existing window and the node retains its journal lock.
 
-Native Windows storage and graceful process controls must land and be independently validated before enabling Windows runtime operations. Current Windows controls return `windows_pending`; a portable webview alone is not proof of Windows support.
+Windows runtime operations require private NTFS storage and the bundled native helpers. Native tests validate ACLs, locking, process trees and owner-pipe shutdown; installed Windows GUI acceptance remains required before publishing its installer.
 
 Tests use synthetic credentials and disposable temporary directories/fake executables. Launching the app does not itself start provider work: Start remains explicit. Real account/canary testing and production validation belong to the release owner.
 
 ## Complete runtime package
 
-The complete bundle contains the desktop shell, native Go node, Rust proof helper, `open-agent-api` v0.1.28, Codex CLI 0.159.2 and Claude CLI 2.1.286. Users do not need a development toolchain to run these packaged binaries. The model API binary is packaged but its desktop supervisor and configuration UI are still required before the desktop exposes a usable local chat endpoint. The node's verified network services remain Codex and X; packaging Claude does not add a verified Claude network service.
+The complete bundle contains the desktop shell, native Go node, Rust proof helper, `open-agent-api` v0.1.28, Codex CLI 0.159.2 and Claude CLI 2.1.286. Users do not need a development toolchain to run these packaged binaries. The desktop starts and stops the local model API through its native supervisor. The node's verified network services remain Codex and X; packaging Claude does not add a verified Claude network service.
 
 Build on the target OS and architecture. Prepare the three reviewed native binaries and the official unpacked native provider packages, then run:
 
@@ -82,8 +82,16 @@ Claude's native package and license are kept intact. Each user must authenticate
 
 ## Local model API controls
 
-The complete Mac bundle can start and stop its bundled model API from the desktop. It binds only `127.0.0.1` on an operator-selected port (default 8088), requires a generated 256-bit bearer, and reports Ready only after health succeeds, unauthenticated model access returns 401 and authenticated access returns 200. Show local API key explicitly reveals the private bearer; it clears on window blur or page exit. The file is owned by the current user with mode 0600, and symlink or shared-file reads fail closed. The bearer is never included in status, logs or process arguments.
+The complete bundle can start and stop its bundled model API from the desktop. It binds only `127.0.0.1` on an operator-selected port (default 8088), requires a generated 256-bit bearer, and reports Ready only after health succeeds, unauthenticated model access returns 401 and authenticated access returns 200. Show local API key explicitly reveals the private bearer; it clears on window blur or page exit. The file is private to the current user (mode 0600 on Unix; current-user/SYSTEM ACL on Windows), and symlink or shared-file reads fail closed. The bearer is never included in status, logs or process arguments.
 
 Codex clients use only completed app-owned login profiles for registered account IDs, plus bundled profile/scaffold files. Unrelated environment credentials and host profiles are cleared. An optional personal Anthropic API key enables the bundled Claude provider; it stays only in that service's environment, is not saved to disk, and must be re-entered after stopping. Claude subscription OAuth is not imported into this API. Neither discovery nor readiness establishes provider entitlement.
 
-The app permits network execution or the local API at a time, serialized through one native control lock, so independent processes cannot silently exceed account capacity. Adding an account takes effect in the local API after restart; removing a Codex account first stops the API. Quit stops the API before draining the node. Native Windows storage/process integration remains a release gate and API controls fail closed there.
+The app permits network execution or the local API at a time, serialized through one native control lock, so independent processes cannot silently exceed account capacity. Adding an account takes effect in the local API after restart; removing a Codex account first stops the API. Quit stops the API before draining the node. Windows private storage uses the Go node’s NTFS, current-user/SYSTEM ACL and reparse-point checks. Local API supervision uses the same native process-tree boundary as node helpers. Full installed Windows GUI acceptance remains a release gate.
+
+## Ownership of local processes
+
+The desktop starts `scarlett-node desktop run` and holds its input pipe open. Stop closes that owned pipe after requesting drain; the node stops admission and lets accepted work finish within the existing two-minute shutdown bound. An unexpected desktop exit also closes the pipe. No runtime PID from a file or status response is signalled. The ordinary terminal `scarlett-node run` keeps its existing signal-based behavior.
+
+The local API runs through `scarlett-node desktop api PORT`. That host selects only the API binary beside its own executable, fixes the listener to loopback and stops its owned API tree when desktop input closes. Unix uses an owned process group; Windows uses suspended startup and a kill-on-close Job Object. Windowless creation does not grant process breakaway. Local API stop can cancel requests in progress; it does not submit them again.
+
+The Windows bridge creates or checks private directories before starting the webview and obtains its bearer through fixed `desktop private-dir` and `desktop bearer` helpers. Existing broad ACLs, symlinks/reparse points and unsupported filesystems fail closed. The API bearer stays in the private local file and protected helper output; it is never a process argument or a status field.

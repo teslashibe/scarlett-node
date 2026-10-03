@@ -83,6 +83,11 @@ jobs:
             "$RUNNER_TEMP/scarlett-runtime/open-agent-api$suffix" \
             "$RUNNER_TEMP/scarlett-runtime/codex/package" \
             "$RUNNER_TEMP/scarlett-runtime/claude/package"
+      - name: Validate owner closure drains accepted synthetic node work
+        run: |
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
+          SCARLETT_TEST_NODE_BINARY="$RUNNER_TEMP/scarlett-runtime/scarlett-node$suffix" go test -race . -run '^TestActualDesktopOwnerDrainFinishesAcceptedWorkAndSurvivesRestart$' -count=1
       - name: Desktop tests and native checks
         run: |
           npm --prefix desktop ci --ignore-scripts
@@ -91,11 +96,13 @@ jobs:
           cargo +1.95 test --locked --manifest-path desktop/src-tauri/Cargo.toml
           cargo +1.95 clippy --locked --all-targets --manifest-path desktop/src-tauri/Cargo.toml -- -D warnings
       - name: Validate native desktop API supervision without account login
-        if: runner.os == 'macOS'
         env:
-          SCARLETT_NATIVE_API_TEST: ${{ runner.temp }}/scarlett-runtime/open-agent-api
           SCARLETT_NATIVE_RESOURCE_TEST: ${{ github.workspace }}/desktop/src-tauri/runtime
-        run: cargo +1.95 test --locked --manifest-path desktop/src-tauri/Cargo.toml local_api::tests::native_api_supervisor_uses_disposable_profiles_and_stops -- --ignored
+        run: |
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
+          export SCARLETT_NATIVE_API_TEST="$RUNNER_TEMP/scarlett-runtime/open-agent-api$suffix"
+          cargo +1.95 test --locked --manifest-path desktop/src-tauri/Cargo.toml local_api::tests::native_api_supervisor_uses_disposable_profiles_and_stops -- --ignored
       - name: Build installer for testing
         working-directory: desktop
         run: npm run tauri build -- --debug --config src-tauri/tauri.complete.generated.json

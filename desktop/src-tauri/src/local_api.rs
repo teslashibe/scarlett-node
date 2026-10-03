@@ -1,5 +1,5 @@
 //! App-owned loopback service. No inherited account profiles or renderer paths.
-use crate::node::{Account, Error, Result, private_dir, regular};
+use crate::node::{Account, Error, Result, private_dir_with_helper, regular};
 use serde::Serialize;
 use serde_json::json;
 use std::{
@@ -30,6 +30,7 @@ struct Running {
 pub struct LocalApi {
     state: PathBuf,
     binary: PathBuf,
+    helper: PathBuf,
     resources: PathBuf,
     node_state: PathBuf,
     running: Mutex<Option<Running>>,
@@ -38,6 +39,14 @@ impl LocalApi {
     pub fn new(node_state: &Path, binary: PathBuf, resources: PathBuf) -> Self {
         Self {
             state: node_state.join("local-api"),
+            helper: binary
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(if cfg!(windows) {
+                    "scarlett-node.exe"
+                } else {
+                    "scarlett-node"
+                }),
             binary,
             resources,
             node_state: node_state.into(),
@@ -45,23 +54,23 @@ impl LocalApi {
         }
     }
     fn prepare(&self) -> Result<()> {
-        private_dir(&self.node_state)?;
-        private_dir(&self.state)?;
+        private_dir_with_helper(&self.node_state, &self.helper)?;
+        private_dir_with_helper(&self.state, &self.helper)?;
         for name in ["codex", "claude", "claude-runs", "tmp"] {
-            private_dir(&self.state.join(name))?;
+            private_dir_with_helper(&self.state.join(name), &self.helper)?;
         }
         Ok(())
     }
     fn available(&self) -> bool {
-        // Windows storage and process shutdown must pass native acceptance first.
-        cfg!(unix)
-            && regular(&self.binary)
+        // Native storage and process checks run before a runtime becomes ready.
+        regular(&self.binary)
+            && regular(&self.helper)
             && regular(&self.resources.join("codex_profile.json"))
             && regular(&self.resources.join("codex_scaffold.json"))
     }
     pub fn key(&self) -> Result<String> {
         self.prepare()?;
-        private_key(&self.state.join("bearer"))
+        private_key(&self.state.join("bearer"), &self.helper)
     }
     fn command(&self, port: u16, accounts: &[Account], claude_key: &str) -> Result<Command> {
         if port < 1024
@@ -84,14 +93,14 @@ impl LocalApi {
             }
             let home = self.node_state.join("codex-logins").join(&account.id);
             // Only this app's completed login profiles; never registry-provided paths.
-            private_dir(&home)?;
+            private_dir_with_helper(&home, &self.helper)?;
             if !regular(&home.join("auth.json")) {
                 return Err(Error::LoginFailed);
             }
             clients.push(json!({"label": account.id, "codex_home": home, "auth_path": home.join("auth.json"), "profile_path": profile, "scaffold_path": scaffold}));
         }
-        let mut cmd = Command::new(&self.binary);
-        cmd.args(["--host", "127.0.0.1", "--port", &port.to_string()])
+        let mut cmd = Command::new(&self.helper);
+        cmd.args(["desktop", "api", &port.to_string()])
             .env_clear()
             .current_dir(&self.state)
             .env("HOME", &self.state)
@@ -143,7 +152,7 @@ impl LocalApi {
                 }),
             )
             .env("CLAUDE_BRIDGE_EXECUTABLE", &self.binary)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
@@ -164,6 +173,8 @@ impl LocalApi {
         }
         #[cfg(unix)]
         cmd.process_group(0);
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000);
         Ok(cmd)
     }
     pub async fn start(&self, port: u16, accounts: &[Account], claude_key: String) -> Result<()> {
@@ -290,40 +301,38 @@ async fn stop_process(child: &mut Child) -> Result<()> {
     {
         return Ok(());
     }
-    #[cfg(unix)]
-    {
-        let pid = child.id().ok_or(Error::CommandFailed)?;
-        if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
-            return Err(Error::CommandFailed);
+    drop(child.stdin.take());
+    match tokio::time::timeout(Duration::from_secs(20), child.wait()).await {
+        Ok(result) => {
+            result.map_err(|_| Error::CommandFailed)?;
+            Ok(())
         }
-        match tokio::time::timeout(Duration::from_secs(20), child.wait()).await {
-            Ok(result) => {
-                result.map_err(|_| Error::CommandFailed)?;
-                Ok(())
-            }
-            Err(_) => {
-                // Only the process group created for this owned child, never an observed PID.
-                unsafe {
-                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                }
-                child.kill().await.map_err(|_| Error::CommandFailed)?;
-                Err(Error::CommandTimeout)
-            }
+        Err(_) => {
+            child.kill().await.map_err(|_| Error::CommandFailed)?;
+            Err(Error::CommandTimeout)
         }
-    }
-    #[cfg(windows)]
-    {
-        Err(Error::WindowsPending)
     }
 }
-fn private_key(path: &Path) -> Result<String> {
+fn private_key(path: &Path, helper: &Path) -> Result<String> {
     #[cfg(windows)]
     {
-        let _ = path;
-        Err(Error::WindowsPending)
+        let value = crate::node::private_helper(helper, "bearer", path)?;
+        let key = value
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(Error::PrivateStorageUnavailable)?;
+        if key.len() != 64
+            || !key
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(Error::PrivateStorageUnavailable);
+        }
+        Ok(key.to_owned())
     }
     #[cfg(unix)]
     {
+        let _ = helper;
         use std::{
             fs::OpenOptions,
             io::{Read, Write},
@@ -391,14 +400,20 @@ mod tests {
         use std::os::unix::fs::{PermissionsExt, symlink};
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join("bearer");
-        let key = private_key(&file).unwrap();
+        let key = private_key(&file, Path::new("unused")).unwrap();
         assert_eq!(key.len(), 64);
-        assert_eq!(private_key(&file).unwrap(), key);
+        assert_eq!(private_key(&file, Path::new("unused")).unwrap(), key);
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(private_key(&file), Err(Error::PrivateStorageUnavailable));
+        assert_eq!(
+            private_key(&file, Path::new("unused")),
+            Err(Error::PrivateStorageUnavailable)
+        );
         let link = root.path().join("link");
         symlink(&file, &link).unwrap();
-        assert_eq!(private_key(&link), Err(Error::PrivateStorageUnavailable));
+        assert_eq!(
+            private_key(&link, Path::new("unused")),
+            Err(Error::PrivateStorageUnavailable)
+        );
     }
     #[cfg(unix)]
     #[test]
@@ -408,6 +423,7 @@ mod tests {
         let resources = root.path().join("runtime");
         std::fs::create_dir(&resources).unwrap();
         std::fs::write(&binary, "fixture").unwrap();
+        std::fs::write(root.path().join("scarlett-node"), "fixture").unwrap();
         for file in ["codex_profile.json", "codex_scaffold.json"] {
             std::fs::write(resources.join(file), "{}").unwrap();
         }
@@ -416,7 +432,7 @@ mod tests {
         let command = command.as_std();
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            ["--host", "127.0.0.1", "--port", "8088"]
+            ["desktop", "api", "8088"]
         );
         let env = command
             .get_envs()
@@ -460,7 +476,6 @@ mod tests {
         assert!(!protected_ready(port, &"a".repeat(64)).await);
         server.await.unwrap();
     }
-    #[cfg(unix)]
     #[tokio::test]
     #[ignore = "requires explicitly supplied reviewed native API and resources; makes no provider jobs"]
     async fn native_api_supervisor_uses_disposable_profiles_and_stops() {
@@ -491,6 +506,22 @@ mod tests {
         assert!(!root.path().join("state/local-api/codex/auth.json").exists());
         api.stop().await.unwrap();
         assert!(!api.snapshot().await.running);
+        assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
+        api.start(port, &[], String::new()).await.unwrap();
+        // OS closure of the desktop's pipe has this same observable boundary.
+        // The host must stop the API even without a native Stop invocation.
+        {
+            let mut running = api.running.lock().await;
+            drop(running.as_mut().unwrap().child.stdin.take());
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while api.snapshot().await.running {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "API survived owner input closure"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
     }
 }

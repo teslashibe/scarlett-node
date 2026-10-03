@@ -24,7 +24,11 @@ func Run(cmd *exec.Cmd) error {
 	if _, err = windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits))); err != nil {
 		return err
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_SUSPENDED}
+	flags := uint32(windows.CREATE_SUSPENDED)
+	if cmd.SysProcAttr != nil {
+		flags |= cmd.SysProcAttr.CreationFlags & windows.CREATE_NO_WINDOW
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: flags}
 	cmd.WaitDelay = 5 * time.Second
 	cmd.Cancel = func() error {
 		// Also cover cancellation in the short suspended-start/assignment window.
