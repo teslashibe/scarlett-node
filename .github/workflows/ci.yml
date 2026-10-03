@@ -46,6 +46,12 @@ jobs:
         env:
           SCARLETT_TEST_NODE_BINARY: ${{ runner.temp }}/scarlett-node
 
+      - name: Offline performance experiment checks
+        run: |
+          scripts/xperf.sh --offline
+          scripts/codexperf.sh --offline
+          python3 scripts/codexperf-report.py --self-test
+
   prover:
     runs-on: ubuntu-latest
     timeout-minutes: 40
