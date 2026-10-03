@@ -1,0 +1,980 @@
+//! Fixed native CLI delegation. Raw provider/CLI output never crosses the UI boundary.
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::{Duration, Instant},
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::{Child, Command},
+    sync::Mutex,
+};
+
+const COORDINATOR: &str = "https://network.scarlett.ai";
+const VERIFIER: &str = "verifier.scarlett.ai:7047";
+const CLI_VERSION: &str = "codex-cli 0.159.2";
+const OUTPUT_LIMIT: usize = 32768;
+
+#[derive(Clone)]
+struct Endpoints {
+    coordinator: String,
+    verifier: String,
+    verifier_ca: Option<PathBuf>,
+}
+impl Default for Endpoints {
+    fn default() -> Self {
+        Self {
+            coordinator: COORDINATOR.into(),
+            verifier: VERIFIER.into(),
+            verifier_ca: None,
+        }
+    }
+}
+impl Endpoints {
+    fn resolve(
+        debug: bool,
+        coordinator: Option<&str>,
+        verifier: Option<&str>,
+        ca: Option<&Path>,
+    ) -> Result<Self> {
+        if !debug {
+            return Ok(Self::default());
+        }
+        let mut out = Self::default();
+        if let Some(raw) = coordinator {
+            let url = tauri::Url::parse(raw).map_err(|_| Error::InvalidInput)?;
+            let loopback = url.host_str().is_some_and(|h| {
+                h == "localhost"
+                    || h.trim_matches(['[', ']'])
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            });
+            if !loopback
+                || !matches!(url.scheme(), "http" | "https")
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || url.path() != "/"
+                || url.port().is_none_or(|p| p < 1024)
+            {
+                return Err(Error::InvalidInput);
+            }
+            out.coordinator = raw.trim_end_matches('/').to_owned();
+        }
+        if let Some(raw) = verifier {
+            let address: std::net::SocketAddr = raw.parse().map_err(|_| Error::InvalidInput)?;
+            if !address.ip().is_loopback() || address.port() < 1024 {
+                return Err(Error::InvalidInput);
+            }
+            out.verifier = raw.into();
+            // Local verifier still needs an explicitly trusted TLS CA; no plaintext flag.
+            let ca = ca.ok_or(Error::InvalidInput)?;
+            if !ca.is_absolute() || !regular(ca) {
+                return Err(Error::InvalidInput);
+            }
+            out.verifier_ca = Some(ca.to_path_buf());
+        } else if ca.is_some() {
+            return Err(Error::InvalidInput);
+        }
+        Ok(out)
+    }
+}
+
+#[derive(Clone, Serialize, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Error {
+    InvalidInput,
+    RuntimeUnavailable,
+    AccountsUnavailable,
+    CliUnavailable,
+    CommandFailed,
+    CommandTimeout,
+    AlreadyRunning,
+    NotPaired,
+    LoginBusy,
+    LoginFailed,
+    PrivateStorageUnavailable,
+    #[cfg(windows)]
+    WindowsPending,
+}
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct Account {
+    pub id: String,
+    pub service: String,
+    pub concurrency: u8,
+}
+#[derive(Clone, Serialize, Default)]
+pub struct Snapshot {
+    pub runtime_available: bool,
+    pub accounts_available: bool,
+    pub helper_available: bool,
+    pub codex_login_available: bool,
+    pub paired: bool,
+    pub supervised: bool,
+    pub login_pending: bool,
+    pub login_error: Option<Error>,
+    pub observation: Option<Value>,
+    pub accounts: Vec<Account>,
+}
+struct Login {
+    child: Child,
+    id: String,
+    concurrency: u8,
+    home: PathBuf,
+    started: Instant,
+}
+pub struct Node {
+    pub state: PathBuf,
+    endpoints: Endpoints,
+    binary: PathBuf,
+    helper: PathBuf,
+    running: Mutex<Option<Child>>,
+    login: Mutex<Option<Login>>,
+    login_error: Mutex<Option<Error>>,
+    mutation: Mutex<()>,
+}
+
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 32
+        && id != "legacy"
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+fn valid_selection(service: &str, id: &str, concurrency: u8) -> Result<()> {
+    if (service != "codex" && service != "x_read")
+        || !valid_id(id)
+        || !(1..=32).contains(&concurrency)
+    {
+        return Err(Error::InvalidInput);
+    }
+    Ok(())
+}
+fn private_dir(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = path;
+        return Err(Error::WindowsPending);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        match std::fs::symlink_metadata(path) {
+            Ok(meta)
+                if meta.is_dir()
+                    && !meta.file_type().is_symlink()
+                    && meta.mode() & 0o077 == 0
+                    && meta.uid() == unsafe { libc::geteuid() } =>
+            {
+                Ok(())
+            }
+            Ok(_) => Err(Error::PrivateStorageUnavailable),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(path)
+                .map_err(|_| Error::PrivateStorageUnavailable),
+            Err(_) => Err(Error::PrivateStorageUnavailable),
+        }
+    }
+}
+fn regular(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+}
+fn account_projection(raw: &[u8]) -> Result<Vec<Account>> {
+    let records: Vec<Value> = serde_json::from_slice(raw).map_err(|_| Error::CommandFailed)?;
+    if records.len() > 16 {
+        return Err(Error::CommandFailed);
+    }
+    records
+        .into_iter()
+        .map(|v| {
+            let a: Account = serde_json::from_value(v).map_err(|_| Error::CommandFailed)?;
+            valid_selection(&a.service, &a.id, a.concurrency).map_err(|_| Error::CommandFailed)?;
+            Ok(a)
+        })
+        .collect()
+}
+fn observation_projection(raw: &[u8]) -> Result<Value> {
+    let v: Value = serde_json::from_slice(raw).map_err(|_| Error::CommandFailed)?;
+    let source = v.as_object().ok_or(Error::CommandFailed)?;
+    let mut out = serde_json::Map::new();
+    for key in [
+        "version",
+        "state",
+        "updated_at",
+        "last_heartbeat_at",
+        "in_flight",
+        "unresolved_attempts",
+        "drain_requested",
+    ] {
+        if let Some(value) = source.get(key)
+            && (value.is_string() || value.is_boolean() || value.is_number())
+        {
+            out.insert(key.into(), value.clone());
+        }
+    }
+    for (key, allowed) in [
+        (
+            "services",
+            &["type", "state", "capacity", "in_flight", "last_error_code"][..],
+        ),
+        (
+            "accounts",
+            &[
+                "id",
+                "service",
+                "state",
+                "capacity",
+                "in_flight",
+                "last_error_code",
+                "rest_until",
+            ][..],
+        ),
+    ] {
+        let items = source
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .take(16)
+                    .filter_map(|item| {
+                        let obj = item.as_object()?;
+                        let mut safe = serde_json::Map::new();
+                        for field in allowed {
+                            if let Some(value) = obj.get(*field)
+                                && (value.is_string() || value.is_number() || value.is_null())
+                            {
+                                safe.insert((*field).into(), value.clone());
+                            }
+                        }
+                        Some(Value::Object(safe))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        out.insert(key.into(), Value::Array(items));
+    }
+    Ok(Value::Object(out))
+}
+impl Node {
+    pub fn new(state: PathBuf, binary: PathBuf, helper: PathBuf) -> Self {
+        Self {
+            state,
+            endpoints: Endpoints::default(),
+            binary,
+            helper,
+            running: Mutex::new(None),
+            login: Mutex::new(None),
+            login_error: Mutex::new(None),
+            mutation: Mutex::new(()),
+        }
+    }
+    pub fn from_environment(state: PathBuf, binary: PathBuf, helper: PathBuf) -> Result<Self> {
+        let mut node = Self::new(state, binary, helper);
+        let coordinator = std::env::var("SCARLETT_DESKTOP_LOCAL_COORDINATOR").ok();
+        let verifier = std::env::var("SCARLETT_DESKTOP_LOCAL_VERIFIER").ok();
+        let ca = std::env::var_os("SCARLETT_DESKTOP_LOCAL_VERIFIER_CA").map(PathBuf::from);
+        node.endpoints = Endpoints::resolve(
+            cfg!(debug_assertions),
+            coordinator.as_deref(),
+            verifier.as_deref(),
+            ca.as_deref(),
+        )?;
+        Ok(node)
+    }
+    pub fn network_url(&self, destination: &str) -> Result<String> {
+        let path = match destination {
+            "setup" => "/setup/",
+            "dashboard" => "/dashboard/",
+            "settings" => "/settings/",
+            _ => return Err(Error::InvalidInput),
+        };
+        Ok(format!("{}{path}", self.endpoints.coordinator))
+    }
+    fn prepare(&self) -> Result<()> {
+        private_dir(&self.state)?;
+        Ok(())
+    }
+    fn command(&self, args: &[&str]) -> Result<Command> {
+        self.prepare()?;
+        if !regular(&self.binary) {
+            return Err(Error::RuntimeUnavailable);
+        }
+        let mut cmd = Command::new(&self.binary);
+        cmd.args(args).env_clear();
+        for name in [
+            "HOME",
+            "USERPROFILE",
+            "SystemRoot",
+            "WINDIR",
+            "TEMP",
+            "TMP",
+            "TMPDIR",
+            "LANG",
+        ] {
+            if let Some(v) = std::env::var_os(name) {
+                cmd.env(name, v);
+            }
+        }
+        cmd.env("SCARLETT_STATE_DIR", &self.state)
+            .env("SCARLETT_ACCOUNTS_FILE", self.state.join("accounts.json"))
+            .env("SCARLETT_COORDINATOR", &self.endpoints.coordinator)
+            .env("SCARLETT_VERIFIER", &self.endpoints.verifier)
+            .env("SCARLETT_EXECUTOR", "services")
+            .env("SCARLETT_SERVICES", "codex,x_read")
+            .env("SCARLETT_PROFILE", "standard")
+            .env("SCARLETT_PROVER", &self.helper)
+            .env(
+                "SCARLETT_CODEX_HOME",
+                self.state.join("unused-legacy-codex"),
+            )
+            .env(
+                "SCARLETT_X_SESSION",
+                self.state.join("unused-legacy-x.json"),
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        if let Some(ca) = &self.endpoints.verifier_ca {
+            cmd.env("SCARLETT_VERIFIER_CA_FILE", ca);
+        }
+        Ok(cmd)
+    }
+    async fn call(&self, args: &[&str], input: Option<Vec<u8>>, seconds: u64) -> Result<Vec<u8>> {
+        let mut child = self
+            .command(args)?
+            .spawn()
+            .map_err(|_| Error::RuntimeUnavailable)?;
+        let stdout = child.stdout.take().ok_or(Error::CommandFailed)?;
+        let result = tokio::time::timeout(Duration::from_secs(seconds), async {
+            if let Some(input) = input {
+                if input.len() > 16384 {
+                    return Err(Error::InvalidInput);
+                }
+                let mut pipe = child.stdin.take().ok_or(Error::CommandFailed)?;
+                pipe.write_all(&input)
+                    .await
+                    .map_err(|_| Error::CommandFailed)?;
+                pipe.shutdown().await.map_err(|_| Error::CommandFailed)?;
+            }
+            drop(child.stdin.take());
+            let mut reader = stdout.take((OUTPUT_LIMIT + 1) as u64);
+            let mut output = Vec::new();
+            reader
+                .read_to_end(&mut output)
+                .await
+                .map_err(|_| Error::CommandFailed)?;
+            if output.len() > OUTPUT_LIMIT {
+                return Err(Error::CommandFailed);
+            }
+            if !child
+                .wait()
+                .await
+                .map_err(|_| Error::CommandFailed)?
+                .success()
+            {
+                return Err(Error::CommandFailed);
+            }
+            Ok(output)
+        })
+        .await
+        .map_err(|_| Error::CommandTimeout)?;
+        // kill_on_drop also covers timeout, malformed output and early pipe errors.
+        result
+    }
+    pub async fn accounts(&self) -> Result<Vec<Account>> {
+        let raw = self
+            .call(&["accounts", "list"], None, 5)
+            .await
+            .map_err(|e| {
+                if e == Error::CommandFailed {
+                    Error::AccountsUnavailable
+                } else {
+                    e
+                }
+            })?;
+        account_projection(&raw)
+    }
+    pub async fn pair(&self, code: String) -> Result<()> {
+        let _guard = self.mutation.lock().await;
+        if code.len() != 64
+            || !code
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(Error::InvalidInput);
+        }
+        if regular(&self.state.join("identity.json")) {
+            return Err(Error::CommandFailed);
+        }
+        // One invocation only. A timeout is ambiguous; never retry automatically.
+        self.call(&["pair"], Some(format!("{code}\n").into_bytes()), 15)
+            .await?;
+        Ok(())
+    }
+    pub async fn connect_x(
+        &self,
+        id: String,
+        concurrency: u8,
+        auth_token: String,
+        ct0: String,
+    ) -> Result<()> {
+        let _guard = self.mutation.lock().await;
+        valid_selection("x_read", &id, concurrency)?;
+        fn secret(v: &str, max: usize) -> bool {
+            !v.is_empty()
+                && v.len() <= max
+                && v.bytes()
+                    .all(|b| (33..=126).contains(&b) && !b";=\\\"".contains(&b))
+        }
+        if !secret(&auth_token, 64) || !secret(&ct0, 160) {
+            return Err(Error::InvalidInput);
+        }
+        self.accounts().await?;
+        let input = serde_json::to_vec(&json!({"auth_token":auth_token,"ct0":ct0}))
+            .map_err(|_| Error::InvalidInput)?;
+        self.call(
+            &[
+                "accounts",
+                "connect",
+                "x_read",
+                &id,
+                &concurrency.to_string(),
+            ],
+            Some(input),
+            5,
+        )
+        .await?;
+        Ok(())
+    }
+    pub async fn remove(&self, service: String, id: String) -> Result<()> {
+        let _guard = self.mutation.lock().await;
+        valid_selection(&service, &id, 1)?;
+        self.accounts().await?;
+        self.call(&["accounts", "remove", &service, &id], None, 5)
+            .await?;
+        Ok(())
+    }
+    pub async fn start(&self) -> Result<()> {
+        let _guard = self.mutation.lock().await;
+        let mut running = self.running.lock().await;
+        if running
+            .as_mut()
+            .is_some_and(|p| p.try_wait().ok().flatten().is_none())
+        {
+            return Err(Error::AlreadyRunning);
+        }
+        if !regular(&self.state.join("identity.json")) {
+            return Err(Error::NotPaired);
+        }
+        if !regular(&self.helper) {
+            return Err(Error::RuntimeUnavailable);
+        }
+        if self.accounts().await?.is_empty() {
+            return Err(Error::AccountsUnavailable);
+        }
+        let mut cmd = self.command(&["run"])?;
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
+        *running = Some(cmd.spawn().map_err(|_| Error::RuntimeUnavailable)?);
+        Ok(())
+    }
+    pub async fn control(&self, action: &str) -> Result<()> {
+        match action {
+            "start" => self.start().await,
+            "pause" => {
+                self.call(&["drain"], None, 5).await?;
+                Ok(())
+            }
+            "resume" => {
+                self.call(&["resume"], None, 5).await?;
+                Ok(())
+            }
+            "stop" => self.stop().await,
+            _ => Err(Error::InvalidInput),
+        }
+    }
+    pub async fn stop(&self) -> Result<()> {
+        let _guard = self.mutation.lock().await;
+        self.cancel_login().await?;
+        let mut running = self.running.lock().await;
+        if let Some(child) = running.as_mut() {
+            if child
+                .try_wait()
+                .map_err(|_| Error::CommandFailed)?
+                .is_some()
+            {
+                *running = None;
+                return Ok(());
+            }
+            self.call(&["drain"], None, 5).await?;
+            #[cfg(unix)]
+            {
+                let pid = child.id().ok_or(Error::CommandFailed)?;
+                if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
+                    return Err(Error::CommandFailed);
+                }
+            }
+            #[cfg(windows)]
+            {
+                return Err(Error::WindowsPending);
+            }
+            // Node gives accepted work up to two minutes, within its lease.
+            if tokio::time::timeout(Duration::from_secs(125), child.wait())
+                .await
+                .is_err()
+            {
+                #[cfg(unix)]
+                {
+                    if let Some(pid) = child.id() {
+                        unsafe {
+                            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                        }
+                    }
+                }
+                child.kill().await.map_err(|_| Error::CommandFailed)?;
+                return Err(Error::CommandTimeout);
+            }
+            *running = None;
+        }
+        Ok(())
+    }
+    pub async fn cancel_login(&self) -> Result<()> {
+        if let Some(mut pending) = self.login.lock().await.take() {
+            let _ = pending.child.kill().await;
+            *self.login_error.lock().await = Some(Error::LoginFailed);
+        }
+        Ok(())
+    }
+    async fn codex_cli(&self) -> Option<PathBuf> {
+        let mut candidates =
+            vec![
+                self.binary
+                    .parent()?
+                    .join(if cfg!(windows) { "codex.exe" } else { "codex" }),
+            ];
+        if let Some(path) = std::env::var_os("PATH") {
+            candidates.extend(
+                std::env::split_paths(&path)
+                    .map(|p| p.join(if cfg!(windows) { "codex.exe" } else { "codex" })),
+            );
+        }
+        for p in candidates {
+            let Ok(p) = p.canonicalize() else { continue };
+            if !regular(&p) {
+                continue;
+            }
+            let mut cmd = Command::new(&p);
+            cmd.arg("--version")
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            for name in ["SystemRoot", "WINDIR"] {
+                if let Some(value) = std::env::var_os(name) {
+                    cmd.env(name, value);
+                }
+            }
+            let checked = tokio::time::timeout(Duration::from_secs(3), async {
+                let mut child = cmd.spawn().ok()?;
+                let stdout = child.stdout.take()?;
+                let mut output = Vec::new();
+                stdout.take(129).read_to_end(&mut output).await.ok()?;
+                if output.len() > 128 {
+                    return None;
+                }
+                let status = child.wait().await.ok()?;
+                (status.success() && String::from_utf8_lossy(&output).trim() == CLI_VERSION)
+                    .then_some(())
+            })
+            .await;
+            if matches!(checked, Ok(Some(()))) {
+                return Some(p);
+            }
+        }
+        None
+    }
+    pub async fn connect_codex(&self, id: String, concurrency: u8) -> Result<()> {
+        let _guard = self.mutation.lock().await;
+        valid_selection("codex", &id, concurrency)?;
+        let accounts = self.accounts().await?;
+        if accounts.iter().any(|a| a.id == id && a.service == "codex") {
+            return Err(Error::InvalidInput);
+        }
+        let mut login = self.login.lock().await;
+        if login.is_some() {
+            return Err(Error::LoginBusy);
+        }
+        let cli = self.codex_cli().await.ok_or(Error::CliUnavailable)?;
+        let profiles = self.state.join("codex-logins");
+        private_dir(&profiles)?;
+        let home = profiles.join(&id);
+        private_dir(&home)?;
+        let mut cmd = Command::new(cli);
+        cmd.args(["-c", "cli_auth_credentials_store=\"file\"", "login"])
+            .env_clear()
+            .env("CODEX_HOME", &home)
+            .current_dir(&home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        for name in [
+            "HOME",
+            "USERPROFILE",
+            "SystemRoot",
+            "WINDIR",
+            "TEMP",
+            "TMP",
+            "TMPDIR",
+            "PATH",
+            "LANG",
+        ] {
+            if let Some(v) = std::env::var_os(name) {
+                cmd.env(name, v);
+            }
+        }
+        let child = cmd.spawn().map_err(|_| Error::CliUnavailable)?;
+        *login = Some(Login {
+            child,
+            id,
+            concurrency,
+            home,
+            started: Instant::now(),
+        });
+        *self.login_error.lock().await = None;
+        Ok(())
+    }
+    pub async fn finish_login(&self) {
+        let _guard = self.mutation.lock().await;
+        let mut login = self.login.lock().await;
+        let Some(p) = login.as_mut() else { return };
+        if p.started.elapsed() > Duration::from_secs(300) {
+            let _ = p.child.kill().await;
+            *self.login_error.lock().await = Some(Error::CommandTimeout);
+            *login = None;
+            return;
+        }
+        let Ok(Some(status)) = p.child.try_wait() else {
+            return;
+        };
+        let p = login.take().unwrap();
+        drop(login);
+        if !status.success() || !regular(&p.home.join("auth.json")) {
+            *self.login_error.lock().await = Some(Error::LoginFailed);
+            return;
+        }
+        let Some(path) = p.home.to_str() else {
+            *self.login_error.lock().await = Some(Error::LoginFailed);
+            return;
+        };
+        if self
+            .call(
+                &[
+                    "accounts",
+                    "add",
+                    "codex",
+                    &p.id,
+                    path,
+                    &p.concurrency.to_string(),
+                ],
+                None,
+                5,
+            )
+            .await
+            .is_err()
+        {
+            *self.login_error.lock().await = Some(Error::LoginFailed);
+        }
+    }
+    pub async fn snapshot(&self) -> Snapshot {
+        self.finish_login().await;
+        let mut s = Snapshot {
+            runtime_available: regular(&self.binary),
+            helper_available: regular(&self.helper),
+            paired: regular(&self.state.join("identity.json")),
+            ..Default::default()
+        };
+        s.codex_login_available = self.codex_cli().await.is_some();
+        if let Ok(accounts) = self.accounts().await {
+            s.accounts_available = true;
+            s.accounts = accounts;
+        }
+        if let Ok(raw) = self.call(&["status"], None, 5).await {
+            s.observation = observation_projection(&raw).ok();
+        }
+        let mut run = self.running.lock().await;
+        if let Some(p) = run.as_mut() {
+            s.supervised = p.try_wait().ok().flatten().is_none();
+            if !s.supervised {
+                *run = None;
+            }
+        }
+        s.login_pending = self.login.lock().await.is_some();
+        s.login_error = self.login_error.lock().await.clone();
+        s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn release_defaults_ignore_debug_endpoint_overrides() {
+        let endpoints = Endpoints::resolve(
+            false,
+            Some("http://remote.example:18083"),
+            Some("192.0.2.1:7047"),
+            Some(Path::new("relative.pem")),
+        )
+        .unwrap();
+        assert_eq!(endpoints.coordinator, COORDINATOR);
+        assert_eq!(endpoints.verifier, VERIFIER);
+        assert!(endpoints.verifier_ca.is_none());
+    }
+    #[test]
+    fn debug_coordinator_only_accepts_loopback_origins() {
+        for origin in [
+            "http://localhost:18083",
+            "http://127.0.0.1:18083/",
+            "https://[::1]:18443",
+        ] {
+            assert!(Endpoints::resolve(true, Some(origin), None, None).is_ok());
+        }
+        for origin in [
+            "https://network.scarlett.ai:18443",
+            "http://192.0.2.1:18083",
+            "http://localhost.evil.test:18083",
+            "http://user:secret@localhost:18083",
+            "http://localhost:18083/setup/",
+            "http://localhost:18083/?next=evil",
+            "http://localhost:18083/#evil",
+            "http://localhost",
+            "http://localhost:80",
+            "ftp://localhost:18083",
+        ] {
+            assert!(Endpoints::resolve(true, Some(origin), None, None).is_err());
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn local_verifier_requires_ca_and_never_enables_plaintext() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let ca = temp.path().join("local-ca.pem");
+        std::fs::write(&ca, "synthetic CA fixture").unwrap();
+        let link = temp.path().join("ca-link.pem");
+        symlink(&ca, &link).unwrap();
+        for verifier in ["127.0.0.1:17047", "[::1]:17047"] {
+            assert!(Endpoints::resolve(true, None, Some(verifier), Some(&ca)).is_ok());
+        }
+        assert!(Endpoints::resolve(true, None, Some("127.0.0.1:17047"), None).is_err());
+        assert!(Endpoints::resolve(true, None, None, Some(&ca)).is_err());
+        for verifier in ["192.0.2.1:17047", "remote.example:17047", "127.0.0.1:443"] {
+            assert!(Endpoints::resolve(true, None, Some(verifier), Some(&ca)).is_err());
+        }
+        for invalid in [link.as_path(), temp.path(), Path::new("relative.pem")] {
+            assert!(
+                Endpoints::resolve(true, None, Some("127.0.0.1:17047"), Some(invalid)).is_err()
+            );
+        }
+        let binary = temp.path().join("node");
+        std::fs::write(&binary, "synthetic node fixture").unwrap();
+        let mut node = Node::new(
+            temp.path().join("state"),
+            binary,
+            temp.path().join("helper"),
+        );
+        node.endpoints = Endpoints::resolve(
+            true,
+            Some("http://localhost:18083"),
+            Some("127.0.0.1:17047"),
+            Some(&ca),
+        )
+        .unwrap();
+        let command = node.command(&["status"]).unwrap();
+        let env = command
+            .as_std()
+            .get_envs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("SCARLETT_VERIFIER_CA_FILE")),
+            Some(&Some(ca.as_os_str()))
+        );
+        assert!(!env.contains_key(std::ffi::OsStr::new("SCARLETT_VERIFIER_PLAINTEXT_FIXTURE")));
+        assert!(!env.contains_key(std::ffi::OsStr::new("SCARLETT_LOCAL_FIXTURE")));
+        assert_eq!(
+            node.network_url("setup").unwrap(),
+            "http://localhost:18083/setup/"
+        );
+        assert_eq!(
+            node.network_url("https://evil.test"),
+            Err(Error::InvalidInput)
+        );
+    }
+    #[test]
+    fn identities_cannot_be_paths_or_shell_args() {
+        for id in ["../x", "x/y", "x;echo", "UPPER", "legacy", ""] {
+            assert!(!valid_id(id));
+        }
+        assert!(valid_id("work-2"));
+    }
+    #[test]
+    fn projection_drops_secret_paths_and_unknown_fields() {
+        let raw=br#"[{"id":"work","service":"codex","concurrency":1,"path":"SECRET_PATH","token":"SECRET"}]"#;
+        let safe = serde_json::to_string(&account_projection(raw).unwrap()).unwrap();
+        assert!(!safe.contains("SECRET"));
+        let status=observation_projection(br#"{"state":"running","credential":"SECRET","services":[{"type":"x_read","state":"configured","token":"SECRET"}],"accounts":[{"id":"work","service":"codex","path":"SECRET"}]}"#).unwrap();
+        assert!(!status.to_string().contains("SECRET"));
+    }
+    #[test]
+    fn unrecognized_registry_is_not_mocked_ready() {
+        assert!(account_projection(br#"{"status":"updated"}"#).is_err());
+        assert!(
+            account_projection(br#"[{"id":"../x","service":"codex","concurrency":1}]"#).is_err()
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn private_storage_refuses_links_and_shared_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path().join("state");
+        private_dir(&p).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(private_dir(&p), Err(Error::PrivateStorageUnavailable));
+        let q = root.path().join("link");
+        symlink(&p, &q).unwrap();
+        assert_eq!(private_dir(&q), Err(Error::PrivateStorageUnavailable));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn secrets_use_stdin_and_account_support_is_real() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = tmp.path().join("node");
+        let script = "#!/bin/sh\ncase \"$1 $2\" in\n'accounts list') printf '[]';;\n'accounts connect') cat > \"$SCARLETT_STATE_DIR/captured.json\"; printf '%s\\n' \"$@\" > \"$SCARLETT_STATE_DIR/args\"; printf '{\"status\":\"updated\"}';;\n*) exit 1;;\nesac\n";
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let node = Node::new(tmp.path().join("state"), binary, tmp.path().join("helper"));
+        node.connect_x(
+            "one".into(),
+            1,
+            "synthetic_token".into(),
+            "synthetic_ct0".into(),
+        )
+        .await
+        .unwrap();
+        let args = std::fs::read_to_string(node.state.join("args")).unwrap();
+        assert_eq!(args, "accounts\nconnect\nx_read\none\n1\n");
+        assert!(!args.contains("synthetic"));
+        let input: Value =
+            serde_json::from_slice(&std::fs::read(node.state.join("captured.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            input,
+            json!({"auth_token":"synthetic_token","ct0":"synthetic_ct0"})
+        );
+        assert_eq!(
+            node.connect_x("../x".into(), 1, "token".into(), "csrf".into())
+                .await,
+            Err(Error::InvalidInput)
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_pairing_is_not_retried_or_returned_raw() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("node");
+        std::fs::write(&binary, "#!/bin/sh\ncat > \"$SCARLETT_STATE_DIR/pair-input\"\nprintf 'attempt\\n' >> \"$SCARLETT_STATE_DIR/attempts\"\nprintf 'SECRET_RAW_PROVIDER_OUTPUT'\nexit 1\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let node = Node::new(
+            temp.path().join("state"),
+            binary,
+            temp.path().join("helper"),
+        );
+        let code = "a".repeat(64);
+        assert_eq!(node.pair(code.clone()).await, Err(Error::CommandFailed));
+        assert_eq!(
+            std::fs::read_to_string(node.state.join("attempts")).unwrap(),
+            "attempt\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(node.state.join("pair-input")).unwrap(),
+            format!("{code}\n")
+        );
+        assert_eq!(
+            serde_json::to_string(&Error::CommandFailed).unwrap(),
+            "\"command_failed\""
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervised_runtime_requires_dependencies_and_drains_before_stop() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("node");
+        let helper = temp.path().join("helper");
+        std::fs::write(&binary, "#!/bin/sh\ncase \"$1 $2\" in\n'accounts list') printf '[{\"id\":\"work\",\"service\":\"codex\",\"concurrency\":1}]';;\n'run ') exec sleep 30;;\n'drain ') printf 'drained' > \"$SCARLETT_STATE_DIR/drain-observed\";;\n*) exit 1;;\nesac\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let node = Node::new(temp.path().join("state"), binary, helper.clone());
+        assert_eq!(node.start().await, Err(Error::NotPaired));
+        node.prepare().unwrap();
+        std::fs::write(node.state.join("identity.json"), "{}").unwrap();
+        assert_eq!(node.start().await, Err(Error::RuntimeUnavailable));
+        std::fs::write(&helper, "synthetic helper fixture").unwrap();
+        node.start().await.unwrap();
+        assert_eq!(node.start().await, Err(Error::AlreadyRunning));
+        let began = Instant::now();
+        node.stop().await.unwrap();
+        assert!(began.elapsed() < Duration::from_secs(5));
+        assert!(node.running.lock().await.is_none());
+        assert_eq!(
+            std::fs::read_to_string(node.state.join("drain-observed")).unwrap(),
+            "drained"
+        );
+        assert_eq!(
+            node.control("shell-command").await,
+            Err(Error::InvalidInput)
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_and_oversized_stdout_are_bounded() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("node");
+        std::fs::write(&binary, "#!/bin/sh\ncase \"$1\" in slow) exec sleep 10;; large) head -c 40000 /dev/zero;; esac\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let node = Node::new(
+            temp.path().join("state"),
+            binary,
+            temp.path().join("helper"),
+        );
+        let start = Instant::now();
+        assert_eq!(
+            node.call(&["slow"], None, 1).await,
+            Err(Error::CommandTimeout)
+        );
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert_eq!(
+            node.call(&["large"], None, 2).await,
+            Err(Error::CommandFailed)
+        );
+    }
+}
