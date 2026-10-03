@@ -50,6 +50,9 @@ type Config struct {
 	AccountCooldown  func(time.Duration) // private provider quota observation
 	LocalAccountID   string              // private attempt identity; never sent to the coordinator
 	XSession         string
+	// XRelay lets this node take X jobs proven by keyed relay, where the
+	// verifier holds the TLS session keys. Off unless the operator opts in.
+	XRelay           bool
 	CodexConcurrency int
 	XConcurrency     int
 	LocalFixture     bool
@@ -123,6 +126,7 @@ func Load() (Config, error) {
 	}
 	if c.Executor == ExecutorServices {
 		c.XSession = os.Getenv("SCARLETT_X_SESSION")
+		c.XRelay = os.Getenv("SCARLETT_X_RELAY") == "1"
 		c.AccountsFile = os.Getenv("SCARLETT_ACCOUNTS_FILE")
 		c.AccountsRequired = c.AccountsFile != ""
 		if c.AccountsFile == "" {

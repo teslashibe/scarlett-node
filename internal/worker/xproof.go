@@ -17,15 +17,19 @@ import (
 
 // XTransport is an http.RoundTripper for an x-go client. It proves each x.com
 // GraphQL GET with `scarlett-prover prove-x`: the node's own connection reaches
-// X over MPC-TLS and the verifier keeps its own copy of the response. Other
-// x.com API calls, including writes, are refused. Everything else, such as
-// transaction-ID bootstrap pages, goes through Base unproven.
+// X over MPC-TLS and the verifier keeps its own copy of the response. With
+// Relay set it runs `scarlett-prover relay-x` instead: the node still opens
+// the connection to X, but the verifier is the TLS client and the node adds
+// only its session values. Other x.com API calls, including writes, are
+// refused. Everything else, such as transaction-ID bootstrap pages, goes
+// through Base unproven.
 type XTransport struct {
 	Prover           string
 	Verifier         string
 	VerifierCA       string
 	PlaintextFixture bool
 	Token            string
+	Relay            bool
 	Base             http.RoundTripper
 }
 
@@ -59,7 +63,11 @@ func (t XTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(req.Context(), t.Prover, "prove-x")
+	command := "prove-x"
+	if t.Relay {
+		command = "relay-x"
+	}
+	cmd := exec.CommandContext(req.Context(), t.Prover, command)
 	cmd.Stdin = bytes.NewReader(input)
 	var stdout, stderr limitedBuffer
 	stdout.max, stderr.max = 4<<20, 4096

@@ -36,6 +36,26 @@ type xPlan struct {
 	Type        string  `json:"type"`
 	Exchanges   []xSpec `json:"exchanges"`
 	MaxAttempts int     `json:"max_attempts"`
+	ProofMode   string  `json:"proof_mode,omitempty"`
+	ProofPolicy string  `json:"proof_policy,omitempty"`
+}
+
+// xRelayPolicy is the only relay policy this node knows. Under it the
+// verifier, not the node, holds the TLS session keys for the X connection.
+const xRelayPolicy = "x-relay-v1"
+
+// relay reports whether the plan asks for a keyed relay proof, and whether
+// its proof mode and policy are a pair this node may serve.
+func (p xPlan) relay(c config.Config) (relay, ok bool) {
+	switch {
+	case (p.ProofMode == "" || p.ProofMode == "mpc") && p.ProofPolicy == "":
+		return false, true
+	case p.ProofMode == "relay" && p.ProofPolicy == xRelayPolicy:
+		// The operator must have opted in: this mode changes who could read
+		// the session cookie, so a coordinator cannot select it alone.
+		return true, c.XRelay
+	}
+	return false, false
 }
 
 func privateJSON(path string, out any) error {
@@ -201,6 +221,9 @@ func validateXLease(c config.Config, l coordinator.Lease) (xPlan, time.Time, str
 	if d.Decode(&plan) != nil || plan.Type != "x.read" || len(plan.Exchanges) != pages || plan.MaxAttempts != pages {
 		return plan, time.Time{}, "invalid_lease"
 	}
+	if _, ok := plan.relay(c); !ok {
+		return plan, time.Time{}, "invalid_lease"
+	}
 	for i, s := range plan.Exchanges {
 		if s.Operation != op || !validID(s.QueryID, 64) || s.Variables == nil || s.Features == nil || i == 0 && s.CursorFrom != nil || i > 0 && (s.CursorFrom == nil || *s.CursorFrom != i-1) {
 			return plan, time.Time{}, "invalid_lease"
@@ -329,7 +352,8 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 	}
 	proof := w.Proof
 	if proof == nil {
-		proof = XTransport{Prover: w.Config.Prover, Verifier: w.Config.Verifier, VerifierCA: w.Config.VerifierCA, PlaintextFixture: w.Config.VerifierPlaintextFixture, Token: l.VerifierToken}
+		relay, _ := plan.relay(w.Config)
+		proof = XTransport{Prover: w.Config.Prover, Verifier: w.Config.Verifier, VerifierCA: w.Config.VerifierCA, PlaintextFixture: w.Config.VerifierPlaintextFixture, Token: l.VerifierToken, Relay: relay}
 	}
 	transport := &xBoundTransport{base: base, proof: proof, bootstrap: true, specs: plan.Exchanges}
 	ids := map[string]string{}

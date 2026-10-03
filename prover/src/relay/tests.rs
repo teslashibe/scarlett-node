@@ -19,34 +19,34 @@ use tokio::{
 use super::{node, ot::NodeOt, record, tag, verifier, wire};
 use crate::xpolicy;
 
-const AUTH: &str = "0123456789abcdef0123456789abcdef01234567";
-const RESPONSE_BODY: &str = r#"{"data":{"user":{"result":{"rest_id":"12","legacy":{"screen_name":"jack"}}}}}"#;
+pub(crate) const AUTH: &str = "0123456789abcdef0123456789abcdef01234567";
+pub(crate) const RESPONSE_BODY: &str = r#"{"data":{"user":{"result":{"rest_id":"12","legacy":{"screen_name":"jack"}}}}}"#;
 
 fn csrf() -> String {
     "c0ffee1234".repeat(16)
 }
 
-fn request() -> Vec<u8> {
+pub(crate) fn request() -> Vec<u8> {
     format!(
-        "GET /i/api/graphql/qid_1/UserByScreenName?variables=%7B%22screen_name%22%3A%22jack%22%7D HTTP/1.1\r\nHost: x.com\r\nAuthorization: Bearer PUBLIC\r\nX-Csrf-Token: {csrf}\r\nCookie: auth_token={AUTH}; ct0={csrf}; twid=u%3D1\r\nConnection: close\r\n\r\n",
+        "GET /i/api/graphql/qid_1/UserByScreenName?features=%7B%7D&variables=%7B%22screen_name%22%3A%22jack%22%7D HTTP/1.1\r\nHost: x.com\r\nAuthorization: Bearer PUBLIC\r\nX-Csrf-Token: {csrf}\r\nCookie: auth_token={AUTH}; ct0={csrf}; twid=u%3D1\r\nConnection: close\r\n\r\n",
         csrf = csrf()
     )
     .into_bytes()
 }
 
-fn response() -> Vec<u8> {
+pub(crate) fn response() -> Vec<u8> {
     format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{RESPONSE_BODY}", RESPONSE_BODY.len()).into_bytes()
 }
 
-struct Server {
-    addr: SocketAddr,
-    roots: RootCertStore,
+pub(crate) struct Server {
+    pub(crate) addr: SocketAddr,
+    pub(crate) roots: RootCertStore,
     /// The request the server decrypted, once it has one.
-    seen: Arc<Mutex<Option<Vec<u8>>>>,
+    pub(crate) seen: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 /// A TLS server for x.com under a private CA that answers one request.
-async fn server(response: Vec<u8>, mut config: impl FnMut(&mut rustls::ServerConfig) + Send + 'static) -> Server {
+pub(crate) async fn server(response: Vec<u8>, mut config: impl FnMut(&mut rustls::ServerConfig) + Send + 'static) -> Server {
     let ca_key = KeyPair::generate().unwrap();
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);

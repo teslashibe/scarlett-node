@@ -82,6 +82,32 @@ struct Job {
     exchanges: Vec<Spec>,
     #[serde(default)]
     max_attempts: Option<usize>,
+    #[serde(default)]
+    proof_mode: ProofMode,
+    #[serde(default)]
+    proof_policy: Option<String>,
+}
+
+/// How a job's reads are proven. A job that names no mode uses MPC-TLS.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofMode {
+    #[default]
+    Mpc,
+    /// The verifier is X's TLS peer through the supplier's connection.
+    Relay,
+}
+
+/// The proof mode a job asks for. A mode other than MPC-TLS must name the
+/// exact policy it accepts, so a job cannot get weaker assumptions than the
+/// coordinator chose by naming only the mode.
+pub fn proof_mode(job: &Value) -> Result<ProofMode> {
+    let job: Job = serde_json::from_value(job.clone()).context("invalid x.read job")?;
+    match (job.proof_mode, job.proof_policy.as_deref()) {
+        (ProofMode::Mpc, None) => Ok(ProofMode::Mpc),
+        (ProofMode::Relay, Some(crate::relay::POLICY)) => Ok(ProofMode::Relay),
+        _ => bail!("X proof mode and policy do not match"),
+    }
 }
 
 /// A proven X read as the verifier parsed it from the transcript.
@@ -211,6 +237,13 @@ pub fn assign(job: &[Spec], fulfilled: &[(usize, &Exchange, &[String])], got: &E
         shown.push('…');
     }
     bail!("{} {shown} matches no pending exchange", got.operation)
+}
+
+/// `assign` for a request that has no response yet: the pending exchange it
+/// would fulfil. The relay verifier authorizes nothing else.
+pub fn assign_request(job: &[Spec], fulfilled: &[(usize, &Exchange, &[String])], read: ReadRequest) -> Result<usize> {
+    let ReadRequest { operation, query_id, variables, features, field_toggles } = read;
+    assign(job, fulfilled, &Exchange { operation, query_id, variables, features, field_toggles, http_status: 0, body: String::new() })
 }
 
 fn matches(spec: &Spec, cursors: Option<&[String]>, got: &Exchange) -> bool {

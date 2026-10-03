@@ -47,7 +47,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 use crate::{
     policy::{self, Verified},
     verifier_store::{self, Record, Store},
-    xpolicy::{self, Exchange, Spec},
+    xpolicy::{self, Exchange, ProofMode, Spec},
     xprove::{MAX_RECV, MAX_SENT},
 };
 
@@ -60,6 +60,8 @@ struct Config {
     limits: verifier_store::Limits,
     concurrency: usize,
     slots: Arc<tokio::sync::Semaphore>,
+    /// TLS client settings for relay sessions, where the verifier is X's TLS peer.
+    relay_tls: Arc<rustls::ClientConfig>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -105,7 +107,7 @@ struct XRecord {
 
 enum Kind {
     Codex,
-    X(Arc<Vec<Spec>>),
+    X(Arc<Vec<Spec>>, ProofMode),
 }
 
 struct Entry {
@@ -132,12 +134,13 @@ fn now_ms() -> u64 {
 fn kind(payload: &Value, durable: bool) -> Result<(Kind, Status)> {
     if payload["type"] == "x.read" {
         let (specs, max) = xpolicy::validate_job(payload)?;
+        let mode = xpolicy::proof_mode(payload)?;
         if durable && (specs.len() > 3 || max != specs.len()) {
             bail!("durable X jobs require 1-3 exchanges with one attempt each");
         }
         let pending = (0..specs.len()).collect();
         Ok((
-            Kind::X(Arc::new(specs)),
+            Kind::X(Arc::new(specs), mode),
             Status::XRead { remaining_attempts: max, complete: false, pending, exchanges: Vec::new(), rejections: Vec::new() },
         ))
     } else {
@@ -153,7 +156,7 @@ fn validate_receipt(kind: &Kind, status: &Status, in_flight: usize) -> Result<()
         (Kind::Codex, Status::Accepted { verified, .. }) if in_flight == 0 && verified.cached_input_tokens.is_none_or(|cached| cached <= verified.input_tokens) => Ok(()),
         (Kind::Codex, Status::Running) if in_flight == 1 => Ok(()),
         (_, Status::Rejected { .. } | Status::Expired) if in_flight == 0 => Ok(()),
-        (Kind::X(specs), Status::XRead { remaining_attempts, complete, pending, exchanges, rejections }) => {
+        (Kind::X(specs, _), Status::XRead { remaining_attempts, complete, pending, exchanges, rejections }) => {
             if remaining_attempts
                 .checked_add(exchanges.len())
                 .and_then(|n| n.checked_add(rejections.len()))
@@ -319,6 +322,7 @@ mod durable_tests {
                 limits: verifier_store::Limits::default(),
                 concurrency: 64,
                 slots: Arc::new(tokio::sync::Semaphore::new(64)),
+                relay_tls: crate::relay::verifier::tls_config(rustls::RootCertStore::empty()).unwrap(),
             },
             Mutex::new(Sessions::restore(store, records).unwrap()),
         ))
@@ -658,6 +662,111 @@ mod durable_tests {
 
 }
 
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+    use crate::relay::tests::{RESPONSE_BODY, request, response, server};
+    use serde_json::json;
+    use tokio::io::AsyncWriteExt;
+
+    const KEY: &str = "synthetic-fixture-key-never-used-remotely";
+
+    fn shared(roots: rustls::RootCertStore) -> Shared {
+        Arc::new((
+            Config {
+                key: KEY.into(),
+                upstream: "127.0.0.1:1".into(),
+                session_limit: Duration::from_secs(20),
+                limits: verifier_store::Limits::default(),
+                concurrency: 64,
+                slots: Arc::new(tokio::sync::Semaphore::new(64)),
+                relay_tls: crate::relay::verifier::tls_config(roots).unwrap(),
+            },
+            Mutex::new(Sessions::default()),
+        ))
+    }
+    fn headers() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", format!("Bearer {KEY}").parse().unwrap());
+        h
+    }
+    fn job(screen_name: &str, mode: Option<(&str, Option<&str>)>) -> CreateRequest {
+        let mut payload = json!({"type":"x.read","max_attempts":1,"exchanges":[{"operation":"UserByScreenName","query_id":"qid_1","variables":{"screen_name":screen_name},"features":{}}]});
+        if let Some((mode, policy)) = mode {
+            payload["proof_mode"] = mode.into();
+            if let Some(policy) = policy {
+                payload["proof_policy"] = policy.into();
+            }
+        }
+        CreateRequest { job_id: "synthetic".into(), attempt: "1".into(), fence: None, expires_at_ms: None, ttl_seconds: Some(60), payload }
+    }
+    /// Registers `job`, runs a supplier relay session for the fixture request
+    /// against it and returns the supplier's result and the job's status.
+    async fn prove(job: CreateRequest) -> (Result<Vec<u8>>, Value, Option<Vec<u8>>) {
+        let x = server(response(), |_| {}).await;
+        let s = shared(x.roots.clone());
+        let (code, Json(created)) = create(State(s.clone()), headers(), Json(job)).await;
+        assert_eq!(code, StatusCode::CREATED);
+        let (mut node_end, verifier_end) = tokio::io::duplex(1 << 20);
+        let session = tokio::spawn(handle(s.clone(), Box::new(verifier_end)));
+        node_end.write_all(format!("{}\n", created["token"].as_str().unwrap()).as_bytes()).await.unwrap();
+        let tcp = tokio::net::TcpStream::connect(x.addr).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(30), crate::relay::node::session(node_end, tcp, &request())).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(30), session).await.unwrap();
+        let (_, Json(view)) = status(State(s), headers(), Path(("synthetic".into(), "1".into()))).await;
+        (result, view, x.seen.lock().unwrap().clone())
+    }
+
+    #[tokio::test]
+    async fn relay_job_records_the_read_exactly_as_an_mpc_proof_would() {
+        let (result, view, seen) = prove(job("jack", Some(("relay", Some(crate::relay::POLICY))))).await;
+        assert_eq!(result.unwrap(), response());
+        assert_eq!(seen.as_deref(), Some(&request()[..]));
+        assert_eq!(view["status"], "x_read");
+        assert_eq!(view["complete"], true);
+        assert_eq!(view["remaining_attempts"], 0);
+        let exchange = &view["exchanges"][0];
+        assert_eq!((exchange["index"].as_u64(), exchange["fulfilled"].as_bool(), exchange["http_status"].as_u64()), (Some(0), Some(true), Some(200)));
+        assert_eq!(exchange["body"], RESPONSE_BODY);
+        assert_eq!(exchange["operation"], "UserByScreenName");
+        assert_eq!(exchange["variables"], json!({"screen_name":"jack"}));
+        // The recorded request size is the request's, with nothing about the secrets.
+        assert_eq!(exchange["sent_bytes"].as_u64(), Some(request().len() as u64));
+        assert!(!view.to_string().contains(crate::relay::tests::AUTH));
+    }
+
+    #[tokio::test]
+    async fn relay_job_authorizes_only_a_read_it_pinned() {
+        // The job pins a different profile than the supplier asks for.
+        let (result, view, seen) = prove(job("someone_else", Some(("relay", Some(crate::relay::POLICY))))).await;
+        assert!(result.is_err());
+        assert!(seen.is_none(), "an unpinned request reached X under the verifier's keys");
+        assert_eq!(view["complete"], false);
+        assert_eq!(view["rejections"], json!(["proof_rejected"]));
+        assert_eq!(view["remaining_attempts"], 0);
+    }
+
+    #[tokio::test]
+    async fn an_mpc_job_does_not_accept_a_relay_session() {
+        for mode in [None, Some(("mpc", None))] {
+            let (result, view, seen) = prove(job("jack", mode)).await;
+            assert!(result.is_err());
+            assert!(seen.is_none());
+            assert_eq!(view["complete"], false);
+            assert_eq!(view["rejections"], json!(["proof_rejected"]));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_job_must_name_the_relay_policy_exactly() {
+        let x = server(response(), |_| {}).await;
+        for mode in [("relay", None), ("relay", Some("x-relay-v2")), ("mpc", Some(crate::relay::POLICY)), ("proxy", None)] {
+            let s = shared(x.roots.clone());
+            assert_eq!(create(State(s), headers(), Json(job("jack", Some(mode)))).await.0, StatusCode::BAD_REQUEST, "{mode:?}");
+        }
+    }
+}
+
 type Shared = Arc<(Config, Mutex<Sessions>)>;
 
 fn bounded_env(name: &str, default: u64, min: u64, max: u64) -> Result<u64> {
@@ -697,7 +806,8 @@ pub async fn run() -> Result<()> {
         (None, None) if plaintext && listen.parse::<std::net::SocketAddr>().is_ok_and(|a| a.ip().is_loopback()) => None,
         _ => bail!("verifier needs a TLS certificate/key or an explicit loopback plaintext fixture"),
     };
-    let shared: Shared = Arc::new((Config { key, upstream, session_limit: Duration::from_secs(limit), limits, concurrency, slots: Arc::new(tokio::sync::Semaphore::new(concurrency)) }, Mutex::new(sessions)));
+    let relay_tls = crate::relay::verifier::tls_config(crate::relay::verifier::mozilla_roots()?)?;
+    let shared: Shared = Arc::new((Config { key, upstream, session_limit: Duration::from_secs(limit), limits, concurrency, slots: Arc::new(tokio::sync::Semaphore::new(concurrency)), relay_tls }, Mutex::new(sessions)));
     let cleanup = shared.clone();
     tokio::spawn(async move {
         loop {
@@ -877,7 +987,9 @@ async fn status(
 
 enum Job {
     Codex(Value),
-    X(Arc<Vec<Spec>>),
+    /// The pinned reads, how they are proven, and the reads already fulfilled
+    /// when the session began.
+    X(Arc<Vec<Spec>>, ProofMode, Vec<(usize, Exchange, Vec<String>)>),
 }
 
 async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()> {
@@ -909,10 +1021,11 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
                 entry.status = Status::Running;
                 Job::Codex(entry.payload.clone())
             }
-            Kind::X(specs) => {
-                let Status::XRead { remaining_attempts, complete, .. } = &mut entry.status else {
+            Kind::X(specs, mode) => {
+                let Status::XRead { remaining_attempts, complete, exchanges, .. } = &mut entry.status else {
                     bail!("session is in an unexpected state")
                 };
+                let fulfilled = exchanges.iter().filter(|r| r.fulfilled).map(|r| (r.index, r.exchange.clone(), r.cursors.clone())).collect();
                 if *remaining_attempts == 0 || *complete {
                     s.by_token.remove(token);
                     bail!("x.read session has no attempts left");
@@ -922,7 +1035,7 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
                 if *remaining_attempts == 0 {
                     s.by_token.remove(token);
                 }
-                Job::X(specs.clone())
+                Job::X(specs.clone(), *mode, fulfilled)
             }
         };
         entry.in_flight += 1;
@@ -961,8 +1074,14 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
                 s.commit(&key)?;
             }
         }
-        Job::X(specs) => {
-            let outcome = match tokio::time::timeout(limit, verify_x(socket)).await {
+        Job::X(specs, mode, fulfilled) => {
+            let proof = async {
+                match mode {
+                    ProofMode::Mpc => verify_x(socket).await,
+                    ProofMode::Relay => relay_x(socket, config.relay_tls.clone(), &specs, &fulfilled).await,
+                }
+            };
+            let outcome = match tokio::time::timeout(limit, proof).await {
                 // Parse the response before taking the lock that every session shares.
                 Ok(Ok((exchange, sent_bytes, received_bytes))) => Ok((xpolicy::outcome(&exchange), exchange, sent_bytes, received_bytes)),
                 Ok(Err(_)) => Err("proof_rejected".into()),
@@ -1033,6 +1152,19 @@ async fn verify(socket: crate::control::Socket, job: &Value, upstream: &str) -> 
     let sent_hidden: Vec<_> = transcript.sent_unauthed().iter().collect();
     let received_hidden: Vec<_> = transcript.received_unauthed().iter().collect();
     policy::check(&server_name, transcript.sent_unsafe(), &sent_hidden, transcript.received_unsafe(), &received_hidden, job)
+}
+
+/// A relay session: the verifier is X's TLS peer through the supplier's
+/// connection. It authorizes only a request for a read this job still wants,
+/// and what it returns went through the same policy check as an MPC-TLS proof.
+async fn relay_x(socket: crate::control::Socket, tls: Arc<rustls::ClientConfig>, specs: &[Spec], fulfilled: &[(usize, Exchange, Vec<String>)]) -> Result<(Exchange, usize, usize)> {
+    let authorize = |sent: &[u8], hidden: &[std::ops::Range<usize>]| {
+        let done: Vec<(usize, &Exchange, &[String])> = fulfilled.iter().map(|(index, exchange, cursors)| (*index, exchange, cursors.as_slice())).collect();
+        xpolicy::assign_request(specs, &done, xpolicy::check_request(sent, hidden)?).map(|_| ())
+    };
+    let outcome = crate::relay::verifier::run(socket, tls, xpolicy::HOST, authorize).await?;
+    let exchange = xpolicy::check(xpolicy::HOST, &outcome.sent, &outcome.hidden, &outcome.received, &[])?;
+    Ok((exchange, outcome.sent.len(), outcome.received.len()))
 }
 
 /// Returns the verified exchange and the transcript's sent and received sizes.

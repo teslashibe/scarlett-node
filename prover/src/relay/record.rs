@@ -80,7 +80,8 @@ impl Keys {
         Ok((kind, body))
     }
 
-    /// Seals a record that is entirely the verifier's own, such as an alert.
+    /// Seals a record as the key holder would. Tests use it to play the server.
+    #[cfg(test)]
     pub fn seal(&mut self, kind: u8, content: &[u8]) -> Result<Vec<u8>> {
         let mut inner = content.to_vec();
         inner.push(kind);

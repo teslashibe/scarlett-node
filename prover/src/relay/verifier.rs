@@ -266,7 +266,8 @@ fn traffic_keys(conn: ClientConnection) -> Result<(ClientKey, Keys)> {
     Ok((client, Keys::new(&key, iv, seq)?))
 }
 
-/// The X policy's request check, as the session's authorization step.
+/// The X policy's request check alone, for tests that have no job.
+#[cfg(test)]
 pub fn authorize_x(public: &[u8], hidden: &[Range<usize>]) -> Result<()> {
     xpolicy::check_request(public, hidden).map(|_| ())
 }

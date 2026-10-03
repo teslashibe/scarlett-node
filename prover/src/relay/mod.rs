@@ -20,7 +20,7 @@ pub mod ot;
 pub mod record;
 pub mod tag;
 #[cfg(all(test, unix))]
-mod tests;
+pub(crate) mod tests;
 #[cfg(unix)]
 pub mod verifier;
 pub mod wire;

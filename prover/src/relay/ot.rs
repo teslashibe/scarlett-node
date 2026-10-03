@@ -74,6 +74,7 @@ impl NodeOt {
         Ok((wire::KOS_CHECK, encode(&check)?))
     }
 
+    #[cfg(test)]
     pub fn ready(&self) -> bool {
         matches!(self.state, NodeState::Ready(_))
     }

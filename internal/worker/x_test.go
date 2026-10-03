@@ -258,6 +258,60 @@ func TestXWireFixtureMatchesPinnedClientRequest(t *testing.T) {
 	}
 }
 
+// A relay lease is served only when the operator opted in, and only under the
+// one policy name this node knows. Nothing about the mode is implied.
+func TestXRelayLeaseNeedsOperatorOptInAndTheExactPolicy(t *testing.T) {
+	raw, e := os.ReadFile("../../api/fixtures/lease-x.json")
+	if e != nil {
+		t.Fatal(e)
+	}
+	lease := func(mode, policy string) coordinator.Lease {
+		var l coordinator.Lease
+		if e := json.Unmarshal(raw, &l); e != nil {
+			t.Fatal(e)
+		}
+		var payload map[string]any
+		if e := json.Unmarshal(l.XPayload, &payload); e != nil {
+			t.Fatal(e)
+		}
+		if mode != "" {
+			payload["proof_mode"] = mode
+		}
+		if policy != "" {
+			payload["proof_policy"] = policy
+		}
+		l.XPayload, _ = json.Marshal(payload)
+		return l
+	}
+	base := lease("", "")
+	c, _, _ := xFixture(t, *base.XRequest)
+	for _, tc := range []struct {
+		mode, policy string
+		optIn, relay bool
+		code         string
+	}{
+		{"", "", false, false, ""},
+		{"mpc", "", false, false, ""},
+		{"mpc", "", true, false, ""},
+		{"relay", xRelayPolicy, true, true, ""},
+		{"relay", xRelayPolicy, false, false, "invalid_lease"},
+		{"relay", "", true, false, "invalid_lease"},
+		{"relay", "x-relay-v2", true, false, "invalid_lease"},
+		{"", xRelayPolicy, true, false, "invalid_lease"},
+		{"mpc", xRelayPolicy, true, false, "invalid_lease"},
+		{"proxy", "", true, false, "invalid_lease"},
+	} {
+		c.XRelay = tc.optIn
+		plan, _, code := validateXLease(c, lease(tc.mode, tc.policy))
+		if code != tc.code {
+			t.Fatalf("mode %q policy %q opt-in %v: code %q, want %q", tc.mode, tc.policy, tc.optIn, code, tc.code)
+		}
+		if relay, _ := plan.relay(c); code == "" && relay != tc.relay {
+			t.Fatalf("mode %q policy %q: relay %v, want %v", tc.mode, tc.policy, relay, tc.relay)
+		}
+	}
+}
+
 func TestTypedXQuotaCarriesOnlyCooldownIntoLocalScheduler(t *testing.T) {
 	observed := time.Duration(0)
 	w := X{Config: config.Config{AccountCooldown: func(wait time.Duration) { observed = wait }}}
