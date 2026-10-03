@@ -54,19 +54,6 @@ public static class ScarlettAcceptanceWindow {
     public static void ControlKey(ushort key) {
         Send(new Input[] { Key(0x11, false), Key(key, false), Key(key, true), Key(0x11, true) });
     }
-    public static void Text(string text) {
-        if (text.Length == 0 || text.Length > 512) throw new InvalidOperationException("Synthetic text size is unsupported");
-        Input[] inputs = new Input[text.Length * 2];
-        for (int i = 0; i < text.Length; i++) {
-            inputs[i * 2] = Key(0, false);
-            inputs[i * 2].value.keyboard.scan = text[i];
-            inputs[i * 2].value.keyboard.flags = 4;
-            inputs[i * 2 + 1] = Key(0, true);
-            inputs[i * 2 + 1].value.keyboard.scan = text[i];
-            inputs[i * 2 + 1].value.keyboard.flags = 6;
-        }
-        Send(inputs);
-    }
     public static void SelectAllAndClear() {
         Send(new Input[] { Key(0x11, false), Key(0x41, false), Key(0x41, true), Key(0x11, true),
             Key(0x08, false), Key(0x08, true) });
@@ -425,8 +412,8 @@ function Check-Preferences {
 }
 
 function Set-Text([string]$Name, [string]$Value) {
-    # Use the native input stream for real input/change events. WebView2 can
-    # advertise ValuePattern while SetValue fails to commit the browser field.
+    # Use the same text delivery already proved by the per-window probe.
+    # WebView2 can advertise ValuePattern while SetValue fails to commit.
     # Only disposable fixtures call this helper, never real credentials.
     if ($Value -notmatch '^[a-z0-9-]+$' -or $Value.Length -gt 512) { throw 'Synthetic input contains unsupported characters' }
     Wait-Check { (Find-Input $Name).Current.IsEnabled } 15 "Text input did not become ready: $Name"
@@ -442,16 +429,33 @@ function Set-Text([string]$Name, [string]$Value) {
         return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
     } 10 'Synthetic input did not acquire keyboard focus'
     [ScarlettAcceptanceWindow]::SelectAllAndClear()
-    [ScarlettAcceptanceWindow]::Text($Value)
+    [System.Windows.Forms.SendKeys]::SendWait($Value)
     # Masked cookie fields may refuse value readback. Exact persistence is
     # checked against the synthetic fixture after the Connect action.
     if (-not $control.Current.IsPassword) {
-        Wait-Check {
+        try {
+            Wait-Check {
+                $current = Find-Input $Name
+                $pattern = $null
+                return $null -ne $current -and $current.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern) -and
+                    ([string]$pattern.Current.Value) -ceq $Value
+            } 10 'Synthetic text value did not commit'
+        } catch {
             $current = Find-Input $Name
             $pattern = $null
-            return $null -ne $current -and $current.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern) -and
-                ([string]$pattern.Current.Value) -ceq $Value
-        } 10 'Synthetic text value did not commit'
+            $available = $null -ne $current -and $current.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)
+            $observed = ''
+            if ($available -and -not $current.Current.IsPassword) { $observed = [string]$pattern.Current.Value }
+            $diagnostic = @{ controlPresent = $null -ne $current; controlFocused = $null -ne $current -and $current.Current.HasKeyboardFocus
+                foregroundOwned = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+                valuePatternAvailable = $available; expectedLength = $Value.Length; observedLength = $observed.Length
+                valueMatches = $observed -ceq $Value; realProviderJobs = 0 }
+            New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+            $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-text-input-failure.json')
+            Write-Output ($diagnostic | ConvertTo-Json -Compress)
+            $observed = $null
+            throw
+        }
     }
 }
 function Select-Browser([int]$Index, [string]$ExpectedBrowser) {
