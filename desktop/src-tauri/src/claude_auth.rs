@@ -244,12 +244,12 @@ impl ClaudeAuth {
         }
         match login.child.try_wait() {
             Ok(None) => return,
-            Ok(Some(exit)) if exit.success() => {
-                if self.subscription().await && std::fs::remove_dir(self.blocked()).is_ok() {
-                    *self.error.lock().await = None;
-                } else {
-                    *self.error.lock().await = Some(Error::ClaudeLoginFailed);
-                }
+            Ok(Some(exit))
+                if exit.success()
+                    && self.subscription().await
+                    && std::fs::remove_dir(self.blocked()).is_ok() =>
+            {
+                *self.error.lock().await = None;
             }
             _ => {
                 *self.error.lock().await = Some(Error::ClaudeLoginFailed);
@@ -318,8 +318,13 @@ fn subscription_status(raw: &[u8], expected_config: &Path) -> bool {
     let Ok(v) = serde_json::from_slice::<Value>(raw) else {
         return false;
     };
-    v.get("configDirectory").and_then(Value::as_str) == expected_config.to_str()
-        && expected_config.is_absolute()
+    let Some(expected) = expected_config
+        .to_str()
+        .filter(|_| expected_config.is_absolute())
+    else {
+        return false;
+    };
+    v.get("configDirectory").and_then(Value::as_str) == Some(expected)
         && v.get("loggedIn").and_then(Value::as_bool) == Some(true)
         && v.get("authMethod").and_then(Value::as_str) == Some("claude.ai")
         && v.get("apiProvider").and_then(Value::as_str) == Some("firstParty")
@@ -382,6 +387,12 @@ mod tests {
             &serde_json::to_vec(&mismatched).unwrap(),
             expected
         ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let invalid = Path::new(std::ffi::OsStr::from_bytes(b"/private/\xff/claude"));
+            assert!(!subscription_status(br#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}"#, invalid));
+        }
         let safe = serde_json::to_string(&Snapshot {
             connected: true,
             ..Default::default()

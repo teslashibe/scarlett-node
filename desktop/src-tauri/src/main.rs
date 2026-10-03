@@ -58,6 +58,22 @@ async fn desktop_status(
     status.local_api = api.snapshot().await;
     Ok(status)
 }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaudeBilling {
+    mode: String,
+    key: Option<String>,
+}
+impl ClaudeBilling {
+    fn key(self) -> node::Result<String> {
+        let key = self.key.unwrap_or_default();
+        match self.mode.as_str() {
+            "subscription" if key.is_empty() => Ok(key),
+            "api_key" if !key.is_empty() => Ok(key),
+            _ => Err(Error::InvalidInput),
+        }
+    }
+}
 #[tauri::command]
 async fn control_local_api(
     window: WebviewWindow,
@@ -65,20 +81,17 @@ async fn control_local_api(
     api: State<'_, Arc<LocalApi>>,
     action: String,
     port: Option<u16>,
-    claude_key: Option<String>,
-    claude_mode: Option<String>,
+    claude: Option<ClaudeBilling>,
     runtime: State<'_, RuntimeControl>,
 ) -> node::Result<()> {
     local_window(&window)?;
     let _guard = runtime.0.lock().await;
     match action.as_str() {
         "start" => {
-            let key = claude_key.unwrap_or_default();
-            match claude_mode.as_deref().unwrap_or("subscription") {
-                "subscription" if key.is_empty() => {}
-                "api_key" if !key.is_empty() => {}
-                _ => return Err(Error::InvalidInput),
-            }
+            let key = claude
+                .map(ClaudeBilling::key)
+                .transpose()?
+                .unwrap_or_default();
             let status = node.snapshot().await;
             if status.supervised
                 || matches!(
@@ -527,6 +540,41 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn claude_billing_requires_an_explicit_key_mode() {
+        assert_eq!(
+            ClaudeBilling {
+                mode: "subscription".into(),
+                key: None
+            }
+            .key(),
+            Ok(String::new())
+        );
+        assert_eq!(
+            ClaudeBilling {
+                mode: "api_key".into(),
+                key: Some("synthetic-key".into())
+            }
+            .key(),
+            Ok("synthetic-key".into())
+        );
+        for billing in [
+            ClaudeBilling {
+                mode: "subscription".into(),
+                key: Some("synthetic-key".into()),
+            },
+            ClaudeBilling {
+                mode: "api_key".into(),
+                key: None,
+            },
+            ClaudeBilling {
+                mode: "unknown".into(),
+                key: None,
+            },
+        ] {
+            assert_eq!(billing.key(), Err(Error::InvalidInput));
+        }
+    }
     #[test]
     fn navigation_refuses_remote_and_lookalike_origins() {
         for url in [
