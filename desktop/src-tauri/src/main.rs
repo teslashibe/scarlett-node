@@ -259,14 +259,9 @@ async fn connect_x(
     node.connect_x(id, concurrency, auth_token, ct0).await
 }
 #[tauri::command]
-async fn connect_codex(
-    window: WebviewWindow,
-    node: State<'_, Arc<Node>>,
-    id: String,
-    concurrency: u8,
-) -> node::Result<()> {
+async fn connect_codex(window: WebviewWindow, node: State<'_, Arc<Node>>) -> node::Result<()> {
     local_window(&window)?;
-    node.connect_codex(id, concurrency).await
+    node.connect_codex(1).await
 }
 #[tauri::command]
 async fn remove_account(

@@ -276,7 +276,7 @@ function Verify-KeyboardDelivery {
     # Prove native text delivery reaches a harmless empty field before blaming a shortcut.
     Write-Output "Installed keyboard probe: interactive=$([Environment]::UserInteractive), session=$([System.Diagnostics.Process]::GetCurrentProcess().SessionId)"
     $target = $null
-    foreach ($name in @('Local Codex account ID', 'Local account ID')) {
+    foreach ($name in @('Local X account ID', 'Local account ID')) {
         $condition = [System.Windows.Automation.AndCondition]::new(
             [System.Windows.Automation.PropertyCondition]::new(
                 [System.Windows.Automation.AutomationElement]::NameProperty, $name),
@@ -405,6 +405,23 @@ function Close-Window {
     }
     $pattern.Close()
 }
+function Wait-PreferenceSave([int]$Port, [bool]$Background) {
+    # A persisted file precedes the Rust in-memory update and IPC completion.
+    # Close only after the app acknowledges the requested mode, not merely its file.
+    Wait-Check { Saved-Preferences $Port $Background } 15 'Device preferences were not saved privately'
+    $message = if ($Background) {
+        'Preferences saved. Closing the window keeps Scarlett running'
+    } else {
+        'Preferences saved. Closing the window quits Scarlett'
+    }
+    Wait-Check {
+        $condition = [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::NameProperty, $message)
+        $acknowledgment = $script:window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        $save = Find-Button 'Save device preferences'
+        return $null -ne $acknowledgment -and $null -ne $save -and $save.Current.IsEnabled
+    } 15 'App did not acknowledge the completed preference save'
+}
 function Registered-Command {
     $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Run')
     if (-not $key) { return $null }
@@ -417,7 +434,7 @@ function Check-Preferences {
     Check-DefaultCheckbox 'Open Scarlett when I log in' 'Start at login was not opt-in'
     Set-Number 'Saved local API port' 18088
     Click-Button 'Save device preferences'
-    Wait-Check { Saved-Preferences 18088 $false } 15 'Device preferences were not saved privately'
+    Wait-PreferenceSave 18088 $false
     $script:apiPort = 18088
     if ((Api-Status '/health') -ne 0) { throw 'Preferences test port is already occupied' }
     Click-Button 'Start local API'
@@ -450,7 +467,7 @@ function Check-Preferences {
 
     Set-Checkbox 'Keep running when the window closes' $true
     Click-Button 'Save device preferences'
-    Wait-Check { Saved-Preferences 18088 $true } 15 'Background preference did not save'
+    Wait-PreferenceSave 18088 $true
     Click-Button 'Start local API'
     Wait-Check { (Api-Status '/health') -eq 200 } 30 'Background test API did not start'
     $originalProcess = $application.Id
@@ -464,7 +481,7 @@ function Check-Preferences {
     if ($application.Id -ne $originalProcess -or (Api-Status '/health') -ne 200) { throw 'Reopening did not retain the same background app and API' }
     Set-Checkbox 'Keep running when the window closes' $false
     Click-Button 'Save device preferences'
-    Wait-Check { Saved-Preferences 18088 $false } 15 'Background mode did not restore off'
+    Wait-PreferenceSave 18088 $false
     Close-Window
     if (-not $application.WaitForExit(135000)) { throw 'Restored default close did not exit' }
     Wait-Check { (Api-Status '/health') -eq 0 } 30 'Restored default close left API running'

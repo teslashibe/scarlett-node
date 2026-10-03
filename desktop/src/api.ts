@@ -17,8 +17,7 @@ export const api = {
   browserProfiles: () => invoke<BrowserProfile[]>("browser_profiles"),
   importX: (profile: string, id: string, concurrency: number, consent: boolean) =>
     invoke<void>("import_x_profile", { profile, id, concurrency, consent }),
-  connectCodex: (id: string, concurrency: number) =>
-    invoke<void>("connect_codex", { id, concurrency }),
+  connectCodex: () => invoke<void>("connect_codex"),
   remove: (service: string, id: string) =>
     invoke<void>("remove_account", { service, id }),
   cancelLogin: () => invoke<void>("cancel_login"),

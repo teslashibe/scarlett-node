@@ -241,6 +241,33 @@ fn valid_selection(service: &str, id: &str, concurrency: u8) -> Result<()> {
     }
     Ok(())
 }
+// Reserve a new app-owned profile atomically, including after cancelled logins.
+// Existing directories, files and links must never be reused for another login.
+fn new_codex_profile(profiles: &Path, accounts: &[Account]) -> Result<(String, PathBuf)> {
+    if accounts.iter().filter(|a| a.service == "codex").count() >= 8 {
+        return Err(Error::AccountsUnavailable);
+    }
+    for number in 1..=10_000 {
+        let id = format!("codex-{number}");
+        if accounts.iter().any(|a| a.service == "codex" && a.id == id) {
+            continue;
+        }
+        let home = profiles.join(&id);
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&home) {
+            Ok(()) => return Ok((id, home)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(Error::PrivateStorageUnavailable),
+        }
+    }
+    Err(Error::AccountsUnavailable)
+}
 #[cfg(unix)]
 fn private_dir(path: &Path) -> Result<()> {
     {
@@ -814,13 +841,12 @@ impl Node {
         }
         None
     }
-    pub async fn connect_codex(&self, id: String, concurrency: u8) -> Result<()> {
+    pub async fn connect_codex(&self, concurrency: u8) -> Result<()> {
         let _guard = self.mutation.lock().await;
-        valid_selection("codex", &id, concurrency)?;
-        let accounts = self.accounts().await?;
-        if accounts.iter().any(|a| a.id == id && a.service == "codex") {
+        if !(1..=32).contains(&concurrency) {
             return Err(Error::InvalidInput);
         }
+        let accounts = self.accounts().await?;
         let mut login = self.login.lock().await;
         if login.is_some() {
             return Err(Error::LoginBusy);
@@ -828,7 +854,7 @@ impl Node {
         let cli = self.codex_cli().await.ok_or(Error::CliUnavailable)?;
         let profiles = self.state.join("codex-logins");
         private_dir_with_helper(&profiles, &self.binary)?;
-        let home = profiles.join(&id);
+        let (id, home) = new_codex_profile(&profiles, &accounts)?;
         private_dir_with_helper(&home, &self.binary)?;
         let mut cmd = Command::new(cli);
         cmd.args(["-c", "cli_auth_credentials_store=\"file\"", "login"])
@@ -1127,6 +1153,93 @@ mod tests {
         assert!(valid_id("work-2"));
     }
     #[test]
+    fn automatic_codex_profiles_preserve_registered_and_abandoned_names() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("codex-1")).unwrap();
+        std::fs::write(temp.path().join("codex-2"), "retained synthetic file").unwrap();
+        let accounts = vec![Account {
+            id: "codex-3".into(),
+            service: "codex".into(),
+            concurrency: 1,
+        }];
+        let (id, home) = new_codex_profile(temp.path(), &accounts).unwrap();
+        assert_eq!(id, "codex-4");
+        assert_eq!(home, temp.path().join("codex-4"));
+        assert!(home.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("codex-2")).unwrap(),
+            "retained synthetic file"
+        );
+        // A cancelled, empty profile remains reserved for that login.
+        assert_eq!(
+            new_codex_profile(temp.path(), &accounts).unwrap().0,
+            "codex-5"
+        );
+    }
+    #[test]
+    fn automatic_codex_profiles_reserve_distinct_homes_concurrently() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut ids = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| new_codex_profile(temp.path(), &[]).unwrap().0))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 8);
+        assert!(
+            ids.iter()
+                .all(|id| valid_id(id) && temp.path().join(id).is_dir())
+        );
+    }
+    #[test]
+    fn automatic_codex_profiles_enforce_pool_and_storage_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let accounts: Vec<_> = (0..8)
+            .map(|i| Account {
+                id: format!("old-{i}"),
+                service: "codex".into(),
+                concurrency: 1,
+            })
+            .collect();
+        assert_eq!(
+            new_codex_profile(temp.path(), &accounts),
+            Err(Error::AccountsUnavailable)
+        );
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+        assert_eq!(
+            new_codex_profile(&temp.path().join("missing"), &[]),
+            Err(Error::PrivateStorageUnavailable)
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn automatic_codex_profiles_skip_links_and_are_private() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temp = tempfile::tempdir().unwrap();
+        symlink(
+            temp.path().join("missing-target"),
+            temp.path().join("codex-1"),
+        )
+        .unwrap();
+        let (id, home) = new_codex_profile(temp.path(), &[]).unwrap();
+        assert_eq!(id, "codex-2");
+        assert_eq!(
+            std::fs::metadata(home).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(
+            std::fs::symlink_metadata(temp.path().join("codex-1"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+    #[test]
     fn projection_drops_secret_paths_and_unknown_fields() {
         let raw=br#"[{"id":"work","service":"codex","concurrency":1,"path":"SECRET_PATH","token":"SECRET"}]"#;
         let safe = serde_json::to_string(&account_projection(raw).unwrap()).unwrap();
@@ -1153,6 +1266,48 @@ mod tests {
         let q = root.path().join("link");
         symlink(&p, &q).unwrap();
         assert_eq!(private_dir(&q), Err(Error::PrivateStorageUnavailable));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_connect_assigns_profiles_and_cancellation_never_reuses_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("node");
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\n[ \"$1 $2\" = 'accounts list' ] || exit 1\nprintf '[]'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let resources = temp.path().join("resources");
+        let cli = resources.join("runtime/codex/bin/codex");
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(&cli, "#!/bin/sh\nif [ \"$1\" = '--version' ]; then printf 'codex-cli 0.159.2\\n'; exit 0; fi\n[ \"$1\" = '-c' ] && [ \"$2\" = 'cli_auth_credentials_store=\"file\"' ] && [ \"$3\" = 'login' ] || exit 1\nexec /bin/sleep 30\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let node = Node::new(
+            temp.path().join("state"),
+            binary,
+            temp.path().join("helper"),
+        )
+        .with_provider_runtime(&resources);
+        node.connect_codex(1).await.unwrap();
+        {
+            let login = node.login.lock().await;
+            let pending = login.as_ref().unwrap();
+            assert_eq!(pending.id, "codex-1");
+            assert_eq!(pending.concurrency, 1);
+            assert_eq!(pending.home, node.state.join("codex-logins/codex-1"));
+        }
+        assert_eq!(node.connect_codex(1).await, Err(Error::LoginBusy));
+        assert!(!node.state.join("codex-logins/codex-2").exists());
+        node.cancel_login().await.unwrap();
+        node.connect_codex(1).await.unwrap();
+        assert_eq!(node.login.lock().await.as_ref().unwrap().id, "codex-2");
+        node.cancel_login().await.unwrap();
+        assert!(node.state.join("codex-logins/codex-1").is_dir());
+        assert!(node.state.join("codex-logins/codex-2").is_dir());
+        assert!(node.login.lock().await.is_none());
+        assert!(node.accounts().await.unwrap().is_empty());
     }
     #[cfg(unix)]
     #[tokio::test]
