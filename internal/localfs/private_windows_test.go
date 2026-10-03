@@ -297,6 +297,40 @@ func TestOpenPrivateInheritedRejectsBroadOrForeignACLs(t *testing.T) {
 		requireInheritedDACL(t, path)
 		rejectInherited(t, path, "inherited credential owned by another SID accepted")
 	})
+	// Waiving SE_DACL_PROTECTED never waives the DACL: a NULL DACL grants
+	// everyone full access, so the file opens and only the ACL check refuses it.
+	t.Run("null DACL", func(t *testing.T) {
+		path := filepath.Join(privateProfile(t), "auth.json")
+		writeLikeCodexCLI(t, path, []byte("synthetic"))
+		readInherited(t, path, "synthetic")
+		if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Windows reports either a present NULL DACL or none; both grant everyone.
+		if acl, _, err := sd.DACL(); err == nil && acl != nil {
+			t.Fatal("fixture still has a DACL")
+		}
+		if _, err := os.ReadFile(path); err != nil {
+			t.Fatal("NULL DACL fixture unreadable", err)
+		}
+		rejectInherited(t, path, "inherited credential with a NULL DACL accepted")
+	})
+	// Only ACCESS_ALLOWED ACEs are understood. A deny ACE that leaves the file
+	// readable still fails closed.
+	t.Run("deny ACE", func(t *testing.T) {
+		path := filepath.Join(privateProfile(t), "auth.json")
+		writeLikeCodexCLI(t, path, []byte("synthetic"))
+		readInherited(t, path, "synthetic")
+		setUnprotectedACE(t, path, "(D;;0x2;;;WD)")
+		if _, err := os.ReadFile(path); err != nil {
+			t.Fatal("deny-ACE fixture unreadable", err)
+		}
+		rejectInherited(t, path, "inherited credential with a deny ACE accepted")
+	})
 }
 
 // An inherited DACL is only as private as its directory. A directory that only
