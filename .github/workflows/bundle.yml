@@ -5,6 +5,7 @@ on:
       - '**.go'
       - 'go.*'
       - 'prover/**'
+      - '.cargo/**'
       - 'third_party/**'
       - 'scripts/**'
       - 'packaging/**'
