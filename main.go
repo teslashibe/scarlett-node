@@ -193,6 +193,10 @@ func run(c config.Config) error {
 	defer func() {
 		status.State = "draining"
 		status.InFlight = len(slots)
+		if services != nil {
+			status.Services = services.health()
+			status.Accounts = services.accountStatus()
+		}
 		_ = saveRuntimeStatus(c.StateDir, status)
 		waitForWorkers(&running, cancelWork, 2*time.Minute)
 		status.State = "stopped"
@@ -202,6 +206,7 @@ func run(c config.Config) error {
 		}
 		if services != nil {
 			status.Services = services.health()
+			status.Accounts = services.accountStatus()
 		}
 		_ = saveRuntimeStatus(c.StateDir, status)
 	}()

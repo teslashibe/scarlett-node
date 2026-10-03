@@ -329,3 +329,130 @@ func TestManagedAdmissionNeverResurrectsLegacyAfterRestart(t *testing.T) {
 		t.Fatal("restart resurrected legacy X session")
 	}
 }
+
+// These are the coordinator's typed report invariants, independent of account
+// selection or private account-status capacity (which is zero while draining).
+func assertTypedHeartbeatInFlight(t *testing.T, p *servicePool, kind, state string, wantFlight int) {
+	t.Helper()
+	total := 0
+	allBlocked := true
+	found := false
+	for _, h := range p.health() {
+		if h.InFlight > h.Capacity || h.InFlight < 0 || h.Capacity < 0 {
+			t.Fatal("invalid typed in-flight capacity", h)
+		}
+		switch h.State {
+		case "configured", "ready":
+			allBlocked = false
+			if h.Capacity == 0 {
+				t.Fatal("healthy typed service has zero capacity", h)
+			}
+		case "not_added", "auth_required", "exhausted", "unreachable":
+		default:
+			t.Fatal("unknown typed service state", h)
+		}
+		if h.State == "not_added" && (h.Capacity != 0 || h.InFlight != 0) {
+			t.Fatal("disabled service retains work", h)
+		}
+		if h.Kind == kind {
+			found = true
+			if h.State != state || h.InFlight != wantFlight || h.Capacity != wantFlight {
+				t.Fatal("blocked/draining work lost typed capacity", h)
+			}
+		}
+		total += h.Capacity
+	}
+	if !found || total == 0 && !allBlocked {
+		t.Fatal("invalid aggregate zero capacity")
+	}
+}
+func TestTypedCooldownAndAuthenticationRetainAnotherAcceptedSlot(t *testing.T) {
+	for _, code := range []string{"auth_required", "capacity_unavailable", "x_rate_limited"} {
+		t.Run(code, func(t *testing.T) {
+			p := multiPool(t)
+			kind := "codex"
+			if code == "x_rate_limited" {
+				kind = "x_read"
+			}
+			f, _ := loadAccounts(p.config.AccountsFile)
+			for _, a := range f.Accounts {
+				if a.Service == kind && a.ID == "one" {
+					a.Concurrency = 2
+					f.Accounts = []providerAccount{a}
+					break
+				}
+			}
+			saveAccountFixture(t, p, f)
+			one, ok := p.acquireAccount(kind)
+			if !ok {
+				t.Fatal("missing first accepted slot")
+			}
+			two, ok := p.acquireAccount(kind)
+			if !ok {
+				t.Fatal("missing second accepted slot")
+			}
+			p.finishAccount(one, code)
+			state := "exhausted"
+			if code == "auth_required" {
+				state = "auth_required"
+			}
+			assertTypedHeartbeatInFlight(t, p, kind, state, 1)
+			if _, ok := p.acquireAccount(kind); ok {
+				t.Fatal("blocked account accepted fresh work")
+			}
+			p.finishAccount(two, "")
+			assertTypedHeartbeatInFlight(t, p, kind, state, 0)
+		})
+	}
+}
+func TestTypedSoleAccountRemovalAndInvalidFileRetainAcceptedSlots(t *testing.T) {
+	for _, invalid := range []bool{false, true} {
+		t.Run(map[bool]string{false: "removed", true: "invalid-file"}[invalid], func(t *testing.T) {
+			p := multiPool(t)
+			f, _ := loadAccounts(p.config.AccountsFile)
+			f.Accounts = []providerAccount{f.Accounts[0]}
+			f.Accounts[0].Concurrency = 2
+			saveAccountFixture(t, p, f)
+			one, ok := p.acquireAccount("codex")
+			if !ok {
+				t.Fatal("missing first slot")
+			}
+			two, ok := p.acquireAccount("codex")
+			if !ok {
+				t.Fatal("missing second slot")
+			}
+			state := "auth_required"
+			if invalid {
+				os.WriteFile(p.config.AccountsFile, []byte(`{"invalid":true}`), 0600)
+				state = "unreachable"
+			} else {
+				f.Accounts = []providerAccount{}
+				saveAccountFixture(t, p, f)
+			}
+			assertTypedHeartbeatInFlight(t, p, "codex", state, 2)
+			if _, ok := p.acquireAccount("codex"); ok {
+				t.Fatal("removed/invalid account accepted fresh work")
+			}
+			p.finishAccount(one, "")
+			assertTypedHeartbeatInFlight(t, p, "codex", state, 1)
+			p.finishAccount(two, "")
+			assertTypedHeartbeatInFlight(t, p, "codex", state, 0)
+		})
+	}
+}
+func TestTypedLegacyToManagedTransitionRetainsSelectedLegacySlot(t *testing.T) {
+	p := poolFixture(t, "codex")
+	p.config.StateDir = t.TempDir()
+	p.config.AccountsFile = filepath.Join(p.config.StateDir, "accounts.json")
+	selected, ok := p.acquireAccount("codex")
+	if !ok {
+		t.Fatal("missing legacy slot")
+	}
+	saveAccountFixture(t, p, accountFile{Version: 1, Accounts: []providerAccount{}})
+	assertTypedHeartbeatInFlight(t, p, "codex", "auth_required", 1)
+	if selected.id != "legacy" {
+		t.Fatal("selected legacy identity changed")
+	}
+	p.finishAccount(selected, "")
+	assertTypedHeartbeatInFlight(t, p, "codex", "auth_required", 0)
+}
