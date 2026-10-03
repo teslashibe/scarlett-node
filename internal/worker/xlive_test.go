@@ -311,9 +311,141 @@ var errCaptured = errors.New("captured, not sent")
 // capture records the X GraphQL reads x-go makes. It forwards them unproven
 // while forward is set and otherwise fails them without sending anything.
 // Other requests, such as x-go's page and script fetches, go out unchanged.
+// TestXLiveRelay is the small live check for one proof mode: the four reads
+// the public catalog sells, each proven once, against the real x.com. It
+// spends exactly six X GraphQL requests: two unproven bootstrap reads that
+// x-go makes when a client is built, then four proven reads. One x-go client
+// does both, so there is no second bootstrap. SCARLETT_X_PROOF_MODE selects
+// relay (default) or mpc; run it twice to compare the modes on the same path.
+//
+//	SCARLETT_X_SESSION=... SCARLETT_PROVER=... SCARLETT_VERIFIER=127.0.0.1:7047 \
+//	SCARLETT_VERIFIER_API=http://127.0.0.1:7070 SCARLETT_VERIFIER_KEY=... \
+//	SCARLETT_X_PROOF_MODE=relay go test -tags xlive -count=1 -run 'TestXLiveRelay$' -v ./internal/worker
+func TestXLiveRelay(t *testing.T) {
+	env := func(k string) string {
+		v := os.Getenv(k)
+		if v == "" {
+			t.Skipf("%s is not set", k)
+		}
+		return v
+	}
+	sessionPath, prover, verifierAddr, api, key := env("SCARLETT_X_SESSION"), env("SCARLETT_PROVER"), env("SCARLETT_VERIFIER"), env("SCARLETT_VERIFIER_API"), env("SCARLETT_VERIFIER_KEY")
+	mode := os.Getenv("SCARLETT_X_PROOF_MODE")
+	if mode == "" {
+		mode = "relay"
+	}
+	if mode != "relay" && mode != "mpc" {
+		t.Fatalf("SCARLETT_X_PROOF_MODE %q is not relay or mpc", mode)
+	}
+	var session x.Session
+	data, err := os.ReadFile(sessionPath)
+	if err != nil || json.Unmarshal(data, &session) != nil {
+		t.Fatal("X session file is unreadable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	// One client. Construction sends Viewer and UserByRestId unproven; one
+	// retry only, so a failing read cannot silently spend more of the budget.
+	capt := &capture{forward: true}
+	client, err := session.NewClient(ctx, x.WithHTTPClient(&http.Client{Timeout: 5 * time.Minute, Transport: capt}), x.WithRetry(1, time.Millisecond), x.WithMinRequestGap(time.Second))
+	if err != nil {
+		t.Fatalf("x-go client: %v", err)
+	}
+	if len(capt.got) != 2 || capt.got[0].Operation != "Viewer" || capt.got[1].Operation != "UserByRestId" {
+		t.Fatalf("session validation sent %d reads, want Viewer and UserByRestId", len(capt.got))
+	}
+
+	// Plan the four catalog reads without sending them.
+	capt.forward = false
+	p := &plan{t: t, capture: capt}
+	reads := []liveRead{
+		{"GetProfile", 1, false, func(c *x.Client, _ string) ([]string, string, error) {
+			u, err := c.GetProfile(ctx, "jack")
+			if err == nil && u.ID != "12" {
+				err = fmt.Errorf("@jack has id %q", u.ID)
+			}
+			return nil, "", err
+		}},
+		{"GetTweet", 1, false, func(c *x.Client, _ string) ([]string, string, error) {
+			tw, err := c.GetTweet(ctx, "20")
+			if err == nil && tw.Text != "just setting up my twttr" {
+				err = fmt.Errorf("unexpected text %q", tw.Text)
+			}
+			return nil, "", err
+		}},
+		{"GetTweetDetail", 1, false, func(c *x.Client, _ string) ([]string, string, error) {
+			d, err := c.GetTweetDetail(ctx, "20")
+			if err == nil && d.Tweet.ID != "20" {
+				err = fmt.Errorf("detail is for tweet %q", d.Tweet.ID)
+			}
+			return nil, "", err
+		}},
+		{"SearchTweets", 1, false, tweetRead(func(c *x.Client, cur string) (x.TweetPage, error) {
+			return c.SearchTweetsPage(ctx, "bitcoin", 20, cur, x.WithSearchType(x.SearchLatest))
+		})},
+	}
+	for _, r := range reads {
+		p.add(r.name, func(cursor string) { r.fetch(client, cursor) }, -1)
+	}
+	want := map[string]bool{"UserByScreenName": true, "TweetResultByRestId": true, "TweetDetail": true, "SearchTimeline": true}
+	for _, s := range p.specs {
+		if !want[s.Operation] {
+			t.Fatalf("planned %s, not a catalog read", s.Operation)
+		}
+		delete(want, s.Operation)
+	}
+	if len(want) != 0 {
+		t.Fatalf("catalog reads not planned: %v", want)
+	}
+
+	payload := map[string]any{"type": "x.read", "exchanges": p.specs, "max_attempts": len(p.specs)}
+	if mode == "relay" {
+		payload["proof_mode"], payload["proof_policy"] = "relay", "x-relay-v1"
+	}
+	jobID := fmt.Sprintf("xlive-%s-%d", mode, time.Now().UnixNano())
+	var created struct{ Token string }
+	verifierAPI(t, ctx, http.MethodPost, api+"/v1/sessions", key, map[string]any{"job_id": jobID, "attempt": "1", "ttl_seconds": 600, "payload": payload}, &created)
+
+	// The same client now proves its reads through the recorder.
+	rec := &recorder{t: t, next: XTransport{Prover: prover, Verifier: verifierAddr, VerifierCA: os.Getenv("SCARLETT_VERIFIER_CA_FILE"), Token: created.Token, Relay: mode == "relay"}}
+	capt.next = rec
+	for _, r := range reads {
+		start := time.Now()
+		if _, _, err := r.fetch(client, ""); err != nil {
+			t.Errorf("%s: %v", r.name, err)
+		}
+		t.Logf("%-15s %s node wall %s", r.name, mode, time.Since(start).Round(time.Millisecond))
+	}
+
+	status := waitForVerifier(t, ctx, api, jobID, key, rec.attempts)
+	if len(status.Rejections) > 0 {
+		t.Errorf("verifier rejected exchanges: %v", status.Rejections)
+	}
+	if len(status.Exchanges) != len(rec.bodies) {
+		t.Fatalf("verifier recorded %d exchanges, x-go received %d", len(status.Exchanges), len(rec.bodies))
+	}
+	if !status.Complete {
+		t.Errorf("job not complete; pending %v", status.Pending)
+	}
+	for i, e := range status.Exchanges {
+		if e.Operation != rec.ops[i] || e.Body != rec.bodies[i] {
+			t.Errorf("exchange %d: verifier has %s (%d bytes), x-go parsed %s (%d bytes)", i, e.Operation, len(e.Body), rec.ops[i], len(rec.bodies[i]))
+		}
+		if e.HTTPStatus != 200 || !e.Fulfilled {
+			t.Errorf("exchange %d %s: HTTP %d fulfilled %v", i, e.Operation, e.HTTPStatus, e.Fulfilled)
+		}
+		t.Logf("#%-3d %-20s %s HTTP %d  X sent %5d B  X received %6d B  body %7d B  verifier %5d ms  node %6d ms", e.Index, e.Operation, mode, e.HTTPStatus, e.SentBytes, e.ReceivedBytes, len(e.Body), e.DurationMS, rec.took[i].Milliseconds())
+	}
+	t.Logf("%s: %d proven reads, %d X requests in total", mode, len(status.Exchanges), len(status.Exchanges)+2)
+}
+
 type capture struct {
 	forward bool
 	got     []spec
+	// next, when set, serves X reads after they are recorded, so one x-go
+	// client can plan and then prove without a second bootstrap.
+	next http.RoundTripper
 }
 
 func (c *capture) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -337,6 +469,9 @@ func (c *capture) RoundTrip(req *http.Request) (*http.Response, error) {
 	c.got = append(c.got, s)
 	if c.forward {
 		return http.DefaultTransport.RoundTrip(req)
+	}
+	if c.next != nil {
+		return c.next.RoundTrip(req)
 	}
 	return nil, errCaptured
 }
