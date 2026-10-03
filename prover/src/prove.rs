@@ -85,6 +85,23 @@ fn provider_error_kind(event: &Value) -> &'static str {
     }
 }
 
+// Reviewed against OpenAI codex rust-v0.159.2: model-provider-info/src/lib.rs
+// pins the version header, login/src/auth/default_client.rs pins the originator,
+// and core/src/client.rs pins the Responses WebSocket beta. The User-Agent names
+// this wrapper honestly; this prover does not execute the Codex CLI.
+const CODEX_COMPATIBILITY_VERSION: &str = "0.159.2";
+const CODEX_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
+
+fn codex_websocket_request() -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
+    let mut request = format!("wss://{HOST}{PATH}").into_client_request()?;
+    let headers = request.headers_mut();
+    headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
+    headers.insert("user-agent", HeaderValue::from_str(&format!("codex_cli_rs/{CODEX_COMPATIBILITY_VERSION} (scarlett TLSNotary wrapper) dumb"))?);
+    headers.insert("version", HeaderValue::from_static(CODEX_COMPATIBILITY_VERSION));
+    headers.insert("openai-beta", HeaderValue::from_static(CODEX_WEBSOCKET_BETA));
+    Ok(request)
+}
+
 pub async fn run(request: Request) -> Result<Summary> {
     validate_job(&request.payload)?;
     if request.token.len() != 64 || !request.token.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -123,14 +140,10 @@ pub async fn run(request: Request) -> Result<Summary> {
         let prover_task = tokio::spawn(prover.into_future());
 
         let started = Instant::now();
-        let mut ws_request = format!("wss://{HOST}{PATH}").into_client_request()?;
+        let mut ws_request = codex_websocket_request()?;
         let headers = ws_request.headers_mut();
         headers.insert("authorization", HeaderValue::from_str(&format!("Bearer {}", creds.access_token))?);
         headers.insert("chatgpt-account-id", HeaderValue::from_str(&creds.account_id)?);
-        headers.insert("originator", HeaderValue::from_static("codex_cli_rs"));
-        headers.insert("user-agent", HeaderValue::from_static("codex_cli_rs/0.144.1 (api wrapper) dumb"));
-        headers.insert("version", HeaderValue::from_static("0.144.1"));
-        headers.insert("openai-beta", HeaderValue::from_static("responses_websockets=2026-02-06"));
 
         let (mut ws, _) = tokio_tungstenite::client_async(ws_request, tls.compat())
             .await
@@ -285,6 +298,26 @@ fn complement(len: usize, mut hidden: Vec<Range<usize>>) -> Vec<Range<usize>> {
 #[cfg(test)]
 mod provider_error_tests {
     use super::*;
+
+    #[test]
+    fn current_compatibility_headers_keep_fixed_provider_route_and_honest_identity() {
+        let request = codex_websocket_request().unwrap();
+        assert_eq!(request.uri().scheme_str(), Some("wss"));
+        assert_eq!(request.uri().host(), Some("chatgpt.com"));
+        assert_eq!(request.uri().path(), "/backend-api/codex/responses");
+        let headers = request.headers();
+        assert_eq!(headers["originator"], "codex_cli_rs");
+        assert_eq!(headers["version"], "0.159.2");
+        assert_eq!(headers["user-agent"], "codex_cli_rs/0.159.2 (scarlett TLSNotary wrapper) dumb");
+        assert_eq!(headers["openai-beta"], "responses_websockets=2026-02-06");
+        assert!(!headers.contains_key("authorization"));
+        assert!(!headers.contains_key("chatgpt-account-id"));
+        assert!(!headers.contains_key("x-openai-internal-codex-responses-lite"));
+        assert!(!headers.contains_key("service-tier"));
+        for value in headers.values() {
+            assert!(!value.as_bytes().windows(7).any(|bytes| bytes == b"0.144.1"));
+        }
+    }
 
     #[test]
     fn classifies_nested_and_direct_errors_without_echoing_provider_fields() {
