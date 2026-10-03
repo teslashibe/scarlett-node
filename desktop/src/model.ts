@@ -1,3 +1,4 @@
+export type Preferences = { schema: 1; local_api_port: number; background: boolean };
 export type Account = {
   id: string;
   service: "codex" | "x_read";
@@ -51,6 +52,7 @@ export const errorMessage = (code: unknown): string =>
     api_not_ready: "The local API did not become ready securely. Check its status before trying again",
     api_port_in_use: "The local port is unavailable. Choose another port or stop the service using it",
     api_process_exited: "The local API stopped before becoming ready. Check the bundled installation",
+    autostart_unavailable: "Scarlett could not update the login setting. Check the current setting before trying again",
     mode_conflict: "Stop the other service before switching between network jobs and the local API",
     private_storage_unavailable:
       "Scarlett could not open its private local storage",

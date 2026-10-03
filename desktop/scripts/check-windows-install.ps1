@@ -1,9 +1,11 @@
 # Runs only on a disposable native CI runner, never an operator's Windows profile
 param(
     [Parameter(Mandatory = $true)][string]$Installer,
-    [Parameter(Mandatory = $true)][string]$EvidenceDirectory
+    [Parameter(Mandatory = $true)][string]$EvidenceDirectory,
+    [switch]$Preferences
 )
 $ErrorActionPreference = 'Stop'
+$script:apiPort = 8088
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows') {
     throw 'Installed UI acceptance requires a disposable Windows CI runner'
 }
@@ -41,7 +43,7 @@ function Response-Status($Response) {
     } finally { $Response.Close() }
 }
 function Api-Status([string]$Path, [string]$Bearer = '') {
-    $request = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:8088$Path")
+    $request = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:$($script:apiPort)$Path")
     $request.Timeout = 2000
     $request.ReadWriteTimeout = 2000
     $request.KeepAlive = $false
@@ -86,8 +88,7 @@ function Click-Button([string]$Name) {
     }
     $invoke.Invoke()
 }
-function Start-App {
-    $script:application = Start-Process -FilePath $script:executable -WorkingDirectory $script:install -PassThru
+function Wait-AppWindow {
     Wait-Check {
         $condition = [System.Windows.Automation.AndCondition]::new(
             [System.Windows.Automation.PropertyCondition]::new(
@@ -102,9 +103,18 @@ function Start-App {
     } 45 'Installed desktop window did not appear'
     $script:window.SetFocus()
     Wait-Check {
-        $button = Find-Button 'Start local API'
-        return $null -ne $button -and $button.Current.IsEnabled
+        $start = Find-Button 'Start local API'
+        $stop = Find-Button 'Stop local API'
+        # A background reopen retains its running API, so Start is disabled.
+        # Either enabled lifecycle control proves the renderer is ready; each
+        # subsequent operation still waits for its specific control/state.
+        return ($null -ne $start -and $start.Current.IsEnabled) -or
+            ($null -ne $stop -and $stop.Current.IsEnabled)
     } 30 'Installed desktop API controls did not become available'
+}
+function Start-App {
+    $script:application = Start-Process -FilePath $script:executable -WorkingDirectory $script:install -PassThru
+    Wait-AppWindow
 }
 function Focus-QuitShortcut {
     # UIA Invoke can operate a background window. SendKeys instead targets the
@@ -171,7 +181,133 @@ function Verify-KeyboardDelivery {
     Write-Output 'Installed acceptance: synthetic keyboard delivery verified'
 }
 
-$install = Join-Path $env:RUNNER_TEMP 'scarlett-installed-ui-acceptance'
+
+function Find-Input([string]$Name) {
+    $condition = [System.Windows.Automation.AndCondition]::new(
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::NameProperty, $Name),
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::IsKeyboardFocusableProperty, $true)
+    )
+    return $script:window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+}
+function Set-Number([string]$Name, [int]$Value) {
+    $inputControl = Find-Input $Name
+    if (-not $inputControl -or -not $inputControl.Current.IsEnabled) { throw "Number input unavailable: $Name" }
+    $pattern = $null
+    if ($inputControl.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) {
+        $pattern.SetValue([string]$Value)
+    } elseif ($inputControl.TryGetCurrentPattern([System.Windows.Automation.RangeValuePattern]::Pattern, [ref]$pattern)) {
+        $pattern.SetValue([double]$Value)
+    } else { throw "Number input value pattern unavailable: $Name" }
+}
+function Checkbox-Is([string]$Name, [bool]$Enabled) {
+    $control = Find-Input $Name
+    if (-not $control -or -not $control.Current.IsEnabled) { return $false }
+    $pattern = $null
+    if (-not $control.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
+        throw "Checkbox toggle pattern unavailable: $Name"
+    }
+    $wanted = [System.Windows.Automation.ToggleState]::Off
+    if ($Enabled) { $wanted = [System.Windows.Automation.ToggleState]::On }
+    return $pattern.Current.ToggleState -eq $wanted
+}
+function Set-Checkbox([string]$Name, [bool]$Enabled) {
+    Wait-Check { (Find-Input $Name).Current.IsEnabled } 15 "Checkbox unavailable: $Name"
+    if (Checkbox-Is $Name $Enabled) { return }
+    $pattern = $null
+    if (-not (Find-Input $Name).TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
+        throw "Checkbox toggle pattern unavailable: $Name"
+    }
+    $pattern.Toggle()
+    Wait-Check { Checkbox-Is $Name $Enabled } 15 "Checkbox did not update: $Name"
+}
+function Saved-Preferences([int]$Port, [bool]$Background) {
+    $path = Join-Path $state 'preferences.json'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+    $saved = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
+    return $saved.schema -eq 1 -and $saved.local_api_port -eq $Port -and $saved.background -eq $Background
+}
+function Close-Window {
+    $pattern = $null
+    if (-not $script:window.TryGetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern, [ref]$pattern)) {
+        throw 'Native window close pattern unavailable'
+    }
+    $pattern.Close()
+}
+function Registered-Command {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Run')
+    if (-not $key) { return $null }
+    try { return $key.GetValue('Scarlett Node', $null) } finally { $key.Dispose() }
+}
+function Check-Preferences {
+    if ($null -ne (Registered-Command)) { throw 'Clean runner already has a Scarlett login registration' }
+    Start-App
+    if (-not (Checkbox-Is 'Keep running when the window closes' $false)) { throw 'Background mode was not opt-in' }
+    if (-not (Checkbox-Is 'Open Scarlett when I log in' $false)) { throw 'Start at login was not opt-in' }
+    Set-Number 'Saved local API port' 18088
+    Click-Button 'Save device preferences'
+    Wait-Check { Saved-Preferences 18088 $false } 15 'Device preferences were not saved privately'
+    $script:apiPort = 18088
+    if ((Api-Status '/health') -ne 0) { throw 'Preferences test port is already occupied' }
+    Click-Button 'Start local API'
+    Wait-Check { (Api-Status '/health') -eq 200 } 30 'Saved port did not start the local API'
+    Close-Window
+    if (-not $application.WaitForExit(135000)) { throw 'Default window close did not quit' }
+    Wait-Check { (Api-Status '/health') -eq 0 } 30 'Default window close left the API running'
+    Write-Output 'Installed preferences: default close drained and saved port passed'
+
+    Start-App
+    if ((Api-Status '/health') -ne 0) { throw 'Opening the app automatically started the API' }
+    # Enabling the actual OS registration must quote the installed path with
+    # spaces and include no provider/node/API arguments.
+    Set-Checkbox 'Open Scarlett when I log in' $true
+    $script:ownsLoginRegistration = $true
+    $expectedCommand = '"' + $executable + '"'
+    Wait-Check { (Registered-Command) -ceq $expectedCommand } 15 'Windows login command was not one quoted app executable'
+    Click-Button 'Start local API'
+    Wait-Check { (Api-Status '/health') -eq 200 } 30 'Saved API port did not survive reopening'
+    Focus-QuitShortcut
+    [System.Windows.Forms.SendKeys]::SendWait('^q')
+    if (-not $application.WaitForExit(135000)) { throw 'Preferences app Quit did not exit' }
+    Wait-Check { (Api-Status '/health') -eq 0 } 30 'Preferences Quit left API running'
+    Start-App
+    if (-not (Checkbox-Is 'Open Scarlett when I log in' $true)) { throw 'Native login registration did not survive app reopening' }
+    if ((Api-Status '/health') -ne 0) { throw 'Registered app opening automatically started API' }
+    Set-Checkbox 'Open Scarlett when I log in' $false
+    Wait-Check { $null -eq (Registered-Command) } 15 'Disabling login left the native registration'
+    $script:ownsLoginRegistration = $false
+    Write-Output 'Installed preferences: quoted native login enable/read-back/disable passed'
+
+    Set-Checkbox 'Keep running when the window closes' $true
+    Click-Button 'Save device preferences'
+    Wait-Check { Saved-Preferences 18088 $true } 15 'Background preference did not save'
+    Click-Button 'Start local API'
+    Wait-Check { (Api-Status '/health') -eq 200 } 30 'Background test API did not start'
+    $originalProcess = $application.Id
+    Close-Window
+    Start-Sleep -Seconds 3
+    $application.Refresh()
+    if ($application.HasExited -or (Api-Status '/health') -ne 200) { throw 'Background close stopped the app or API' }
+    $reopen = Start-Process -FilePath $executable -WorkingDirectory $install -PassThru
+    if (-not $reopen.WaitForExit(15000)) { $reopen.Kill(); throw 'Single-instance reopening launched a second desktop' }
+    Wait-AppWindow
+    if ($application.Id -ne $originalProcess -or (Api-Status '/health') -ne 200) { throw 'Reopening did not retain the same background app and API' }
+    Set-Checkbox 'Keep running when the window closes' $false
+    Click-Button 'Save device preferences'
+    Wait-Check { Saved-Preferences 18088 $false } 15 'Background mode did not restore off'
+    Close-Window
+    if (-not $application.WaitForExit(135000)) { throw 'Restored default close did not exit' }
+    Wait-Check { (Api-Status '/health') -eq 0 } 30 'Restored default close left API running'
+    @{
+        savedPort = 'passed'; defaultCloseDrain = 'passed'; backgroundClose = 'passed'
+        singleInstanceReopen = 'passed'; quotedLoginCommand = 'passed'; nativeLoginRegistration = 'passed'
+        loginReadBack = 'passed'; loginDisable = 'passed'; actualOSLogin = 'not tested'
+        realProviderJobs = 0; backgroundRestored = $false; loginRestored = $false
+    } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-preferences-ui.json')
+}
+
+$install = Join-Path $env:RUNNER_TEMP 'Scarlett Installed UI Acceptance'
 $state = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'ai.scarlett.node'
 if ((Test-Path $install) -or (Test-Path $state)) {
     throw 'Acceptance requires a clean installer destination and app-owned profile'
@@ -192,6 +328,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Installed component integrity or API payload v
 $previousPath = $env:PATH
 $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
 $application = $null
+$script:ownsLoginRegistration = $false
 $key = $null
 try {
     Start-App
@@ -231,9 +368,14 @@ try {
         unexpectedDesktopExit = 'passed'; uiQuit = 'passed'; quitInputFocus = 'verified'; realProviderJobs = 0
         signedInstaller = $false; remoteAccountLoginTested = $false
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-installed-ui.json')
+    if ($Preferences) { Check-Preferences }
 } finally {
     $key = $null
     $env:PATH = $previousPath
+    if ($script:ownsLoginRegistration) {
+        $ownedRun = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Run', $true)
+        if ($ownedRun) { try { $ownedRun.DeleteValue('Scarlett Node', $false) } finally { $ownedRun.Dispose() } }
+    }
     if ($application -and -not $application.HasExited) {
         $application.Kill()
         $application.WaitForExit(10000) | Out-Null

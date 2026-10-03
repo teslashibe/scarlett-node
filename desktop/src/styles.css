@@ -207,3 +207,6 @@ footer p {
     transition: filter 0.12s;
   }
 }
+
+label.check { display: flex; align-items: center; gap: 10px; }
+label.check input { width: auto; }
