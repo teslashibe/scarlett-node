@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="desktop/src-tauri/icons/icon.svg" width="88" alt="Scarlett Node">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+    <img src="docs/assets/logo-light.svg" width="96" alt="Scarlett Node">
+  </picture>
 </p>
 
 <h1 align="center">Scarlett Node</h1>
@@ -48,7 +51,7 @@ flowchart LR
     N -- "/proven" --> C
     N -- "TCP from the node's own address" --> P
     N <-- "MPC-TLS: TLS keys held jointly<br/>~60 MB upload per X read" --> V
-    V -- "keyed relay: verifier is the TLS client,<br/>records pass through the node · ~63 KB per X read" --> N
+    V -- "keyed relay: verifier is the TLS client,<br/>records pass through the node · 70–90 KB per X read" --> N
     V -- "verified response, model, usage" --> C
 ```
 
@@ -93,7 +96,7 @@ For X there are two ways to run step 2. **MPC-TLS** is the standard TLSNotary mo
   <tr>
     <td width="33%" valign="top">
       <b>Two X proof modes</b><br>
-      MPC-TLS or keyed relay per job. Relay brings node upload per read from tens of megabytes down to about 63 KB.
+      MPC-TLS or keyed relay per job. Relay brings node upload per read from about 60 MB down to under 100 KB.
     </td>
     <td width="33%" valign="top">
       <b>Drain, upgrade, resume</b><br>
@@ -181,7 +184,7 @@ The coordinator constructs the request; buyers cannot supply URLs, query IDs, fe
 | Who holds the TLS keys | Node and verifier jointly | The verifier only |
 | Verifier can learn hidden values | No | Yes, if dishonest or compromised (see below) |
 | Verifier decides what is sent | No | Yes, one request per session |
-| Node upload per read | About 60 MB, whatever the response size | About 63 KB |
+| Node upload per read | 60–62 MB measured | 68–89 KB measured, growing with the response |
 | Reads allowed | Typed jobs use the four catalog reads; the transport allows 14 | Only the four catalog reads; the verifier refuses others |
 | Default | Always served | On; `SCARLETT_X_RELAY=0` turns it off |
 
