@@ -11,6 +11,10 @@ fn main() {
             "cancel_login",
             "control_local_api",
             "local_api_key",
+            "desktop_preferences",
+            "save_desktop_preferences",
+            "desktop_autostart",
+            "set_desktop_autostart",
         ]),
     ))
     .expect("desktop build configuration");

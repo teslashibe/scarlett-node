@@ -22,12 +22,15 @@ app.innerHTML = `<header><span class="brand">SCARLETT <small>Node</small></span>
 <form id="codex-form"><h3>Connect Codex</h3><p>Your browser handles login. Scarlett keeps a separate private profile on this device</p><label>Local account ID<input id="codex-id" autocomplete="off" pattern="[a-z0-9_-]{1,32}" maxlength="32" placeholder="work-codex" required></label><label>Concurrent jobs<input id="codex-capacity" type="number" min="1" max="32" value="1" required></label><button type="submit">Connect Codex</button><button id="cancel-login" type="button" class="quiet" hidden>Cancel login</button><p id="codex-note" class="muted"></p></form>
 <form id="x-form"><h3>Connect X</h3><p>Paste only these two cookies. They stay on this device; the node uses X for read-only work</p><label>Local account ID<input id="x-id" autocomplete="off" pattern="[a-z0-9_-]{1,32}" maxlength="32" placeholder="personal-x" required></label><label>Concurrent jobs<input id="x-capacity" type="number" min="1" max="32" value="1" required></label><label>auth_token<input id="x-token" type="password" autocomplete="off" spellcheck="false" maxlength="64" required></label><label>ct0<input id="x-ct0" type="password" autocomplete="off" spellcheck="false" maxlength="160" required></label><button type="submit">Connect X</button><p class="muted">Browser import will appear when this build supports it</p></form></div></section>
 <section aria-labelledby="local-api-heading"><h2 id="local-api-heading">Local model API</h2><p>Connect your tools to this device using an OpenAI-compatible API. It uses the Codex accounts connected above. Stop network jobs before starting the local API</p><p id="api-status" class="muted"></p><label>Local port<input id="api-port" type="number" min="1024" max="65535" value="8088"></label><label>Claude API key (optional)<input id="claude-key" type="password" autocomplete="off" spellcheck="false" maxlength="512"></label><p class="muted">Claude uses your own Anthropic API key. The key stays in the running service and is cleared when it stops</p><div class="actions"><button id="api-start" type="button">Start local API</button><button id="api-stop" type="button" class="quiet">Stop local API</button><button id="api-show-key" type="button" class="quiet">Show local API key</button><button id="api-hide-key" type="button" class="quiet" hidden>Hide key</button></div><label id="api-key-label" hidden>Local API key<input id="api-key" type="password" readonly autocomplete="off" spellcheck="false"></label><p class="muted">Use the address above as your base URL and this private key as the bearer token. Restart the local API after adding Codex accounts</p></section>
-<footer><p>Suppliers earn points only. Local status does not confirm a points award</p><p>Closing the window keeps Scarlett in your menu bar. Quit there to drain and stop the node</p><button id="settings" class="quiet">Manage node access ↗</button></footer></main>`;
+<section aria-labelledby="preferences-heading"><h2 id="preferences-heading">This device</h2><form id="preferences-form"><label class="check"><input id="background" type="checkbox">Keep running when the window closes</label><p class="muted">When off, closing the window drains accepted jobs and quits Scarlett. When on, use the menu bar or tray to reopen or quit</p><label>Saved local API port<input id="saved-api-port" type="number" min="1024" max="65535" required></label><button type="submit">Save device preferences</button></form><label class="check"><input id="autostart" type="checkbox" disabled>Open Scarlett when I log in</label><p class="muted">Opening Scarlett does not start network jobs or the local API. You choose when to start them</p></section>
+<footer><p>Suppliers earn points only. Local status does not confirm a points award</p><p>Choose what happens when the window closes in This device. Quit drains and stops the node</p><button id="settings" class="quiet">Manage node access ↗</button></footer></main>`;
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T;
 let snapshot: Snapshot | undefined;
 let busy = false;
 let polling = false;
+let preferencesAvailable = false;
+let autostartAvailable = false;
 const notice = (text: string, error = false) => {
   const n = $("notice");
   n.textContent = text;
@@ -36,6 +39,9 @@ const notice = (text: string, error = false) => {
 };
 function render(s: Snapshot) {
   snapshot = s;
+  for (const id of ["background", "saved-api-port"]) $(id).toggleAttribute("disabled", busy || !preferencesAvailable);
+  $("preferences-form").querySelector("button")!.toggleAttribute("disabled", busy || !preferencesAvailable);
+  $("autostart").toggleAttribute("disabled", busy || !autostartAvailable);
   const local = s.local_api;
   $("api-status").textContent = local?.running ? `${local.ready ? "Ready" : "Not ready"} · ${local.base_url ?? ""} · ${local.claude_enabled ? "Codex and Claude" : "Codex"}` : local?.available ? "Stopped · listens only on this device" : "Local API controls are unavailable in this build";
   $("api-start").toggleAttribute("disabled", busy || !local?.available || local.running || s.supervised || externalRuntime(s));
@@ -103,7 +109,7 @@ function render(s: Snapshot) {
     $("accounts").append(row);
   }
   $("account-note").textContent = s.accounts_available
-    ? `${s.accounts.length} local accounts`
+    ? `${s.accounts.length} local ${s.accounts.length === 1 ? "account" : "accounts"}`
     : "Unavailable in this node build";
   $("codex-form")
     .querySelector("button[type=submit]")!
@@ -242,6 +248,38 @@ window.addEventListener("pagehide", () => {
   for (const id of ["pair-code", "x-token", "x-ct0", "claude-key"])
     $<HTMLInputElement>(id).value = "";
 });
+async function loadPreferences() {
+  const settings = await api.preferences();
+  $<HTMLInputElement>("api-port").value = String(settings.local_api_port);
+  $<HTMLInputElement>("saved-api-port").value = String(settings.local_api_port);
+  $<HTMLInputElement>("background").checked = settings.background;
+  preferencesAvailable = true;
+  try {
+    $<HTMLInputElement>("autostart").checked = await api.autostart();
+    autostartAvailable = true;
+    $("autostart").removeAttribute("disabled");
+  } catch (e) { notice(errorMessage(e), true); }
+}
+$("preferences-form").addEventListener("submit", event => {
+  event.preventDefault();
+  const port = Number($<HTMLInputElement>("saved-api-port").value);
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) { notice("Choose a local port between 1024 and 65535", true); return; }
+  void act(async () => {
+    await api.savePreferences({schema: 1, local_api_port: port, background: $<HTMLInputElement>("background").checked});
+    if (!snapshot?.local_api?.running) $<HTMLInputElement>("api-port").value = String(port);
+  }, "Device preferences saved");
+});
+$("autostart").addEventListener("change", () => {
+  const input = $<HTMLInputElement>("autostart");
+  void act(async () => {
+    try { await api.setAutostart(input.checked); }
+    finally {
+      try { input.checked = await api.autostart(); }
+      catch (e) { autostartAvailable = false; input.disabled = true; throw e; }
+    }
+  }, "Login setting updated");
+});
+void loadPreferences().catch(e => notice(errorMessage(e), true));
 void refresh();
 setInterval(() => {
   if (!busy) void refresh();

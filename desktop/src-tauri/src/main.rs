@@ -1,13 +1,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod local_api;
 mod node;
+mod preferences;
 use local_api::LocalApi;
 use node::{Error, Node};
+use preferences::{Data as PreferenceData, Preferences};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_opener::OpenerExt;
 struct RuntimeControl(tokio::sync::Mutex<()>);
 
@@ -82,6 +85,60 @@ async fn control_local_api(
 fn local_api_key(window: WebviewWindow, api: State<'_, Arc<LocalApi>>) -> node::Result<String> {
     local_window(&window)?;
     api.key()
+}
+#[tauri::command]
+fn desktop_preferences(
+    window: WebviewWindow,
+    preferences: State<'_, Arc<Preferences>>,
+) -> node::Result<PreferenceData> {
+    local_window(&window)?;
+    preferences.snapshot()
+}
+#[tauri::command]
+async fn save_desktop_preferences(
+    window: WebviewWindow,
+    node: State<'_, Arc<Node>>,
+    preferences: State<'_, Arc<Preferences>>,
+    runtime: State<'_, RuntimeControl>,
+    data: PreferenceData,
+) -> node::Result<()> {
+    local_window(&window)?;
+    data.validate()?;
+    let _guard = runtime.0.lock().await;
+    node.save_preferences(&data).await?;
+    preferences.updated(data)
+}
+#[tauri::command]
+fn desktop_autostart(window: WebviewWindow, app: tauri::AppHandle) -> node::Result<bool> {
+    local_window(&window)?;
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|_| Error::AutostartUnavailable)
+}
+#[tauri::command]
+async fn set_desktop_autostart(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    enabled: bool,
+    runtime: State<'_, RuntimeControl>,
+) -> node::Result<()> {
+    local_window(&window)?;
+    let _guard = runtime.0.lock().await;
+    let manager = app.autolaunch();
+    if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    }
+    .map_err(|_| Error::AutostartUnavailable)?;
+    if manager
+        .is_enabled()
+        .map_err(|_| Error::AutostartUnavailable)?
+        != enabled
+    {
+        return Err(Error::AutostartUnavailable);
+    }
+    Ok(())
 }
 #[tauri::command]
 async fn pair_node(
@@ -206,6 +263,10 @@ fn main() {
             }
         }))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .menu(|app| {
             use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
             // The native predefined macOS Quit terminates directly, bypassing
@@ -241,7 +302,11 @@ fn main() {
             remove_account,
             cancel_login,
             control_local_api,
-            local_api_key
+            local_api_key,
+            desktop_preferences,
+            save_desktop_preferences,
+            desktop_autostart,
+            set_desktop_autostart
         ])
         .setup(move |app| {
             let state = app.path().app_data_dir()?;
@@ -255,6 +320,10 @@ fn main() {
             )
             .map_err(|_| "private desktop storage unavailable")?;
             app.manage(RuntimeControl(tokio::sync::Mutex::new(())));
+            app.manage(Arc::new(
+                Preferences::load(&state, &directory.join(format!("scarlett-node{suffix}")))
+                    .map_err(|_| "private desktop preferences unavailable")?,
+            ));
             app.manage(Arc::new(LocalApi::new(
                 &state,
                 directory.join(format!("open-agent-api{suffix}")),
@@ -286,10 +355,16 @@ fn main() {
                     .on_navigation(local_url)
                     .build()?;
             let handle = window.clone();
+            let window_done = done.clone();
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
-                    let _ = handle.hide();
+                    let app = handle.app_handle();
+                    if app.state::<Arc<Preferences>>().background() {
+                        let _ = handle.hide();
+                    } else {
+                        quit(app.clone(), window_done.clone());
+                    }
                 }
             });
             use tauri::{

@@ -111,6 +111,7 @@ pub enum Error {
     ApiPortInUse,
     ApiProcessExited,
     ModeConflict,
+    AutostartUnavailable,
     PrivateStorageUnavailable,
 }
 pub type Result<T> = std::result::Result<T, Error>;
@@ -208,7 +209,6 @@ pub(crate) fn private_dir_with_helper(path: &Path, helper: &Path) -> Result<()> 
         Ok(())
     }
 }
-#[cfg(windows)]
 pub(crate) fn private_helper(binary: &Path, action: &str, path: &Path) -> Result<Value> {
     if !path.is_absolute() || !regular(binary) {
         return Err(Error::PrivateStorageUnavailable);
@@ -229,8 +229,11 @@ pub(crate) fn private_helper(binary: &Path, action: &str, path: &Path) -> Result
             command.env(name, value);
         }
     }
-    use std::os::windows::process::CommandExt;
-    command.creation_flags(0x08000000);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
     let mut child = command
         .spawn()
         .map_err(|_| Error::PrivateStorageUnavailable)?;
@@ -791,6 +794,27 @@ impl Node {
         {
             *self.login_error.lock().await = Some(Error::LoginFailed);
         }
+    }
+    pub async fn save_preferences(&self, data: &crate::preferences::Data) -> Result<()> {
+        let path = self.state.join("preferences.json");
+        let raw = serde_json::to_vec(data).map_err(|_| Error::InvalidInput)?;
+        let output = self
+            .call(
+                &[
+                    "desktop",
+                    "preferences-set",
+                    path.to_str().ok_or(Error::InvalidInput)?,
+                ],
+                Some(raw),
+                5,
+            )
+            .await?;
+        let persisted: crate::preferences::Data =
+            serde_json::from_slice(&output).map_err(|_| Error::PrivateStorageUnavailable)?;
+        if &persisted != data {
+            return Err(Error::PrivateStorageUnavailable);
+        }
+        Ok(())
     }
     pub async fn snapshot(&self) -> Snapshot {
         if self.prepare().is_err() {
