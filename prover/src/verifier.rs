@@ -1476,7 +1476,7 @@ async fn prove_session(socket: crate::control::Socket, upstream: Option<&str>) -
     let _driver_guard = CancelDriver(driver_task.abort_handle());
     let mut session = Driver::new(driver_task);
 
-    let (server_name, transcript) = session.step(async {
+    let verifier = session.step(async {
         let verifier = handle.new_verifier(VerifierConfig::builder().root_store(RootCertStore::mozilla()).build()?)?;
         let verifier = match (verifier.commit().await?, upstream) {
             (VerifierCommitStart::Proxy(verifier), Some(upstream)) => {
@@ -1508,11 +1508,16 @@ async fn prove_session(socket: crate::control::Socket, upstream: Option<&str>) -
             verifier.close().await?;
             bail!("supplier did not reveal the server name");
         }
-        let (VerifierOutput { server_name, transcript, .. }, verifier) = verifier.accept().await?;
-        verifier.close().await?;
-        Ok((server_name, transcript))
+        Ok(verifier)
     }).await?;
-    session.finish(async { Ok(()) }, || handle.close()).await?;
+    // The prover can close after its final proof message, while queued ZK
+    // verification is still running. Drain only this final verification stage;
+    // earlier disconnects still fail immediately. The caller's expiry timeout
+    // bounds the whole session, including this one-second drain.
+    let (VerifierOutput { server_name, transcript, .. }, verifier) = session.verify(
+        async { Ok(verifier.accept().await?) }, Duration::from_secs(1)
+    ).await?;
+    session.finish(async { Ok(verifier.close().await?) }, || handle.close()).await?;
 
     let ServerName::Dns(server_name) = server_name.context("server name missing")?;
     Ok((server_name.as_str().to_owned(), transcript.context("transcript missing")?))

@@ -296,9 +296,31 @@ impl<S, E: Into<anyhow::Error>> Driver<S, E> {
         }
     }
 
+    /// Final proof verification may finish after the peer has sent its last
+    /// protocol message and closed the transport.
+    pub async fn verify<T>(&mut self, step: impl Future<Output = Result<T>>, drain: Duration) -> Result<T> {
+        let mut step = std::pin::pin!(step);
+        tokio::select! {
+            biased;
+            done = &mut step => done,
+            ended = &mut self.task => {
+                self.ended = true;
+                match ended {
+                    Ok(Ok(_)) => tokio::time::timeout(drain, step).await.context("TLSNotary final verification did not drain")?,
+                    Ok(Err(e)) => Err(e.into().context("TLSNotary session failed")),
+                    Err(e) => Err(anyhow::Error::from(e).context("TLSNotary session failed")),
+                }
+            }
+        }
+    }
+
     /// Closes the prover and then the session once the proof is sent. The
     /// verifier may hang up as soon as it has the proof, which is not a failure.
     pub async fn finish(mut self, close_prover: impl Future<Output = Result<()>>, close_session: impl FnOnce()) -> Result<()> {
+        if self.ended {
+            close_session();
+            return Ok(());
+        }
         tokio::select! {
             biased;
             closed = close_prover => closed?,
@@ -309,6 +331,78 @@ impl<S, E: Into<anyhow::Error>> Driver<S, E> {
             self.task.await?.map_err(Into::into)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod driver_tests {
+    use super::*;
+
+    async fn closed_driver() -> Driver<(), anyhow::Error> {
+        let task = tokio::spawn(async { Ok(()) });
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        Driver::new(task)
+    }
+
+    #[tokio::test]
+    async fn final_verification_drains_queued_proof_after_clean_eof() {
+        let mut driver = closed_driver().await;
+        let verified = driver.verify(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok("simulated validated output")
+        }, Duration::from_millis(100)).await.unwrap();
+        assert_eq!(verified, "simulated validated output");
+        // Once the driver has been consumed, shutdown must neither await it
+        // again nor wait for an acknowledgement from the closed peer.
+        tokio::time::timeout(Duration::from_millis(100), driver.finish(std::future::pending(), || {})).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn incomplete_final_proof_has_a_bounded_eof_drain() {
+        let mut driver = closed_driver().await;
+        let result = tokio::time::timeout(Duration::from_millis(500), driver.verify(
+            std::future::pending::<Result<()>>(), Duration::from_millis(20)
+        )).await.unwrap();
+        assert!(result.unwrap_err().to_string().contains("final verification did not drain"));
+    }
+
+    #[tokio::test]
+    async fn invalid_final_proof_is_rejected_after_clean_eof() {
+        let mut driver = closed_driver().await;
+        let error = driver.verify(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Err::<(), _>(anyhow!("invalid synthetic proof"))
+        }, Duration::from_millis(100)).await.unwrap_err();
+        assert_eq!(error.to_string(), "invalid synthetic proof");
+    }
+
+    #[tokio::test]
+    async fn eof_before_final_proof_still_fails_immediately() {
+        let mut driver = closed_driver().await;
+        let error = tokio::time::timeout(Duration::from_millis(100), driver.step(std::future::pending::<Result<()>>())).await.unwrap().unwrap_err();
+        assert_eq!(error.to_string(), "TLSNotary session closed");
+    }
+
+    #[tokio::test]
+    async fn failed_driver_does_not_drain_unverified_work() {
+        let task = tokio::spawn(async { Err::<(), _>(anyhow!("synthetic transport failure")) });
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut driver = Driver::new(task);
+        let error = tokio::time::timeout(Duration::from_millis(100), driver.verify(std::future::pending::<Result<()>>(), Duration::from_secs(1))).await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("TLSNotary session failed"));
+    }
+
+    #[tokio::test]
+    async fn outer_deadline_still_preempts_the_final_proof_drain() {
+        let mut driver = closed_driver().await;
+        let result = tokio::time::timeout(Duration::from_millis(20), driver.verify(
+            std::future::pending::<Result<()>>(), Duration::from_secs(1)
+        )).await;
+        assert!(result.is_err());
     }
 }
 
