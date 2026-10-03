@@ -143,6 +143,39 @@ function Focus-QuitShortcut {
     Write-Output 'Installed acceptance: foreground and WebView keyboard focus verified'
 }
 
+function Verify-KeyboardDelivery {
+    # UIA Invoke/SetFocus can succeed without an interactive input desktop.
+    # Prove SendKeys reaches a harmless empty field before blaming a shortcut.
+    Write-Output "Installed keyboard probe: interactive=$([Environment]::UserInteractive), session=$([System.Diagnostics.Process]::GetCurrentProcess().SessionId)"
+    $target = $null
+    foreach ($name in @('Local Codex account ID', 'Local account ID')) {
+        $condition = [System.Windows.Automation.AndCondition]::new(
+            [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::NameProperty, $name),
+            [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::Edit)
+        )
+        $target = $script:window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        if ($null -ne $target) { break }
+    }
+    $value = $null
+    if ($null -eq $target -or -not $target.Current.IsEnabled -or
+        -not $target.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$value) -or
+        $value.Current.Value -ne '') { throw 'Keyboard probe requires an empty disposable account field' }
+    $handle = $application.MainWindowHandle
+    [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
+    [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
+    $target.SetFocus()
+    Wait-Check {
+        return $target.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+    } 10 'Keyboard probe did not acquire foreground and field focus'
+    [System.Windows.Forms.SendKeys]::SendWait('keyboard-probe')
+    Wait-Check { $value.Current.Value -ceq 'keyboard-probe' } 10 'CI keyboard injection did not reach the editable control'
+    $value.SetValue('')
+    Write-Output 'Installed acceptance: synthetic keyboard delivery verified'
+}
+
 
 function Find-Input([string]$Name) {
     $condition = [System.Windows.Automation.AndCondition]::new(
@@ -318,6 +351,7 @@ try {
     Click-Button 'Start local API'
     Wait-Check { (Api-Status '/health') -eq 200 } 30 'Desktop recovery did not start the API'
     Write-Output 'Installed acceptance: unexpected exit and recovery passed'
+    Verify-KeyboardDelivery
     Focus-QuitShortcut
     [System.Windows.Forms.SendKeys]::SendWait('^q')
     if (-not $application.WaitForExit(135000)) { throw 'Installed desktop Quit did not exit' }
