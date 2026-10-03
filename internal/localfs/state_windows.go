@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -82,6 +83,40 @@ func EnsureDir(path string) error {
 			return err
 		}
 		closeHandles(checked)
+	}
+	return CheckDir(path)
+}
+
+// CreateDir claims exactly one new directory below an existing private parent.
+// The protected ACL is applied by CreateDirectory itself, so the directory is
+// never observable with an inherited ACL. Any existing entry, including an
+// older inherited-ACL directory, file or link, reports fs.ErrExist and is never
+// adopted or repaired.
+func CreateDir(path string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || len(filepath.VolumeName(path)) != 2 || strings.Contains(path[2:], ":") || filepath.Dir(path) == path {
+		return errors.New("private directory requires a clean local absolute path")
+	}
+	if err := CheckDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	sa, _, err := directorySecurity()
+	if err != nil {
+		return err
+	}
+	parents, err := parentHandles(path)
+	if err != nil {
+		return err
+	}
+	name, err := windows.UTF16PtrFromString(path)
+	if err == nil {
+		err = windows.CreateDirectory(name, sa)
+	}
+	closeHandles(parents)
+	if errors.Is(err, fs.ErrExist) {
+		return &os.PathError{Op: "mkdir", Path: path, Err: fs.ErrExist}
+	}
+	if err != nil {
+		return err
 	}
 	return CheckDir(path)
 }

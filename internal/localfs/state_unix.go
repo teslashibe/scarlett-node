@@ -35,6 +35,26 @@ func EnsureDir(path string) error {
 	return os.Chmod(path, 0700)
 }
 
+// CreateDir claims exactly one new 0700 directory below an existing private
+// parent. Any existing entry, including a link, reports fs.ErrExist and is
+// never adopted or repaired.
+func CreateDir(path string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || filepath.Dir(path) == path {
+		return errors.New("private directory requires a clean absolute path")
+	}
+	if err := CheckDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	if err := os.Mkdir(path, 0700); err != nil {
+		return err
+	}
+	// The umask can only remove owner bits here; restore exactly 0700.
+	if err := os.Chmod(path, 0700); err != nil {
+		return err
+	}
+	return CheckDir(path)
+}
+
 func SyncDir(path string) error {
 	f, err := os.Open(path)
 	if err != nil {

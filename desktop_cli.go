@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -43,6 +44,22 @@ func desktopCommand(args []string, owner io.Reader, out io.Writer) error {
 			return errors.New("desktop private storage unavailable")
 		}
 		return json.NewEncoder(out).Encode(map[string]bool{"ok": true})
+	}
+	// Exclusive reservation for a new app-owned profile. A Windows directory
+	// created without a security descriptor only inherits ACEs and can never pass
+	// CheckDir, so the protected ACL must be applied by the create itself. An
+	// existing entry is a taken name for the caller to skip, never an error.
+	if len(args) == 2 && args[0] == "private-dir-new" {
+		if !filepath.IsAbs(args[1]) || filepath.Clean(args[1]) != args[1] {
+			return errors.New("invalid private directory")
+		}
+		status := "created"
+		if err := localfs.CreateDir(args[1]); errors.Is(err, fs.ErrExist) {
+			status = "exists"
+		} else if err != nil {
+			return errors.New("desktop private storage unavailable")
+		}
+		return json.NewEncoder(out).Encode(map[string]string{"status": status})
 	}
 	if len(args) == 2 && args[0] == "bearer" {
 		key, err := desktopBearer(args[1])
@@ -97,7 +114,7 @@ func desktopCommand(args []string, owner io.Reader, out io.Writer) error {
 		}
 		return err
 	}
-	return errors.New("usage: scarlett-node desktop private-dir PATH|bearer PATH|run|api PORT")
+	return errors.New("usage: scarlett-node desktop private-dir PATH|private-dir-new PATH|bearer PATH|run|api PORT")
 }
 
 func desktopBearer(path string) (string, error) {
