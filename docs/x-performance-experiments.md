@@ -33,12 +33,20 @@ The harness initializes x-go once before measuring samples. Its public transacti
 | `SCARLETT_XPERF_MODE` | `mpc` default, `proxy` | TLSNotary proof mode |
 | `SCARLETT_XPERF_HEADERS` | `normal` default, `minimal` | Minimal removes fetch metadata, language and referer headers; authentication, cookies, CSRF, user agent, transaction ID and query fields stay intact |
 | `SCARLETT_XPERF_WORKLOAD` | `search` default, `empty`, `profile`, `post`, `pagination` | Public fixtures: Solana latest search with count 20, fixed improbable empty search, @jack profile, post 20, or two pages of the same search |
-| `SCARLETT_XPERF_SAMPLES` | `1`–`100`, default `1` | Serial fresh jobs; start with one compatibility sample before longer runs |
+| `SCARLETT_XPERF_SAMPLES` | `1` to `1000`, default `1` | Hard ceiling for fresh jobs, including a sustained run; start with one compatibility sample before longer runs |
 | `SCARLETT_XPERF_MAX_RECV` | Byte ceiling up to 262144; omitted by default | Helper receive allocation candidate; bounded oversize failure is a failed sample |
 | `SCARLETT_XPERF_SENT_RECORDS` | `3`–`32`, omitted by default | MPC sent TLS-record allocation, including protocol records |
 | `SCARLETT_XPERF_RECV_RECORDS` | `3`–`32`, omitted by default | MPC online receive TLS-record allocation, including protocol records |
 | `SCARLETT_XPERF_PREPARE_HOLD_MS` | `0`–`30000`, default `0` | Prepares a known job, holds, then begins logical demand; fresh cryptographic material is used once |
 | `SCARLETT_XPERF_RESPONSE_READY` | `0` default, `1` | Emit a numeric response-ready event to private stderr |
+| `SCARLETT_XPERF_CONCURRENCY` | `1` default, `2`, `4` | Maximum jobs admitted by the host |
+| `SCARLETT_XPERF_ACCOUNT_CAPACITY` | `1` to `4`, default `1` | In-flight job cap for the single local X account |
+| `SCARLETT_XPERF_RECEIPT_CAPACITY` | `1` to `4`, default `1` | Maximum jobs retaining a verifier session through receipt recovery |
+| `SCARLETT_XPERF_MIN_GAP_MS` | `0` to `60000`, default `1000` | Minimum gap between admissions on the same account |
+| `SCARLETT_XPERF_SUSTAINED_SECONDS` | `0` default, or `60` to `3600` | Stop admitting jobs at this measured-window deadline, then drain work already started |
+| `SCARLETT_XPERF_NETWORK_PROFILE` | `direct` default, `simulated-rtt0`, `simulated-rtt20`, `simulated-rtt80`, `simulated-rtt160` | Direct TLS or a loopback relay with 0, 10, 40 or 80 ms added one-way propagation delay |
+| `SCARLETT_XPERF_BANDWIDTH_BYTES_SECOND` | `0` default, or `1` to `1000000000` | Aggregate relay serialization rate in each direction; zero leaves bandwidth unlimited; requires a simulated profile |
+| `SCARLETT_XPERF_VERIFIER_SERVER_NAME` | Omitted default, verifier certificate DNS name | Optional TLS identity for a verifier reached through a literal loopback socket; requires the matching experimental helper |
 
 Proxy samples require a separate verifier started with `SCARLETT_VERIFIER_X_PROXY_EXPERIMENT=1`. Their control payload includes `proof_mode: "proxy"` and `proof_policy: "x-proxy-experimental-v1"`; changing only the helper setting cannot downgrade a production MPC job. MPC allocation and preparation options are rejected on Proxy samples.
 
@@ -48,9 +56,11 @@ The two-page workload currently uses one proven connection per page. It provides
 
 After every attempted job, the harness independently reads its verifier receipt. A sample counts as verified only when the receipt is complete, no exchanges remain pending, all attempts have been consumed, and no rejection occurred. Each exchange must be fulfilled with HTTP 200 and match its index, exact typed request, decoded response body SHA256 and provider transcript byte counts. Paginated requests use the cursor parsed from the preceding response. An empty search must actually return no requested posts.
 
-The runner stops on the first failure, including authentication and rate limits. It never retries ambiguous provider work or reuses a completed token. A failure creates an explicit metrics row, so a short successful prefix cannot conceal the rejected attempt.
+The runner stops new admissions on the first failure, including authentication and rate limits, or a proven response whose `X-Rate-Limit-Remaining` is zero. It also checks that stop before creating a verifier session and before each provider exchange. Work already executing drains to its receipt; an in-flight provider call can finish after the stop. It never retries ambiguous provider work or reuses a completed token. A failure creates an explicit metrics row, so a short successful prefix cannot conceal the rejected attempt.
 
-`metrics.jsonl` contains fixed variant/status labels and numeric measurements. It excludes session values, verifier tokens, account identifiers, request URLs, cursor values, result bodies and raw diagnostics. `manifest.json` records the source revision, tracked diff hash, experiment file hashes, helper binary hash and test topology facts. Pin and commit the experiment files before publishing a reproducibility claim.
+Rate-limit limit, remaining and reset headers enter metrics only as bounded integers from the proven HTTP response. Missing or malformed values stay absent. A 429 or zero remaining sets the account cooldown to at least 30 seconds and extends it to an observed later reset. An authentication failure blocks that account. These states stop the whole run; the runner never rotates accounts or automatically resumes after a cooldown. If the helper fails before returning a response, quota headers remain unknown. Read the final receipt recovery flags, pending attempts and rejection counts before beginning another run.
+
+`metrics.jsonl` contains fixed variant/status labels and numeric measurements. `run-summary.json` preserves the full admission and drain window, including an idle wait at the end of a sustained window. Concurrent rows carry queue wait, host/account/receipt caps, the run timestamps and the observed single-account scope. It excludes session values, verifier tokens, account identifiers, request URLs, cursor values, result bodies and raw diagnostics. `manifest.json` records the source revision, tracked diff hash, experiment file hashes, helper binary hash and test topology facts. Pin and commit the experiment files before publishing a reproducibility claim.
 
 `run.log`, `build.log` and bounded helper `*.stderr` diagnostics remain private. Do not paste them into reports or chats. The response-ready event contributes only its whitelisted elapsed time. CPU and peak RSS refer to the helper process; Go parsing, the verifier and provider resources require separate host instrumentation.
 
@@ -60,7 +70,25 @@ Verifier traffic counters measure accepted TCP payload bytes, including the veri
 scripts/xperf-report.py /absolute/private/runs/mpc-search-001/metrics.jsonl
 ```
 
-The report uses nearest-rank p50/p95, includes actual successes and failures, and flags fewer than 30 successful samples. Throughput covers the recorded serial window, including gaps and failures. It is not a concurrency or long-running capacity benchmark. Interleave fresh baseline and candidate runs, then measure concurrency and sustained capacity separately.
+The report uses nearest-rank p50/p95, includes actual successes and failures, and flags fewer than 30 successful samples. Its Wilson 95% interval describes the fraction of attempted jobs that verified. It assumes independent attempts; a shared account or correlated failures can make that assumption unsuitable. Latency uncertainty needs separate analysis. Throughput uses the elapsed experiment windows, including queue gaps, failures and drain time. It sums distinct input-file windows instead of counting time between separate runs. Profiles and capacity limits remain separate groups. The report includes observed overlapping jobs and the effective capacity ceiling, so requesting four workers with account capacity one cannot be reported as four active jobs.
+
+A sustained window passes only with at least 30 successful jobs, no failures or stop, and a recorded duration covering the requested window of at least 60 seconds. Reaching the sample ceiling early remains a short run. A passing local experiment alone does not establish stable production capacity. Interleave fresh baseline and candidate runs using the same workload, allocations, mode, account gap and sample/window limits.
+
+## Concurrency and simulated network profiles
+
+The live harness reads one local session and creates one x-go client. The client is safe for concurrent use; each job owns its mutable request capture and typed-response replay state through its context. Every job gets a fresh verifier registration, fence and exact request hash, and each receipt remains matched to that job. Admission retains account and receipt capacity through final receipt polling. The existing production `servicePool` keeps ownership of production services and credentials; this experiment does not change it.
+
+Start at concurrency one. Raising host concurrency to two or four still leaves the default account and receipt caps at one. Set those caps explicitly only for a permitted account/verifier-capacity experiment. A single real account can measure concurrent reads on that account, but cannot validate independent multiple-account throughput. Synthetic selection tests exercise independent fixture accounts, cooldown and backpressure without creating or reading additional real sessions.
+
+`scripts/xperf.sh` starts `scripts/xperf-shaper.py` for a simulated profile, binds it to `127.0.0.1` on a fresh port, and stops it when the run exits. Python 3.11 or later is required. The shaper validates an initial TLS handshake record, then relays opaque TCP bytes without terminating TLS, decrypting traffic or logging payloads. The helper still authenticates the verifier certificate using its normal CA and hostname checks. The control API and X provider link are outside the shaped path.
+
+For a local certificate with a `127.0.0.1` SAN, use the existing verifier CA file. To shape a remote verifier with a DNS certificate, set `SCARLETT_XPERF_VERIFIER_SERVER_NAME` to its certificate hostname and use a helper that supports `verifier_server_name`. That helper permits the override only with a literal loopback TLS dial socket and still validates the original certificate name and CA. Do not disable certificate validation. The harness refuses a simulated profile unless its private relay-ready file matches the active loopback endpoint, profile, delay and bandwidth.
+
+The relay schedules each chunk from arrival time plus propagation delay. Bandwidth adds serialization time using one shared schedule per direction across connections. It does not sleep for the full propagation delay after every preceding chunk. Queues preserve byte order, apply backpressure and hold at most 32 queued chunks of 16 KiB per direction per connection, plus a reader and writer chunk. Stream buffers are separately bounded. Upload EOF propagates as a TCP half-close while downloads finish. Errors cancel both directions, release queued bytes and connection slots, and clear serialization reservations once the relay becomes idle. The relay admits at most the requested host concurrency, capped at four.
+
+`shaper-stats.json` contains only fixed topology/profile labels, booleans and numeric accepted/completed/rejected/error, byte, elapsed-time and peak-queue/connection counters. TLS headers and handshake traffic contribute to the byte totals. They exclude IP/TCP headers and retransmissions. The relay never contains X credentials in plaintext. Its elapsed interval includes relay startup, bootstrap and measured work; use `run-summary.json` for verified throughput.
+
+For a paired comparison, keep all other options identical and use fresh output directories. Compare `simulated-rtt0` with `simulated-rtt80` at the same bandwidth to measure 80 ms of added RTT on the verifier link. Pair both at concurrency one before increasing concurrency. Record each manifest and final relay counter file; a failed run remains a failed sample. These tags describe added latency on the existing path, not total measured RTT, an actual regional deployment or a different provider egress IP. Real regional placement and datacenter X compatibility require separately deployed verifiers and live measurements.
 
 ## Offline checks
 
@@ -69,4 +97,4 @@ scripts/xperf.sh --offline
 scripts/xperf-report.py --self-test
 ```
 
-These checks perform no provider calls. They cover exact request capture, private file permissions, credential-free control payloads and measurements, candidate transport preservation, experimental policy binding, receipt rejection and numeric report generation. Live calls require both the `xperf` build tag and `SCARLETT_XPERF=1`.
+These checks perform no provider calls. They cover exact request capture, private file permissions, credential-free control payloads and measurements, candidate transport preservation, experimental policy binding, receipt rejection, concurrent job capture, account cooldown/backpressure and numeric report generation. Relay checks cover deterministic delay/serialization scheduling, valid-CA TLS hostname checks, byte order, half-close, connection limits and recovery. Relay fixtures use disposable synthetic certificates and loopback data only. Live calls require both the `xperf` build tag and `SCARLETT_XPERF=1`.

@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -24,6 +25,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -35,15 +37,17 @@ import (
 // This harness is experimental and deliberately independent of XTransport's
 // production defaults. Credentials enter only through private local files.
 type xperfConfig struct {
-	session, prover, verifier, ca, api, key, output string
-	mode, headers, workload                         string
-	samples, maxRecv, sentRecords, recvRecords      int
-	prepareHoldMS                                   int
-	responseReady                                   bool
+	session, prover, verifier, ca, api, key, output         string
+	mode, headers, workload, networkProfile, serverName     string
+	samples, maxRecv, sentRecords, recvRecords              int
+	prepareHoldMS                                           int
+	responseReady                                           bool
+	concurrency, accountCapacity, receiptCapacity           int
+	minGapMS, sustainedSeconds, simulatedDelayMS, bandwidth int
 }
 
 func xperfConfiguration() (xperfConfig, error) {
-	c := xperfConfig{session: os.Getenv("SCARLETT_X_SESSION"), prover: os.Getenv("SCARLETT_PROVER"), verifier: os.Getenv("SCARLETT_VERIFIER"), ca: os.Getenv("SCARLETT_VERIFIER_CA_FILE"), api: os.Getenv("SCARLETT_VERIFIER_API"), output: os.Getenv("SCARLETT_XPERF_OUTPUT"), mode: os.Getenv("SCARLETT_XPERF_MODE"), headers: os.Getenv("SCARLETT_XPERF_HEADERS"), workload: os.Getenv("SCARLETT_XPERF_WORKLOAD")}
+	c := xperfConfig{session: os.Getenv("SCARLETT_X_SESSION"), prover: os.Getenv("SCARLETT_PROVER"), verifier: os.Getenv("SCARLETT_VERIFIER"), ca: os.Getenv("SCARLETT_VERIFIER_CA_FILE"), api: os.Getenv("SCARLETT_VERIFIER_API"), output: os.Getenv("SCARLETT_XPERF_OUTPUT"), mode: os.Getenv("SCARLETT_XPERF_MODE"), headers: os.Getenv("SCARLETT_XPERF_HEADERS"), workload: os.Getenv("SCARLETT_XPERF_WORKLOAD"), networkProfile: os.Getenv("SCARLETT_XPERF_NETWORK_PROFILE"), serverName: os.Getenv("SCARLETT_XPERF_VERIFIER_SERVER_NAME")}
 	if c.mode == "" {
 		c.mode = "mpc"
 	}
@@ -62,11 +66,17 @@ func xperfConfiguration() (xperfConfig, error) {
 		out           *int
 		def, min, max int
 	}{
-		{"SCARLETT_XPERF_SAMPLES", &c.samples, 1, 1, 100},
+		{"SCARLETT_XPERF_SAMPLES", &c.samples, 1, 1, 1000},
 		{"SCARLETT_XPERF_MAX_RECV", &c.maxRecv, 0, 0, 256 << 10},
 		{"SCARLETT_XPERF_SENT_RECORDS", &c.sentRecords, 0, 0, 32},
 		{"SCARLETT_XPERF_RECV_RECORDS", &c.recvRecords, 0, 0, 32},
 		{"SCARLETT_XPERF_PREPARE_HOLD_MS", &c.prepareHoldMS, 0, 0, 30000},
+		{"SCARLETT_XPERF_CONCURRENCY", &c.concurrency, 1, 1, 4},
+		{"SCARLETT_XPERF_ACCOUNT_CAPACITY", &c.accountCapacity, 1, 1, 4},
+		{"SCARLETT_XPERF_RECEIPT_CAPACITY", &c.receiptCapacity, 1, 1, 4},
+		{"SCARLETT_XPERF_MIN_GAP_MS", &c.minGapMS, 1000, 0, 60000},
+		{"SCARLETT_XPERF_SUSTAINED_SECONDS", &c.sustainedSeconds, 0, 0, 3600},
+		{"SCARLETT_XPERF_BANDWIDTH_BYTES_SECOND", &c.bandwidth, 0, 0, 1000000000},
 	} {
 		*p.out = p.def
 		if value := os.Getenv(p.name); value != "" {
@@ -74,6 +84,23 @@ func xperfConfiguration() (xperfConfig, error) {
 		}
 		if err != nil || *p.out < p.min || *p.out > p.max {
 			return c, errors.New("invalid_variant")
+		}
+	}
+	if c.concurrency != 1 && c.concurrency != 2 && c.concurrency != 4 || c.sustainedSeconds > 0 && c.sustainedSeconds < 60 {
+		return c, errors.New("invalid_capacity_or_window")
+	}
+	if c.networkProfile == "" {
+		c.networkProfile = "direct"
+	}
+	var ok bool
+	c.simulatedDelayMS, ok = xperfNetworkDelay(c.networkProfile)
+	if !ok || c.networkProfile == "direct" && c.bandwidth != 0 {
+		return c, errors.New("invalid_network_profile")
+	}
+	if c.serverName != "" {
+		host, _, e := net.SplitHostPort(c.verifier)
+		if e != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() || len(c.serverName) > 253 || strings.ContainsAny(c.serverName, "/:@ \t\r\n") {
+			return c, errors.New("unsafe_verifier_server_name")
 		}
 	}
 	if c.sentRecords != 0 && c.sentRecords < 3 || c.recvRecords != 0 && c.recvRecords < 3 {
@@ -93,6 +120,20 @@ func xperfConfiguration() (xperfConfig, error) {
 	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Scheme != "https" && !(u.Scheme == "http" && (u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" || u.Hostname() == "::1")) {
 		return c, errors.New("unsafe_control_origin")
 	}
+	if c.networkProfile != "direct" {
+		raw, e := xperfPrivateRead(filepath.Join(c.output, "shaper-ready.json"), 4096)
+		var ready struct {
+			Schema    int    `json:"schema"`
+			Listen    string `json:"listen"`
+			Topology  string `json:"topology"`
+			Profile   string `json:"profile"`
+			Delay     int    `json:"simulated_one_way_delay_ms"`
+			Bandwidth int    `json:"bandwidth_bytes_second"`
+		}
+		if e != nil || json.Unmarshal(raw, &ready) != nil || ready.Schema != 1 || ready.Listen != c.verifier || ready.Topology != "simulated_loopback_tcp_tls" || ready.Profile != c.networkProfile || ready.Delay != c.simulatedDelayMS || ready.Bandwidth != c.bandwidth {
+			return c, errors.New("simulated_shaper_binding_missing")
+		}
+	}
 	c.api = strings.TrimRight(c.api, "/")
 	key, err := xperfPrivateRead(os.Getenv("SCARLETT_VERIFIER_KEY_FILE"), 4096)
 	if err != nil {
@@ -106,6 +147,21 @@ func xperfConfiguration() (xperfConfig, error) {
 		return c, err
 	}
 	return c, nil
+}
+
+func xperfNetworkDelay(profile string) (int, bool) {
+	switch profile {
+	case "direct", "simulated-rtt0":
+		return 0, true
+	case "simulated-rtt20":
+		return 10, true
+	case "simulated-rtt80":
+		return 40, true
+	case "simulated-rtt160":
+		return 80, true
+	default:
+		return 0, false
+	}
 }
 
 func xperfWorkloadAllowed(v string) bool {
@@ -145,6 +201,21 @@ type xperfCapture struct {
 	request    *http.Request
 	replaySpec *xSpec
 	replayBody []byte
+}
+
+// A single account's x-go client remains shared; mutable capture/replay state
+// belongs to the individual job context and cannot cross concurrent jobs.
+type xperfCaptureKey struct{}
+type xperfRouter struct{ bootstrap *xperfCapture }
+
+func (r *xperfRouter) RoundTrip(req *http.Request) (*http.Response, error) {
+	if capture, ok := req.Context().Value(xperfCaptureKey{}).(*xperfCapture); ok {
+		return capture.RoundTrip(req)
+	}
+	if r.bootstrap != nil && r.bootstrap.bootstrap {
+		return r.bootstrap.RoundTrip(req)
+	}
+	return nil, errors.New("request_capture_failed")
 }
 
 var errXPerfCaptured = errors.New("xperf_request_captured")
@@ -294,6 +365,9 @@ func xperfProverInput(c xperfConfig, token string, req *http.Request) ([]byte, i
 		return nil, 0, errors.New("request_serialization")
 	}
 	p := map[string]any{"verifier": c.verifier, "token": token, "request": base64.StdEncoding.EncodeToString(raw.Bytes()), "proof_mode": c.mode}
+	if c.serverName != "" {
+		p["verifier_server_name"] = c.serverName
+	}
 	if c.ca != "" {
 		p["verifier_ca_file"] = c.ca
 	}
@@ -332,14 +406,17 @@ type xperfSummary struct {
 }
 
 type xperfObserved struct {
-	spec                             xSpec
-	bodyHash                         [32]byte
-	bodyBytes, items, httpStatus     int
-	summary                          xperfSummary
-	helperMS                         int64
-	userCPUSeconds, systemCPUSeconds float64
-	peakRSSBytes                     int64
-	provisionalMS                    *uint64
+	spec                                                xSpec
+	bodyHash                                            [32]byte
+	bodyBytes, items, httpStatus                        int
+	summary                                             xperfSummary
+	helperMS                                            int64
+	userCPUSeconds, systemCPUSeconds                    float64
+	peakRSSBytes                                        int64
+	provisionalMS                                       *uint64
+	rateLimit, rateRemaining, rateReset                 *uint64
+	receiptObserved, receiptBound, receiptComplete      bool
+	receiptPending, receiptRemaining, receiptRejections int
 }
 
 func xperfProve(ctx context.Context, c xperfConfig, token string, req *http.Request, diagnostic string) (xperfObserved, []byte, error) {
@@ -397,6 +474,9 @@ func xperfProve(ctx context.Context, c xperfConfig, token string, req *http.Requ
 	}
 	defer resp.Body.Close()
 	o.httpStatus = resp.StatusCode
+	o.rateLimit = xperfNumericHeader(resp.Header, "X-Rate-Limit-Limit")
+	o.rateRemaining = xperfNumericHeader(resp.Header, "X-Rate-Limit-Remaining")
+	o.rateReset = xperfNumericHeader(resp.Header, "X-Rate-Limit-Reset")
 	var reader io.Reader = resp.Body
 	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
 		z, err := gzip.NewReader(resp.Body)
@@ -421,6 +501,23 @@ func xperfProve(ctx context.Context, c xperfConfig, token string, req *http.Requ
 		return o, nil, errors.New("provider_http_failed")
 	}
 	return o, body, nil
+}
+
+func xperfNumericHeader(h http.Header, name string) *uint64 {
+	v := h.Values(name)
+	if len(v) != 1 || len(v[0]) == 0 || len(v[0]) > 20 {
+		return nil
+	}
+	for _, b := range v[0] {
+		if b < '0' || b > '9' {
+			return nil
+		}
+	}
+	n, err := strconv.ParseUint(v[0], 10, 64)
+	if err != nil || n > 1e12 {
+		return nil
+	}
+	return &n
 }
 
 func xperfProvisional(raw []byte) *uint64 {
@@ -600,16 +697,64 @@ type xperfMetric struct {
 	SystemCPUSeconds   float64           `json:"helper_system_cpu_seconds"`
 	PeakRSSBytes       int64             `json:"helper_peak_rss_bytes"`
 	Timings            map[string]uint64 `json:"timings_ms"`
+	Concurrency        int               `json:"concurrency"`
+	AccountCapacity    int               `json:"account_capacity"`
+	ReceiptCapacity    int               `json:"receipt_capacity"`
+	RealAccounts       int               `json:"real_accounts"`
+	QueueWaitMS        int64             `json:"queue_wait_ms"`
+	RunStartNS         int64             `json:"run_start_unix_ns"`
+	RunFinishNS        int64             `json:"run_finish_unix_ns"`
+	SustainedSeconds   int               `json:"sustained_seconds"`
+	NetworkProfile     string            `json:"network_profile"`
+	SimulatedDelayMS   int               `json:"simulated_one_way_delay_ms"`
+	Bandwidth          int               `json:"bandwidth_bytes_second"`
+	RateLimit          *uint64           `json:"rate_limit_limit,omitempty"`
+	RateRemaining      *uint64           `json:"rate_limit_remaining,omitempty"`
+	RateReset          *uint64           `json:"rate_limit_reset_epoch_seconds,omitempty"`
+	ReceiptObserved    bool              `json:"receipt_observed"`
+	ReceiptBound       bool              `json:"receipt_bound"`
+	ReceiptComplete    bool              `json:"receipt_complete"`
+	ReceiptPending     int               `json:"receipt_pending"`
+	ReceiptRemaining   int               `json:"receipt_remaining_attempts"`
+	ReceiptRejections  int               `json:"receipt_rejections"`
 }
 
 func xperfMeasurement(c xperfConfig, sample int, started time.Time, observations []xperfObserved, receiptMS int64, failure string) xperfMetric {
 	now := time.Now()
 	m := xperfMetric{Schema: 1, Sample: sample, Mode: c.mode, Headers: c.headers, Workload: c.workload, Status: "verified", Verified: failure == "", StartNS: started.UnixNano(), FinishNS: now.UnixNano(), DurationMS: now.Sub(started).Milliseconds(), ReceiptWaitMS: receiptMS, Exchanges: len(observations), MaxRecv: c.maxRecv, SentRecords: c.sentRecords, RecvRecords: c.recvRecords, PrepareHoldMS: c.prepareHoldMS, TransportComplete: len(observations) > 0, Timings: map[string]uint64{}}
+	m.Concurrency, m.AccountCapacity, m.ReceiptCapacity = c.concurrency, c.accountCapacity, c.receiptCapacity
+	m.RealAccounts, m.SustainedSeconds = 1, c.sustainedSeconds
+	m.NetworkProfile, m.SimulatedDelayMS, m.Bandwidth = c.networkProfile, c.simulatedDelayMS, c.bandwidth
+	if m.NetworkProfile == "" {
+		m.NetworkProfile = "direct"
+	}
+	if m.Concurrency == 0 {
+		m.Concurrency = 1
+	}
+	if m.AccountCapacity == 0 {
+		m.AccountCapacity = 1
+	}
+	if m.ReceiptCapacity == 0 {
+		m.ReceiptCapacity = 1
+	}
 	if failure != "" {
 		m.Status = xperfFailureLabel(failure)
 	}
 	for _, o := range observations {
 		s := o.summary
+		if o.receiptObserved {
+			m.ReceiptObserved, m.ReceiptBound, m.ReceiptComplete = true, o.receiptBound, o.receiptComplete
+			m.ReceiptPending, m.ReceiptRemaining, m.ReceiptRejections = o.receiptPending, o.receiptRemaining, o.receiptRejections
+		}
+		if o.rateLimit != nil {
+			m.RateLimit = o.rateLimit
+		}
+		if o.rateRemaining != nil {
+			m.RateRemaining = o.rateRemaining
+		}
+		if o.rateReset != nil {
+			m.RateReset = o.rateReset
+		}
 		if s.Status != "proof_sent" || s.Mode != c.mode || s.VerifierSent == nil || s.VerifierReceived == nil || s.TransportLayer != "tcp_payload" || s.TransportSaturated || s.VerifierSent != nil && *s.VerifierSent > 1<<40 || s.VerifierReceived != nil && *s.VerifierReceived > 1<<40 {
 			m.TransportComplete = false
 		} else {
@@ -646,7 +791,7 @@ func xperfMeasurement(c xperfConfig, sample int, started time.Time, observations
 
 func xperfFailureLabel(failure string) string {
 	switch failure {
-	case "bootstrap_failed", "request_capture_failed", "request_policy", "request_serialization", "random_source_failed", "control_request_invalid", "control_unavailable", "control_rejected", "control_response_invalid", "control_token_invalid", "private_diagnostic_write_failed", "helper_failed", "helper_summary_invalid", "helper_response_invalid", "provider_rate_limited", "provider_auth_failed", "provider_http_failed", "typed_result_parse_failed", "pagination_cursor_missing_or_stuck", "receipt_timeout", "receipt_incomplete_or_rejected", "receipt_mismatch", "receipt_proof_mode_mismatch", "receipt_binding_mismatch":
+	case "bootstrap_failed", "request_capture_failed", "request_policy", "request_serialization", "random_source_failed", "control_request_invalid", "control_unavailable", "control_rejected", "control_response_invalid", "control_token_invalid", "private_diagnostic_write_failed", "helper_failed", "helper_summary_invalid", "helper_response_invalid", "provider_rate_limited", "provider_auth_failed", "provider_http_failed", "typed_result_parse_failed", "pagination_cursor_missing_or_stuck", "receipt_timeout", "receipt_incomplete_or_rejected", "receipt_mismatch", "receipt_proof_mode_mismatch", "receipt_binding_mismatch", "provider_quota_exhausted", "account_backpressure", "experiment_window_expired", "metrics_write_failed":
 		return failure
 	default:
 		return "experiment_failed"
@@ -678,31 +823,56 @@ func TestXPerformance(t *testing.T) {
 	defer base.CloseIdleConnections()
 	control := &http.Client{Transport: base, Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	capture := &xperfCapture{bootstrap: true, base: base}
-	client, err := session.NewClient(ctx, x.WithHTTPClient(&http.Client{Timeout: 2 * time.Minute, Transport: capture}), x.WithRetry(1, time.Millisecond), x.WithMinRequestGap(0))
+	router := &xperfRouter{bootstrap: capture}
+	client, err := session.NewClient(ctx, x.WithHTTPClient(&http.Client{Timeout: 2 * time.Minute, Transport: router}), x.WithRetry(1, time.Millisecond), x.WithMinRequestGap(0))
 	if err != nil {
 		_ = enc.Encode(xperfMeasurement(c, 0, time.Now(), nil, 0, "bootstrap_failed"))
 		_ = metrics.Sync()
 		t.Fatal("bootstrap_failed; no proof was attempted")
 	}
 	capture.bootstrap = false
-	for sample := 1; sample <= c.samples; sample++ {
+	var runStartNS int64
+	results, failure := xperfRun(ctx, c, func(jobCtx context.Context, sample int) xperfMetric {
 		started := time.Now()
-		observations, receiptMS, failure := xperfSample(ctx, c, sample, control, client, capture)
-		if err := enc.Encode(xperfMeasurement(c, sample, started, observations, receiptMS, failure)); err != nil {
-			t.Fatal("metrics_write_failed")
+		capture := &xperfCapture{}
+		jobCtx = context.WithValue(jobCtx, xperfCaptureKey{}, capture)
+		observations, receiptMS, failed := xperfSample(jobCtx, c, sample, control, client, capture)
+		return xperfMeasurement(c, sample, started, observations, receiptMS, failed)
+	}, func(m xperfMetric) error {
+		if runStartNS == 0 {
+			runStartNS = m.RunStartNS
 		}
-		if err := metrics.Sync(); err != nil {
-			t.Fatal("metrics_write_failed")
+		if err := enc.Encode(m); err != nil {
+			return err
 		}
-		if failure != "" {
-			t.Fatal(failure + "; stopped without retrying provider work")
-		}
+		return metrics.Sync()
+	})
+	runSummary, summaryErr := os.OpenFile(filepath.Join(c.output, "run-summary.json"), os.O_WRONLY|os.O_CREATE|os.O_EXCL|unix.O_NOFOLLOW, 0600)
+	if summaryErr != nil {
+		t.Fatal("run_summary_write_failed")
 	}
+	summaryErr = json.NewEncoder(runSummary).Encode(map[string]any{"schema": 1, "start_unix_ns": runStartNS, "finish_unix_ns": time.Now().UnixNano(), "attempted_jobs": results, "sample_ceiling": c.samples, "sustained_seconds": c.sustainedSeconds, "stopped": failure != "", "status": func() string {
+		if failure == "" {
+			return "complete"
+		}
+		return xperfFailureLabel(failure)
+	}()})
+	syncErr, closeErr := runSummary.Sync(), runSummary.Close()
+	if summaryErr != nil || syncErr != nil || closeErr != nil {
+		t.Fatal("run_summary_write_failed")
+	}
+	if failure != "" {
+		t.Fatalf("%s; stopped without retrying provider work; recorded attempts=%d", xperfFailureLabel(failure), results)
+	}
+
 }
 
 func xperfSample(parent context.Context, c xperfConfig, sample int, control *http.Client, client *x.Client, capture *xperfCapture) ([]xperfObserved, int64, string) {
 	ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
 	defer cancel()
+	if xperfStopped(ctx) {
+		return nil, 0, "account_backpressure"
+	}
 	specs, request, err := xperfPlan(ctx, client, capture, c.workload)
 	if err != nil {
 		return nil, 0, err.Error()
@@ -719,6 +889,9 @@ func xperfSample(parent context.Context, c xperfConfig, sample int, control *htt
 	var created struct {
 		Token string `json:"token"`
 	}
+	if xperfStopped(ctx) {
+		return nil, 0, "account_backpressure"
+	}
 	if err := xperfAPI(ctx, control, c, http.MethodPost, "/v1/sessions", registration, &created); err != nil {
 		return nil, 0, err.Error()
 	}
@@ -728,6 +901,10 @@ func xperfSample(parent context.Context, c xperfConfig, sample int, control *htt
 	observations := make([]xperfObserved, 0, len(specs))
 	failure, cursor := "", ""
 	for i := range specs {
+		if xperfStopped(ctx) {
+			failure = "account_backpressure"
+			break
+		}
 		if i > 0 {
 			capture.replaySpec, capture.request = nil, nil
 			_, _ = xperfRead(ctx, client, c.workload, cursor)
@@ -741,7 +918,11 @@ func xperfSample(parent context.Context, c xperfConfig, sample int, control *htt
 		observations = append(observations, o)
 		if err != nil {
 			failure = err.Error()
+			xperfStopNow(ctx)
 			break
+		}
+		if o.rateRemaining != nil && *o.rateRemaining == 0 {
+			xperfStopNow(ctx)
 		}
 		capture.replaySpec, capture.replayBody = &o.spec, body
 		parsed, err := xperfRead(ctx, client, c.workload, cursor)
@@ -760,6 +941,12 @@ func xperfSample(parent context.Context, c xperfConfig, sample int, control *htt
 	started := time.Now()
 	r, err := xperfWait(ctx, control, c, job, len(observations))
 	receiptMS := time.Since(started).Milliseconds()
+	if len(observations) > 0 && err == nil {
+		last := &observations[len(observations)-1]
+		last.receiptObserved, last.receiptBound = true, xperfCheckBinding(r, binding) == nil
+		last.receiptComplete = r.Complete && len(r.Pending) == 0 && r.Remaining == 0
+		last.receiptPending, last.receiptRemaining, last.receiptRejections = len(r.Pending), r.Remaining, len(r.Rejections)
+	}
 	if failure == "" {
 		if err != nil {
 			failure = err.Error()
@@ -916,5 +1103,395 @@ func TestXPerfDurableRegistrationFenceAndExpiry(t *testing.T) {
 	r.ExpiresMS++
 	if xperfCheckBinding(r, binding) == nil {
 		t.Fatal("altered expiry accepted")
+	}
+}
+
+// Admission state is experiment-only. Production service/account ownership stays
+// in the existing servicePool; live xperf supplies exactly one local account.
+type xperfAccount struct {
+	capacity, inFlight int
+	next, cooldown     time.Time
+	authBlocked        bool
+}
+type xperfAdmission struct {
+	accounts                                []xperfAccount
+	hostCapacity, receiptCapacity, inFlight int
+	gap                                     time.Duration
+	stopped                                 bool
+}
+
+func (a *xperfAdmission) acquire(now time.Time) (int, time.Time) {
+	if a.stopped || a.inFlight >= a.hostCapacity || a.inFlight >= a.receiptCapacity {
+		return -1, time.Time{}
+	}
+	var wake time.Time
+	for i := range a.accounts {
+		account := &a.accounts[i]
+		if account.authBlocked || account.inFlight >= account.capacity {
+			continue
+		}
+		next := account.next
+		if account.cooldown.After(next) {
+			next = account.cooldown
+		}
+		if next.After(now) {
+			if wake.IsZero() || next.Before(wake) {
+				wake = next
+			}
+			continue
+		}
+		account.inFlight++
+		a.inFlight++
+		account.next = now.Add(a.gap)
+		return i, time.Time{}
+	}
+	return -1, wake
+}
+func (a *xperfAdmission) finish(index int, now time.Time, m xperfMetric) {
+	account := &a.accounts[index]
+	account.inFlight--
+	a.inFlight--
+	quota := m.Status == "provider_rate_limited" || m.RateRemaining != nil && *m.RateRemaining == 0
+	if quota {
+		account.cooldown = now.Add(30 * time.Second)
+		if m.RateReset != nil && *m.RateReset <= 1e12 {
+			reset := time.Unix(int64(*m.RateReset), 0)
+			if reset.After(account.cooldown) {
+				account.cooldown = reset
+			}
+		}
+	}
+	if m.Status == "provider_auth_failed" {
+		account.authBlocked = true
+	}
+	// Any failure stops the whole experiment. Even synthetic independent
+	// accounts cannot be selected to continue around an authoritative limit.
+	if !m.Verified || quota {
+		a.stopped = true
+	}
+}
+
+type xperfStop struct {
+	mu      sync.Mutex
+	stopped bool
+}
+type xperfStopKey struct{}
+
+func (s *xperfStop) stop()           { s.mu.Lock(); s.stopped = true; s.mu.Unlock() }
+func (s *xperfStop) isStopped() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.stopped }
+func xperfStopped(ctx context.Context) bool {
+	stop, _ := ctx.Value(xperfStopKey{}).(*xperfStop)
+	return stop != nil && stop.isStopped()
+}
+func xperfStopNow(ctx context.Context) {
+	if stop, _ := ctx.Value(xperfStopKey{}).(*xperfStop); stop != nil {
+		stop.stop()
+	}
+}
+
+// The dispatcher owns admission and output. Workers publish stop before their
+// result enters the channel, then already-started work drains to its receipt.
+// An ambiguous provider attempt is never resubmitted.
+func xperfRun(ctx context.Context, c xperfConfig, perform func(context.Context, int) xperfMetric, record func(xperfMetric) error) (int, string) {
+	started := time.Now()
+	deadline := time.Time{}
+	if c.sustainedSeconds > 0 {
+		deadline = started.Add(time.Duration(c.sustainedSeconds) * time.Second)
+	}
+	admission := xperfAdmission{accounts: []xperfAccount{{capacity: c.accountCapacity}}, hostCapacity: c.concurrency, receiptCapacity: c.receiptCapacity, gap: time.Duration(c.minGapMS) * time.Millisecond}
+	stop := &xperfStop{}
+	ctx = context.WithValue(ctx, xperfStopKey{}, stop)
+	type result struct {
+		account int
+		metric  xperfMetric
+	}
+	done := make(chan result, c.concurrency)
+	next, recorded, failure := 1, 0, ""
+	queued := started
+	for {
+		now := time.Now()
+		withinWindow := deadline.IsZero() || now.Before(deadline)
+		var wake time.Time
+		for next <= c.samples && withinWindow && ctx.Err() == nil && !stop.isStopped() {
+			account, later := admission.acquire(time.Now())
+			if account < 0 {
+				wake = later
+				break
+			}
+			sample, queueWait := next, time.Since(queued).Milliseconds()
+			next++
+			queued = time.Now()
+			go func() {
+				m := perform(ctx, sample)
+				m.QueueWaitMS, m.RunStartNS = queueWait, started.UnixNano()
+				if !m.Verified || m.RateRemaining != nil && *m.RateRemaining == 0 {
+					stop.stop()
+				}
+				done <- result{account: account, metric: m}
+			}()
+			now = time.Now()
+			withinWindow = deadline.IsZero() || now.Before(deadline)
+		}
+		if admission.inFlight == 0 && (next > c.samples || !withinWindow || ctx.Err() != nil || stop.isStopped() || admission.stopped) {
+			break
+		}
+		if ctx.Err() != nil {
+			stop.stop()
+			if failure == "" {
+				failure = "experiment_window_expired"
+			}
+		}
+		// Wake for an admission gap or the measured window. Completed workers
+		// also wake the dispatcher; no polling or unbounded queue is needed.
+		if !deadline.IsZero() && withinWindow && (wake.IsZero() || deadline.Before(wake)) {
+			wake = deadline
+		}
+		var timer *time.Timer
+		var timerC <-chan time.Time
+		if !wake.IsZero() {
+			timer = time.NewTimer(time.Until(wake))
+			timerC = timer.C
+		}
+		select {
+		case r := <-done:
+			if timer != nil {
+				timer.Stop()
+			}
+			r.metric.RunFinishNS = time.Now().UnixNano()
+			admission.finish(r.account, time.Now(), r.metric)
+			recorded++
+			if err := record(r.metric); err != nil {
+				stop.stop()
+				if failure == "" {
+					failure = "metrics_write_failed"
+				}
+			}
+			if !r.metric.Verified && failure == "" {
+				failure = r.metric.Status
+			}
+			if r.metric.RateRemaining != nil && *r.metric.RateRemaining == 0 && failure == "" {
+				failure = "provider_quota_exhausted"
+			}
+		case <-timerC:
+		}
+	}
+	return recorded, failure
+}
+
+func TestXPerfAdmissionAccountCooldownAndBackpressure(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	a := xperfAdmission{accounts: []xperfAccount{{capacity: 1}, {capacity: 1}}, hostCapacity: 4, receiptCapacity: 2, gap: time.Second}
+	first, _ := a.acquire(now)
+	second, _ := a.acquire(now)
+	if first != 0 || second != 1 {
+		t.Fatal("independent synthetic accounts not selected")
+	}
+	if next, _ := a.acquire(now); next != -1 {
+		t.Fatal("capacity exceeded")
+	}
+	a.finish(first, now, xperfMetric{Verified: true})
+	if next, wake := a.acquire(now); next != -1 || !wake.Equal(now.Add(time.Second)) {
+		t.Fatal("account gap bypassed")
+	}
+	reset, remaining := uint64(now.Add(90*time.Second).Unix()), uint64(0)
+	a.finish(second, now, xperfMetric{Status: "provider_rate_limited", RateReset: &reset, RateRemaining: &remaining})
+	if !a.accounts[second].cooldown.Equal(time.Unix(int64(reset), 0)) || !a.stopped {
+		t.Fatal("authoritative cooldown lost")
+	}
+	if next, _ := a.acquire(now.Add(100 * time.Second)); next != -1 {
+		t.Fatal("experiment rotated account after rate limit")
+	}
+	a = xperfAdmission{accounts: []xperfAccount{{capacity: 4}}, hostCapacity: 4, receiptCapacity: 1}
+	first, _ = a.acquire(now)
+	if first != 0 {
+		t.Fatal("single account unavailable")
+	}
+	if next, _ := a.acquire(now); next != -1 {
+		t.Fatal("receipt backpressure bypassed")
+	}
+	a.finish(first, now, xperfMetric{Status: "provider_auth_failed"})
+	if !a.accounts[0].authBlocked {
+		t.Fatal("authentication failure did not block account")
+	}
+}
+
+func TestXPerfConcurrentStopAndDrain(t *testing.T) {
+	c := xperfConfig{concurrency: 4, accountCapacity: 2, receiptCapacity: 4, samples: 20}
+	var mu sync.Mutex
+	active, peak, attempts := 0, 0, 0
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	failurePublished := make(chan struct{})
+	var rows []xperfMetric
+	go func() {
+		n, failure := xperfRun(context.Background(), c, func(ctx context.Context, sample int) xperfMetric {
+			mu.Lock()
+			active++
+			attempts++
+			if active > peak {
+				peak = active
+			}
+			mu.Unlock()
+			entered <- struct{}{}
+			<-release
+			mu.Lock()
+			active--
+			mu.Unlock()
+			if sample == 1 {
+				xperfStopNow(ctx)
+				close(failurePublished)
+				return xperfMetric{Sample: sample, Status: "provider_rate_limited"}
+			}
+			<-failurePublished
+			return xperfMetric{Sample: sample, Status: "verified", Verified: true}
+		}, func(m xperfMetric) error { rows = append(rows, m); return nil })
+		if n != 2 || failure != "provider_rate_limited" {
+			t.Errorf("unexpected drained attempts=%d status=%s", n, failure)
+		}
+		close(finished)
+	}()
+	<-entered
+	<-entered
+	// The failing worker must publish its stop before either result is consumed.
+	close(release)
+	<-finished
+	mu.Lock()
+	defer mu.Unlock()
+	if peak != 2 || attempts != 2 || len(rows) != 2 {
+		t.Fatal("single account capacity or stop fence bypassed")
+	}
+	for _, row := range rows {
+		if row.RunStartNS <= 0 || row.RunFinishNS < row.RunStartNS || row.QueueWaitMS < 0 {
+			t.Fatal("invalid concurrent window telemetry")
+		}
+	}
+}
+
+func TestXPerfConcurrentCaptureIsBoundToContext(t *testing.T) {
+	router := &xperfRouter{}
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			capture := &xperfCapture{}
+			req, err := http.NewRequestWithContext(context.WithValue(context.Background(), xperfCaptureKey{}, capture), http.MethodGet, fmt.Sprintf("https://x.com/i/api/graphql/q/SearchTimeline?variables=%%7B%%22count%%22%%3A%d%%7D&features=%%7B%%7D", index+1), nil)
+			if err != nil {
+				t.Error("fixture invalid")
+				return
+			}
+			if _, err := router.RoundTrip(req); !errors.Is(err, errXPerfCaptured) || capture.request != nil && capture.request.URL.String() != req.URL.String() {
+				t.Error("capture crossed job context")
+			}
+			spec, err := xperfSpec(capture.request)
+			if err != nil || spec.Variables["count"] != json.Number(strconv.Itoa(index+1)) {
+				t.Error("capture crossed job context")
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestXPerfQuotaTelemetryIsNumericAndBounded(t *testing.T) {
+	h := http.Header{"X-Rate-Limit-Limit": {"50"}, "X-Rate-Limit-Remaining": {"0"}, "X-Rate-Limit-Reset": {"1700000100"}}
+	if v := xperfNumericHeader(h, "X-Rate-Limit-Remaining"); v == nil || *v != 0 {
+		t.Fatal("zero remaining lost")
+	}
+	for _, value := range []string{"SECRET", "-1", "1.5", "18446744073709551615", " 2"} {
+		h.Set("X-Rate-Limit-Remaining", value)
+		if xperfNumericHeader(h, "X-Rate-Limit-Remaining") != nil {
+			t.Fatal("unsafe header accepted")
+		}
+	}
+	h["X-Rate-Limit-Remaining"] = []string{"0", "1"}
+	if xperfNumericHeader(h, "X-Rate-Limit-Remaining") != nil {
+		t.Fatal("ambiguous header accepted")
+	}
+}
+
+func TestXPerfProvenRateHeadersSurvive429Failure(t *testing.T) {
+	dir := t.TempDir()
+	helper := filepath.Join(dir, "fixture-helper")
+	raw := "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 2\r\nX-Rate-Limit-Limit: 50\r\nX-Rate-Limit-Remaining: 0\r\nX-Rate-Limit-Reset: 1700000100\r\n\r\n{}"
+	summary, err := json.Marshal(xperfSummary{Status: "proof_sent", Mode: "mpc", Response: base64.StdEncoding.EncodeToString([]byte(raw))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The executable reads no credentials and makes no network requests.
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf '%s\\n' '"+string(summary)+"'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	req := mustRequest(t, http.MethodGet, "https://x.com/i/api/graphql/q/SearchTimeline?variables=%7B%22count%22%3A20%7D&features=%7B%7D")
+	o, _, err := xperfProve(context.Background(), xperfConfig{prover: helper, mode: "mpc", headers: "normal", verifier: "127.0.0.1:1"}, strings.Repeat("ab", 32), req, filepath.Join(dir, "fixture.stderr"))
+	if err == nil || err.Error() != "provider_rate_limited" || o.rateLimit == nil || *o.rateLimit != 50 || o.rateRemaining == nil || *o.rateRemaining != 0 || o.rateReset == nil || *o.rateReset != 1700000100 {
+		t.Fatal("proven quota telemetry lost at failure")
+	}
+	m := xperfMeasurement(xperfConfig{mode: "mpc", headers: "normal", workload: "search"}, 1, time.Now(), []xperfObserved{o}, 0, err.Error())
+	if m.Verified || m.Status != "provider_rate_limited" || m.RateRemaining == nil || *m.RateRemaining != 0 {
+		t.Fatal("failed quota response counted verified or lost telemetry")
+	}
+}
+
+func TestXPerfConfigurationCapacityAndRelayBinding(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.Chmod(dir, 0700)
+	key := filepath.Join(dir, "fixture-key")
+	if err := os.WriteFile(key, []byte("SYNTHETIC_CONTROL_KEY"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"SCARLETT_XPERF_MODE", "SCARLETT_XPERF_HEADERS", "SCARLETT_XPERF_WORKLOAD", "SCARLETT_XPERF_SAMPLES", "SCARLETT_XPERF_MAX_RECV", "SCARLETT_XPERF_SENT_RECORDS", "SCARLETT_XPERF_RECV_RECORDS", "SCARLETT_XPERF_PREPARE_HOLD_MS", "SCARLETT_XPERF_RESPONSE_READY", "SCARLETT_XPERF_CONCURRENCY", "SCARLETT_XPERF_ACCOUNT_CAPACITY", "SCARLETT_XPERF_RECEIPT_CAPACITY", "SCARLETT_XPERF_MIN_GAP_MS", "SCARLETT_XPERF_SUSTAINED_SECONDS", "SCARLETT_XPERF_NETWORK_PROFILE", "SCARLETT_XPERF_BANDWIDTH_BYTES_SECOND", "SCARLETT_XPERF_VERIFIER_SERVER_NAME"} {
+		t.Setenv(name, "")
+	}
+	for name, value := range map[string]string{"SCARLETT_X_SESSION": "fixture-not-read", "SCARLETT_PROVER": "fixture-not-executed", "SCARLETT_VERIFIER": "127.0.0.1:7047", "SCARLETT_VERIFIER_API": "http://127.0.0.1:7070", "SCARLETT_XPERF_OUTPUT": dir, "SCARLETT_VERIFIER_KEY_FILE": key} {
+		t.Setenv(name, value)
+	}
+	c, err := xperfConfiguration()
+	if err != nil || c.concurrency != 1 || c.accountCapacity != 1 || c.receiptCapacity != 1 || c.minGapMS != 1000 || c.networkProfile != "direct" {
+		t.Fatal("unsafe experiment defaults")
+	}
+	for _, variant := range []struct{ name, value string }{{"SCARLETT_XPERF_CONCURRENCY", "3"}, {"SCARLETT_XPERF_SUSTAINED_SECONDS", "59"}, {"SCARLETT_XPERF_NETWORK_PROFILE", "PRIVATE_REGION"}, {"SCARLETT_XPERF_BANDWIDTH_BYTES_SECOND", "1"}} {
+		t.Setenv(variant.name, variant.value)
+		if _, err := xperfConfiguration(); err == nil {
+			t.Fatal("unsupported experiment option accepted")
+		}
+		t.Setenv(variant.name, "")
+	}
+	t.Setenv("SCARLETT_XPERF_NETWORK_PROFILE", "simulated-rtt80")
+	if _, err := xperfConfiguration(); err == nil || err.Error() != "simulated_shaper_binding_missing" {
+		t.Fatal("simulation label accepted without bound relay")
+	}
+	ready := filepath.Join(dir, "shaper-ready.json")
+	if err := os.WriteFile(ready, []byte(`{"schema":1,"listen":"127.0.0.1:7047","topology":"simulated_loopback_tcp_tls","profile":"simulated-rtt80","simulated_one_way_delay_ms":40,"bandwidth_bytes_second":0}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SCARLETT_XPERF_VERIFIER_SERVER_NAME", "verifier.fixture.invalid")
+	if _, err := xperfConfiguration(); err != nil {
+		t.Fatal("bound relay rejected")
+	}
+	t.Setenv("SCARLETT_VERIFIER", "verifier.fixture.invalid:7047")
+	if _, err := xperfConfiguration(); err == nil || err.Error() != "unsafe_verifier_server_name" {
+		t.Fatal("nonloopback TLS identity override accepted")
+	}
+}
+
+func TestXPerfConcurrentBindingsCannotCrossJobs(t *testing.T) {
+	var bindings []xperfBinding
+	var receipts []xperfReceipt
+	for i := 0; i < 4; i++ {
+		spec := xSpec{Operation: "SearchTimeline", QueryID: "q", Variables: map[string]any{"count": json.Number(strconv.Itoa(i + 1))}, Features: map[string]any{}}
+		_, b, err := xperfRegistration(fmt.Sprintf("xperf-fixture-%d", i), []xSpec{spec}, "mpc", time.Unix(1700000000, 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		bindings = append(bindings, b)
+		receipts = append(receipts, xperfReceipt{JobID: b.job, Attempt: "1", Fence: b.fence, ExpiresMS: b.expiresMS, RequestSHA: b.requestSHA})
+	}
+	for i, b := range bindings {
+		for j, r := range receipts {
+			if (xperfCheckBinding(r, b) == nil) != (i == j) {
+				t.Fatal("concurrent receipt matched another job")
+			}
+		}
 	}
 }
