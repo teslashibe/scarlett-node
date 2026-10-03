@@ -79,14 +79,20 @@ public static class ScarlettAcceptanceWindow {
             Key(0x08, false), Key(0x08, true) };
     }
     public static void SelectAllAndClear() { Send(ClearInputs()); }
-    public static void ReplaceText(string value) {
+    public static void ReplaceText(string value) { ReplaceText(value, false); }
+    public static void ReplaceTextAndTab(string value) { ReplaceText(value, true); }
+    private static void ReplaceText(string value, bool tab) {
         if (String.IsNullOrEmpty(value) || value.Length > 512)
             throw new InvalidOperationException("Synthetic text length outside its bound");
-        Input[] inputs = new Input[6 + value.Length * 2];
+        Input[] inputs = new Input[6 + value.Length * 2 + (tab ? 2 : 0)];
         Array.Copy(ClearInputs(), inputs, 6);
         for (int index = 0; index < value.Length; index++) {
             inputs[6 + index * 2] = Character(value[index], false);
             inputs[7 + index * 2] = Character(value[index], true);
+        }
+        if (tab) {
+            inputs[inputs.Length - 2] = Key(0x09, false);
+            inputs[inputs.Length - 1] = Key(0x09, true);
         }
         Send(inputs);
     }
@@ -494,7 +500,7 @@ function Check-Preferences {
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-preferences-ui.json')
 }
 
-function Set-Text([string]$Name, [string]$Value) {
+function Set-Text([string]$Name, [string]$Value, [string]$NextName = '') {
     # WebView2 can advertise ValuePattern while SetValue fails to commit.
     # Only disposable fixtures call this helper, never real credentials.
     if ($Value -notmatch '^[a-z0-9-]+$' -or $Value.Length -gt 512) { throw 'Synthetic input contains unsupported characters' }
@@ -509,6 +515,20 @@ function Set-Text([string]$Name, [string]$Value) {
     # Queue selection, clearing and Unicode text in one ordered native input
     # batch. An already-empty field cannot acknowledge queued clearing, and
     # mixing SendInput with SendKeys can lose text despite successful focus.
+    if ($control.Current.IsPassword) {
+        if (-not (($Name -eq 'auth_token' -and $NextName -eq 'ct0') -or
+            ($Name -eq 'ct0' -and $NextName -eq 'Connect X'))) { throw 'Masked input requires its reviewed successor control' }
+        # The successor's focus acknowledges the ordered native clear/text
+        # queue without reading a masked field or racing another input API.
+        [ScarlettAcceptanceWindow]::ReplaceTextAndTab($Value)
+        Wait-Check {
+            $next = Find-Input $NextName
+            return $null -ne $next -and $next.Current.HasKeyboardFocus -and
+                [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+        } 10 'Masked text input was not acknowledged by successor focus'
+        return
+    }
+    if ($NextName) { throw 'Ordinary input cannot use a masked successor' }
     [ScarlettAcceptanceWindow]::ReplaceText($Value)
     # Masked cookie fields may refuse value readback. Exact persistence is
     # checked against the synthetic fixture after the Connect action.
@@ -672,10 +692,32 @@ function Check-BrowserImport {
             if (-not (Find-Input $name).Current.IsPassword) { throw 'Cookie paste field was not masked' }
         }
         Set-Text 'Local X account ID' 'browser-paste'
-        Set-Text 'auth_token' $script:fixture.authToken
-        Set-Text 'ct0' $script:fixture.csrf
+        Set-Text 'auth_token' $script:fixture.authToken 'ct0'
+        Set-Text 'ct0' $script:fixture.csrf 'Connect X'
         Click-Button 'Connect X'
-        Wait-Check { @(Imported-Accounts).Count -eq 2 } 20 'Installed masked paste did not persist'
+        try { Wait-Check { @(Imported-Accounts).Count -eq 2 } 20 'Installed masked paste did not persist' }
+        catch {
+            $errorClasses = @{
+                invalidInput = (UI-Contains 'Check the account ID, capacity and cookie values')
+                commandFailed = (UI-Contains 'The node could not complete that action')
+                commandTimeout = (UI-Contains 'The action timed out')
+                privateStorage = (UI-Contains 'Scarlett could not open its private local storage')
+            }
+            $focus = @{}
+            foreach ($name in @('auth_token', 'ct0', 'Connect X')) {
+                $target = Find-Input $name
+                $focus[$name] = $null -ne $target -and $target.Current.HasKeyboardFocus
+            }
+            $connect = Find-Button 'Connect X'
+            $failure = @{ accountCount = @(Imported-Accounts).Count
+                connectEnabled = $null -ne $connect -and $connect.Current.IsEnabled
+                successNoticeVisible = (UI-Contains 'X account connected locally')
+                foregroundOwned = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $application.MainWindowHandle
+                focus = $focus; errorClasses = $errorClasses; realProviderJobs = 0 }
+            $failure | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-masked-input-failure.json')
+            Write-Output ($failure | ConvertTo-Json -Depth 3 -Compress)
+            throw
+        }
         foreach ($record in (Imported-Accounts)) {
             if ($record.service -ne 'x_read' -or $record.id -notin @('browser-firefox', 'browser-paste')) { throw 'Unexpected imported account' }
             $credentialRoot = [System.IO.Path]::GetFullPath((Join-Path $script:importState 'accounts')).TrimEnd('\') + '\'

@@ -3,6 +3,7 @@ on:
   pull_request:
     paths:
       - 'desktop/**'
+      - '.cargo/**'
       - '**.go'
       - 'go.*'
       - 'prover/**'
@@ -37,6 +38,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v7
+      - name: Validate Windows dependency inspection
+        run: python -m unittest discover -s desktop/scripts -p 'test_windows_pe_imports.py'
       - name: Parse installed Windows acceptance script
         if: runner.os == 'Windows'
         shell: powershell
