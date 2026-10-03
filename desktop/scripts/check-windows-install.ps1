@@ -330,7 +330,8 @@ function Set-Text([string]$Name, [string]$Value) {
     }
     $pattern.SetValue($Value)
 }
-function Select-Browser([int]$Index) {
+function Select-Browser([int]$Index, [string]$ExpectedBrowser) {
+    if ($Index -notin @(1, 2) -or $ExpectedBrowser -notin @('Chrome', 'Firefox')) { throw 'Unexpected synthetic browser selection' }
     Wait-Check { (Find-Input 'Browser profile').Current.IsEnabled } 15 'Browser chooser did not become ready'
     $target = Find-Input 'Browser profile'
     if (-not $target -or -not $target.Current.IsEnabled) { throw 'Browser chooser unavailable' }
@@ -343,6 +344,24 @@ function Select-Browser([int]$Index) {
     } 10 'Browser chooser did not acquire input focus'
     [System.Windows.Forms.SendKeys]::SendWait('{HOME}')
     for ($index = 0; $index -lt $Index; $index++) { [System.Windows.Forms.SendKeys]::SendWait('{DOWN}') }
+    # Commit the native select before clicking consent. Keyboard navigation can
+    # leave a preview choice in the popup; consent belongs to the committed
+    # profile and must not race its change event.
+    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+    [System.Windows.Forms.SendKeys]::SendWait('{TAB}')
+    Wait-Check {
+        $selected = Find-Input 'Browser profile'
+        $value = $null
+        if ($selected.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$value)) {
+            return $value.Current.Value.Contains($ExpectedBrowser)
+        }
+        $selection = $null
+        if ($selected.TryGetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern, [ref]$selection)) {
+            $items = @($selection.Current.GetSelection())
+            return $items.Count -eq 1 -and $items[0].Current.Name.Contains($ExpectedBrowser)
+        }
+        throw 'Browser chooser did not expose its committed selection'
+    } 10 'Synthetic browser selection did not commit'
 }
 function UI-Contains([string]$Text) {
     $elements = $script:window.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
@@ -376,10 +395,10 @@ function Check-BrowserImport {
         if ((Imported-Accounts).Count -ne 0) { throw 'Browser test encountered existing accounts' }
         if (-not (Checkbox-Is 'Import only X session cookies from this profile' $false) -or (Find-Button 'Import X account').Current.IsEnabled) { throw 'Browser import did not require opt-in consent' }
         # The two fixture profiles sort Chrome, then Firefox after the prompt.
-        Select-Browser 1
+        Select-Browser 1 'Chrome'
         Set-Checkbox 'Import only X session cookies from this profile' $true
         Wait-Check { (Find-Button 'Import X account').Current.IsEnabled } 10 'Consent did not enable import'
-        Select-Browser 2
+        Select-Browser 2 'Firefox'
         Wait-Check { Checkbox-Is 'Import only X session cookies from this profile' $false } 10 'Changing profile retained consent'
         Wait-Check { -not (Find-Button 'Import X account').Current.IsEnabled } 10 'Profile change allowed import without new consent'
         Set-Text 'Local X account ID' 'browser-firefox'
@@ -388,7 +407,7 @@ function Check-BrowserImport {
         Wait-Check { (Imported-Accounts).Count -eq 1 } 20 'Installed Firefox UI import did not persist'
         Wait-Check { Checkbox-Is 'Import only X session cookies from this profile' $false } 10 'Successful import retained consent'
         Wait-Check { UI-Contains 'access not verified' } 15 'Imported account claimed verified access'
-        Select-Browser 1
+        Select-Browser 1 'Chrome'
         Set-Text 'Local X account ID' 'protected-chrome'
         Set-Checkbox 'Import only X session cookies from this profile' $true
         Click-Button 'Import X account'
