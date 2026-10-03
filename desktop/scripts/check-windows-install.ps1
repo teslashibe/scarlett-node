@@ -149,6 +149,46 @@ function Focus-QuitShortcut {
     Write-Output 'Installed acceptance: foreground and WebView keyboard focus verified'
 }
 
+function Check-QuitShortcut([string]$Failure) {
+    [System.Windows.Forms.SendKeys]::SendWait('^q')
+    if ($application.WaitForExit(135000)) { return }
+    # Keep the shortcut failure, but distinguish missed input from a native
+    # shutdown error. Capture only fixed classifications, never UI text or keys.
+    $shutdownError = $false
+    $focusMatches = $false
+    $foregroundMatches = $false
+    try {
+        $elements = $script:window.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+            [System.Windows.Automation.Condition]::TrueCondition)
+        foreach ($element in $elements) {
+            if ($element.Current.Name.StartsWith('Scarlett could not stop safely. ', [StringComparison]::Ordinal)) {
+                $shutdownError = $true
+            }
+        }
+        $target = Find-Button 'Stop local API'
+        $focusMatches = $null -ne $target -and $target.Current.HasKeyboardFocus
+        $application.Refresh()
+        $foregroundMatches = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $application.MainWindowHandle
+    } catch { }
+    $diagnostic = @{
+        shortcutExited = $false; shutdownErrorVisible = $shutdownError
+        stopControlKeyboardFocus = $focusMatches; foregroundOwnedWindow = $foregroundMatches
+        apiStatusBeforeButton = (Api-Status '/health'); quitButtonInvoked = $false
+        quitButtonExited = $false; realProviderJobs = 0
+    }
+    try {
+        Click-Button 'Quit Scarlett'
+        $diagnostic.quitButtonInvoked = $true
+        $diagnostic.quitButtonExited = $application.WaitForExit(135000)
+    } catch { }
+    $diagnostic.apiStatusAfterButton = Api-Status '/health'
+    New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+    $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-quit-failure.json')
+    Write-Output ($diagnostic | ConvertTo-Json -Compress)
+    # A successful button quit is diagnostic evidence, never a passing shortcut.
+    throw $Failure
+}
+
 function Verify-KeyboardDelivery {
     # UIA Invoke/SetFocus can succeed without an interactive input desktop.
     # Prove SendKeys reaches a harmless empty field before blaming a shortcut.
@@ -269,8 +309,7 @@ function Check-Preferences {
     Click-Button 'Start local API'
     Wait-Check { (Api-Status '/health') -eq 200 } 30 'Saved API port did not survive reopening'
     Focus-QuitShortcut
-    [System.Windows.Forms.SendKeys]::SendWait('^q')
-    if (-not $application.WaitForExit(135000)) { throw 'Preferences app Quit did not exit' }
+    Check-QuitShortcut 'Preferences app Quit did not exit'
     Wait-Check { (Api-Status '/health') -eq 0 } 30 'Preferences Quit left API running'
     Start-App
     if (-not (Checkbox-Is 'Open Scarlett when I log in' $true)) { throw 'Native login registration did not survive app reopening' }
@@ -351,19 +390,38 @@ function Select-Browser([int]$Index, [string]$ExpectedBrowser) {
     # profile and must not race its change event.
     [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
     [System.Windows.Forms.SendKeys]::SendWait('{TAB}')
-    Wait-Check {
-        $selected = Find-Input 'Browser profile'
-        $value = $null
-        if ($selected.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$value)) {
-            return $value.Current.Value.Contains($ExpectedBrowser)
-        }
-        $selection = $null
-        if ($selected.TryGetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern, [ref]$selection)) {
-            $items = @($selection.Current.GetSelection())
-            return $items.Count -eq 1 -and $items[0].Current.Name.Contains($ExpectedBrowser)
-        }
-        throw 'Browser chooser did not expose its committed selection'
-    } 10 'Synthetic browser selection did not commit'
+    $readback = @{ controlPresent = $false; valuePattern = $false; valueMatches = $false
+        selectionPattern = $false; selectedItemCount = 0; selectedLabelMatches = $false }
+    try {
+        Wait-Check {
+            $selected = Find-Input 'Browser profile'
+            $readback.controlPresent = $null -ne $selected
+            if (-not $selected) { return $false }
+            $value = $null
+            $readback.valuePattern = $selected.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$value)
+            # WebView2 can expose ValuePattern with an empty/null value. Read the
+            # selection provider too rather than dereferencing a null string.
+            $readback.valueMatches = $readback.valuePattern -and ([string]$value.Current.Value).Contains($ExpectedBrowser)
+            if ($readback.valueMatches) { return $true }
+            $selection = $null
+            $readback.selectionPattern = $selected.TryGetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern, [ref]$selection)
+            if ($readback.selectionPattern) {
+                $items = @($selection.Current.GetSelection())
+                $readback.selectedItemCount = $items.Count
+                $readback.selectedLabelMatches = $items.Count -eq 1 -and $null -ne $items[0] -and
+                    ([string]$items[0].Current.Name).Contains($ExpectedBrowser)
+                return $readback.selectedLabelMatches
+            }
+            return $false
+        } 10 'Synthetic browser selection did not commit'
+    } catch {
+        # Fixed booleans/counts only: never publish browser names, opaque ids or
+        # any session values read through the accessibility provider.
+        New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+        $readback | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-browser-selection-failure.json')
+        Write-Output ($readback | ConvertTo-Json -Compress)
+        throw
+    }
 }
 function UI-Contains([string]$Text) {
     $elements = $script:window.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
@@ -510,8 +568,7 @@ try {
     Write-Output 'Installed acceptance: unexpected exit and recovery passed'
     Verify-KeyboardDelivery
     Focus-QuitShortcut
-    [System.Windows.Forms.SendKeys]::SendWait('^q')
-    if (-not $application.WaitForExit(135000)) { throw 'Installed desktop Quit did not exit' }
+    Check-QuitShortcut 'Installed desktop Quit did not exit'
     Wait-Check { (Api-Status '/health') -eq 0 } 30 'Installed desktop Quit left the API running'
     New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
     @{
@@ -522,6 +579,13 @@ try {
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-installed-ui.json')
     if ($Preferences) { Check-Preferences }
     if ($BrowserFixture) { Check-BrowserImport }
+} catch {
+    # Record source line numbers for failures hidden by the workflow wrapper,
+    # without publishing stack paths, UI values or native exception messages.
+    $lines = @([regex]::Matches([string]$_.ScriptStackTrace, 'check-windows-install\.ps1: line (\d+)') |
+        ForEach-Object { [int]$_.Groups[1].Value })
+    Write-Output (@{ acceptanceFailureLines = $lines; realProviderJobs = 0 } | ConvertTo-Json -Compress)
+    throw
 } finally {
     $key = $null
     $env:PATH = $previousPath
