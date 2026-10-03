@@ -1,14 +1,13 @@
 //! Encrypted supplier/verifier control transport, configured on the local host.
 use anyhow::{Context, Result, bail};
 use rustls::{
-    ClientConfig, RootCertStore, ServerConfig,
-    pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject},
+    ClientConfig, RootCertStore,
+    pki_types::{CertificateDer, ServerName, pem::PemObject},
 };
 use std::{
     fs::OpenOptions,
     io::{self, IoSlice, Read},
     pin::Pin,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
     sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}},
     task::{Context as TaskContext, Poll},
@@ -18,7 +17,15 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpStream,
 };
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_rustls::TlsConnector;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(unix)]
+use rustls::{ServerConfig, pki_types::PrivateKeyDer};
+#[cfg(unix)]
+use tokio_rustls::TlsAcceptor;
 
 pub trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
@@ -107,10 +114,25 @@ fn pem(path: &Path, private: bool) -> Result<Vec<u8>> {
     if !path.is_absolute() {
         bail!("TLS file must have an absolute path");
     }
+    #[cfg(unix)]
     let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path).context("opening TLS file")?;
+    #[cfg(windows)]
+    let file = {
+        // Windows hosts the supplier client only; no private verifier key is read.
+        if private { bail!("private verifier keys are unsupported on Windows"); }
+        OpenOptions::new().read(true).custom_flags(0x00200000).open(path).context("opening TLS CA file")?
+    };
     let info = file.metadata()?;
-    if !info.is_file() || info.len() > 1 << 20 || private && (info.mode() & 0o077 != 0 || info.uid() != unsafe { libc::geteuid() }) {
+    if !info.is_file() || info.len() > 1 << 20 {
         bail!("invalid TLS file permissions or size");
+    }
+    #[cfg(unix)]
+    if private && (info.mode() & 0o077 != 0 || info.uid() != unsafe { libc::geteuid() }) {
+        bail!("invalid TLS file permissions or size");
+    }
+    #[cfg(windows)]
+    if info.file_attributes() & 0x00000400 != 0 {
+        bail!("TLS CA file must not be a reparse point");
     }
     let mut bytes = Vec::new();
     file.take((1 << 20) + 1).read_to_end(&mut bytes)?;
@@ -185,6 +207,7 @@ pub async fn connect_named(address: &str, ca: Option<&str>, plaintext_fixture: b
     .await
     .context("verifier connection timed out")?
 }
+#[cfg(unix)]
 pub fn acceptor(cert: &str, key: &str) -> Result<TlsAcceptor> {
     let raw = pem(Path::new(cert), false)?;
     let chain = CertificateDer::pem_slice_iter(&raw).collect::<Result<Vec<_>, _>>()?;
@@ -199,7 +222,24 @@ pub fn acceptor(cert: &str, key: &str) -> Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    #[test]
+    fn ca_reads_are_absolute_regular_bounded_and_public_only() {
+        let path = std::env::temp_dir().join(format!("scarlett-ca-{}", rand::random::<u128>()));
+        std::fs::write(&path, b"synthetic public CA fixture").unwrap();
+        assert!(pem(&path, false).is_ok());
+        assert!(pem(&path, true).is_err());
+        assert!(pem(Path::new("relative-ca.pem"), false).is_err());
+        assert!(pem(&std::env::temp_dir(), false).is_err());
+        std::fs::write(&path, vec![0; (1 << 20) + 1]).unwrap();
+        assert!(pem(&path, false).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};

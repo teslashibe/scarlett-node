@@ -106,9 +106,13 @@ pub enum Error {
     NotPaired,
     LoginBusy,
     LoginFailed,
+    ApiUnavailable,
+    ApiNotReady,
+    ApiPortInUse,
+    ApiProcessExited,
+    ModeConflict,
+    AutostartUnavailable,
     PrivateStorageUnavailable,
-    #[cfg(windows)]
-    WindowsPending,
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -120,6 +124,7 @@ pub struct Account {
 }
 #[derive(Clone, Serialize, Default)]
 pub struct Snapshot {
+    pub local_api: crate::local_api::Snapshot,
     pub runtime_available: bool,
     pub accounts_available: bool,
     pub helper_available: bool,
@@ -143,6 +148,7 @@ pub struct Node {
     endpoints: Endpoints,
     binary: PathBuf,
     helper: PathBuf,
+    codex_binary: PathBuf,
     running: Mutex<Option<Child>>,
     login: Mutex<Option<Login>>,
     login_error: Mutex<Option<Error>>,
@@ -166,13 +172,8 @@ fn valid_selection(service: &str, id: &str, concurrency: u8) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(unix)]
 fn private_dir(path: &Path) -> Result<()> {
-    #[cfg(windows)]
-    {
-        let _ = path;
-        return Err(Error::WindowsPending);
-    }
-    #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
         match std::fs::symlink_metadata(path) {
@@ -193,7 +194,78 @@ fn private_dir(path: &Path) -> Result<()> {
         }
     }
 }
-fn regular(path: &Path) -> bool {
+pub(crate) fn private_dir_with_helper(path: &Path, helper: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = helper;
+        private_dir(path)
+    }
+    #[cfg(windows)]
+    {
+        let response = private_helper(helper, "private-dir", path)?;
+        if response.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(Error::PrivateStorageUnavailable);
+        }
+        Ok(())
+    }
+}
+pub(crate) fn private_helper(binary: &Path, action: &str, path: &Path) -> Result<Value> {
+    if !path.is_absolute() || !regular(binary) {
+        return Err(Error::PrivateStorageUnavailable);
+    }
+    let mut command = std::process::Command::new(binary);
+    command
+        .args([
+            std::ffi::OsStr::new("desktop"),
+            std::ffi::OsStr::new(action),
+            path.as_os_str(),
+        ])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for name in ["SystemRoot", "WINDIR"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|_| Error::PrivateStorageUnavailable)?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::PrivateStorageUnavailable);
+            }
+        }
+    };
+    use std::io::Read;
+    let mut output = Vec::new();
+    child
+        .stdout
+        .take()
+        .ok_or(Error::PrivateStorageUnavailable)?
+        .take(129)
+        .read_to_end(&mut output)
+        .map_err(|_| Error::PrivateStorageUnavailable)?;
+    if !status.success() || output.len() > 128 {
+        return Err(Error::PrivateStorageUnavailable);
+    }
+    serde_json::from_slice(&output).map_err(|_| Error::PrivateStorageUnavailable)
+}
+pub(crate) fn regular(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
 }
 fn account_projection(raw: &[u8]) -> Result<Vec<Account>> {
@@ -275,16 +347,29 @@ fn observation_projection(raw: &[u8]) -> Result<Value> {
 }
 impl Node {
     pub fn new(state: PathBuf, binary: PathBuf, helper: PathBuf) -> Self {
+        let codex_binary = binary
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(if cfg!(windows) { "codex.exe" } else { "codex" });
         Self {
             state,
             endpoints: Endpoints::default(),
             binary,
             helper,
+            codex_binary,
             running: Mutex::new(None),
             login: Mutex::new(None),
             login_error: Mutex::new(None),
             mutation: Mutex::new(()),
         }
+    }
+    pub fn with_provider_runtime(mut self, resource_root: &Path) -> Self {
+        self.codex_binary = resource_root
+            .join("runtime")
+            .join("codex")
+            .join("bin")
+            .join(if cfg!(windows) { "codex.exe" } else { "codex" });
+        self
     }
     pub fn from_environment(state: PathBuf, binary: PathBuf, helper: PathBuf) -> Result<Self> {
         let mut node = Self::new(state, binary, helper);
@@ -312,7 +397,7 @@ impl Node {
         Ok(format!("{}{path}", self.endpoints.coordinator))
     }
     fn prepare(&self) -> Result<()> {
-        private_dir(&self.state)?;
+        private_dir_with_helper(&self.state, &self.binary)?;
         Ok(())
     }
     fn command(&self, args: &[&str]) -> Result<Command> {
@@ -356,6 +441,8 @@ impl Node {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000);
         if let Some(ca) = &self.endpoints.verifier_ca {
             cmd.env("SCARLETT_VERIFIER_CA_FILE", ca);
         }
@@ -497,8 +584,8 @@ impl Node {
         if self.accounts().await?.is_empty() {
             return Err(Error::AccountsUnavailable);
         }
-        let mut cmd = self.command(&["run"])?;
-        cmd.stdin(Stdio::null())
+        let mut cmd = self.command(&["desktop", "run"])?;
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         #[cfg(unix)]
@@ -537,34 +624,29 @@ impl Node {
                 return Ok(());
             }
             self.call(&["drain"], None, 5).await?;
-            #[cfg(unix)]
+            // Closing this owned pipe requests drain without signaling a stale PID.
+            drop(child.stdin.take());
             {
-                let pid = child.id().ok_or(Error::CommandFailed)?;
-                if unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) } != 0 {
-                    return Err(Error::CommandFailed);
-                }
-            }
-            #[cfg(windows)]
-            {
-                return Err(Error::WindowsPending);
-            }
-            // Node gives accepted work up to two minutes, within its lease.
-            if tokio::time::timeout(Duration::from_secs(125), child.wait())
-                .await
-                .is_err()
-            {
-                #[cfg(unix)]
-                {
-                    if let Some(pid) = child.id() {
-                        unsafe {
-                            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                // Node gives accepted work up to two minutes, within its lease.
+                match tokio::time::timeout(Duration::from_secs(125), child.wait()).await {
+                    Ok(result) => {
+                        result.map_err(|_| Error::CommandFailed)?;
+                    }
+                    Err(_) => {
+                        #[cfg(unix)]
+                        {
+                            if let Some(pid) = child.id() {
+                                unsafe {
+                                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                                }
+                            }
                         }
+                        child.kill().await.map_err(|_| Error::CommandFailed)?;
+                        return Err(Error::CommandTimeout);
                     }
                 }
-                child.kill().await.map_err(|_| Error::CommandFailed)?;
-                return Err(Error::CommandTimeout);
+                *running = None;
             }
-            *running = None;
         }
         Ok(())
     }
@@ -576,18 +658,7 @@ impl Node {
         Ok(())
     }
     async fn codex_cli(&self) -> Option<PathBuf> {
-        let mut candidates =
-            vec![
-                self.binary
-                    .parent()?
-                    .join(if cfg!(windows) { "codex.exe" } else { "codex" }),
-            ];
-        if let Some(path) = std::env::var_os("PATH") {
-            candidates.extend(
-                std::env::split_paths(&path)
-                    .map(|p| p.join(if cfg!(windows) { "codex.exe" } else { "codex" })),
-            );
-        }
+        let candidates = [&self.codex_binary];
         for p in candidates {
             let Ok(p) = p.canonicalize() else { continue };
             if !regular(&p) {
@@ -596,10 +667,15 @@ impl Node {
             let mut cmd = Command::new(&p);
             cmd.arg("--version")
                 .env_clear()
+                .env("HOME", &self.state)
+                .env("USERPROFILE", &self.state)
+                .env("CODEX_HOME", self.state.join("runtime-probe"))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .kill_on_drop(true);
+            #[cfg(windows)]
+            cmd.creation_flags(0x08000000);
             for name in ["SystemRoot", "WINDIR"] {
                 if let Some(value) = std::env::var_os(name) {
                     cmd.env(name, value);
@@ -637,9 +713,9 @@ impl Node {
         }
         let cli = self.codex_cli().await.ok_or(Error::CliUnavailable)?;
         let profiles = self.state.join("codex-logins");
-        private_dir(&profiles)?;
+        private_dir_with_helper(&profiles, &self.binary)?;
         let home = profiles.join(&id);
-        private_dir(&home)?;
+        private_dir_with_helper(&home, &self.binary)?;
         let mut cmd = Command::new(cli);
         cmd.args(["-c", "cli_auth_credentials_store=\"file\"", "login"])
             .env_clear()
@@ -649,6 +725,8 @@ impl Node {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000);
         for name in [
             "HOME",
             "USERPROFILE",
@@ -717,7 +795,31 @@ impl Node {
             *self.login_error.lock().await = Some(Error::LoginFailed);
         }
     }
+    pub async fn save_preferences(&self, data: &crate::preferences::Data) -> Result<()> {
+        let path = self.state.join("preferences.json");
+        let raw = serde_json::to_vec(data).map_err(|_| Error::InvalidInput)?;
+        let output = self
+            .call(
+                &[
+                    "desktop",
+                    "preferences-set",
+                    path.to_str().ok_or(Error::InvalidInput)?,
+                ],
+                Some(raw),
+                5,
+            )
+            .await?;
+        let persisted: crate::preferences::Data =
+            serde_json::from_slice(&output).map_err(|_| Error::PrivateStorageUnavailable)?;
+        if &persisted != data {
+            return Err(Error::PrivateStorageUnavailable);
+        }
+        Ok(())
+    }
     pub async fn snapshot(&self) -> Snapshot {
+        if self.prepare().is_err() {
+            return Snapshot::default();
+        }
         self.finish_login().await;
         let mut s = Snapshot {
             runtime_available: regular(&self.binary),
@@ -906,6 +1008,33 @@ mod tests {
     }
     #[cfg(unix)]
     #[tokio::test]
+    async fn codex_login_uses_only_the_fixed_bundled_native_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let bundled = temp.path().join("resources/runtime/codex/bin/codex");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        // Even a compatible sibling outside the fixed resource layout is ignored.
+        let sibling = temp.path().join("codex");
+        std::fs::write(&sibling, "#!/bin/sh\nprintf 'codex-cli 0.159.2\\n'\n").unwrap();
+        std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let node = Node::new(
+            temp.path().join("state"),
+            temp.path().join("node"),
+            temp.path().join("helper"),
+        )
+        .with_provider_runtime(&temp.path().join("resources"));
+        assert!(node.codex_cli().await.is_none());
+        std::fs::write(&bundled, "#!/bin/sh\nprintf 'codex-cli 0.154.0\\n'\n").unwrap();
+        std::fs::set_permissions(&bundled, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(node.codex_cli().await.is_none());
+        std::fs::write(&bundled, "#!/bin/sh\n[ \"$CODEX_HOME\" = \"$HOME/runtime-probe\" ] || exit 1\nprintf 'codex-cli 0.159.2\\n'\n").unwrap();
+        assert_eq!(
+            node.codex_cli().await,
+            Some(bundled.canonicalize().unwrap())
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
     async fn secrets_use_stdin_and_account_support_is_real() {
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
@@ -973,7 +1102,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let binary = temp.path().join("node");
         let helper = temp.path().join("helper");
-        std::fs::write(&binary, "#!/bin/sh\ncase \"$1 $2\" in\n'accounts list') printf '[{\"id\":\"work\",\"service\":\"codex\",\"concurrency\":1}]';;\n'run ') exec sleep 30;;\n'drain ') printf 'drained' > \"$SCARLETT_STATE_DIR/drain-observed\";;\n*) exit 1;;\nesac\n").unwrap();
+        std::fs::write(&binary, "#!/bin/sh\ncase \"$1 $2\" in\n'accounts list') printf '[{\"id\":\"work\",\"service\":\"codex\",\"concurrency\":1}]';;\n'desktop run') cat >/dev/null;;\n'drain ') printf 'drained' > \"$SCARLETT_STATE_DIR/drain-observed\";;\n*) exit 1;;\nesac\n").unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         let node = Node::new(temp.path().join("state"), binary, helper.clone());
         assert_eq!(node.start().await, Err(Error::NotPaired));

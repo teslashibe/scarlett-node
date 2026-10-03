@@ -11,8 +11,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/teslashibe/scarlett-node/internal/config"
+	"github.com/teslashibe/scarlett-node/internal/localfs"
 	"github.com/teslashibe/scarlett-node/internal/worker"
-	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
 
@@ -110,7 +111,7 @@ func accountsCommand(args []string, input io.Reader, output io.Writer) error {
 		if e != nil {
 			return e
 		}
-		dir = filepath.Join(h, ".local", "state", "scarlett-node")
+		dir = config.DefaultStateDir(h)
 	}
 	if !filepath.IsAbs(dir) {
 		return errors.New("state directory must be absolute")
@@ -123,21 +124,14 @@ func accountsCommand(args []string, input io.Reader, output io.Writer) error {
 		return errors.New("accounts file must be absolute")
 	}
 	// The CLI only writes into an existing private directory.
-	info, e := os.Lstat(filepath.Dir(path))
-	if e != nil || !info.IsDir() || info.Mode().Perm()&0077 != 0 {
+	if e := localfs.CheckDir(filepath.Dir(path)); e != nil {
 		return errors.New("accounts directory must be private")
 	}
-	lock, e := os.OpenFile(filepath.Join(filepath.Dir(path), ".accounts.lock"), os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0600)
+	lock, e := localfs.LockPrivateWait(filepath.Join(filepath.Dir(path), ".accounts.lock"))
 	if e != nil {
 		return errors.New("cannot lock account configuration")
 	}
 	defer lock.Close()
-	if info, e := lock.Stat(); e != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
-		return errors.New("invalid account configuration lock")
-	}
-	if unix.Flock(int(lock.Fd()), unix.LOCK_EX) != nil {
-		return errors.New("cannot lock account configuration")
-	}
 	f, e := loadAccounts(path)
 	if e != nil && !os.IsNotExist(e) {
 		return errors.New("cannot read private account configuration")

@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/teslashibe/scarlett-node/internal/localfs"
 )
 
 func fixture() Record {
@@ -173,14 +176,25 @@ func TestWriteFailureAndBoundsFailClosed(t *testing.T) {
 	if _, e := j.Ready(r, "result", bytes.Repeat([]byte("x"), 131073)); e == nil {
 		t.Fatal("accepted oversized report")
 	}
-	if e := os.Rename(dir, dir+"-moved"); e != nil {
+	moved := dir + "-moved"
+	if runtime.GOOS == "windows" {
+		// A live lock forbids namespace replacement on Windows. Simulate a vanished
+		// journal destination without weakening that ownership protection.
+		if e := os.Rename(dir, moved); e == nil {
+			t.Fatal("moved live Windows lock")
+		}
+		j.dir = moved
+	} else if e := os.Rename(dir, moved); e != nil {
 		t.Fatal(e)
 	}
 	if _, e := j.Ready(r, "proven", []byte(`{}`)); e == nil {
 		t.Fatal("ignored disk failure")
 	}
 	j.Close()
-	j = open(t, dir+"-moved")
+	if runtime.GOOS == "windows" {
+		moved = dir
+	}
+	j = open(t, moved)
 	if e := j.Begin(r); !errors.Is(e, ErrExists) {
 		t.Fatal("disk failure lost provider-call boundary", e)
 	}
@@ -198,7 +212,7 @@ func TestFullJournalRejectsNewWorkWithoutEvictingUncertainAttempts(t *testing.T)
 		if e != nil {
 			t.Fatal(e)
 		}
-		if e = os.WriteFile(filepath.Join(dir, key(r)+".json"), raw, 0600); e != nil {
+		if e = localfs.WriteAtomic(filepath.Join(dir, key(r)+".json"), raw, true); e != nil {
 			t.Fatal(e)
 		}
 	}

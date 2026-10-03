@@ -16,6 +16,7 @@ import (
 	"github.com/teslashibe/scarlett-node/internal/attempts"
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
+	"github.com/teslashibe/scarlett-node/internal/localfs"
 	"github.com/teslashibe/scarlett-node/internal/worker"
 )
 
@@ -32,6 +33,9 @@ func main() {
 	}
 }
 func start(args []string) error {
+	if len(args) > 0 && args[0] == "desktop" {
+		return desktopCommand(args[1:], os.Stdin, os.Stdout)
+	}
 	if len(args) > 0 && args[0] == "accounts" {
 		return accountsCommand(args[1:], os.Stdin, os.Stdout)
 	}
@@ -89,21 +93,10 @@ func pair(c config.Config) error {
 }
 func loadIdentity(c config.Config) (identity, error) {
 	var id identity
-	info, err := os.Lstat(c.StateDir)
-	if err != nil {
+	if err := localfs.CheckDir(c.StateDir); err != nil {
 		return id, err
 	}
-	if !info.IsDir() || info.Mode().Perm()&0077 != 0 {
-		return id, errors.New("state directory permissions must be 0700")
-	}
-	info, err = os.Lstat(identityPath(c))
-	if err != nil {
-		return id, err
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
-		return id, errors.New("identity file must be regular and private (0600)")
-	}
-	f, err := os.Open(identityPath(c))
+	f, err := localfs.OpenPrivate(identityPath(c))
 	if err != nil {
 		return id, err
 	}
@@ -128,6 +121,9 @@ func loadIdentity(c config.Config) (identity, error) {
 const capacityRest = 30 * time.Second
 
 func run(c config.Config) error {
+	return runWithOwner(c, nil)
+}
+func runWithOwner(c config.Config, owner io.Reader) error {
 	if err := prepareStateDir(c.StateDir); err != nil {
 		return err
 	}
@@ -158,6 +154,9 @@ func run(c config.Config) error {
 		wait = time.Second
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	if owner != nil {
+		go func() { _, _ = io.Copy(io.Discard, owner); stop() }()
+	}
 	defer stop()
 	workCtx, cancelWork := context.WithCancel(context.Background())
 	defer cancelWork()

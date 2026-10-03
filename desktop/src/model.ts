@@ -1,3 +1,4 @@
+export type Preferences = { schema: 1; local_api_port: number; background: boolean };
 export type Account = {
   id: string;
   service: "codex" | "x_read";
@@ -12,6 +13,7 @@ export type AccountHealth = {
   last_error_code?: string;
 };
 export type Snapshot = {
+  local_api?: { available: boolean; running: boolean; ready: boolean; base_url?: string | null; claude_enabled: boolean };
   runtime_available: boolean;
   accounts_available: boolean;
   helper_available: boolean;
@@ -37,7 +39,7 @@ export const errorMessage = (code: unknown): string =>
     accounts_unavailable:
       "This node build does not support account management yet",
     cli_unavailable:
-      "Install the reviewed Codex CLI 0.159.2 to connect an account",
+      "The bundled Codex runtime is missing or incompatible",
     command_failed:
       "The node could not complete that action. For pairing, check the website before requesting another code",
     command_timeout:
@@ -46,6 +48,12 @@ export const errorMessage = (code: unknown): string =>
     not_paired: "Pair this node first",
     login_busy: "Finish or cancel the current Codex login first",
     login_failed: "Codex login did not complete. You can reconnect",
+    api_unavailable: "The local model API is unavailable in this build",
+    api_not_ready: "The local API did not become ready securely. Check its status before trying again",
+    api_port_in_use: "The local port is unavailable. Choose another port or stop the service using it",
+    api_process_exited: "The local API stopped before becoming ready. Check the bundled installation",
+    autostart_unavailable: "Scarlett could not update the login setting. Check the current setting before trying again",
+    mode_conflict: "Stop the other service before switching between network jobs and the local API",
     private_storage_unavailable:
       "Scarlett could not open its private local storage",
     windows_pending:
@@ -59,6 +67,7 @@ export function canStart(s: Snapshot): boolean {
     s.paired &&
     s.accounts.length > 0 &&
     !s.supervised &&
+    !s.local_api?.running &&
     !externalRuntime(s)
   );
 }

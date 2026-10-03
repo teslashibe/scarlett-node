@@ -11,8 +11,9 @@ import (
 	"time"
 
 	"github.com/teslashibe/scarlett-node/internal/attempts"
+	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
-	"golang.org/x/sys/unix"
+	"github.com/teslashibe/scarlett-node/internal/localfs"
 )
 
 // Local observations contain no credentials, prompts, outputs or proof tokens.
@@ -38,7 +39,7 @@ func localCommand(command string, output io.Writer) error {
 		if err != nil {
 			return err
 		}
-		dir = filepath.Join(home, ".local", "state", "scarlett-node")
+		dir = config.DefaultStateDir(home)
 	}
 	if !filepath.IsAbs(dir) {
 		return errors.New("state directory must be absolute")
@@ -90,7 +91,7 @@ func localCommand(command string, output io.Writer) error {
 }
 
 func readLocalFile(name string, limit int64) ([]byte, error) {
-	f, err := os.OpenFile(name, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	f, err := localfs.OpenPrivate(name)
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +100,7 @@ func readLocalFile(name string, limit int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > limit {
+	if info.Size() > limit {
 		return nil, errors.New("local state file must be regular, private and bounded")
 	}
 	raw, err := io.ReadAll(io.LimitReader(f, limit+1))
@@ -133,42 +134,9 @@ func saveRuntimeStatus(dir string, status runtimeStatus) error {
 }
 
 func writeLocalFile(dir, name string, raw []byte) error {
-	path := filepath.Join(dir, name)
-	if info, err := os.Lstat(path); err == nil {
-		if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
-			return errors.New("invalid local state destination")
-		}
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	f, err := os.CreateTemp(dir, ".control-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(f.Name())
-	if _, err = f.Write(raw); err == nil {
-		err = f.Sync()
-	}
-	if closeErr := f.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	if err = os.Rename(f.Name(), path); err != nil {
-		return err
-	}
-	return syncDirectory(dir)
+	return localfs.WriteAtomic(filepath.Join(dir, name), raw, true)
 }
-
-func syncDirectory(dir string) error {
-	f, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return f.Sync()
-}
+func syncDirectory(dir string) error { return localfs.SyncDir(dir) }
 
 func waitForWorkers(workers *sync.WaitGroup, cancel func(), grace time.Duration) {
 	done := make(chan struct{})

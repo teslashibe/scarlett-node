@@ -1,9 +1,12 @@
 {
   "identifier": "main",
   "description": "Local Scarlett window with fixed node commands",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "allow-desktop-status",
+    "allow-quit-desktop",
     "allow-pair-node",
     "allow-control-node",
     "allow-open-network",
@@ -11,6 +14,12 @@
     "allow-connect-codex",
     "allow-remove-account",
     "allow-cancel-login",
+    "allow-control-local-api",
+    "allow-local-api-key",
+    "allow-desktop-preferences",
+    "allow-save-desktop-preferences",
+    "allow-desktop-autostart",
+    "allow-set-desktop-autostart",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

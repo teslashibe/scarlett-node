@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -16,8 +15,8 @@ import (
 
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
+	"github.com/teslashibe/scarlett-node/internal/localfs"
 	x "github.com/teslashibe/x-go"
-	"golang.org/x/sys/unix"
 )
 
 type X struct {
@@ -51,13 +50,13 @@ type xPlan struct {
 }
 
 func privateJSON(path string, out any) error {
-	f, e := os.OpenFile(path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	f, e := localfs.OpenPrivate(path)
 	if e != nil {
 		return errors.New("local provider credential file unavailable")
 	}
 	defer f.Close()
 	info, e := f.Stat()
-	if e != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > 8192 {
+	if e != nil || info.Size() > 8192 {
 		return errors.New("provider credential file must be private, regular and bounded")
 	}
 	raw, e := io.ReadAll(io.LimitReader(f, 8193))
