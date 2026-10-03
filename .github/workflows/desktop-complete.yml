@@ -59,6 +59,9 @@ jobs:
           go build -trimpath -o "$RUNNER_TEMP/scarlett-runtime/scarlett-node$suffix" .
           GOBIN="$RUNNER_TEMP/scarlett-runtime" go install github.com/teslashibe/open-agent-api/cmd/open-agent-api@v0.1.29
           cargo +1.95 build --release --locked --manifest-path prover/Cargo.toml
+      - name: Validate native Windows proof runtime fixtures
+        if: runner.os == 'Windows'
+        run: cargo +1.95 test --locked --manifest-path prover/Cargo.toml
       - name: Download and verify pinned official provider binaries
         env:
           NATIVE_PLATFORM: ${{ matrix.platform }}
