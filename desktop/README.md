@@ -111,3 +111,17 @@ Profile discovery reads directory/file metadata only. It returns opaque profile 
 The helper uses a bundled, cgo-free SQLite reader, opens stores read-only and immutable, and refuses populated WAL/journal files. It neither copies nor changes a browser database. Cookie-store changes during import fail with a retry message. Unsupported or inaccessible stores do not add an account. Linux CLI builds support standard Firefox profiles only; the desktop release targets remain Mac and Windows.
 
 Tests use disposable synthetic databases, encrypted cookie fixtures and malformed Safari records. Windows native tests generate their own current-user DPAPI fixture. These checks do not establish compatibility with every installed browser version or prove real X access. Imported accounts remain **Configured · access not verified** until their existing provider execution path verifies access.
+
+## Device preferences
+
+The This device section saves only a versioned local API port and a window-close choice in the private app directory. New installations default to port 8088 and drain/quit when the window closes. Operators can explicitly choose to keep running in the menu bar or tray. Open Scarlett in the native menu (Cmd/Ctrl-1), the tray, macOS Finder/Dock reopen and Windows duplicate launch restore the existing window without starting a second runtime. Saved ports apply on the next local API start; updating a preference does not interrupt accepted jobs or start a service. Corrupt/private-storage failures are reported rather than silently resetting preferences.
+
+Open Scarlett when I log in is a separate OS setting, disabled until the operator opts in. The native Tauri autostart manager queries the actual OS registration and uses a macOS LaunchAgent or Windows user startup registration. It registers only the installed app, without credentials or provider arguments. Opening at login still requires the operator to start the node or local API. The renderer receives no direct autostart-plugin permissions; fixed local-window commands own this setting. A failed setting change is reported and the UI rereads OS state. Moving an app after enabling login launch requires disabling/re-enabling it at its new installed location.
+
+Go preference persistence tests use disposable private directories, including repeated reads/writes, invalid version/port/secret input, corruption and concurrent writer rejection. Native installed UI and OS login-registration acceptance remain required on Mac and Windows before claiming those platform flows passed.
+
+## Installed Windows validation
+
+The native complete-bundle workflow installs its testing NSIS package into a clean disposable runner directory, checks the installed component hashes and versions, then clears the development PATH before launching the installed desktop. Windows UI Automation invokes the real Start and Stop controls. Authenticated and unauthenticated model requests check the private bearer; a forced desktop exit and Ctrl-Q check API cleanup and recovery. All profiles are new, no provider accounts are connected and no inference or X requests run. Evidence records only outcomes, never credentials. The script refuses to run outside a disposable Windows CI runner or against existing app-owned state.
+
+Passing this check establishes the tested installer and UI lifecycle. It does not establish signature trust, remote provider login or verified paid network execution; those remain release requirements.
