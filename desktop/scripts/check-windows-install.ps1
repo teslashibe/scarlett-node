@@ -104,8 +104,13 @@ function Wait-AppWindow {
     } 45 'Installed desktop window did not appear'
     $script:window.SetFocus()
     Wait-Check {
-        $button = Find-Button 'Start local API'
-        return $null -ne $button -and $button.Current.IsEnabled
+        $start = Find-Button 'Start local API'
+        $stop = Find-Button 'Stop local API'
+        # A background reopen retains its running API, so Start is disabled.
+        # Either enabled lifecycle control proves the renderer is ready; each
+        # subsequent operation still waits for its specific control/state.
+        return ($null -ne $start -and $start.Current.IsEnabled) -or
+            ($null -ne $stop -and $stop.Current.IsEnabled)
     } 30 'Installed desktop API controls did not become available'
 }
 function Start-App {
