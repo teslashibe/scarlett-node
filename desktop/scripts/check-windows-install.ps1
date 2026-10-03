@@ -79,6 +79,19 @@ public static class ScarlettAcceptanceWindow {
             Key(0x08, false), Key(0x08, true) };
     }
     public static void SelectAllAndClear() { Send(ClearInputs()); }
+    public static void SelectOption(int index) {
+        if (index < 1 || index > 2)
+            throw new InvalidOperationException("Synthetic option index outside its bound");
+        Input[] inputs = new Input[6 + index * 2];
+        int offset = 0;
+        inputs[offset++] = Key(0x24, false); inputs[offset++] = Key(0x24, true);
+        for (int step = 0; step < index; step++) {
+            inputs[offset++] = Key(0x28, false); inputs[offset++] = Key(0x28, true);
+        }
+        inputs[offset++] = Key(0x0D, false); inputs[offset++] = Key(0x0D, true);
+        inputs[offset++] = Key(0x09, false); inputs[offset++] = Key(0x09, true);
+        Send(inputs);
+    }
     public static void ReplaceText(string value) { ReplaceText(value, false); }
     public static void ReplaceTextAndTab(string value) { ReplaceText(value, true); }
     private static void ReplaceText(string value, bool tab) {
@@ -570,15 +583,10 @@ function Select-Browser([int]$Index, [string]$ExpectedBrowser) {
     Wait-Check {
         return $target.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
     } 10 'Browser chooser did not acquire input focus'
-    [System.Windows.Forms.SendKeys]::SendWait('{HOME}')
-    # PowerShell variable names are case-insensitive; the loop counter must
-    # not overwrite the requested Index before sending its navigation keys.
-    for ($step = 0; $step -lt $Index; $step++) { [System.Windows.Forms.SendKeys]::SendWait('{DOWN}') }
-    # Commit the native select before clicking consent. Keyboard navigation can
-    # leave a preview choice in the popup; consent belongs to the committed
-    # profile and must not race its change event.
-    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-    [System.Windows.Forms.SendKeys]::SendWait('{TAB}')
+    # Open the actual native chooser and queue its navigation/commit keys
+    # together. Separate SendKeys calls can return before WebView2 handles them.
+    Click-Control $target
+    [ScarlettAcceptanceWindow]::SelectOption($Index)
     $readback = @{ controlPresent = $false; valuePattern = $false; valueMatches = $false
         selectionPattern = $false; selectedItemCount = 0; selectedLabelMatches = $false }
     try {
