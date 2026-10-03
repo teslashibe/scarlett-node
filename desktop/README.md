@@ -32,7 +32,7 @@ Then run `npm run tauri build -- --bundles app` from `desktop` on Mac. The sidec
 - X connects only the two approved cookie fields through protected stdin, preserving node validation and storage. Remove updates the private registry; the running node stops new admission on its next scheduling observation and retains credentials until safe explicit disposal after drain; it does not revoke the upstream session.
 - Total service concurrency remains the native default of one per service in this slice. Per-account limits cannot increase that total. Broader local capacity/preferences belong in the account-management integration.
 
-The native pool contract is proposed in [node PR 27](https://github.com/teslashibe/scarlett-node/pull/27), rebased to `b99ad50`. This desktop branch is based on node `be7c72` and does not include those changes. Integrate reviewed node changes and rebuild the sidecars before real account testing.
+The native pool contract landed in [node PR 27](https://github.com/teslashibe/scarlett-node/pull/27), merged at `5ea00650`. This desktop branch includes that main revision. Rebuild both sidecars from the reviewed combined checkout before real account testing. An explicit missing app-owned registry lists no accounts and fails closed for new work; unrelated host profiles are not inherited.
 
 ## Local release validation
 
