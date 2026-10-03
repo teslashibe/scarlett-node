@@ -127,3 +127,46 @@ The native complete-bundle workflow installs its testing NSIS package into a cle
 Passing this check establishes the tested installer and UI lifecycle. It does not establish signature trust, remote provider login or verified paid network execution; those remain release requirements.
 
 Installed Windows import acceptance uses new synthetic Chrome/Firefox stores below RUNNER_TEMP and redirects only browser roots for the test app. It exercises profile-specific consent and reset, Firefox import, the protected Chrome paste fallback, masked paste, unchanged stores and native private account persistence. It makes no provider requests. Account ID fields have distinct X/Codex labels for assistive technology. This acceptance is a release gate; test configuration is not a browser import mode for operators.
+
+## Mac release signing
+
+After reviewing the exact release source and native components, build the complete
+release app with `npm run tauri build -- --bundles app --no-sign --config
+src-tauri/tauri.complete.generated.json`. Omit `--debug`. Keep the original unsigned
+build as provenance and sign a separate copy. The provider archives must already
+have passed their pinned archive checks during complete-bundle preparation.
+
+Configure an existing `APPLE_SIGNING_IDENTITY` that starts with `Developer ID
+Application: `, its ten-character `SCARLETT_APPLE_TEAM_ID`, and an existing
+`SCARLETT_NOTARY_KEYCHAIN_PROFILE`. Store notarization credentials through Apple's
+Keychain tooling, outside the repository and chat. The signing script does not
+create certificates, import credentials or alter Keychain settings.
+
+```sh
+python3 desktop/scripts/sign-macos-bundle.py \
+  "/absolute/release-copy/Scarlett Node.app" \
+  "/absolute/new-output/Scarlett-Node.dmg"
+```
+
+The script refuses a changed component inventory, altered input bytes, links,
+another product identity or an already finalized signing manifest. It verifies
+every bundled native provider object's existing Developer ID signature and
+hardened runtime, preserving those exact bytes and notices. It signs Scarlett's
+three sidecars and desktop executable, verifies their team and hardened runtime,
+records both input and signed sidecar digests, then seals the outer app. A generic
+hash refresh cannot turn an altered vendor binary into an accepted release.
+
+The packaged integrity and protected local API check must pass before notarization.
+Both the app and resulting drag-to-Applications DMG require an Accepted notarization
+response and a valid stapled ticket. The app must pass Gatekeeper assessment;
+the DMG signature must match the configured team. Only then is a neighboring
+`.evidence.json` written with artifact digests and notarization IDs. A failed or
+partly signed app must be rebuilt from its reviewed inputs, rather than signed
+again in place. Tool failures expose no raw signing or Keychain output.
+
+This is a Mac release preparation step, not automatic publication. It requires
+real signing credentials and does not replace downloaded-installer UI, remote
+account, upgrade/downgrade or paid-loop acceptance. Stable download publication
+still uses the infrastructure release process after those checks. Windows
+Authenticode signing remains a separate native release requirement. Platform
+setup follows [Tauri's signing guide](https://v2.tauri.app/distribute/sign/macos/).

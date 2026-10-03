@@ -102,6 +102,9 @@ jobs:
           suffix=""
           if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
           SCARLETT_TEST_NODE_BINARY="$RUNNER_TEMP/scarlett-runtime/scarlett-node$suffix" go test -race . -run '^TestActualDesktopOwnerDrainFinishesAcceptedWorkAndSurvivesRestart$' -count=1
+      - name: Mac release signing contract tests
+        if: runner.os == 'macOS'
+        run: python3 -m unittest discover -s desktop/scripts -p 'test_macos_signing.py'
       - name: Desktop tests and native checks
         run: |
           npm --prefix desktop ci --ignore-scripts
