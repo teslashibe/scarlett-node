@@ -19,6 +19,7 @@ public static class ScarlettAcceptanceWindow {
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
+    [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
     [StructLayout(LayoutKind.Sequential)] private struct KeyboardInput {
         public ushort key, scan; public uint flags, time; public UIntPtr extra;
     }
@@ -59,7 +60,20 @@ public static class ScarlettAcceptanceWindow {
     public static void ControlKey(ushort key) {
         Send(new Input[] { Key(0x11, false), Key(key, false), Key(key, true), Key(0x11, true) });
     }
-    public static void PressKey(ushort key) { Send(new Input[] { Key(key, false), Key(key, true) }); }
+    public static void Click(int x, int y) {
+        int left = GetSystemMetrics(76), top = GetSystemMetrics(77);
+        int width = GetSystemMetrics(78), height = GetSystemMetrics(79);
+        if (width < 2 || height < 2 || x < left || y < top ||
+            (long)x >= (long)left + width || (long)y >= (long)top + height)
+            throw new InvalidOperationException("Synthetic click outside desktop bounds");
+        Input move = new Input();
+        move.value.mouse.x = (int)(((long)x - left) * 65535 / (width - 1));
+        move.value.mouse.y = (int)(((long)y - top) * 65535 / (height - 1));
+        move.value.mouse.flags = 0xC001;
+        Input down = new Input(); down.value.mouse.flags = 2;
+        Input up = new Input(); up.value.mouse.flags = 4;
+        Send(new Input[] { move, down, up });
+    }
     private static Input[] ClearInputs() {
         return new Input[] { Key(0x11, false), Key(0x41, false), Key(0x41, true), Key(0x11, true),
             Key(0x08, false), Key(0x08, true) };
@@ -130,7 +144,7 @@ function Find-Button([string]$Name) {
     )
     return $script:window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
 }
-function Focus-Control([System.Windows.Automation.AutomationElement]$Control) {
+function Click-Control([System.Windows.Automation.AutomationElement]$Control) {
     $handle = $application.MainWindowHandle
     [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
     [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
@@ -138,10 +152,11 @@ function Focus-Control([System.Windows.Automation.AutomationElement]$Control) {
     if ($Control.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) {
         $scroll.ScrollIntoView()
     }
-    $Control.SetFocus()
     Wait-Check {
-        return $Control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
-    } 10 'Installed control did not acquire keyboard focus'
+        return [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+    } 10 'Installed control did not acquire foreground input'
+    $point = $Control.GetClickablePoint()
+    [ScarlettAcceptanceWindow]::Click([int]$point.X, [int]$point.Y)
 }
 function Click-Button([string]$Name) {
     Wait-Check {
@@ -150,10 +165,7 @@ function Click-Button([string]$Name) {
     } 30 "UI control did not become available: $Name"
     $button = Find-Button $Name
     if (-not $button -or -not $button.Current.IsEnabled) { throw "UI control unavailable: $Name" }
-    Focus-Control $button
-    # Drive the browser's ordinary keyboard action rather than mixing UIA
-    # invocation with queued native input from the preceding control.
-    [ScarlettAcceptanceWindow]::PressKey(0x20)
+    Click-Control $button
 }
 function Wait-AppWindow {
     Wait-Check {
@@ -346,9 +358,23 @@ function Check-DefaultCheckbox([string]$Name, [string]$Failure) {
 function Set-Checkbox([string]$Name, [bool]$Enabled) {
     Wait-Check { (Find-Input $Name).Current.IsEnabled } 15 "Checkbox unavailable: $Name"
     if (Checkbox-Is $Name $Enabled) { return }
-    Focus-Control (Find-Input $Name)
-    [ScarlettAcceptanceWindow]::PressKey(0x20)
-    Wait-Check { Checkbox-Is $Name $Enabled } 15 "Checkbox did not update: $Name"
+    Click-Control (Find-Input $Name)
+    try { Wait-Check { Checkbox-Is $Name $Enabled } 15 "Checkbox did not update: $Name" }
+    catch {
+        $originalFailure = $_
+        $control = Find-Input $Name
+        $pattern = $null
+        $hasToggle = $null -ne $control -and $control.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)
+        $diagnostic = @{ controlPresent = $null -ne $control; controlEnabled = $null -ne $control -and $control.Current.IsEnabled
+            controlFocused = $null -ne $control -and $control.Current.HasKeyboardFocus
+            toggleSupported = $hasToggle; toggleOn = $hasToggle -and $pattern.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::On
+            expectedOn = $Enabled; foregroundOwned = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $application.MainWindowHandle
+            modifiersReleased = [ScarlettAcceptanceWindow]::ModifiersReleased(); realProviderJobs = 0 }
+        New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+        $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-checkbox-input-failure.json')
+        Write-Output ($diagnostic | ConvertTo-Json -Compress)
+        throw $originalFailure
+    }
 }
 function Saved-Preferences([int]$Port, [bool]$Background) {
     $path = Join-Path $state 'preferences.json'
@@ -457,8 +483,11 @@ function Set-Text([string]$Name, [string]$Value) {
     Wait-Check { (Find-Input $Name).Current.IsEnabled } 15 "Text input did not become ready: $Name"
     $control = Find-Input $Name
     if (-not $control -or -not $control.Current.IsEnabled) { throw "Text input unavailable: $Name" }
-    Focus-Control $control
+    Click-Control $control
     $handle = $application.MainWindowHandle
+    Wait-Check {
+        return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+    } 10 'Synthetic input did not acquire keyboard focus'
     # Queue selection, clearing and Unicode text in one ordered native input
     # batch. An already-empty field cannot acknowledge queued clearing, and
     # mixing SendInput with SendKeys can lose text despite successful focus.
