@@ -128,4 +128,14 @@ The native complete-bundle workflow installs its testing NSIS package into a cle
 
 Passing this check establishes the tested installer and UI lifecycle. It does not establish signature trust, remote provider login or verified paid network execution; those remain release requirements.
 
+The Windows acceptance also builds an installation-only next-patch version of
+the same runtime source. In its disposable profile it retains two synthetic X
+accounts, a synthetic node identity, an uncertain journal record, preferences
+and the private local API bearer across installation of the next version and
+reinstallation of the original version. Each replaced app must reopen without
+starting work, retain the durable bytes, start its protected API and drain on
+Quit. Evidence is recorded only after these assertions pass. This tests the
+installation lifecycle for that version pair; signed installers, historical
+schema compatibility and the Mac upgrade/downgrade UI remain separate checks.
+
 Installed Windows import acceptance uses new synthetic Chrome/Firefox stores below RUNNER_TEMP and redirects only browser roots for the test app. It exercises profile-specific consent and reset, Firefox import, the protected Chrome paste fallback, masked paste, unchanged stores and native private account persistence. It makes no provider requests. Account ID fields have distinct X/Codex labels for assistive technology. This acceptance is a release gate; test configuration is not a browser import mode for operators.

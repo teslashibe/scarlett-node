@@ -151,14 +151,22 @@ jobs:
       - name: Prepare isolated Windows browser stores
         if: runner.os == 'Windows'
         run: python desktop/scripts/prepare-browser-fixtures.py "$RUNNER_TEMP/scarlett-browser-fixtures"
+      - name: Build the Windows installation-only upgrade variant
+        if: runner.os == 'Windows'
+        working-directory: desktop
+        run: |
+          node scripts/prepare-upgrade-fixture.mjs "$RUNNER_TEMP/scarlett-upgrade-installers"
+          npm run tauri build -- --debug --config src-tauri/tauri.upgrade-testing.generated.json
       - name: Validate installed Windows desktop, preferences and browser import without login
         if: runner.os == 'Windows'
-        timeout-minutes: 15
+        timeout-minutes: 20
         shell: powershell
         run: |
-          $installers = @(Get-ChildItem -LiteralPath desktop/src-tauri/target/debug/bundle/nsis -Filter '*.exe')
-          if ($installers.Count -ne 1) { throw 'Expected one native testing installer' }
-          & desktop/scripts/check-windows-install.ps1 -Installer $installers[0].FullName -EvidenceDirectory "$env:RUNNER_TEMP/scarlett-installed-evidence" -Preferences -BrowserFixture "$env:RUNNER_TEMP/scarlett-browser-fixtures/fixture.json"
+          $fixturePath = "$env:RUNNER_TEMP/scarlett-upgrade-installers/fixture.json"
+          $fixture = [System.IO.File]::ReadAllText($fixturePath) | ConvertFrom-Json
+          $upgrades = @(Get-ChildItem -LiteralPath desktop/src-tauri/target/debug/bundle/nsis -Filter ("*_" + $fixture.upgradeVersion + "_*.exe"))
+          if ($upgrades.Count -ne 1) { throw 'Expected one versioned upgrade testing installer' }
+          & desktop/scripts/check-windows-install.ps1 -Installer $fixture.baselineInstaller -EvidenceDirectory "$env:RUNNER_TEMP/scarlett-installed-evidence" -Preferences -BrowserFixture "$env:RUNNER_TEMP/scarlett-browser-fixtures/fixture.json" -UpgradeFixture $fixturePath -UpgradeInstaller $upgrades[0].FullName
       - uses: actions/upload-artifact@v4
         if: ${{ always() && steps.installer.conclusion == 'success' }}
         with:
