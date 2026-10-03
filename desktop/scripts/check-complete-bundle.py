@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from windows_pe_imports import assert_no_developer_crt
 
 if len(sys.argv) != 3:
     raise SystemExit('Supply the installed executable directory and installed resource directory')
@@ -35,6 +36,12 @@ for item in metadata['sidecars']:
     assert not file.is_symlink() and file.is_file()
     assert file.stat().st_size == item['bytes']
     assert hashlib.sha256(file.read_bytes()).hexdigest() == item['sha256']
+
+if os.name == 'nt':
+    for name in ('scarlett-node', 'scarlett-prover', 'open-agent-api', 'scarlett-node-desktop'):
+        file = binaries / (name + suffix)
+        if file.is_file():
+            assert_no_developer_crt(file)
 
 with tempfile.TemporaryDirectory(prefix='scarlett-bundle-smoke-') as temporary:
     home = Path(temporary)

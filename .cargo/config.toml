@@ -1,0 +1,4 @@
+# The Windows proof helper must run without a separately installed VC runtime.
+# Keep the pinned upstream provider binaries unchanged.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
