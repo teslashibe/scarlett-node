@@ -29,7 +29,7 @@ class WindowsSigningContracts(unittest.TestCase):
             sidecars.append({'name': name, 'bytes': file.stat().st_size, 'sha256': signing.digest(file)})
         (self.root / 'target/release/scarlett-node-desktop.exe').write_bytes(b'MZ synthetic desktop')
         self.metadata = {'schemaVersion': 1, 'target': signing.TARGET, 'codexVersion': '0.159.2',
-                         'claudeVersion': '2.1.286', 'modelApiVersion': '0.1.31', 'files': entries, 'sidecars': sidecars}
+                         'claudeVersion': '2.1.286', 'modelApiVersion': '0.1.32', 'files': entries, 'sidecars': sidecars}
         self.write_metadata()
 
     def tearDown(self):
@@ -77,7 +77,8 @@ class WindowsSigningContracts(unittest.TestCase):
 
     def test_wrong_platform_or_versions_rejected(self):
         for key, value in [('target', 'aarch64-apple-darwin'), ('modelApiVersion', 'old'),
-                           ('modelApiVersion', '0.1.29'), ('modelApiVersion', '0.1.30'), ('claudeVersion', 'old')]:
+                           ('modelApiVersion', '0.1.29'), ('modelApiVersion', '0.1.30'),
+                           ('modelApiVersion', '0.1.31'), ('claudeVersion', 'old')]:
             with self.subTest(key=key, value=value):
                 old = self.metadata[key]; self.metadata[key] = value; self.write_metadata()
                 with self.assertRaises(ValueError): signing.verify_inputs(self.root)

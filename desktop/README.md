@@ -88,7 +88,7 @@ Tests use synthetic credentials and disposable temporary directories/fake execut
 
 ## Complete runtime package
 
-The complete bundle contains the desktop shell, native Go node, Rust proof helper, `open-agent-api` v0.1.31, Codex CLI 0.159.2 and Claude CLI 2.1.286. Users do not need a development toolchain to run these packaged binaries. The desktop starts and stops the local model API through its native supervisor. The node's verified network services remain Codex and X; packaging Claude does not add a verified Claude network service.
+The complete bundle contains the desktop shell, native Go node, Rust proof helper, `open-agent-api` v0.1.32, Codex CLI 0.159.2 and Claude CLI 2.1.286. Users do not need a development toolchain to run these packaged binaries. The desktop starts and stops the local model API through its native supervisor. The node's verified network services remain Codex and X; packaging Claude does not add a verified Claude network service.
 
 Build on the target OS and architecture. Prepare the three reviewed native binaries and the official unpacked native provider packages, then run:
 
