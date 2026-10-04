@@ -121,11 +121,10 @@ jobs:
           try {
             [System.IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SCARLETT_WINDOWS_PFX_BASE64))
             $env:SCARLETT_WINDOWS_PFX_BASE64 = $null
-            # The PR rehearsal runs this same importer. It puts the key in the CNG
-            # software key storage provider without export rights (a key from an
-            # OpenSSL PKCS#12 file would otherwise land in a legacy CryptoAPI
-            # provider that cannot sign SHA-256), deletes the file, checks the
-            # pin and that the certificate is not a trusted root.
+            # The PR rehearsal runs this same importer: Import-PfxCertificate
+            # without -Exportable, then it requires the pinned certificate with a
+            # non-exportable current-user CNG software key, refuses trusted roots
+            # and deletes the PKCS#12 file.
             & desktop/scripts/import-windows-identity.ps1 -Pfx $pfx -Thumbprint $pin
             if ($LASTEXITCODE -ne 0) { throw 'The Windows signing identity was not imported' }
           } finally {

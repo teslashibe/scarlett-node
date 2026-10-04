@@ -6,14 +6,12 @@
 # validity is made with OpenSSL 3 and exported as PKCS#12 with OpenSSL 3's
 # defaults (AES-256-CBC, PBKDF2, SHA-256 MAC), as the release key was.
 # import-windows-identity.ps1 imports it exactly as the release workflow imports
-# its key; then the release workflow's signing commands run sign-windows-bundle.py
+# its key (Import-PfxCertificate without -Exportable, then the pin, key-provider,
+# export-policy and trust-store checks); then the release workflow's signing
+# commands run sign-windows-bundle.py
 # with the pins injected through the rehearsal identities override. Its evidence
 # says "rehearsal": true, which the release assembler rejects. The identity, its
 # key and the key files are removed on exit; no trust root is ever added.
-#
-# A control first imports a copy of that PKCS#12 file the way the release
-# workflow used to (Import-PfxCertificate) and reports, without failing, which
-# key provider Windows chose and whether SignTool could make a SHA-256 signature.
 #
 # usage: rehearse-windows-signing.ps1 -Desktop <absolute desktop checkout>
 #   -WorkDirectory <new absolute directory> -ControlBinary <absolute unsigned exe>
@@ -76,33 +74,27 @@ function New-RandomHex([int]$Bytes) {
     return -join ($buffer | ForEach-Object { $_.ToString('x2') })
 }
 
-function Invoke-SignToolControl([string]$Tool, [string]$Thumbprint, [string]$Target) {
-    # No timestamp: this isolates whether the key's provider can sign SHA-256.
-    $preference = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        $text = @(& $Tool sign /q /s My /sha1 $Thumbprint /fd SHA256 $Target 2>&1 | ForEach-Object { [string]$_ }) -join "`n"
-        $code = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $preference
+function Invoke-LegacySignerControl([string]$Root, [string]$Target, [hashtable]$Values) {
+    # TEMPORARY diagnostic (removed before merge): the previous release signer
+    # function, unchanged, on this identity, from the prepared root as cwd.
+    $saved = @{}
+    foreach ($name in $Values.Keys) {
+        $saved[$name] = [Environment]::GetEnvironmentVariable($name)
+        [Environment]::SetEnvironmentVariable($name, $Values[$name])
     }
-    if ($code -eq 0) { return 'succeeded' }
-    $hresult = ''
-    if ($text -match '\((?:-?[0-9]+/)?0x([0-9A-Fa-f]{8})\)') { $hresult = ' with 0x' + $Matches[1].ToUpperInvariant() }
-    return 'failed' + $hresult
-}
-
-function Get-KeyProviderDescription($Certificate) {
-    $key = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Certificate)
+    $location = [Environment]::CurrentDirectory
     try {
-        if ($key -is [System.Security.Cryptography.RSACng]) { return "CNG '" + $key.Key.Provider.Provider + "'" }
-        if ($key -is [System.Security.Cryptography.RSACryptoServiceProvider]) {
-            $info = $key.CspKeyContainerInfo
-            return "CryptoAPI '" + $info.ProviderName + "' (provider type " + $info.ProviderType + ')'
-        }
-        return 'an unrecognised provider'
+        [Environment]::CurrentDirectory = $Root
+        $command = "`$ErrorActionPreference = 'Stop'; Set-Location -LiteralPath '" + $Root + "'; . '" + $env:SCARLETT_REHEARSAL_LEGACY_SIGNER + "'; " +
+            "try { Sign-WindowsReleaseFile '" + $Target + "' | Out-Null; 'succeeded' } " +
+            "catch { 'threw ' + `$_.Exception.GetType().Name + ': ' + `$_.Exception.Message + ' (line ' + `$_.InvocationInfo.ScriptLineNumber + ')' }"
+        $preference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try { return @(& powershell.exe -NoProfile -NonInteractive -Command $command 2>&1 | ForEach-Object { [string]$_ }) -join ' / ' }
+        finally { $ErrorActionPreference = $preference }
     } finally {
-        if ($key -is [System.IDisposable]) { $key.Dispose() }
+        [Environment]::CurrentDirectory = $location
+        foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
     }
 }
 
@@ -123,7 +115,6 @@ try {
     $key = Join-Path $keys.FullName 'key.pem'
     $certificate = Join-Path $keys.FullName 'cert.pem'
     $pfx = Join-Path $keys.FullName 'identity.pfx'
-    $controlPfx = Join-Path $keys.FullName 'control.pfx'
     Invoke-RehearsalNative $openssl.Path @('genpkey', '-algorithm', 'RSA', '-pkeyopt', 'rsa_keygen_bits:3072', '-out', $key) | Out-Null
     Invoke-RehearsalNative $openssl.Path @('req', '-new', '-x509', '-config', $config, '-key', $key, '-sha256', '-days', '1',
         '-set_serial', ('0x' + (New-RandomHex 16)), '-out', $certificate) | Out-Null
@@ -139,7 +130,6 @@ try {
         Write-Output $structure
         throw 'The rehearsal PKCS#12 file does not use the OpenSSL 3 default AES-256/PBKDF2/SHA-256 protection'
     }
-    Copy-Item -LiteralPath $pfx -Destination $controlPfx
 
     # Pins come from the rehearsal identities override, as in sign-macos rehearsals.
     $identities = Join-Path $WorkDirectory 'rehearsal-identities.json'
@@ -153,60 +143,51 @@ try {
     $upper = $sha1.ToUpperInvariant()
     $signtool = Find-WindowsSdkSignTool
 
-    # Control (informational): the previous release import.
-    $controlTarget = Join-Path $WorkDirectory 'control-target.exe'
-    Copy-Item -LiteralPath $ControlBinary -Destination $controlTarget
-    try {
-        $password = ConvertTo-SecureString -String $env:SCARLETT_WINDOWS_PFX_PASSWORD -AsPlainText -Force
-        $legacy = @(Import-PfxCertificate -FilePath $controlPfx -CertStoreLocation Cert:\CurrentUser\My -Password $password)
-        if ($legacy.Count -ne 1 -or $legacy[0].Thumbprint -cne $upper -or -not $legacy[0].HasPrivateKey) {
-            throw 'The control import does not match the rehearsal certificate'
-        }
-        $provider = Get-KeyProviderDescription $legacy[0]
-        $outcome = Invoke-SignToolControl $signtool $upper $controlTarget
-        Write-Output ('Control (informational): Import-PfxCertificate put the OpenSSL 3 PKCS#12 key in ' + $provider +
-            '; SignTool SHA-256 signing with it ' + $outcome)
-        if ($env:SCARLETT_REHEARSAL_LEGACY_SIGNER) {
-            # Temporary diagnostic: the previous release signer function, unchanged,
-            # with this Import-PfxCertificate identity, on an unsigned sidecar.
-            $legacyRoot = Join-Path $WorkDirectory 'legacy-root'
-            $legacyTarget = Join-Path $legacyRoot 'binaries\open-agent-api-x86_64-pc-windows-msvc.exe'
-            New-Item -ItemType Directory -Path (Split-Path -Parent $legacyTarget) -Force | Out-Null
-            Copy-Item -LiteralPath $ControlBinary -Destination $legacyTarget
-            $saved = @{}
-            $values = @{ SCARLETT_SIGNING_SCHEME = 'self-signed-stable'; SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT = $upper
-                SCARLETT_WINDOWS_CERT_SHA256 = $sha256; SCARLETT_WINDOWS_TIMESTAMP_URL = 'http://timestamp.digicert.com'
-                SCARLETT_WINDOWS_SIGNTOOL = $signtool; SCARLETT_WINDOWS_SIGNING_ROOT = $legacyRoot }
-            foreach ($name in $values.Keys) {
-                $saved[$name] = [Environment]::GetEnvironmentVariable($name)
-                [Environment]::SetEnvironmentVariable($name, $values[$name])
-            }
-            try {
-                $command = "`$ErrorActionPreference = 'Stop'; . '" + $env:SCARLETT_REHEARSAL_LEGACY_SIGNER + "'; " +
-                    "try { Sign-WindowsReleaseFile '" + $legacyTarget + "' | Out-Null; 'Legacy signer: succeeded' } " +
-                    "catch { 'Legacy signer threw: ' + `$_.Exception.GetType().Name + ': ' + `$_.Exception.Message + ' (line ' + `$_.InvocationInfo.ScriptLineNumber + ')' }"
-                $preference = $ErrorActionPreference
-                $ErrorActionPreference = 'Continue'
-                try {
-                    $legacyOutput = @(& powershell.exe -NoProfile -NonInteractive -Command $command 2>&1 | ForEach-Object { [string]$_ })
-                } finally { $ErrorActionPreference = $preference }
-                $legacyOutput | ForEach-Object { Write-Output ('Control (legacy signer): ' + $_) }
-            } finally {
-                foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
-            }
-        }
-    } finally {
-        Remove-Item -LiteralPath ('Cert:\CurrentUser\My\' + $upper) -DeleteKey -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $controlPfx, $controlTarget -Force -ErrorAction SilentlyContinue
-    }
-    if (Test-Path -LiteralPath ('Cert:\CurrentUser\My\' + $upper)) { throw 'The control identity was not removed' }
-
     # The release import, unchanged: import-windows-identity.ps1 deletes the file.
     $global:LASTEXITCODE = 0
     & (Join-Path $scripts 'import-windows-identity.ps1') -Pfx $pfx -Thumbprint $sha1
     if ($LASTEXITCODE -ne 0) { throw 'The rehearsal identity import failed' }
     if (Test-Path -LiteralPath $pfx) { throw 'The importer left the PKCS#12 file behind' }
     $env:SCARLETT_WINDOWS_PFX_PASSWORD = $null
+
+    if ($env:SCARLETT_REHEARSAL_LEGACY_SIGNER) {
+        # TEMPORARY diagnostic (removed before merge): Tauri 2.12.1 passes sidecars
+        # to the sign callback as binaries/<name>-<triple>.exe relative to src-tauri.
+        $legacyRoot = Join-Path $WorkDirectory 'legacy-root'
+        New-Item -ItemType Directory -Path (Join-Path $legacyRoot 'binaries') | Out-Null
+        foreach ($name in @('open-agent-api', 'scarlett-prover', 'scarlett-node')) {
+            Copy-Item -LiteralPath $ControlBinary -Destination (Join-Path $legacyRoot ('binaries\' + $name + '-x86_64-pc-windows-msvc.exe'))
+        }
+        $values = @{ SCARLETT_SIGNING_SCHEME = 'self-signed-stable'; SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT = $upper
+            SCARLETT_WINDOWS_CERT_SHA256 = $sha256; SCARLETT_WINDOWS_TIMESTAMP_URL = 'http://timestamp.digicert.com'
+            SCARLETT_WINDOWS_SIGNTOOL = $signtool; SCARLETT_WINDOWS_SIGNING_ROOT = $legacyRoot }
+        Write-Output ('Control (legacy signer, absolute sidecar path): ' +
+            (Invoke-LegacySignerControl $legacyRoot (Join-Path $legacyRoot 'binaries\open-agent-api-x86_64-pc-windows-msvc.exe') $values))
+        Write-Output ('Control (legacy signer, Tauri relative sidecar path): ' +
+            (Invoke-LegacySignerControl $legacyRoot 'binaries/scarlett-prover-x86_64-pc-windows-msvc.exe' $values))
+        $saved = @{}
+        foreach ($name in $values.Keys) { $saved[$name] = [Environment]::GetEnvironmentVariable($name); [Environment]::SetEnvironmentVariable($name, $values[$name]) }
+        $location = [Environment]::CurrentDirectory
+        try {
+            [Environment]::CurrentDirectory = $legacyRoot
+            $info = New-Object System.Diagnostics.ProcessStartInfo
+            $info.FileName = 'powershell.exe'
+            $info.Arguments = '-NoProfile -NonInteractive -File "' + (Join-Path $scripts 'sign-windows-file.ps1') + '" -File binaries/scarlett-node-x86_64-pc-windows-msvc.exe'
+            $info.WorkingDirectory = $legacyRoot
+            $info.UseShellExecute = $false
+            $info.RedirectStandardError = $true
+            $info.RedirectStandardOutput = $true
+            $process = [System.Diagnostics.Process]::Start($info)
+            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+            $stderrText = $process.StandardError.ReadToEnd()
+            $process.WaitForExit()
+            Write-Output ('Control (current signer, Tauri relative sidecar path): exit ' + $process.ExitCode + ' ' + ($stderrText -replace "`r?`n", ' / '))
+        } finally {
+            [Environment]::CurrentDirectory = $location
+            foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
+        }
+        Remove-Item -LiteralPath $legacyRoot -Recurse -Force
+    }
 
     # The release workflow's signing step, with only the evidence location changed.
     $env:SCARLETT_SIGNING_SCHEME = 'self-signed-stable'

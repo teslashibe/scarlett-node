@@ -89,7 +89,10 @@ HRESULT. Python checker failures add the script line and exception class, and
 installed acceptance adds its script line numbers. Native messages, paths,
 certificate details and secrets are never printed.
 
-The Tauri callback permits exactly its five copied x86 NSIS plugin DLL paths.
+Tauri 2.12.1 passes sidecars to the callback relative to `src-tauri`
+(`binaries/<name>-<triple>.exe`); the callback resolves a plain relative path
+against its working directory and then applies every prepared-root and allowlist
+check. The Tauri callback permits exactly its five copied x86 NSIS plugin DLL paths.
 Generated x86 uninstallers must match NSIS 3.11's `nst<hex>.tmp` filename inside
 a fresh `target/release/nsis-signing-temp` directory. Only the packaging child
 receives that directory as TMP/TEMP and explicit callback context; it is removed
@@ -353,12 +356,10 @@ darwin-amd64.dmg,windows-amd64.exe}`, the set the publisher accepts) beside
 `SHA256SUMS` and `evidence/`.
 
 On Windows the key is imported by `desktop/scripts/import-windows-identity.ps1`
-into the current user's CNG Microsoft Software Key Storage Provider without
-export rights; the PKCS#12 file is deleted and the pin and trust stores are
-checked. `Import-PfxCertificate` is not used: an OpenSSL PKCS#12 file names no
-key provider, so Windows would place the key in the legacy CryptoAPI
-"Microsoft Enhanced Cryptographic Provider v1.0", which cannot make the SHA-256
-signatures SignTool `/fd SHA256` needs.
+with `Import-PfxCertificate` and no `-Exportable`. It then requires exactly the
+pinned certificate with a non-exportable, current-user RSA-3072 key in the CNG
+Microsoft Software Key Storage Provider (where Windows Server 2025 puts an
+OpenSSL 3 PKCS#12 key), refuses a trusted-root copy and deletes the PKCS#12 file.
 
 PR CI rehearses both platforms with no secrets.
 `desktop/scripts/rehearse-macos-signing.sh` makes a throwaway certificate with the
@@ -370,9 +371,8 @@ makes a throwaway RSA-3072 certificate with the release extensions, exports it a
 PKCS#12 with OpenSSL 3 defaults (AES-256-CBC, PBKDF2, SHA-256 MAC) like the release
 key, imports it with `import-windows-identity.ps1` and runs
 `sign-windows-bundle.py`: signing, NSIS packaging, installed acceptance and the
-pinned signature checks on the complete release build. A control reports which
-provider `Import-PfxCertificate` would have chosen and whether SignTool could sign
-with it. The ephemeral fixture described above also still runs.
+pinned signature checks on the complete release build. The ephemeral fixture
+described above also still runs.
 A rehearsal may substitute its own identities file through
 `SCARLETT_SIGNING_IDENTITIES`, which is honoured only with
 `SCARLETT_SIGNING_REHEARSAL=1`. Everything signed that way records

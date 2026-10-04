@@ -152,17 +152,17 @@ class ReleaseWorkflowTests(unittest.TestCase):
         windows = named(self.release, 'Import the Windows signing key without export rights')
         self.assertIn('& desktop/scripts/import-windows-identity.ps1 -Pfx $pfx -Thumbprint $pin', windows)
         self.assertIn("if ($LASTEXITCODE -ne 0) { throw 'The Windows signing identity was not imported' }", windows)
-        self.assertNotIn('Import-PfxCertificate', windows)
-        self.assertNotIn('-Exportable', windows)
+        # The step itself imports nothing; the shared importer does.
+        self.assertNotIn('Import-PfxCertificate -', windows)
+        self.assertNotIn('-Exportable', windows.replace('without -Exportable', ''))
         self.assertIn('Remove-Item -LiteralPath $pfx', windows)
         importer = (ROOT / 'desktop/scripts/import-windows-identity.ps1').read_text()
-        # A CNG software key: an OpenSSL PKCS#12 key imported by
-        # Import-PfxCertificate lands in a CryptoAPI provider that cannot sign SHA-256.
-        self.assertIn('PFXImportCertStore(ref blob, password, CRYPT_USER_KEYSET | PKCS12_ALWAYS_CNG_KSP)', importer)
-        self.assertNotIn('CRYPT_EXPORTABLE =', importer)
-        self.assertNotIn('Import-PfxCertificate -', importer)
+        self.assertIn('Import-PfxCertificate -FilePath $file -CertStoreLocation Cert:\\CurrentUser\\My -Password $password', importer)
+        self.assertNotRegex(importer, r'(?m)^[^#\n]*Import-PfxCertificate[^\n]*-Exportable')
+        # The imported key must be a non-exportable current-user CNG software key.
         self.assertIn("'Microsoft Software Key Storage Provider'", importer)
         self.assertIn('AllowPlaintextExport', importer)
+        self.assertIn('-not $key.Key.IsMachineKey', importer)
         self.assertIn("Remove-Item -LiteralPath $Path -Force", importer)
         self.assertIn("'Cert:\\CurrentUser\\Root\\', 'Cert:\\LocalMachine\\Root\\'", importer)
         mac = named(self.release, 'Import the Mac signing key into a temporary keychain')
