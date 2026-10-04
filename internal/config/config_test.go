@@ -196,3 +196,39 @@ func TestJournalCapacityEnvironment(t *testing.T) {
 		}
 	}
 }
+
+// The warm X client is on unless the operator sets SCARLETT_X_WARM=0.
+func TestWarmXClientDefaultsOnWithExplicitOptOut(t *testing.T) {
+	t.Setenv("SCARLETT_COORDINATOR", "https://example.org")
+	t.Setenv("SCARLETT_PROFILE", "synthetic")
+	t.Setenv("SCARLETT_EXECUTOR", ExecutorServices)
+	t.Setenv("SCARLETT_SERVICES", "x_read")
+	t.Setenv("SCARLETT_VERIFIER", "127.0.0.1:7047")
+	t.Setenv("SCARLETT_PROVER", "scarlett-prover")
+	t.Setenv("SCARLETT_X_SESSION", filepath.Join(t.TempDir(), "synthetic-x.json"))
+	for _, tc := range []struct {
+		value string
+		set   bool
+		warm  bool
+	}{{"", false, true}, {"1", true, true}, {"0", true, false}, {"false", true, false}, {"OFF", true, false}, {" no ", true, false}, {"yes", true, true}} {
+		if tc.set {
+			t.Setenv("SCARLETT_X_WARM", tc.value)
+		} else {
+			os.Unsetenv("SCARLETT_X_WARM")
+		}
+		c, err := Load()
+		if err != nil {
+			t.Fatalf("SCARLETT_X_WARM=%q set=%v: %v", tc.value, tc.set, err)
+		}
+		if c.XWarm != tc.warm {
+			t.Fatalf("SCARLETT_X_WARM=%q set=%v: warm %v, want %v", tc.value, tc.set, c.XWarm, tc.warm)
+		}
+	}
+	// Outside services mode the field stays off; nothing warms a gateway node.
+	t.Setenv("SCARLETT_EXECUTOR", ExecutorGateway)
+	t.Setenv("SCARLETT_GATEWAY", "http://127.0.0.1:8088")
+	os.Unsetenv("SCARLETT_SERVICES")
+	if c, err := Load(); err != nil || c.XWarm {
+		t.Fatal("gateway executor warms X", err)
+	}
+}

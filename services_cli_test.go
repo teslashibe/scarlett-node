@@ -75,7 +75,8 @@ func actualServicesCLIHeartbeat(t *testing.T, binary string, empty bool) {
 			cmd.Env = append(cmd.Env, e)
 		}
 	}
-	cmd.Env = append(cmd.Env, "SCARLETT_EXECUTOR=services", "SCARLETT_VERIFIER=127.0.0.1:17047", "SCARLETT_SERVICES=codex,x_read", "SCARLETT_COORDINATOR="+server.URL, "SCARLETT_COORDINATOR_CA_FILE="+ca, "SCARLETT_CODEX_HOME="+home, "SCARLETT_X_SESSION="+session, "SCARLETT_PROFILE=standard", "SCARLETT_STATE_DIR="+state, "SCARLETT_CREDENTIAL="+credential, "SCARLETT_NODE_ID=synthetic-node")
+	// SCARLETT_X_WARM=0: this synthetic session must never be sent to x.com.
+	cmd.Env = append(cmd.Env, "SCARLETT_EXECUTOR=services", "SCARLETT_X_WARM=0", "SCARLETT_VERIFIER=127.0.0.1:17047", "SCARLETT_SERVICES=codex,x_read", "SCARLETT_COORDINATOR="+server.URL, "SCARLETT_COORDINATOR_CA_FILE="+ca, "SCARLETT_CODEX_HOME="+home, "SCARLETT_X_SESSION="+session, "SCARLETT_PROFILE=standard", "SCARLETT_STATE_DIR="+state, "SCARLETT_CREDENTIAL="+credential, "SCARLETT_NODE_ID=synthetic-node")
 	if os.Getenv("SCARLETT_TEST_BUNDLE") != "1" {
 		cmd.Env = append(cmd.Env, "SCARLETT_PROVER="+helper)
 	}

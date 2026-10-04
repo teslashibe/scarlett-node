@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"net/http"
 	"os/exec"
 	"sync"
 	"time"
@@ -16,6 +18,10 @@ type serviceEntry struct {
 	state, lastError, stamp string
 	restUntil               time.Time
 	helperMissing           bool
+	// warming: a background build or refresh of this X account's client is
+	// running (see keepXWarm); warmStart is when it began.
+	warming   bool
+	warmStart time.Time
 }
 type servicePool struct {
 	mu                                      sync.Mutex
@@ -25,6 +31,13 @@ type servicePool struct {
 	saved                                   map[string]savedAccountHealth
 	next                                    map[string]int
 	accountMode, accountsError, healthError bool
+	// xWarm keeps an x-go client warm per X account and reports an account
+	// ready only once its client is built (worker.WarmXClient). xBase is the
+	// transport those constructions use (nil: the network); ctx bounds them
+	// (nil: Background).
+	xWarm bool
+	xBase http.RoundTripper
+	ctx   context.Context
 }
 
 func newServicePool(c config.Config) *servicePool {
@@ -35,17 +48,17 @@ func newServicePool(c config.Config) *servicePool {
 	return p
 }
 func (p *servicePool) refresh(now time.Time) {
-	if p.refreshAccounts(now) {
-		return
-	}
-	_, helperError := exec.LookPath(p.config.Prover)
-	for kind, s := range p.entries {
-		if !s.enabled {
-			s.state = "not_added"
-			continue
+	if !p.refreshAccounts(now) {
+		_, helperError := exec.LookPath(p.config.Prover)
+		for kind, s := range p.entries {
+			if !s.enabled {
+				s.state = "not_added"
+				continue
+			}
+			refreshAccount(p.accounts[kind+":legacy"], now, helperError != nil)
 		}
-		refreshAccount(p.accounts[kind+":legacy"], now, helperError != nil)
 	}
+	p.keepXWarm(now)
 }
 func (p *servicePool) health() []coordinator.ServiceHealth {
 	p.mu.Lock()

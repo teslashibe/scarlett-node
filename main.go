@@ -189,6 +189,9 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	var services *servicePool
 	if c.Executor == config.ExecutorServices {
 		services = newServicePool(c)
+		// X accounts get their x-go client built now, in the background, and
+		// kept warm; the heartbeat says ready once that is done.
+		services.xWarm, services.ctx = c.XWarm, workCtx
 		capacity = services.capacity()
 	}
 	slots := make(chan struct{}, capacity)
@@ -203,6 +206,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 		}
 		_ = saveRuntimeStatus(c.StateDir, status)
 		waitForWorkers(&running, cancelWork, 2*time.Minute)
+		worker.ShutdownXClients()
 		status.State = "stopped"
 		status.InFlight = 0
 		if records, err := journal.Pending(); err == nil {

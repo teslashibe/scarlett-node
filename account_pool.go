@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -375,15 +376,20 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 	if s.inFlight > 0 {
 		s.inFlight--
 	}
+	p.settle(s, code)
+	p.saveHealth()
+}
+
+// settle applies one outcome code to an account: the state machine the
+// heartbeat reports from, shared by finished jobs and client warm-ups.
+func (p *servicePool) settle(s *serviceEntry, code string) {
 	// An older concurrent result cannot repair an authoritative auth failure.
 	if s.state == "auth_required" && code != "auth_required" {
-		p.saveHealth()
 		return
 	}
 	// An older transient result cannot shorten an authoritative quota reset or
 	// replace its exhausted state, including when another attempt finishes later.
 	if (code == "prover_error" || code == "x_request_failed") && s.state == "exhausted" && time.Now().Before(s.restUntil) {
-		p.saveHealth()
 		return
 	}
 	s.lastError = code
@@ -412,8 +418,80 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 			s.restUntil = until
 		}
 	}
+}
+
+// keepXWarm ties each X account's heartbeat state to its warm client. An
+// account with credentials is "configured" until its x-go client has
+// validated the session and bootstrapped, "ready" from then on; the client is
+// built here in the background at start, rebuilt when it falls stale, and
+// built again after the session file changes. Builds run one at a time
+// node-wide and never block a job: a job on a "configured" account builds on
+// demand. Outcomes arrive through warmed. The caller holds p.mu.
+func (p *servicePool) keepXWarm(now time.Time) {
+	if !p.xWarm || p.healthError || p.accountsError || !p.entries["x_read"].enabled {
+		return
+	}
+	changed := false
+	for _, a := range p.accounts {
+		s := a.entry
+		if a.spec.Service != "x_read" || a.removed || a.spec.Path == "" || s.state != "configured" && s.state != "ready" {
+			continue
+		}
+		st := worker.XClientStatus(a.spec.Path, now)
+		if st.Warm && s.state == "configured" {
+			// A job built the client on demand; the account is as ready as a
+			// warm-up would have made it.
+			p.settle(s, "")
+			changed = true
+		}
+		if s.warming || st.Building || st.Warm && !st.Stale {
+			continue
+		}
+		s.warming, s.warmStart = true, now
+		ctx := p.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		go worker.WarmXClient(ctx, a.spec.Path, p.xBase, p.config.InferenceTimeout, func(code string) { p.warmed(a, code) })
+	}
+	if changed {
+		p.saveHealth()
+	}
+}
+
+// warmed applies a warm-up or refresh outcome to the account's state. A first
+// build makes the account ready or maps its failure through the same codes a
+// job would report; a failed refresh of an account whose earlier client still
+// serves changes nothing, unless X refused the session itself.
+func (p *servicePool) warmed(a *pooledAccount, code string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	s := a.entry
+	s.warming = false
+	took := time.Since(s.warmStart).Round(time.Millisecond)
+	st := worker.XClientStatus(a.spec.Path, time.Now())
+	switch {
+	case code == "":
+		// The client reported warm must be the one behind the account's
+		// current path; a path changed meanwhile warms on the next refresh.
+		if st.Warm {
+			if s.state == "configured" {
+				fmt.Fprintf(os.Stderr, "x account %s: client warm (%s)\n", a.spec.ID, took)
+			}
+			p.settle(s, "")
+		}
+	case code == "auth_required":
+		fmt.Fprintf(os.Stderr, "x account %s: X refused the session; sign in to X again\n", a.spec.ID)
+		p.settle(s, code)
+	case st.Warm:
+		fmt.Fprintf(os.Stderr, "x account %s: background client refresh failed (%s); the current client keeps serving\n", a.spec.ID, code)
+	default:
+		fmt.Fprintf(os.Stderr, "x account %s: client warm-up failed (%s)\n", a.spec.ID, code)
+		p.settle(s, code)
+	}
 	p.saveHealth()
 }
+
 func (p *servicePool) accountStatus() []accountStatus {
 	p.mu.Lock()
 	defer p.mu.Unlock()

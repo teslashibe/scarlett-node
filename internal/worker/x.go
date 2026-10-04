@@ -389,81 +389,23 @@ func validateXLease(c config.Config, l coordinator.Lease) (xPlan, time.Time, str
 	return plan, deadline, ""
 }
 
-type xBoundTransport struct {
-	base, proof http.RoundTripper
-	bootstrap   bool
-	specs       []xSpec
-	next        int
-}
-
-func (t *xBoundTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	if r.Method != http.MethodGet || r.URL.Scheme != "https" || r.URL.User != nil {
-		return nil, errUnprovenXCall
-	}
-	if t.bootstrap {
-		if r.URL.Host == "x.com" && strings.HasPrefix(r.URL.Path, "/i/api/") {
-			parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/i/api/graphql/"), "/")
-			if len(parts) != 2 || parts[1] != "Viewer" && parts[1] != "UserByRestId" {
-				return nil, errUnprovenXCall
-			}
-		} else if !(r.URL.Host == "x.com" && !strings.HasPrefix(r.URL.Path, "/i/api/") || r.URL.Host == "abs.twimg.com") {
-			return nil, errUnprovenXCall
-		}
-		return t.base.RoundTrip(r)
-	}
-	if r.URL.Host != "x.com" || t.next >= len(t.specs) {
-		return nil, errUnprovenXCall
-	}
-	s := t.specs[t.next]
-	if r.URL.Path != "/i/api/graphql/"+s.QueryID+"/"+s.Operation || r.URL.Fragment != "" {
-		return nil, errUnprovenXCall
-	}
-	q := r.URL.Query()
-	for k, v := range q {
-		if len(v) != 1 || k != "variables" && k != "features" && k != "fieldToggles" {
-			return nil, errUnprovenXCall
-		}
-	}
-	v, e := uniqueJSON([]byte(q.Get("variables")))
-	if e != nil {
-		return nil, errUnprovenXCall
-	}
-	vars, ok := v.(map[string]any)
-	if !ok {
-		return nil, errUnprovenXCall
-	}
-	if s.CursorFrom != nil {
-		cursor, ok := vars["cursor"].(string)
-		if !ok || cursor == "" || len(cursor) > 4096 {
-			return nil, errUnprovenXCall
-		}
-		delete(vars, "cursor")
-	}
-	f, e := uniqueJSON([]byte(q.Get("features")))
-	if e != nil || !reflect.DeepEqual(vars, s.Variables) || !reflect.DeepEqual(f, s.Features) {
-		return nil, errUnprovenXCall
-	}
-	if s.FieldToggles != nil {
-		f, e := uniqueJSON([]byte(q.Get("fieldToggles")))
-		if e != nil || !reflect.DeepEqual(f, s.FieldToggles) {
-			return nil, errUnprovenXCall
-		}
-	} else if _, present := q["fieldToggles"]; present {
-		return nil, errUnprovenXCall
-	}
-	response, e := t.proof.RoundTrip(r)
-	if e == nil {
-		t.next++
-	}
-	return response, e
-}
+// Run serves one x_read lease on the account's warm client (see xclient.go).
 func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 	plan, deadline, code := validateXLease(w.Config, l)
 	if code != "" {
 		return code
 	}
+	ids := map[string]string{}
+	for _, s := range plan.Exchanges {
+		if previous, ok := ids[s.Operation]; ok && previous != s.QueryID {
+			return "invalid_lease"
+		}
+		ids[s.Operation] = s.QueryID
+	}
+	key := xClientKey(w.Config.XSession)
 	session, e := readXSession(w.Config.XSession)
 	if e != nil {
+		xClients.forget(key)
 		return "auth_required"
 	}
 	ctx, cancel := context.WithDeadline(ctx, deadline)
@@ -476,20 +418,52 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 	if proof == nil {
 		proof = xTransport(w.Config, plan, l.VerifierToken)
 	}
-	transport := &xBoundTransport{base: base, proof: proof, bootstrap: true, specs: plan.Exchanges}
-	ids := map[string]string{}
-	for _, s := range plan.Exchanges {
-		if previous, ok := ids[s.Operation]; ok && previous != s.QueryID {
-			return "invalid_lease"
+	xClients.learn(ids)
+	stamp := xSessionStamp(session)
+	// The account's client is shared across jobs; this job's exchanges and
+	// proof transport travel in the context of each read it makes. A warm
+	// account does nothing here but the proven reads.
+	for strict := false; ; strict = true {
+		warm, e := xClients.get(ctx, key, session, stamp, base, w.Config.InferenceTimeout, ids, strict)
+		if e != nil {
+			return w.buildFailure(ctx, e)
 		}
-		ids[s.Operation] = s.QueryID
+		binding := &xBinding{proof: proof, specs: plan.Exchanges}
+		e = xRead(withXBinding(ctx, binding), warm.client, l.XRequest)
+		if binding.mismatched() && !strict && binding.proven() == 0 {
+			// x-go built the first read with its own query ID for the
+			// operation, not the lease's. Nothing was sent; rebuild the
+			// client with the lease's IDs and run the job on that.
+			continue
+		}
+		if binding.proven() > 0 {
+			xClients.proven(key, warm)
+		}
+		if errors.Is(e, errXIncomplete) {
+			return "x_incomplete"
+		}
+		if e != nil {
+			code := w.failure(ctx, e)
+			if code == "auth_required" || xStaleClient(e) {
+				xClients.drop(key, warm)
+			}
+			return code
+		}
+		if binding.proven() != len(plan.Exchanges) {
+			return "x_incomplete"
+		}
+		// The coordinator reads the verifier's own response copies; none are submitted.
+		return ""
 	}
-	client, e := session.NewClient(ctx, x.WithHTTPClient(&http.Client{Transport: transport, Timeout: w.Config.InferenceTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}), x.WithRetry(1, time.Millisecond), x.WithQueryIDs(ids), x.WithMinRequestGap(time.Second))
-	if e != nil {
-		return w.failure(ctx, e)
-	}
-	transport.bootstrap = false
-	request := l.XRequest
+}
+
+// errXIncomplete is a paginated read whose page carried no cursor to the
+// next page the lease pinned.
+var errXIncomplete = errors.New("search page carried no cursor for the next pinned page")
+
+// xRead runs the lease's semantic read with x-go's pinned methods.
+func xRead(ctx context.Context, client *x.Client, request *coordinator.XRequest) error {
+	var e error
 	switch request.Operation {
 	case "profile":
 		_, e = client.GetProfile(ctx, request.Username)
@@ -506,19 +480,26 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 				break
 			}
 			if i+1 < request.Pages && page.NextCursor == "" {
-				return "x_incomplete"
+				return errXIncomplete
 			}
 			cursor = page.NextCursor
 		}
 	}
-	if e != nil {
-		return w.failure(ctx, e)
+	return e
+}
+
+// buildFailure classifies a client construction that failed before this job
+// could read anything. The construction has its own deadline; only this job's
+// expiry while waiting for it is "expired".
+func (w X) buildFailure(ctx context.Context, e error) string {
+	var limited *x.RateLimitError
+	if errors.As(e, &limited) && w.Config.AccountCooldown != nil {
+		w.Config.AccountCooldown(limited.Wait)
 	}
-	if transport.next != len(plan.Exchanges) {
-		return "x_incomplete"
+	if ctx.Err() != nil {
+		return "expired"
 	}
-	// The coordinator reads the verifier's own response copies; none are submitted.
-	return ""
+	return xBuildFailure(e)
 }
 func xFailure(ctx context.Context, e error) string {
 	// The relay helper caught the verifier sealing something other than this

@@ -176,6 +176,8 @@ The node serves four public reads, the ones published in [`api/x-request-catalog
 
 The coordinator constructs the request; buyers cannot supply URLs, query IDs, feature flags, extra variables or an initial cursor. Only the values of the `auth_token`, `ct0` and `kdt` cookies and of `X-Csrf-Token` are hidden. Writes, other `x.com/i/api/` requests, other hosts and hidden response bytes are refused. Results are what X showed the node's account at that moment; the proof does not show that X returned everything that exists.
 
+The node keeps one x-go client warm per X account. Building one costs four unproven requests to X (x-go's session validation, then the page and script its transaction header is derived from) and about twelve seconds; the node pays that once per account when it starts, not once per job, so a job on a warm account does nothing but its proven reads. The heartbeat says an X account is `configured` while its client is still being built and `ready` once X has accepted the session; a session X refuses is `auth_required` until the session file changes, which rebuilds the client without a restart. An account idle for thirty minutes is re-validated in the background (the client built earlier keeps serving), so a session that dies while nobody is buying is noticed before a buyer's job fails on it; an account that proved a read in that time is left alone. `SCARLETT_X_WARM=0` turns the warm-up and refresh off, and clients are then built on demand by the first job.
+
 ### X proof modes
 
 | | MPC-TLS | Keyed relay |
@@ -224,6 +226,7 @@ Settings come from the environment, typically via `~/.config/scarlett-node/node.
 | `SCARLETT_X_SESSION` | Absolute path to a private x-go session JSON file (single-account mode) |
 | `SCARLETT_ACCOUNTS_FILE` | Absolute path of the multi-account registry, if not in the state directory |
 | `SCARLETT_X_RELAY` | Serve X jobs proven by keyed relay; `0` serves MPC-TLS only |
+| `SCARLETT_X_WARM` | Build each X account's client at start and keep it warm; `0` builds on demand only |
 | `SCARLETT_CODEX_CONCURRENCY` | Total simultaneous Codex jobs across accounts |
 | `SCARLETT_X_CONCURRENCY` | Total simultaneous X jobs across accounts |
 | `SCARLETT_STATE_DIR` | Private directory for identity, journal and account health |

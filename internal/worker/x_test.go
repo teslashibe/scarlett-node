@@ -191,20 +191,30 @@ func TestXExactRequestFenceAndNoRetries(t *testing.T) {
 	if code := (X{Config: c, Base: roundTripFunc(xBootstrap), Proof: proof}).Run(context.Background(), l); code != "x_rate_limited" || proofs.Load() != 1 {
 		t.Fatal("rate limited job retried or misclassified", code, proofs.Load())
 	}
-	transport := &xBoundTransport{base: roundTripFunc(xBootstrap), proof: proof, specs: plan.Exchanges}
+	var bases atomic.Int32
+	board := &xSwitchboard{base: roundTripFunc(func(r *http.Request) (*http.Response, error) { bases.Add(1); return xBootstrap(r) })}
+	bound := withXBinding(context.Background(), &xBinding{proof: proof, specs: plan.Exchanges})
 	s := plan.Exchanges[0]
 	v, _ := json.Marshal(s.Variables)
 	f, _ := json.Marshal(s.Features)
 	query := url.Values{"variables": {string(v)}, "features": {string(f)}}
 	path := "https://x.com/i/api/graphql/" + s.QueryID + "/" + s.Operation
 	for _, bad := range []string{"https://other.example/i/api/graphql/q/UserByScreenName", path + "?" + query.Encode() + "&variables=%7B%7D", path + "?variables=%7B%22screen_name%22%3A%22other%22%7D&features=" + url.QueryEscape(string(f))} {
-		r, _ := http.NewRequest("GET", bad, nil)
-		if _, e := transport.RoundTrip(r); e == nil {
+		r, _ := http.NewRequestWithContext(bound, "GET", bad, nil)
+		if _, e := board.RoundTrip(r); e == nil {
 			t.Fatal("accepted changed request")
 		}
 	}
-	if proofs.Load() != 1 {
-		t.Fatal("fenced request consumed another proof")
+	// Outside construction, a request with no job binding is refused whatever
+	// it asks for: the pinned read, x-go's own validation reads, or a page.
+	for _, unbound := range []string{path + "?" + query.Encode(), "https://x.com/i/api/graphql/q/Viewer", "https://x.com/", "https://abs.twimg.com/responsive-web/client-web/ondemand.s.0a.js"} {
+		r, _ := http.NewRequest("GET", unbound, nil)
+		if _, e := board.RoundTrip(r); !errors.Is(e, errUnprovenXCall) {
+			t.Fatal("unbound request reached a transport", unbound, e)
+		}
+	}
+	if proofs.Load() != 1 || bases.Load() != 0 {
+		t.Fatal("fenced request consumed another proof or reached Base", proofs.Load(), bases.Load())
 	}
 }
 func TestXCredentialsAndEmptyPaginationAreFailClosed(t *testing.T) {

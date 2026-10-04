@@ -55,7 +55,12 @@ type Config struct {
 	// upload per read from tens of megabytes to tens of kilobytes, and the
 	// node already trusts the operator-run verifier with its session (see
 	// README). SCARLETT_X_RELAY=0 opts out; the node then serves MPC-TLS only.
-	XRelay           bool
+	XRelay bool
+	// XWarm keeps one x-go client warm per X account: built at start, kept
+	// across jobs and refreshed in the background, so a job does only its
+	// proven reads and a session that dies while idle is noticed. On by
+	// default; SCARLETT_X_WARM=0 builds clients on demand only.
+	XWarm            bool
 	CodexConcurrency int
 	XConcurrency     int
 	LocalFixture     bool
@@ -134,6 +139,12 @@ func Load() (Config, error) {
 			c.XRelay = false
 		default:
 			c.XRelay = true
+		}
+		switch strings.ToLower(strings.TrimSpace(os.Getenv("SCARLETT_X_WARM"))) {
+		case "0", "false", "off", "no":
+			c.XWarm = false
+		default:
+			c.XWarm = true
 		}
 		c.AccountsFile = os.Getenv("SCARLETT_ACCOUNTS_FILE")
 		c.AccountsRequired = c.AccountsFile != ""
