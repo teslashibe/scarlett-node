@@ -78,6 +78,18 @@ function Assert-PreservedProviderResource([string]$Path, [string]$Root, [string]
     }
 }
 
+function Resolve-CallbackPath([string]$Path) {
+    # Tauri 2.12.1 passes sidecars as config-relative paths (binaries/<name>-<triple>.exe)
+    # from its working directory, src-tauri. Only a plain relative path is
+    # made absolute; rooted, drive-relative, UNC and stream forms are left as
+    # given, so Assert-RegularLocalFile still refuses them. The result must
+    # still pass every prepared-root and allowlist check below.
+    if ($Path -and $Path -notmatch '^[\\/]' -and -not $Path.Contains(':')) {
+        return [System.IO.Path]::GetFullPath([System.IO.Path]::Combine([System.Environment]::CurrentDirectory, $Path))
+    }
+    return $Path
+}
+
 function Resolve-WindowsSigningTarget([string]$Path, $PreservedProvider = $null) {
     # Windows PowerShell cannot bind an omitted [ref] parameter to null.
     # Omission is allowed; an explicitly supplied flag must remain a reference.
@@ -87,7 +99,7 @@ function Resolve-WindowsSigningTarget([string]$Path, $PreservedProvider = $null)
         }
         $PreservedProvider.Value = $false
     }
-    $resolved = Assert-RegularLocalFile $Path
+    $resolved = Assert-RegularLocalFile (Resolve-CallbackPath $Path)
     if ($env:SCARLETT_WINDOWS_SIGNING_ROOT -notmatch '^[a-zA-Z]:[\\/]' -or
         $env:SCARLETT_WINDOWS_SIGNING_ROOT.Substring(2).Contains(':')) {
         throw 'Explicit local prepared release directory required'
@@ -185,13 +197,43 @@ function Sign-WindowsReleaseFile([string]$Path) {
     # the main executable. Keep our pinned signature byte for byte so finalized
     # component hashes remain valid; refuse any other existing signature.
     if (Test-PinnedSignature $resolved $publisher $scheme $certificateSha256) { return }
-    $nativeOutput = & $tool sign /q /s My /sha1 $publisher /fd SHA256 /tr $timestamp /td SHA256 $resolved 2>&1
-    if ($LASTEXITCODE -ne 0) { throw 'Native signing or timestamping failed' }
+    $script:ScarlettNativeFailureCode = $null
+    # Windows PowerShell turns redirected native stderr into errors under Stop.
+    # Collect SignTool's text and judge the outcome by its exit code alone.
+    $preference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $nativeOutput = @(& $tool sign /q /s My /sha1 $publisher /fd SHA256 /tr $timestamp /td SHA256 $resolved 2>&1 |
+            ForEach-Object { [string]$_ })
+        $nativeExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $preference
+    }
+    if ($nativeExit -ne 0) {
+        # Keep only SignTool's HRESULT and a fixed classification of its text.
+        $text = $nativeOutput -join "`n"
+        $nativeOutput = $null
+        if ($text -match '\((?:-?[0-9]+/)?0x([0-9A-Fa-f]{8})\)') {
+            $script:ScarlettNativeFailureCode = '0x' + $Matches[1].ToUpperInvariant()
+        }
+        if ($text -match 'No certificates were found that met all the given criteria') {
+            throw 'SignTool found no publisher certificate with a usable private key'
+        }
+        # 0x80090008 (NTE_BAD_ALGID) here means the key's provider cannot make
+        # SHA-256 signatures, as with a legacy CryptoAPI RSA_FULL key.
+        if ($text -match 'SignerSign\(\) failed') { throw 'SignTool could not sign with the publisher key' }
+        if ($text -match '(?i)timestamp') { throw 'SignTool could not obtain the RFC3161 timestamp' }
+        throw 'Native signing or timestamping failed'
+    }
     $nativeOutput = $null
     Read-TrustedSignature $resolved $publisher $scheme $certificateSha256 | Out-Null
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
     try { Sign-WindowsReleaseFile $File }
-    catch { throw 'Windows release signing failed; artifact is not approved for publication' }
+    catch {
+        # Callers capture stderr: the summary, then only a literal reason.
+        Write-LiteralFailureReason $_ 'Windows release signing failed; artifact is not approved for publication'
+        exit 1
+    }
 }

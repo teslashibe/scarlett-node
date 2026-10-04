@@ -80,7 +80,19 @@ written only after installed payload, lifecycle, preferences and browser tests
 pass. Real account login, signed upgrade/downgrade and publication remain
 separate gates; contract tests and unsigned rejection do not prove real signing.
 
-The Tauri callback permits exactly its five copied x86 NSIS plugin DLL paths.
+A failed run prints the fixed summary and one `Reason:` line built only from our
+own literal strings: the operation (for example `Signing scarlett-node`), its exit
+code and, when one raised it, the literal `throw` reason from
+`sign-windows-file.ps1`, `check-windows-signatures.ps1` or
+`import-windows-identity.ps1`, optionally followed by SignTool's eight-digit
+HRESULT. Python checker failures add the script line and exception class, and
+installed acceptance adds its script line numbers. Native messages, paths,
+certificate details and secrets are never printed.
+
+Tauri 2.12.1 passes sidecars to the callback relative to `src-tauri`
+(`binaries/<name>-<triple>.exe`); the callback resolves a plain relative path
+against its working directory and then applies every prepared-root and allowlist
+check. The Tauri callback permits exactly its five copied x86 NSIS plugin DLL paths.
 Generated x86 uninstallers must match NSIS 3.11's `nst<hex>.tmp` filename inside
 a fresh `target/release/nsis-signing-temp` directory. Only the packaging child
 receives that directory as TMP/TEMP and explicit callback context; it is removed
@@ -343,11 +355,24 @@ secrets. It runs `release-manifest.py`, which checks every evidence file and com
 darwin-amd64.dmg,windows-amd64.exe}`, the set the publisher accepts) beside
 `SHA256SUMS` and `evidence/`.
 
+On Windows the key is imported by `desktop/scripts/import-windows-identity.ps1`
+with `Import-PfxCertificate` and no `-Exportable`. It then requires exactly the
+pinned certificate with a non-exportable, current-user RSA-3072 key in the CNG
+Microsoft Software Key Storage Provider (where Windows Server 2025 puts an
+OpenSSL 3 PKCS#12 key), refuses a trusted-root copy and deletes the PKCS#12 file.
+
 PR CI rehearses both platforms with no secrets.
 `desktop/scripts/rehearse-macos-signing.sh` makes a throwaway certificate with the
 release extensions, imports it with the release import script and runs the
 `self-signed-stable` signer over a copy of the complete debug app, then the launch
-smoke runs on the rehearsal DMG. The Windows fixture is described above.
+smoke runs on the rehearsal DMG. The `windows_release_rehearsal` job repeats the
+release Windows job's build steps, then `desktop/scripts/rehearse-windows-signing.ps1`
+makes a throwaway RSA-3072 certificate with the release extensions, exports it as
+PKCS#12 with OpenSSL 3 defaults (AES-256-CBC, PBKDF2, SHA-256 MAC) like the release
+key, imports it with `import-windows-identity.ps1` and runs
+`sign-windows-bundle.py`: signing, NSIS packaging, installed acceptance and the
+pinned signature checks on the complete release build. The ephemeral fixture
+described above also still runs.
 A rehearsal may substitute its own identities file through
 `SCARLETT_SIGNING_IDENTITIES`, which is honoured only with
 `SCARLETT_SIGNING_REHEARSAL=1`. Everything signed that way records

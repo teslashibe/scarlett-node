@@ -1118,7 +1118,7 @@ function Check-InstallationRoundTrip {
             if ($setup.ExitCode -ne 0) { throw 'Installation round trip failed' }
             $version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($executable).ProductVersion
             if ($version -notin @($candidate.version, ($candidate.version + '.0'))) { throw 'Installed executable has the wrong product version' }
-            & $script:pythonExe desktop/scripts/check-complete-bundle.py $install $install
+            & $script:pythonExe (Join-Path $PSScriptRoot 'check-complete-bundle.py') $install $install
             if ($LASTEXITCODE -ne 0) { throw 'Replaced installation failed complete component validation' }
             $after = Durable-Hashes
             if ($after.Count -ne $before.Count) { throw 'Installation changed private account/identity/journal files' }
@@ -1174,7 +1174,8 @@ foreach ($file in @($executable, (Join-Path $install 'scarlett-node.exe'),
     (Join-Path $install 'runtime/COMPONENTS.json'))) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw 'Installed runtime component missing' }
 }
-python desktop/scripts/check-complete-bundle.py $install $install
+# The release signer runs this script from desktop/, PR CI from the repository root.
+python (Join-Path $PSScriptRoot 'check-complete-bundle.py') $install $install
 if ($LASTEXITCODE -ne 0) { throw 'Installed component integrity or API payload validation failed' }
 
 # Keep one absolute interpreter for installation validation after PATH cleanup.

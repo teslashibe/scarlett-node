@@ -3,6 +3,7 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 
@@ -233,6 +234,91 @@ class WindowsReleaseIdentityContracts(unittest.TestCase):
             'scheme': 'self-signed-stable', 'publisherThumbprint': PINNED['sha1'].upper(),
             'certificateSha256': PINNED['sha256'], 'vendorBytesPreserved': True})
         self.assertIs(signing.release_signing('self-signed-stable', PINNED['sha1'], PINNED['sha256'], True)['rehearsal'], True)
+
+
+class FailureDiagnostics(unittest.TestCase):
+    """Failures name the operation and reason, never a native message, path or secret."""
+
+    def child(self, code, stdout='', stderr='', seconds=60, name='child.py'):
+        with tempfile.TemporaryDirectory() as folder:
+            script = Path(folder) / name
+            script.write_text('import sys\nsys.stdout.write(%r)\nsys.stderr.write(%r)\nraise SystemExit(%d)\n' % (stdout, stderr, code))
+            with self.assertRaises(signing.ChildFailure) as caught:
+                signing.run('Signing scarlett-node', [sys.executable, str(script)], folder, None, seconds)
+        return str(caught.exception)
+
+    def test_literal_powershell_reason_is_reported_with_exit_code(self):
+        reasons = signing.powershell_reasons()
+        for reason in ('Reviewed publisher thumbprint required', 'SignTool could not sign with the publisher key',
+                       'WinVerifyTrust must report only CERT_E_UNTRUSTEDROOT',
+                       'The signing key must be a non-exportable current-user CNG software key'):
+            self.assertIn(reason, reasons)
+        stderr = 'Windows release signing failed; artifact is not approved for publication\nReviewed publisher thumbprint required\n'
+        self.assertEqual(self.child(1, stderr=stderr),
+                         'Signing scarlett-node failed with exit code 1: Reviewed publisher thumbprint required')
+
+    def test_signtool_hresult_follows_only_a_literal_reason(self):
+        coded = 'SignTool could not sign with the publisher key (0x80090008)'
+        self.assertTrue(self.child(1, stderr='summary\n' + coded + '\n').endswith(': ' + coded))
+        for line in ('SignTool could not sign with the publisher key (0x80090008) extra',
+                     'SignTool could not sign with the publisher key (0x8009000g)',
+                     'SignTool could not sign with the publisher key (0x80090008',
+                     'Unknown reason (0x80090008)'):
+            with self.subTest(line=line):
+                self.assertEqual(self.child(1, stderr=line), 'Signing scarlett-node failed with exit code 1')
+
+    def test_native_messages_and_paths_are_never_reported(self):
+        for stderr in ('Cannot find path \'D:\\a\\_temp\\signing\\identity.pfx\' because it does not exist.',
+                       'At D:\\a\\scarlett-node\\desktop\\scripts\\sign-windows-file.ps1:196 char:13',
+                       'The specified network password is not correct.',
+                       'Reviewed publisher thumbprint required: D:\\a'):
+            with self.subTest(stderr=stderr):
+                self.assertEqual(self.child(1, stderr=stderr), 'Signing scarlett-node failed with exit code 1')
+
+    def test_python_checker_reports_script_line_and_exception_class(self):
+        traceback = ('Traceback (most recent call last):\n'
+                     '  File "D:\\a\\scarlett-node\\desktop\\scripts\\check-complete-bundle.py", line 83, in <module>\n'
+                     '    assert time.monotonic() < deadline\n'
+                     'AssertionError: Bundled model API did not become ready\n')
+        self.assertEqual(self.child(1, stderr=traceback),
+                         'Signing scarlett-node failed with exit code 1: check-complete-bundle.py line 83, '
+                         'AssertionError: Bundled model API did not become ready')
+        private = traceback.replace('Bundled model API did not become ready', "'D:\\\\private\\\\value'")
+        self.assertEqual(self.child(1, stderr=private),
+                         'Signing scarlett-node failed with exit code 1: check-complete-bundle.py line 83, AssertionError')
+
+    def test_installed_acceptance_reports_only_line_numbers(self):
+        stdout = 'Installed acceptance: started\n{"realProviderJobs":0,"acceptanceFailureLines":[1092,1210]}\n'
+        self.assertEqual(self.child(1, stdout=stdout, stderr='native text D:\\a\n'),
+                         'Signing scarlett-node failed with exit code 1: check-windows-install.ps1 lines 1092,1210')
+
+    def test_unavailable_or_slow_children_name_the_operation(self):
+        with self.assertRaises(signing.ChildFailure) as caught:
+            signing.run('Tauri CLI version', [str(Path(tempfile.gettempdir()) / 'scarlett-missing-tool.exe')], None, None)
+        self.assertEqual(str(caught.exception), 'Tauri CLI version could not start')
+        with self.assertRaises(signing.ChildFailure) as caught:
+            signing.run('NSIS packaging and callback signing', [sys.executable, '-c', 'import time; time.sleep(30)'], None, None, 1)
+        self.assertEqual(str(caught.exception), 'NSIS packaging and callback signing timed out after 1 seconds')
+
+    def test_failure_reason_prints_only_our_literals_numbers_and_class_names(self):
+        self.assertEqual(signing.failure_reason(ValueError('Sign only a clean reviewed source checkout')),
+                         'Sign only a clean reviewed source checkout')
+        self.assertEqual(signing.failure_reason(ValueError('Signing pins are lowercase hex SHA-1 and SHA-256')),
+                         'Signing pins are lowercase hex SHA-1 and SHA-256')
+        self.assertEqual(signing.failure_reason(ValueError('D:\\a\\secret')), 'ValueError')
+        self.assertEqual(signing.failure_reason(json.JSONDecodeError('Expecting value', 'secret document', 0)), 'JSONDecodeError')
+        self.assertEqual(signing.failure_reason(KeyError('files')), "Missing field 'files'")
+        self.assertEqual(signing.failure_reason(KeyError('D:\\a\\secret')), 'KeyError')
+        self.assertEqual(signing.failure_reason(FileNotFoundError(2, 'No such file', 'D:\\a\\secret.pfx')), 'FileNotFoundError errno 2')
+        self.assertEqual(signing.failure_reason(TypeError('secret')), 'TypeError')
+        self.assertEqual(signing.failure_reason(RuntimeError('D:\\a\\secret')), 'RuntimeError')
+        failure = signing.ChildFailure('Signing scarlett-node failed with exit code 1')
+        self.assertEqual(signing.failure_reason(failure), 'Signing scarlett-node failed with exit code 1')
+
+    def test_literal_reasons_carry_no_paths_or_values(self):
+        for reason in signing.powershell_reasons():
+            with self.subTest(reason=reason):
+                self.assertNotRegex(reason, r'[\\$`{}]|[A-Za-z]:/')
 
 
 if __name__ == '__main__':

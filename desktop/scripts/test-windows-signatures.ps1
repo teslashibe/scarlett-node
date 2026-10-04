@@ -12,6 +12,33 @@ function Require-Rejection([scriptblock]$Action) {
     if (-not $rejected) { throw 'Unsafe signature fixture was accepted' }
 }
 
+function Invoke-ScriptForDiagnostics([string]$Script, [string[]]$Arguments) {
+    # Runs a signing script as Python and Tauri do (powershell.exe -File) and
+    # returns its exit code and non-empty stderr lines.
+    $quoted = @($Arguments | ForEach-Object { if ($_ -cmatch '^-[A-Za-z]+$') { $_ } else { '"' + $_ + '"' } })
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = 'powershell.exe'
+    $info.Arguments = '-NoProfile -NonInteractive -File "' + (Join-Path $PSScriptRoot $Script) + '" ' + ($quoted -join ' ')
+    $info.UseShellExecute = $false
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $process = [System.Diagnostics.Process]::Start($info)
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+    [void]$stdout.Result
+    # Windows PowerShell may serialize module-loading progress as CLIXML records.
+    $lines = @($stderr -split "`r?`n" | Where-Object { $_ -and $_ -notmatch '^(#< CLIXML|<Objs )' })
+    return @{ Code = $process.ExitCode; Lines = $lines }
+}
+
+function Assert-DiagnosticLines($Result, [string[]]$Expected) {
+    if ($Result.Code -ne 1 -or $Result.Lines.Count -ne $Expected.Count) { throw 'Script failure diagnostics differ from the contract' }
+    for ($index = 0; $index -lt $Expected.Count; $index++) {
+        if ($Result.Lines[$index] -cne $Expected[$index]) { throw 'Script failure diagnostics differ from the contract' }
+    }
+}
+
 function Write-NSISPEFixture([string]$Path, [bool]$DLL) {
     # Header-only synthetic x86 PE: exercises guards, never executed or signed.
     $bytes = [byte[]]::new(512)
@@ -144,12 +171,45 @@ try {
             throw 'Existing Scarlett signing target was rejected'
         }
     }
+    # Tauri 2.12.1 passes sidecars relative to its working directory, src-tauri.
+    # They resolve inside the prepared release; escapes are still refused.
+    $savedDirectory = [System.Environment]::CurrentDirectory
+    try {
+        [System.Environment]::CurrentDirectory = $signingRoot
+        foreach ($relative in @('binaries/scarlett-node-x86_64-pc-windows-msvc.exe', 'binaries\scarlett-node-x86_64-pc-windows-msvc.exe')) {
+            if ((Resolve-WindowsSigningTarget $relative) -cne [System.IO.Path]::GetFullPath($signingInput)) {
+                throw 'Tauri relative sidecar path was not resolved inside the prepared release'
+            }
+        }
+        Require-Rejection { Resolve-WindowsSigningTarget '..\scarlett-node-desktop.exe' }
+        Require-Rejection { Resolve-WindowsSigningTarget 'binaries\..\..\scarlett-node-desktop.exe' }
+        Require-Rejection { Resolve-WindowsSigningTarget '\binaries\scarlett-node-x86_64-pc-windows-msvc.exe' }
+    } finally {
+        [System.Environment]::CurrentDirectory = $savedDirectory
+    }
     # A real unsigned Go executable cannot substitute for the trusted SDK tool.
     # Reject it before opening any publisher key or invoking a signing command.
     $env:SCARLETT_WINDOWS_SIGNTOOL = $binary
     Require-Rejection { Sign-WindowsReleaseFile $signingInput }
     if ((Get-FileHash -LiteralPath $signingInput -Algorithm SHA256).Hash -cne $signingBefore) {
         throw 'Rejected signing-tool substitution changed the native executable'
+    }
+    # -File callers (sign-windows-bundle.py, Tauri) read the fixed summary and
+    # then only a literal reason; a native message or path is never written.
+    $signingSummary = 'Windows release signing failed; artifact is not approved for publication'
+    Assert-DiagnosticLines (Invoke-ScriptForDiagnostics 'sign-windows-file.ps1' @('-File', $signingInput)) @(
+        $signingSummary, 'Use the Windows-trusted Microsoft SDK SignTool')
+    Assert-DiagnosticLines (Invoke-ScriptForDiagnostics 'sign-windows-file.ps1' @(
+        '-File', (Join-Path $signingRoot 'binaries\missing-x86_64-pc-windows-msvc.exe'))) @($signingSummary)
+    Assert-DiagnosticLines (Invoke-ScriptForDiagnostics 'check-windows-signatures.ps1' @('-Installer', $binary,
+        '-InstalledDirectory', $fixtureRoot, '-ExpectedPublisherThumbprint', $publisher, '-Scheme', 'unsigned',
+        '-EvidenceFile', $evidence)) @('Windows release signature acceptance failed; artifact is not approved for publication',
+        'An explicit Windows signing scheme is required')
+    Assert-DiagnosticLines (Invoke-ScriptForDiagnostics 'import-windows-identity.ps1' @(
+        '-Pfx', (Join-Path $fixtureRoot 'missing.pfx'), '-Thumbprint', 'NOT-A-PIN')) @(
+        'The Windows signing identity was not imported', 'Supply the pinned lowercase certificate SHA-1')
+    if ((Get-FileHash -LiteralPath $signingInput -Algorithm SHA256).Hash -cne $signingBefore -or (Test-Path -LiteralPath $evidence)) {
+        throw 'Failure diagnostics changed a fixture'
     }
     # Model the exact pinned Tauri 2.12.1 NSIS callback targets with synthetic
     # x86 DLL headers. Resolve only; no publisher key is opened.
