@@ -170,8 +170,9 @@ func writeLikeCodexCLI(t *testing.T, path string, raw []byte) {
 	requireInheritedDACL(t, path)
 }
 
-// open-agent-api v0.1.31 persists a renewal through os.CreateTemp in the same
-// directory, Chmod(0600) and a rename, which keeps the inherited DACL.
+// open-agent-api persists a renewal through os.CreateTemp in the same
+// directory and a rename. v0.1.32 copies the replaced profile's owner, and its
+// DACL only when protected, so a codex-cli profile keeps the inherited DACL.
 func replaceLikeOpenAgentAPI(t *testing.T, path string, raw []byte) {
 	t.Helper()
 	temp, err := os.CreateTemp(filepath.Dir(path), ".codex-auth-*.tmp")
