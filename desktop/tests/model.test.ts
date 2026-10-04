@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  canConnectCodex,
   canStart,
+  codexAccountLimitReached,
+  codexNote,
+  MAX_CODEX_ACCOUNTS,
   statusText,
   errorMessage,
   validId,
@@ -92,4 +96,30 @@ test("Removed accounts remain visible while draining and omitted snapshots clear
   };
   assert.deepEqual(drainingAccounts(s).map((a) => a.id), ["removed"]);
   assert.deepEqual(drainingAccounts({ ...s, observation: { state: "stopped" } }), []);
+});
+test("Connect Codex is disabled at the node's eight-account limit with a clear reason", () => {
+  const codex = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({
+      id: `codex-${i + 1}`,
+      service: "codex" as const,
+      concurrency: 1,
+    }));
+  const x = { id: "personal-x", service: "x_read" as const, concurrency: 1 };
+  assert.equal(MAX_CODEX_ACCOUNTS, 8);
+  const below: Snapshot = { ...base, accounts: [...codex(7), x] };
+  assert.equal(codexAccountLimitReached(below), false);
+  assert.equal(canConnectCodex(below), true);
+  assert.equal(codexNote(below), "Provider access is checked when it serves work");
+  const full: Snapshot = { ...base, accounts: [...codex(8), x] };
+  assert.equal(codexAccountLimitReached(full), true);
+  assert.equal(canConnectCodex(full), false);
+  assert.match(codexNote(full), /Remove a Codex account first. Up to 8 Codex accounts/);
+  assert.equal(codexNote({ ...full, login_error: "login_failed" }), codexNote(full));
+  // The native error has its own message, distinct from missing support.
+  assert.equal(errorMessage("account_limit"), codexNote(full));
+  assert.notEqual(errorMessage("account_limit"), errorMessage("accounts_unavailable"));
+  for (const key of ["accounts_available", "codex_login_available"] as const)
+    assert.equal(canConnectCodex({ ...below, [key]: false }), false);
+  assert.equal(canConnectCodex({ ...below, login_pending: true }), false);
+  assert.equal(codexNote({ ...full, login_pending: true }), "Finish login in your browser");
 });

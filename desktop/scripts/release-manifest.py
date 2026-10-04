@@ -15,8 +15,8 @@ The new output directory receives:
               copy inside the published version, so this stays outside release/)
   evidence/   the signing evidence and component manifests, for review
 
-  release-manifest.py check-version 0.1.0
-  release-manifest.py assemble --version 0.1.0 --channel stable \\
+  release-manifest.py check-version 0.1.1
+  release-manifest.py assemble --version 0.1.1 --channel stable \\
       --node-commit <GITHUB_SHA> --model-api-commit <open-agent-api v0.1.31 commit> \\
       --workflow-run https://github.com/<owner>/<repo>/actions/runs/<id>/attempts/<n> \\
       --darwin-arm64 DIR --darwin-amd64 DIR --windows-amd64 DIR --output NEW_DIR
@@ -91,12 +91,16 @@ def read_json(path, limit=1048576):
 
 
 def app_versions():
-    """The desktop version recorded in tauri.conf.json, package.json and Cargo.toml."""
+    """The desktop version recorded in tauri.conf.json, package.json, Cargo.toml and both lockfiles."""
     tauri = json.loads((REPOSITORY / 'desktop/src-tauri/tauri.conf.json').read_text())['version']
     package = json.loads((REPOSITORY / 'desktop/package.json').read_text())['version']
+    lock = json.loads((REPOSITORY / 'desktop/package-lock.json').read_text())
     cargo = re.search(r'^\[package\]\n(?:[^\[\n][^\n]*\n)*?version = "([^"]+)"$',
                       (REPOSITORY / 'desktop/src-tauri/Cargo.toml').read_text(), re.MULTILINE)
-    return {tauri, package, cargo.group(1) if cargo else None}
+    locked = re.search(r'^name = "scarlett-node-desktop"\nversion = "([^"]+)"$',
+                       (REPOSITORY / 'desktop/src-tauri/Cargo.lock').read_text(), re.MULTILINE)
+    return {tauri, package, lock.get('version'), lock.get('packages', {}).get('', {}).get('version'),
+            cargo.group(1) if cargo else None, locked.group(1) if locked else None}
 
 
 def check_version(version):

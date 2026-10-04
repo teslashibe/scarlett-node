@@ -28,7 +28,7 @@ Then run `npm run tauri build -- --bundles app` from `desktop` on Mac. The sidec
 - Pool commands: `accounts list`; `accounts connect SERVICE ID CONCURRENCY` with credential JSON on stdin; `accounts add codex ID ABSOLUTE_PROFILE CONCURRENCY`; `accounts remove SERVICE ID`.
 - Pool list: an array of `{id,service,concurrency}`. Local status can contain `accounts[{id,service,state,capacity,in_flight,last_error_code,rest_until}]`. Only bounded selected metadata reaches JS.
 - Services: `codex` and `x_read`. IDs use lowercase letters/digits/underscore/hyphen, 1–32 characters; `legacy` is reserved. The binary owns maximum eight accounts/provider, concurrency, cooldown and pinned-attempt recovery.
-- Press **Connect Codex** and sign in with your ChatGPT account in the browser. Scarlett assigns a local name such as `codex-1`, reserves a new private profile and registers it after successful login, with one concurrent job per account. Repeat to connect another account. Existing profiles, including cancelled login directories, are never reused. No OpenAI account ID or local nickname is required. The native CLI is fixed to the bundled `codex-cli 0.159.2`, with file credential storage explicitly selected; it does not reuse `~/.codex` or discover a CLI on PATH. Missing or incompatible bundled CLI disables Connect Codex. Login and model entitlement remain distinct.
+- Press **Connect Codex** and sign in with your ChatGPT account in the browser. Scarlett assigns a local name such as `codex-1`, reserves a new private profile and registers it after successful login, with one concurrent job per account. Repeat to connect another account, up to eight Codex accounts; at eight, Connect Codex is disabled until you remove one. Existing profiles, including cancelled login directories, are never reused. On Windows the profile is created by the fixed `desktop private-dir-new` helper with its current-user/SYSTEM protected ACL applied at creation; an existing name, including an older unprotected directory, is skipped and never adopted or repaired. No OpenAI account ID or local nickname is required. The native CLI is fixed to the bundled `codex-cli 0.159.2`, with file credential storage explicitly selected; it does not reuse `~/.codex` or discover a CLI on PATH. Missing or incompatible bundled CLI disables Connect Codex. Login and model entitlement remain distinct.
 - X connects only the two approved cookie fields through protected stdin, preserving node validation and storage. Remove updates the private registry; the running node stops new admission on its next scheduling observation and retains credentials until safe explicit disposal after drain; it does not revoke the upstream session.
 - Total service concurrency remains the native default of one per service in this slice. Per-account limits cannot increase that total. Broader local capacity/preferences belong in the account-management integration.
 
@@ -198,7 +198,7 @@ certificate or add trust roots to make a release pass.
 
 ```powershell
 & desktop/scripts/check-windows-signatures.ps1 `
-  -Installer 'C:\release\Scarlett-Node-0.1.0-windows-amd64.exe' `
+  -Installer 'C:\release\Scarlett-Node-0.1.1-windows-amd64.exe' `
   -InstalledDirectory 'C:\acceptance\Scarlett Node' `
   -ExpectedPublisherThumbprint $ReviewedCertificateThumbprint `
   -Scheme self-signed-stable -CertificateSha256 $ReviewedCertificateSha256 `
@@ -273,7 +273,7 @@ create certificates, import credentials or alter Keychain trust settings.
 SCARLETT_SIGNING_SCHEME=self-signed-stable SCARLETT_MAC_KEYCHAIN=/absolute/release.keychain-db \
 python3 desktop/scripts/sign-macos-bundle.py \
   "/absolute/release-copy/Scarlett Node.app" \
-  "/absolute/new-output/Scarlett-Node-0.1.0-darwin-arm64.dmg"
+  "/absolute/new-output/Scarlett-Node-0.1.1-darwin-arm64.dmg"
 ```
 
 The script refuses a changed component inventory, altered input bytes, links,

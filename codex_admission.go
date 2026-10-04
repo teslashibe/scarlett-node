@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
 	"github.com/teslashibe/scarlett-node/internal/localfs"
 )
@@ -22,7 +23,8 @@ func codexAdmissionValid(home string, deadline time.Time) bool {
 	if !filepath.IsAbs(home) || deadline.IsZero() {
 		return false
 	}
-	f, err := localfs.OpenPrivate(filepath.Join(home, "auth.json"))
+	// codex-cli and open-agent-api write auth.json with an inherited Windows DACL.
+	f, err := localfs.OpenPrivateInherited(filepath.Join(home, "auth.json"))
 	if err != nil {
 		return false
 	}
@@ -37,6 +39,14 @@ func codexAdmissionValid(home string, deadline time.Time) bool {
 
 func codexAdmissionWindow(now time.Time) time.Time {
 	return now.Add(coordinator.MaxOfferLifetime)
+}
+
+// Legacy codex-tlsn nodes serve only funded Codex offers, and submitLease
+// refuses each one locally when the credential cannot outlive it. Such a node
+// must not advertise available, or every offer waits out its deadline. The
+// unfunded local fixture never reaches that guard.
+func legacyCodexAdmissionBlocked(c config.Config, now time.Time) bool {
+	return c.Executor == config.ExecutorCodexTLSN && !c.LocalFixture && !codexAdmissionValid(c.CodexHome, codexAdmissionWindow(now))
 }
 
 // Official CLI 0.159.2 token_data.rs defines managed access_token as a JWT and

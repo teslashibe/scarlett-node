@@ -23,3 +23,6 @@ func restoreFixtureHelper(path string) error { return os.Chmod(path, 0700) }
 
 func makeFixturePublic(path string) error  { return os.Chmod(path, 0644) }
 func makeFixturePrivate(path string) error { return os.Chmod(path, 0600) }
+
+// codex-cli and open-agent-api already create credential files 0600 on Unix.
+func externalCredentialFixture(*testing.T, string) {}

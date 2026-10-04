@@ -281,6 +281,33 @@ class ReleaseManifestTests(ReleaseFixture):
         self.rejected('workflow run', workflow_run='https://github.com/teslashibe/scarlett-node/actions/runs/1')
         self.rejected('workflow run', workflow_run='http://github.com/teslashibe/scarlett-node/actions/runs/1/attempts/1')
 
+    def test_release_version_requires_every_manifest_and_lockfile_to_agree(self):
+        manifests = ['desktop/src-tauri/tauri.conf.json', 'desktop/package.json', 'desktop/package-lock.json',
+                     'desktop/src-tauri/Cargo.toml', 'desktop/src-tauri/Cargo.lock']
+        repository = self.folder / 'repository'
+        for path in manifests:
+            (repository / path).parent.mkdir(parents=True, exist_ok=True)
+            (repository / path).write_bytes((release.REPOSITORY / path).read_bytes())
+        original = release.REPOSITORY
+        release.REPOSITORY = repository
+        self.addCleanup(setattr, release, 'REPOSITORY', original)
+        self.assertEqual(release.check_version(VERSION), VERSION)
+        stale = '9.9.9'
+        lock = repository / 'desktop/package-lock.json'
+        data = json.loads(lock.read_text())
+        data['packages']['']['version'] = stale
+        lock.write_text(json.dumps(data))
+        with self.assertRaisesRegex(ValueError, 'reviewed desktop version'):
+            release.check_version(VERSION)
+        lock.write_bytes((original / 'desktop/package-lock.json').read_bytes())
+        cargo = repository / 'desktop/src-tauri/Cargo.lock'
+        text = cargo.read_text()
+        marker = 'name = "scarlett-node-desktop"\nversion = "%s"' % VERSION
+        self.assertIn(marker, text)
+        cargo.write_text(text.replace(marker, 'name = "scarlett-node-desktop"\nversion = "%s"' % stale))
+        with self.assertRaisesRegex(ValueError, 'reviewed desktop version'):
+            release.check_version(VERSION)
+
     def test_output_is_new_and_failures_leave_nothing(self):
         self.output.mkdir()
         with self.assertRaisesRegex(ValueError, 'new absolute output'):

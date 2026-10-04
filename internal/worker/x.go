@@ -5,11 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -36,6 +40,144 @@ type xPlan struct {
 	Type        string  `json:"type"`
 	Exchanges   []xSpec `json:"exchanges"`
 	MaxAttempts int     `json:"max_attempts"`
+	ProofMode   string  `json:"proof_mode,omitempty"`
+	ProofPolicy string  `json:"proof_policy,omitempty"`
+}
+
+// xRelayPolicy is the only relay policy this node knows. Under it the
+// verifier, not the node, holds the TLS session keys for the X connection.
+const xRelayPolicy = "x-relay-v1"
+
+// xTransport is the proving transport a validated plan asks for.
+func xTransport(c config.Config, plan xPlan, token string) XTransport {
+	relay, ok := plan.relay(c)
+	return XTransport{Prover: c.Prover, Verifier: c.Verifier, VerifierCA: c.VerifierCA, PlaintextFixture: c.VerifierPlaintextFixture, Token: token, Relay: relay && ok}
+}
+
+// XOfferServable reports whether this node could serve an x_read offer's
+// proof mode, from the payload the offer carries. It lets the node decline
+// before funded acceptance instead of burning the job afterwards. An offer
+// without a payload cannot be judged yet and passes.
+func XOfferServable(c config.Config, payload json.RawMessage) bool {
+	if len(payload) == 0 {
+		return true
+	}
+	var plan struct {
+		ProofMode   string `json:"proof_mode"`
+		ProofPolicy string `json:"proof_policy"`
+	}
+	if json.Unmarshal(payload, &plan) != nil {
+		return false
+	}
+	_, ok := xPlan{ProofMode: plan.ProofMode, ProofPolicy: plan.ProofPolicy}.relay(c)
+	return ok
+}
+
+// relay reports whether the plan asks for a keyed relay proof, and whether
+// its proof mode and policy are a pair this node may serve.
+func (p xPlan) relay(c config.Config) (relay, ok bool) {
+	switch {
+	case (p.ProofMode == "" || p.ProofMode == "mpc") && p.ProofPolicy == "":
+		return false, true
+	case p.ProofMode == "relay" && p.ProofPolicy == xRelayPolicy:
+		// The operator must have opted in: this mode changes who could read
+		// the session cookie, so a coordinator cannot select it alone. A node
+		// that has caught its verifier misusing the session serves no more
+		// relay until an operator restarts it.
+		return true, c.XRelay && !RelayHalted()
+	}
+	return false, false
+}
+
+// relayMisuseMarker is how a caught verifier misuse arrives from the relay
+// helper's stderr. It must match relay::node::MISUSE in prover/src/relay/node.rs.
+const relayMisuseMarker = "verifier misused this node's X session"
+
+// relayHalt latches the first time this node catches its verifier sealing
+// something other than the node's own request. It is a node-wide stop, not a
+// per-account one: every account routes through the single operator-run
+// verifier, so a misuse implicates the verifier, not the account. The node
+// keeps serving MPC-TLS and offers no more keyed relay until an operator
+// restarts it and investigates — deliberately sticky, because this is a trust
+// break the operator should see, not a transient error to retry past.
+var relayHalt struct {
+	sync.Mutex
+	halted bool
+	reason string
+	at     time.Time
+	// file, when set, makes the halt durable: it is written on halt and read
+	// at startup, so a restart (the desktop app restarts the node on its own)
+	// cannot quietly re-arm relay. `scarlett-node relay-resume` removes it.
+	file string
+}
+
+// RelayHaltFile is the marker's name inside the node's state directory.
+const RelayHaltFile = "relay-halt"
+
+// LoadRelayHalt makes the halt durable under dir and restores one left by an
+// earlier run. Call once at startup, before any heartbeat.
+func LoadRelayHalt(dir string) error {
+	path := filepath.Join(dir, RelayHaltFile)
+	raw, err := os.ReadFile(path)
+	relayHalt.Lock()
+	defer relayHalt.Unlock()
+	relayHalt.file = path
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	relayHalt.halted = true
+	relayHalt.reason = strings.TrimSpace(string(raw))
+	fmt.Fprintf(os.Stderr, "keyed relay stays halted from an earlier run (%s); run `scarlett-node relay-resume` once the verifier has been checked\n", relayHalt.reason)
+	return nil
+}
+
+// HaltRelay stops this node from offering or accepting keyed-relay work and
+// prints one alert line. Safe to call repeatedly; only the first halts and alerts.
+func HaltRelay(reason string) {
+	relayHalt.Lock()
+	first := !relayHalt.halted
+	relayHalt.halted, relayHalt.reason, relayHalt.at = true, reason, time.Now()
+	file := relayHalt.file
+	relayHalt.Unlock()
+	if !first {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "ALERT keyed relay halted: %s — this node serves no more relay jobs until `scarlett-node relay-resume`; investigate the verifier first\n", reason)
+	if file != "" {
+		// Best effort: the in-memory halt holds for this run regardless.
+		if err := localfs.WriteAtomic(file, []byte(reason+"\n"), true); err != nil {
+			fmt.Fprintln(os.Stderr, "keyed relay halt could not be recorded:", err)
+		}
+	}
+}
+
+// RelayHaltReason is the recorded reason, or empty when relay is not halted.
+func RelayHaltReason() string {
+	relayHalt.Lock()
+	defer relayHalt.Unlock()
+	if !relayHalt.halted {
+		return ""
+	}
+	return relayHalt.reason
+}
+
+// RelayHalted reports whether a caught verifier misuse has stopped relay on
+// this node. MPC-TLS X reads are unaffected.
+func RelayHalted() bool {
+	relayHalt.Lock()
+	defer relayHalt.Unlock()
+	return relayHalt.halted
+}
+
+// ResetRelayHaltForTests clears the latch and forgets the marker path. The
+// only runtime reset is the operator's `scarlett-node relay-resume`.
+func ResetRelayHaltForTests() {
+	relayHalt.Lock()
+	relayHalt.halted, relayHalt.reason, relayHalt.at, relayHalt.file = false, "", time.Time{}, ""
+	relayHalt.Unlock()
 }
 
 func privateJSON(path string, out any) error {
@@ -201,6 +343,9 @@ func validateXLease(c config.Config, l coordinator.Lease) (xPlan, time.Time, str
 	if d.Decode(&plan) != nil || plan.Type != "x.read" || len(plan.Exchanges) != pages || plan.MaxAttempts != pages {
 		return plan, time.Time{}, "invalid_lease"
 	}
+	if _, ok := plan.relay(c); !ok {
+		return plan, time.Time{}, "invalid_lease"
+	}
 	for i, s := range plan.Exchanges {
 		if s.Operation != op || !validID(s.QueryID, 64) || s.Variables == nil || s.Features == nil || i == 0 && s.CursorFrom != nil || i > 0 && (s.CursorFrom == nil || *s.CursorFrom != i-1) {
 			return plan, time.Time{}, "invalid_lease"
@@ -329,7 +474,7 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 	}
 	proof := w.Proof
 	if proof == nil {
-		proof = XTransport{Prover: w.Config.Prover, Verifier: w.Config.Verifier, VerifierCA: w.Config.VerifierCA, PlaintextFixture: w.Config.VerifierPlaintextFixture, Token: l.VerifierToken}
+		proof = xTransport(w.Config, plan, l.VerifierToken)
 	}
 	transport := &xBoundTransport{base: base, proof: proof, bootstrap: true, specs: plan.Exchanges}
 	ids := map[string]string{}
@@ -376,6 +521,14 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 	return ""
 }
 func xFailure(ctx context.Context, e error) string {
+	// The relay helper caught the verifier sealing something other than this
+	// node's own request. The request has already gone out; what the node can
+	// still do is refuse to be used that way again and make the operator look.
+	// That holds even when the lease has meanwhile expired.
+	if e != nil && strings.Contains(e.Error(), relayMisuseMarker) {
+		HaltRelay(relayMisuseMarker)
+		return "relay_misuse"
+	}
 	if ctx.Err() != nil {
 		return "expired"
 	}

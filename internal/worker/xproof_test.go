@@ -24,7 +24,12 @@ func fakeXProver(mode string) {
 	_ = json.Unmarshal(data, &in)
 	raw, err := base64.StdEncoding.DecodeString(in.Request)
 	req := string(raw)
-	if mode == "xfail" || err != nil || len(os.Args) != 2 || os.Args[1] != "prove-x" || in.Verifier != "verifier:7047" || len(in.Token) != 64 ||
+	// "xrelay" stands in for the helper's keyed relay command; every other mode for MPC-TLS.
+	command := "prove-x"
+	if mode == "xrelay" {
+		command = "relay-x"
+	}
+	if mode == "xfail" || err != nil || len(os.Args) != 2 || os.Args[1] != command || in.Verifier != "verifier:7047" || len(in.Token) != 64 ||
 		!strings.HasPrefix(req, "GET /i/api/graphql/") || !strings.Contains(req, "\r\nConnection: close\r\n") ||
 		!strings.Contains(req, "\r\nAccept-Encoding: gzip\r\n") || !strings.HasSuffix(req, "\r\n\r\n") {
 		fmt.Fprintln(os.Stderr, "bad prove-x input")
@@ -84,6 +89,37 @@ func TestXTransport(t *testing.T) {
 	t.Setenv("SCARLETT_FAKE_PROVER", "xfail")
 	if _, err := client.Get(read); err == nil || !strings.Contains(err.Error(), "bad prove-x input") {
 		t.Fatalf("prover failure: err %v", err)
+	}
+}
+
+// The relay flag changes only which helper command proves the read: the
+// request, the refusals and the response handling stay the MPC-TLS ones.
+func TestXTransportRelayUsesTheRelayCommandOnly(t *testing.T) {
+	read := "https://x.com/i/api/graphql/q/TweetResultByRestId?variables=%7B%7D"
+	transport := XTransport{Prover: os.Args[0], Verifier: "verifier:7047", Token: strings.Repeat("ab", 32), Relay: true}
+	client := &http.Client{Transport: transport}
+
+	t.Setenv("SCARLETT_FAKE_PROVER", "xrelay")
+	resp, err := client.Get(read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if want := `{"echo":"GET /i/api/graphql/q/TweetResultByRestId?variables=%7B%7D HTTP/1.1"}`; string(body) != want {
+		t.Fatalf("relayed read = %q", body)
+	}
+	if _, err := client.Do(mustRequest(t, http.MethodPost, "https://x.com/i/api/graphql/q/FavoriteTweet")); !errors.Is(err, errUnprovenXCall) {
+		t.Fatalf("relay transport sent a write: %v", err)
+	}
+	// A helper that only speaks MPC-TLS must not be given a relay job, and the reverse.
+	t.Setenv("SCARLETT_FAKE_PROVER", "x")
+	if _, err := client.Get(read); err == nil {
+		t.Fatal("relay transport ran the MPC-TLS command")
+	}
+	transport.Relay = false
+	t.Setenv("SCARLETT_FAKE_PROVER", "xrelay")
+	if _, err := (&http.Client{Transport: transport}).Get(read); err == nil {
+		t.Fatal("MPC-TLS transport ran the relay command")
 	}
 }
 

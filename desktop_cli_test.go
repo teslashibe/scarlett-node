@@ -60,8 +60,64 @@ func TestDesktopPrivateHelpersUseRealPrivateStorageAndStableBearer(t *testing.T)
 	}
 }
 
+// The desktop reserves each Codex login profile with private-dir-new and then
+// checks it with private-dir, exactly as this test does. A name already taken
+// by any entry, including an older inherited-ACL directory, is reported for the
+// caller to skip and is never adopted or repaired.
+func TestDesktopPrivateDirNewReservesProtectedProfilesExclusively(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "codex-logins")
+	if err := desktopCommand([]string{"private-dir", root}, strings.NewReader(""), &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	reserve := func(path string) string {
+		t.Helper()
+		var out bytes.Buffer
+		if err := desktopCommand([]string{"private-dir-new", path}, strings.NewReader(""), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+	home := filepath.Join(root, "codex-1")
+	if got := reserve(home); got != "{\"status\":\"created\"}\n" {
+		t.Fatal("unexpected reservation response")
+	}
+	var out bytes.Buffer
+	if err := desktopCommand([]string{"private-dir", home}, strings.NewReader(""), &out); err != nil || out.String() != "{\"ok\":true}\n" {
+		t.Fatal("reserved profile failed the private directory check", err)
+	}
+	if got := reserve(home); got != "{\"status\":\"exists\"}\n" {
+		t.Fatal("reserved profile was claimed twice")
+	}
+	orphan := filepath.Join(root, "codex-2")
+	if err := os.Mkdir(orphan, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(orphan, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if got := reserve(orphan); got != "{\"status\":\"exists\"}\n" {
+		t.Fatal("existing unprotected directory was not reported as taken")
+	}
+	if err := desktopCommand([]string{"private-dir", orphan}, strings.NewReader(""), &bytes.Buffer{}); err == nil {
+		t.Fatal("existing unprotected directory was adopted or repaired")
+	}
+	// Shared on Unix; inherited-only ACL on Windows.
+	shared := filepath.Join(t.TempDir(), "shared")
+	if err := os.Mkdir(shared, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shared, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"relative", filepath.Join(root, "missing", "codex-3"), filepath.Join(shared, "codex-4")} {
+		if err := desktopCommand([]string{"private-dir-new", path}, strings.NewReader(""), &bytes.Buffer{}); err == nil {
+			t.Fatal("reservation accepted an invalid or unprotected parent")
+		}
+	}
+}
+
 func TestDesktopHelpersRejectPathsPortsAndUnknownCommands(t *testing.T) {
-	for _, args := range [][]string{{"private-dir", "relative"}, {"bearer", "relative"}, {"api", "80"}, {"api", "65536"}, {"api", "localhost:8088"}, {"api", "8088", "extra"}, {"delete", "anything"}} {
+	for _, args := range [][]string{{"private-dir", "relative"}, {"private-dir-new", "relative"}, {"private-dir-new"}, {"bearer", "relative"}, {"api", "80"}, {"api", "65536"}, {"api", "localhost:8088"}, {"api", "8088", "extra"}, {"delete", "anything"}} {
 		if err := desktopCommand(args, strings.NewReader(""), &bytes.Buffer{}); err == nil {
 			t.Fatalf("accepted invalid command %q", args[0])
 		}
