@@ -169,3 +169,172 @@ func TestRunLoopStopAbortsHeldHeartbeat(t *testing.T) {
 		t.Fatal("stop did not abort the held heartbeat")
 	}
 }
+
+// startLongPollNode runs a synthetic node that advertises available against a
+// coordinator served by handler, and returns its config and a stop function
+// that waits for it to exit.
+func startLongPollNode(t *testing.T, handler http.HandlerFunc) (config.Config, func()) {
+	t.Helper()
+	dir := privateTestDir(t)
+	home := filepath.Join(dir, "codex")
+	if err := privateFixtureMkdir(home, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrivateFixture(filepath.Join(home, "auth.json"), syntheticCodexAuth(time.Now().Add(-time.Hour)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// LocalFixture skips the local Codex admission guard, so the node
+	// advertises available until something local changes.
+	c := config.Config{Executor: config.ExecutorCodexTLSN, Profile: "standard", StateDir: filepath.Join(dir, "state"), CodexHome: home, Credential: "synthetic-credential", NodeID: "synthetic-node", Concurrency: 1, Bid: 100, Verifier: "locally-configured.invalid:7047", Prover: filepath.Join(dir, "synthetic-prover-never-run"), JournalLimits: attempts.DefaultLimits(), MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: 3 * time.Second, LocalFixture: true}
+	server := httptest.NewTLSServer(handler)
+	t.Cleanup(server.Close)
+	c.Coordinator = server.URL
+	c.CoordinatorCA = filepath.Join(privateTestDir(t), "synthetic-coordinator-ca.pem")
+	if err := writePrivateFixture(c.CoordinatorCA, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	reader, writer := io.Pipe()
+	done := make(chan error, 1)
+	go func() { done <- runWithOwner(c, reader) }()
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			writer.Close()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Error(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Error("synthetic node did not stop")
+			}
+			reader.Close()
+		})
+	}
+	t.Cleanup(stop)
+	return c, stop
+}
+
+// An operator drain during a held heartbeat ends the hold within about a
+// second, and the node heartbeats again at once, reporting the drain, instead
+// of leaving the coordinator free to hand over a lease for up to the full hold.
+func TestRunLoopDrainEndsHeldHeartbeat(t *testing.T) {
+	type arrival struct {
+		state string
+		at    time.Time
+	}
+	type release struct {
+		at        time.Time
+		cancelled bool
+	}
+	arrivals := make(chan arrival, 8)
+	releases := make(chan release, 8)
+	c, stop := startLongPollNode(t, func(w http.ResponseWriter, r *http.Request) {
+		var h coordinator.Heartbeat
+		if r.URL.Path != "/api/node/v1/heartbeat" || json.NewDecoder(r.Body).Decode(&h) != nil {
+			t.Error("unexpected request", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		arrivals <- arrival{h.State, time.Now()}
+		// Hold every heartbeat for the full hold the node asked for, as an
+		// idle coordinator does, unless the node hangs up first.
+		_, _ = io.Copy(io.Discard, r.Body)
+		this := release{}
+		select {
+		case <-r.Context().Done():
+			this.cancelled = true
+		case <-time.After(time.Duration(h.WaitSeconds) * time.Second):
+			io.WriteString(w, `{"lease":null}`)
+		}
+		this.at = time.Now()
+		releases <- this
+	})
+	var held arrival
+	select {
+	case held = <-arrivals:
+	case <-time.After(5 * time.Second):
+		t.Fatal("node never heartbeated")
+	}
+	if held.state != "available" {
+		t.Fatalf("held heartbeat advertised %q", held.state)
+	}
+	drainedAt := time.Now()
+	if err := writeLocalFile(c.StateDir, "drain", []byte("drained\n")); err != nil {
+		t.Fatal(err)
+	}
+	var ended release
+	select {
+	case ended = <-releases:
+	case <-time.After(5 * time.Second):
+		t.Fatal("drain did not end the held heartbeat")
+	}
+	if !ended.cancelled {
+		t.Fatal("the coordinator answered the held heartbeat; the node never cut it short")
+	}
+	if took := ended.at.Sub(drainedAt); took > 1500*time.Millisecond {
+		t.Fatalf("drain ended the held heartbeat after %v", took)
+	}
+	var after arrival
+	select {
+	case after = <-arrivals:
+	case <-time.After(5 * time.Second):
+		t.Fatal("node did not heartbeat again after the drain")
+	}
+	if after.state != "exhausted" {
+		t.Fatalf("heartbeat after the drain advertised %q", after.state)
+	}
+	// No failure backoff (one second for a local fixture) before it.
+	if gap := after.at.Sub(ended.at); gap > 500*time.Millisecond {
+		t.Fatalf("heartbeat after the drain waited %v", gap)
+	}
+	stop()
+}
+
+// With nothing local changing, the node leaves a held heartbeat to the
+// coordinator: the watch does not cut it short.
+func TestRunLoopKeepsUnchangedHeldHeartbeat(t *testing.T) {
+	const hold = 2500 * time.Millisecond // several watch intervals
+	type call struct {
+		state     string
+		cancelled bool
+	}
+	calls := make(chan call, 8)
+	var mu sync.Mutex
+	n := 0
+	_, stop := startLongPollNode(t, func(w http.ResponseWriter, r *http.Request) {
+		var h coordinator.Heartbeat
+		if r.URL.Path != "/api/node/v1/heartbeat" || json.NewDecoder(r.Body).Decode(&h) != nil {
+			t.Error("unexpected request", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		mu.Lock()
+		first := n == 0
+		n++
+		mu.Unlock()
+		this := call{state: h.State}
+		_, _ = io.Copy(io.Discard, r.Body)
+		if first {
+			select {
+			case <-r.Context().Done():
+				this.cancelled = true
+			case <-time.After(hold):
+				io.WriteString(w, `{"lease":null}`)
+			}
+		} else {
+			<-r.Context().Done()
+		}
+		calls <- this
+	})
+	var first call
+	select {
+	case first = <-calls:
+	case <-time.After(hold + 5*time.Second):
+		t.Fatal("held heartbeat never ended")
+	}
+	if first.cancelled || first.state != "available" {
+		t.Fatalf("held heartbeat advertised %q, cancelled %v", first.state, first.cancelled)
+	}
+	stop()
+}
