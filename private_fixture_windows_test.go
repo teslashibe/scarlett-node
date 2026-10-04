@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/teslashibe/scarlett-node/internal/localfs"
 	"golang.org/x/sys/windows"
 )
 
@@ -51,4 +52,31 @@ func setFixtureACL(path, descriptor string) error {
 		return err
 	}
 	return windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil)
+}
+
+// A Codex credential written outside the node keeps the DACL its directory
+// gives it. A non-elevated desktop's codex-cli owns the file as the user. An
+// elevated administrator on Windows Server, as on hosted runners, may create
+// it owned by BUILTIN\Administrators instead, so only the owner is reassigned.
+// The fixture stays the unprotected shape strict OpenPrivate rejects.
+func externalCredentialFixture(t *testing.T, path string) {
+	t.Helper()
+	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION, u.User.Sid, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if control, _, err := sd.Control(); err != nil || control&windows.SE_DACL_PROTECTED != 0 {
+		t.Fatal("external credential fixture has a protected DACL", err)
+	}
+	if f, err := localfs.OpenPrivate(path); err == nil {
+		f.Close()
+		t.Fatal("strict OpenPrivate accepted an inherited credential DACL")
+	}
 }

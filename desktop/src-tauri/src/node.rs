@@ -99,6 +99,7 @@ pub enum Error {
     InvalidInput,
     RuntimeUnavailable,
     AccountsUnavailable,
+    AccountLimit,
     CliUnavailable,
     CommandFailed,
     CommandTimeout,
@@ -241,32 +242,65 @@ fn valid_selection(service: &str, id: &str, concurrency: u8) -> Result<()> {
     }
     Ok(())
 }
+/// Codex accounts the node accepts per provider; see maxProviderAccounts.
+const MAX_CODEX_ACCOUNTS: usize = 8;
+const CODEX_PROFILE_NAMES: u32 = 10_000;
 // Reserve a new app-owned profile atomically, including after cancelled logins.
 // Existing directories, files and links must never be reused for another login.
-fn new_codex_profile(profiles: &Path, accounts: &[Account]) -> Result<(String, PathBuf)> {
-    if accounts.iter().filter(|a| a.service == "codex").count() >= 8 {
-        return Err(Error::AccountsUnavailable);
+fn new_codex_profile(
+    profiles: &Path,
+    accounts: &[Account],
+    helper: &Path,
+    names: u32,
+) -> Result<(String, PathBuf)> {
+    if accounts.iter().filter(|a| a.service == "codex").count() >= MAX_CODEX_ACCOUNTS {
+        return Err(Error::AccountLimit);
     }
-    for number in 1..=10_000 {
+    for number in 1..=names {
         let id = format!("codex-{number}");
         if accounts.iter().any(|a| a.service == "codex" && a.id == id) {
             continue;
         }
         let home = profiles.join(&id);
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        match builder.create(&home) {
-            Ok(()) => return Ok((id, home)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return Err(Error::PrivateStorageUnavailable),
+        if reserve_private_dir(&home, helper)? {
+            return Ok((id, home));
         }
     }
-    Err(Error::AccountsUnavailable)
+    Err(Error::AccountLimit)
+}
+/// Exclusively creates one new private directory. `Ok(false)` means the name is
+/// already held by any entry, including a file, a link or an older directory.
+fn reserve_private_dir(path: &Path, helper: &Path) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let _ = helper;
+        match std::fs::DirBuilder::new()
+            .recursive(false)
+            .mode(0o700)
+            .create(path)
+        {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(_) => Err(Error::PrivateStorageUnavailable),
+        }
+    }
+    #[cfg(windows)]
+    {
+        // std::fs::DirBuilder calls CreateDirectoryW(path, NULL): the directory
+        // only inherits ACEs and the node's private-dir check rejects it. The
+        // node helper applies its protected DACL in the create itself.
+        if std::fs::symlink_metadata(path).is_ok() {
+            // Cheap skip only; the helper's exclusive create stays authoritative.
+            return Ok(false);
+        }
+        let response = private_helper(helper, "private-dir-new", path)?;
+        match response.get("status").and_then(Value::as_str) {
+            Some("created") => Ok(true),
+            Some("exists") => Ok(false),
+            _ => Err(Error::PrivateStorageUnavailable),
+        }
+    }
 }
 // The node renews only Codex profiles directly under this root: the app's own
 // completed logins. The node and the local API never run together, so the node
@@ -860,6 +894,14 @@ impl Node {
         }
         None
     }
+    // Each login gets a fresh private CODEX_HOME that the node itself accepts.
+    fn reserve_codex_login(&self, accounts: &[Account]) -> Result<(String, PathBuf)> {
+        let profiles = self.state.join("codex-logins");
+        private_dir_with_helper(&profiles, &self.binary)?;
+        let (id, home) = new_codex_profile(&profiles, accounts, &self.binary, CODEX_PROFILE_NAMES)?;
+        private_dir_with_helper(&home, &self.binary)?;
+        Ok((id, home))
+    }
     pub async fn connect_codex(&self, concurrency: u8) -> Result<()> {
         let _guard = self.mutation.lock().await;
         if !(1..=32).contains(&concurrency) {
@@ -871,10 +913,7 @@ impl Node {
             return Err(Error::LoginBusy);
         }
         let cli = self.codex_cli().await.ok_or(Error::CliUnavailable)?;
-        let profiles = self.state.join("codex-logins");
-        private_dir_with_helper(&profiles, &self.binary)?;
-        let (id, home) = new_codex_profile(&profiles, &accounts)?;
-        private_dir_with_helper(&home, &self.binary)?;
+        let (id, home) = self.reserve_codex_login(&accounts)?;
         let mut cmd = Command::new(cli);
         cmd.args(["-c", "cli_auth_credentials_store=\"file\"", "login"])
             .env_clear()
@@ -1188,36 +1227,81 @@ mod tests {
         }
         assert!(valid_id("work-2"));
     }
+    /// The real built node helper. Windows creates private directories only
+    /// through it, so Windows runs must supply it (desktop-complete does).
+    /// Unix runs use it when supplied to cross-check the node's own checks.
+    fn test_node_helper() -> Option<PathBuf> {
+        let helper = std::env::var_os("SCARLETT_TEST_NODE_BINARY").map(PathBuf::from);
+        assert!(
+            cfg!(unix) || helper.is_some(),
+            "set SCARLETT_TEST_NODE_BINARY to the built scarlett-node.exe"
+        );
+        helper
+    }
+    /// A private profile root, as connect_codex prepares `codex-logins`.
+    fn profile_root(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        let helper = test_node_helper().unwrap_or_else(|| temp.path().join("unused-helper"));
+        let profiles = temp.path().join("codex-logins");
+        private_dir_with_helper(&profiles, &helper).unwrap();
+        (profiles, helper)
+    }
+    /// An unprotected directory: inherited-only ACL on Windows (as the earlier
+    /// DirBuilder reservation left it), group/other access on Unix.
+    fn unprotected_dir(path: &Path) {
+        std::fs::create_dir(path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
     #[test]
     fn automatic_codex_profiles_preserve_registered_and_abandoned_names() {
         let temp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(temp.path().join("codex-1")).unwrap();
-        std::fs::write(temp.path().join("codex-2"), "retained synthetic file").unwrap();
+        let (profiles, helper) = profile_root(&temp);
+        unprotected_dir(&profiles.join("codex-1"));
+        std::fs::write(profiles.join("codex-2"), "retained synthetic file").unwrap();
         let accounts = vec![Account {
             id: "codex-3".into(),
             service: "codex".into(),
             concurrency: 1,
         }];
-        let (id, home) = new_codex_profile(temp.path(), &accounts).unwrap();
+        let (id, home) =
+            new_codex_profile(&profiles, &accounts, &helper, CODEX_PROFILE_NAMES).unwrap();
         assert_eq!(id, "codex-4");
-        assert_eq!(home, temp.path().join("codex-4"));
+        assert_eq!(home, profiles.join("codex-4"));
         assert!(home.is_dir());
+        assert_eq!(private_dir_with_helper(&home, &helper), Ok(()));
         assert_eq!(
-            std::fs::read_to_string(temp.path().join("codex-2")).unwrap(),
+            std::fs::read_to_string(profiles.join("codex-2")).unwrap(),
             "retained synthetic file"
+        );
+        // An older unprotected reservation is skipped, never adopted or repaired.
+        assert_eq!(
+            private_dir_with_helper(&profiles.join("codex-1"), &helper),
+            Err(Error::PrivateStorageUnavailable)
         );
         // A cancelled, empty profile remains reserved for that login.
         assert_eq!(
-            new_codex_profile(temp.path(), &accounts).unwrap().0,
+            new_codex_profile(&profiles, &accounts, &helper, CODEX_PROFILE_NAMES)
+                .unwrap()
+                .0,
             "codex-5"
         );
     }
     #[test]
     fn automatic_codex_profiles_reserve_distinct_homes_concurrently() {
         let temp = tempfile::tempdir().unwrap();
+        let (profiles, helper) = profile_root(&temp);
         let mut ids = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..8)
-                .map(|_| scope.spawn(|| new_codex_profile(temp.path(), &[]).unwrap().0))
+                .map(|_| {
+                    scope.spawn(|| {
+                        new_codex_profile(&profiles, &[], &helper, CODEX_PROFILE_NAMES)
+                            .unwrap()
+                            .0
+                    })
+                })
                 .collect();
             handles
                 .into_iter()
@@ -1229,13 +1313,15 @@ mod tests {
         assert_eq!(ids.len(), 8);
         assert!(
             ids.iter()
-                .all(|id| valid_id(id) && temp.path().join(id).is_dir())
+                .all(|id| valid_id(id)
+                    && private_dir_with_helper(&profiles.join(id), &helper).is_ok())
         );
     }
     #[test]
     fn automatic_codex_profiles_enforce_pool_and_storage_limits() {
         let temp = tempfile::tempdir().unwrap();
-        let accounts: Vec<_> = (0..8)
+        let (profiles, helper) = profile_root(&temp);
+        let accounts: Vec<_> = (0..MAX_CODEX_ACCOUNTS)
             .map(|i| Account {
                 id: format!("old-{i}"),
                 service: "codex".into(),
@@ -1243,14 +1329,38 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            new_codex_profile(temp.path(), &accounts),
-            Err(Error::AccountsUnavailable)
+            new_codex_profile(&profiles, &accounts, &helper, CODEX_PROFILE_NAMES),
+            Err(Error::AccountLimit)
         );
-        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&profiles).unwrap().count(), 0);
+        // X accounts never count toward the Codex limit.
+        let mut mixed = accounts[1..].to_vec();
+        mixed.push(Account {
+            id: "x-one".into(),
+            service: "x_read".into(),
+            concurrency: 1,
+        });
         assert_eq!(
-            new_codex_profile(&temp.path().join("missing"), &[]),
+            new_codex_profile(&profiles, &mixed, &helper, CODEX_PROFILE_NAMES)
+                .unwrap()
+                .0,
+            "codex-1"
+        );
+        // Exhausted candidate names report the same limit, not missing support.
+        std::fs::write(profiles.join("codex-2"), "retained synthetic file").unwrap();
+        assert_eq!(
+            new_codex_profile(&profiles, &[], &helper, 2),
+            Err(Error::AccountLimit)
+        );
+        assert_eq!(
+            serde_json::to_string(&Error::AccountLimit).unwrap(),
+            "\"account_limit\""
+        );
+        assert_eq!(
+            new_codex_profile(&profiles.join("missing"), &[], &helper, CODEX_PROFILE_NAMES),
             Err(Error::PrivateStorageUnavailable)
         );
+        assert!(!profiles.join("missing").exists());
     }
     #[cfg(unix)]
     #[test]
@@ -1262,7 +1372,8 @@ mod tests {
             temp.path().join("codex-1"),
         )
         .unwrap();
-        let (id, home) = new_codex_profile(temp.path(), &[]).unwrap();
+        let (id, home) =
+            new_codex_profile(temp.path(), &[], Path::new("unused"), CODEX_PROFILE_NAMES).unwrap();
         assert_eq!(id, "codex-2");
         assert_eq!(
             std::fs::metadata(home).unwrap().permissions().mode() & 0o777,
@@ -1273,6 +1384,47 @@ mod tests {
                 .unwrap()
                 .file_type()
                 .is_symlink()
+        );
+    }
+    // Regression for Windows Connect Codex: the reserved CODEX_HOME must pass the
+    // node's own private-dir check, not only this bridge's view of it.
+    #[test]
+    fn codex_login_reservation_passes_the_real_node_private_storage_check() {
+        let Some(helper) = test_node_helper() else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::new(
+            temp.path().join("state"),
+            helper.clone(),
+            temp.path().join("prover"),
+        );
+        node.prepare().unwrap();
+        let ok = json!({"ok": true});
+        let (id, home) = node.reserve_codex_login(&[]).unwrap();
+        assert_eq!(id, "codex-1");
+        assert_eq!(home, node.state.join("codex-logins").join("codex-1"));
+        assert_eq!(
+            private_helper(&helper, "private-dir", &home),
+            Ok(ok.clone())
+        );
+        let orphan = node.state.join("codex-logins").join("codex-2");
+        unprotected_dir(&orphan);
+        assert_eq!(
+            private_helper(&helper, "private-dir", &orphan),
+            Err(Error::PrivateStorageUnavailable)
+        );
+        let (id, home) = node.reserve_codex_login(&[]).unwrap();
+        assert_eq!(id, "codex-3");
+        assert_eq!(private_helper(&helper, "private-dir", &home), Ok(ok));
+        assert_eq!(
+            private_helper(&helper, "private-dir", &orphan),
+            Err(Error::PrivateStorageUnavailable)
+        );
+        // The helper itself reports a taken name instead of failing.
+        assert_eq!(
+            private_helper(&helper, "private-dir-new", &home),
+            Ok(json!({"status": "exists"}))
         );
     }
     #[test]

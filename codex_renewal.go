@@ -239,10 +239,12 @@ func managedProfile(root, path string) (os.FileInfo, os.FileInfo, bool) {
 	if localfs.CheckOwnedDir(root) != nil || localfs.CheckOwnedDir(path) != nil {
 		return nil, nil, false
 	}
-	// The credential itself must already pass the node's private-file check
-	// (owner and protected ACL on Windows). Renewal keeps that descriptor; it
-	// never repairs one, so a profile that fails here is left for reconnection.
-	f, err := localfs.OpenPrivate(filepath.Join(path, "auth.json"))
+	// The credential itself must already pass the node's Codex credential check,
+	// the same one account refresh and funded admission use: on Windows a
+	// codex-cli login may inherit its ACL from the protected private profile
+	// checked above. Renewal keeps that descriptor; it never repairs one, so a
+	// profile that fails here is left for reconnection.
+	f, err := localfs.OpenPrivateInherited(filepath.Join(path, "auth.json"))
 	if err != nil {
 		return nil, nil, false
 	}

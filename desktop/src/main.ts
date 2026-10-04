@@ -3,7 +3,9 @@ import "./styles.css";
 import { api } from "./api.ts";
 import {
   accountHealth,
+  canConnectCodex,
   canStart,
+  codexNote,
   errorMessage,
   statusText,
   externalRuntime,
@@ -136,24 +138,12 @@ function render(s: Snapshot) {
     : "Unavailable in this node build";
   $("codex-form")
     .querySelector("button[type=submit]")!
-    .toggleAttribute(
-      "disabled",
-      busy ||
-        !s.accounts_available ||
-        !s.codex_login_available ||
-        s.login_pending,
-    );
+    .toggleAttribute("disabled", busy || !canConnectCodex(s));
   $("x-form")
     .querySelector("button[type=submit]")!
     .toggleAttribute("disabled", busy || !s.accounts_available);
   $("cancel-login").hidden = !s.login_pending;
-  $("codex-note").textContent = s.login_pending
-    ? "Finish login in your browser"
-    : !s.codex_login_available
-      ? "The bundled Codex runtime is missing or incompatible"
-      : s.login_error
-        ? errorMessage(s.login_error)
-        : "Provider access is checked when it serves work";
+  $("codex-note").textContent = codexNote(s);
 }
 async function refresh() {
   if (polling) return;

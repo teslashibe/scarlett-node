@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -162,6 +163,42 @@ func mustOrigin(t *testing.T, raw string) *url.URL {
 		t.Fatal(err)
 	}
 	return u
+}
+
+// A coordinator older than proof_modes rejects the whole heartbeat; the
+// client reports that as a distinct error and the node can send the older
+// shape, which drops only proof_modes.
+func TestPollReportsRejectionAndProofModesCanBeStripped(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var h Heartbeat
+		if json.NewDecoder(r.Body).Decode(&h) != nil {
+			t.Fatal("bad heartbeat body")
+		}
+		for _, s := range h.Services {
+			if s.ProofModes != nil {
+				http.Error(w, `{"error":"invalid heartbeat"}`, http.StatusBadRequest)
+				return
+			}
+		}
+		json.NewEncoder(w).Encode(HeartbeatReply{})
+	}))
+	defer server.Close()
+	services := []ServiceHealth{{Kind: "codex", State: "ready", Capacity: 1}, {Kind: "x_read", State: "ready", Capacity: 1, ProofModes: []string{"mpc", "relay"}}}
+	h := Heartbeat{Version: Version, NodeID: "node", Services: services}
+	if _, err := New(server.URL, "demo").Poll(context.Background(), h); !errors.Is(err, ErrHeartbeatRejected) {
+		t.Fatalf("400 reported as %v", err)
+	}
+	stripped, removed := WithoutProofModes(services)
+	if !removed || stripped[1].ProofModes != nil || stripped[0].Kind != "codex" || stripped[1].Capacity != 1 || services[1].ProofModes == nil {
+		t.Fatalf("strip: removed %v, result %+v, original mutated %v", removed, stripped, services[1].ProofModes == nil)
+	}
+	h.Services = stripped
+	if _, err := New(server.URL, "demo").Poll(context.Background(), h); err != nil {
+		t.Fatalf("legacy heartbeat rejected: %v", err)
+	}
+	if _, removed := WithoutProofModes(stripped); removed {
+		t.Fatal("nothing left to strip but removed reported")
+	}
 }
 
 func TestPollWithoutChallenge(t *testing.T) {

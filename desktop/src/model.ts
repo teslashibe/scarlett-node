@@ -33,12 +33,15 @@ export type Snapshot = {
     drain_requested?: boolean;
   } | null;
 };
+// The node accepts at most eight accounts per provider (node.rs MAX_CODEX_ACCOUNTS).
+export const MAX_CODEX_ACCOUNTS = 8;
 export const errorMessage = (code: unknown): string =>
   ({
     invalid_input: "Check the account ID, capacity and cookie values",
     runtime_unavailable: "The node or proof helper is missing from this build",
     accounts_unavailable:
       "This node build does not support account management yet",
+    account_limit: `Remove a Codex account first. Up to ${MAX_CODEX_ACCOUNTS} Codex accounts are supported on this device`,
     cli_unavailable:
       "The bundled Codex runtime is missing or incompatible",
     command_failed:
@@ -79,6 +82,30 @@ export function canStart(s: Snapshot): boolean {
     !s.local_api?.running &&
     !externalRuntime(s)
   );
+}
+export function codexAccountLimitReached(s: Snapshot): boolean {
+  return (
+    s.accounts.filter((a) => a.service === "codex").length >=
+    MAX_CODEX_ACCOUNTS
+  );
+}
+export function canConnectCodex(s: Snapshot): boolean {
+  return (
+    s.accounts_available &&
+    s.codex_login_available &&
+    !s.login_pending &&
+    !codexAccountLimitReached(s)
+  );
+}
+export function codexNote(s: Snapshot): string {
+  if (s.login_pending) return "Finish login in your browser";
+  if (!s.codex_login_available)
+    return "The bundled Codex runtime is missing or incompatible";
+  if (s.accounts_available && codexAccountLimitReached(s))
+    return errorMessage("account_limit");
+  return s.login_error
+    ? errorMessage(s.login_error)
+    : "Provider access is checked when it serves work";
 }
 export function externalRuntime(s: Snapshot): boolean {
   return (

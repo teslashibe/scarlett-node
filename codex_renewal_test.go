@@ -769,6 +769,48 @@ func TestCodexRenewalRefusesNonPrivateCredential(t *testing.T) {
 	}
 }
 
+// Desktop Connect Codex logins are written by codex-cli inside a protected
+// private profile, so on Windows auth.json inherits that profile's ACL. Renewal
+// accepts the same credential shape account refresh and funded admission read,
+// before and after the gateway's rewrite, which keeps an inherited descriptor.
+func TestCodexRenewalRenewsDesktopProfileLogin(t *testing.T) {
+	p := poolFixture(t, "codex")
+	state, err := filepath.EvalSymlinks(p.config.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.config.StateDir, p.config.AccountsFile = state, filepath.Join(state, "accounts.json")
+	home := desktopCodexAccount(t, p)
+	p.config.CodexManagedRoot = filepath.Dir(home)
+	auth := filepath.Join(home, "auth.json")
+	writeCodexAuthLikeCLI(t, auth, renewableSyntheticCodexAuth())
+	if _, _, ok := managedProfile(p.config.CodexManagedRoot, home); !ok {
+		t.Fatal("desktop codex-cli login refused for renewal")
+	}
+	var calls atomic.Int32
+	setRenewal(p, func(path string) (managedAuthentication, error) {
+		if path != auth {
+			return nil, errors.New("unexpected profile")
+		}
+		return renewalFunc(func(context.Context, time.Time) error {
+			calls.Add(1)
+			return nil
+		}), nil
+	}, noPending)
+	awaitRenewal(t, stepRenewal(t, p))
+	if calls.Load() != 1 {
+		t.Fatal("desktop profile not renewed", calls.Load())
+	}
+	renewed := time.Now().Add(365 * 24 * time.Hour).Unix()
+	replaceCodexAuthLikeGateway(t, auth, syntheticCodexClaims(fmt.Sprintf(`{"exp":%d}`, renewed), renewed))
+	if _, _, ok := managedProfile(p.config.CodexManagedRoot, home); !ok {
+		t.Fatal("gateway-renewed desktop login refused for renewal")
+	}
+	if h := healthKind(t, p, "codex"); h.State != "configured" || h.Capacity != 1 {
+		t.Fatal("renewed desktop login not admissible", h.State)
+	}
+}
+
 // main.go reads the slot ceiling while renewal runs; it must be the static
 // configuration, never the capacity renewal temporarily withholds.
 func TestCodexRenewalStaticSlotCeiling(t *testing.T) {

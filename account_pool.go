@@ -62,7 +62,7 @@ func validHealth(state, code string) bool {
 		return false
 	}
 	switch code {
-	case "", "auth_required", "capacity_unavailable", "x_rate_limited", "prover_error", "x_request_failed", "report_pending", "expired", "invalid_lease", "service_unavailable", "x_incomplete", "execution_uncertain":
+	case "", "auth_required", "capacity_unavailable", "x_rate_limited", "prover_error", "x_request_failed", "report_pending", "expired", "invalid_lease", "service_unavailable", "x_incomplete", "execution_uncertain", "relay_misuse":
 		return true
 	}
 	return false
@@ -286,11 +286,13 @@ func (p *servicePool) refreshAccounts(now time.Time) bool {
 }
 func refreshAccount(a *pooledAccount, now time.Time, helperMissing bool) {
 	s := a.entry
-	path := a.spec.Path
+	path, open := a.spec.Path, localfs.OpenPrivate
 	if a.spec.Service == "codex" {
-		path = filepath.Join(path, "auth.json")
+		// codex-cli and open-agent-api write auth.json with an inherited Windows
+		// DACL; X sessions are written by the node itself.
+		path, open = filepath.Join(path, "auth.json"), localfs.OpenPrivateInherited
 	}
-	f, e := localfs.OpenPrivate(path)
+	f, e := open(path)
 	var info os.FileInfo
 	if e == nil {
 		info, e = f.Stat()
@@ -440,6 +442,13 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 	s.lastError = code
 	switch code {
 	case "":
+		if s.state != "auth_required" && s.restUntil.IsZero() {
+			s.state = "ready"
+		}
+	case "relay_misuse":
+		// The verifier misbehaved, not this account. Keep the account ready
+		// for MPC-TLS work; the node-wide halt (worker.HaltRelay) is what
+		// stops relay, and the code stays in lastError so status shows why.
 		if s.state != "auth_required" && s.restUntil.IsZero() {
 			s.state = "ready"
 		}

@@ -10,7 +10,18 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func OpenPrivate(path string) (*os.File, error) { return privateFile(path, false) }
+func OpenPrivate(path string) (*os.File, error) { return privateFile(path, false, false) }
+
+// OpenPrivateInherited reads a provider credential that another local program
+// rewrites, such as Codex auth.json from codex-cli or open-agent-api. Both
+// create the file without a security descriptor, so it carries only ACEs
+// inherited from its directory and no SE_DACL_PROTECTED. Such a DACL is
+// accepted only below a pinned parent whose own DACL passes the protected
+// private-directory check, and the file must still belong to the current user
+// and grant only the current user and SYSTEM. Node-owned state keeps
+// OpenPrivate, which also guards WriteAtomic replacement. Neither open repairs
+// an ACL.
+func OpenPrivateInherited(path string) (*os.File, error) { return privateFile(path, false, true) }
 
 // Parent handles deny delete/rename while resolving the final file. No component
 // may be a reparse point. Device/UNC paths and alternate data streams are closed.
@@ -55,7 +66,7 @@ func closeHandles(handles []windows.Handle) {
 	}
 }
 
-func privateFile(path string, create bool) (*os.File, error) {
+func privateFile(path string, create, inherited bool) (*os.File, error) {
 	parents, err := parentHandles(path)
 	if err != nil {
 		return nil, err
@@ -88,23 +99,29 @@ func privateFile(path string, create bool) (*os.File, error) {
 		return nil, &os.PathError{Op: "open", Path: path, Err: err}
 	}
 	f := os.NewFile(uintptr(h), path)
-	if err = validatePrivate(h, user.User.Sid); err != nil {
+	// An inherited DACL is only as private as the directory it came from. The
+	// parent stays pinned by a handle that denies its rename or delete.
+	inherited = inherited && validateACL(parents[len(parents)-1], user.User.Sid, false) == nil
+	if err = validatePrivate(h, user.User.Sid, inherited); err != nil {
 		f.Close()
 		return nil, err
 	}
 	return f, nil
 }
 
-func validatePrivate(h windows.Handle, user *windows.SID) error {
+func validatePrivate(h windows.Handle, user *windows.SID, inherited bool) error {
 	var info windows.ByHandleFileInformation
 	kind, err := windows.GetFileType(h)
 	if err != nil || kind != windows.FILE_TYPE_DISK || windows.GetFileInformationByHandle(h, &info) != nil || info.FileAttributes&(windows.FILE_ATTRIBUTE_REPARSE_POINT|windows.FILE_ATTRIBUTE_DIRECTORY) != 0 {
 		return errors.New("private file must be regular without a reparse point")
 	}
-	return validateACL(h, user)
+	return validateACL(h, user, inherited)
 }
 
-func validateACL(h windows.Handle, user *windows.SID) error {
+// validateACL requires the current user as owner and only ACCESS_ALLOWED ACEs,
+// explicit or inherited, for the current user or SYSTEM. inherited only waives
+// SE_DACL_PROTECTED; every ACE is still checked.
+func validateACL(h windows.Handle, user *windows.SID, inherited bool) error {
 	sd, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		return err
@@ -114,7 +131,7 @@ func validateACL(h windows.Handle, user *windows.SID) error {
 		return errors.New("private file must belong to the current user")
 	}
 	control, _, err := sd.Control()
-	if err != nil || control&windows.SE_DACL_PROTECTED == 0 {
+	if err != nil || !inherited && control&windows.SE_DACL_PROTECTED == 0 {
 		return errors.New("private file requires a protected ACL")
 	}
 	acl, _, err := sd.DACL()
@@ -147,7 +164,7 @@ func LockPrivateWait(path string) (*os.File, error) {
 }
 
 func lockPrivate(path string, nonblocking bool) (*os.File, error) {
-	f, err := privateFile(path, true)
+	f, err := privateFile(path, true, false)
 	if err != nil {
 		return nil, err
 	}

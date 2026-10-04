@@ -258,6 +258,177 @@ func TestXWireFixtureMatchesPinnedClientRequest(t *testing.T) {
 	}
 }
 
+// A relay lease is served only when the operator opted in, and only under the
+// one policy name this node knows. Nothing about the mode is implied.
+func TestXRelayLeaseNeedsOperatorOptInAndTheExactPolicy(t *testing.T) {
+	raw, e := os.ReadFile("../../api/fixtures/lease-x.json")
+	if e != nil {
+		t.Fatal(e)
+	}
+	lease := func(mode, policy string) coordinator.Lease {
+		var l coordinator.Lease
+		if e := json.Unmarshal(raw, &l); e != nil {
+			t.Fatal(e)
+		}
+		var payload map[string]any
+		if e := json.Unmarshal(l.XPayload, &payload); e != nil {
+			t.Fatal(e)
+		}
+		if mode != "" {
+			payload["proof_mode"] = mode
+		}
+		if policy != "" {
+			payload["proof_policy"] = policy
+		}
+		l.XPayload, _ = json.Marshal(payload)
+		return l
+	}
+	base := lease("", "")
+	c, _, _ := xFixture(t, *base.XRequest)
+	for _, tc := range []struct {
+		mode, policy string
+		optIn, relay bool
+		code         string
+	}{
+		{"", "", false, false, ""},
+		{"mpc", "", false, false, ""},
+		{"mpc", "", true, false, ""},
+		{"relay", xRelayPolicy, true, true, ""},
+		{"relay", xRelayPolicy, false, false, "invalid_lease"},
+		{"relay", "", true, false, "invalid_lease"},
+		{"relay", "x-relay-v2", true, false, "invalid_lease"},
+		{"", xRelayPolicy, true, false, "invalid_lease"},
+		{"mpc", xRelayPolicy, true, false, "invalid_lease"},
+		{"proxy", "", true, false, "invalid_lease"},
+	} {
+		c.XRelay = tc.optIn
+		plan, _, code := validateXLease(c, lease(tc.mode, tc.policy))
+		if code != tc.code {
+			t.Fatalf("mode %q policy %q opt-in %v: code %q, want %q", tc.mode, tc.policy, tc.optIn, code, tc.code)
+		}
+		if relay, _ := plan.relay(c); code == "" && relay != tc.relay {
+			t.Fatalf("mode %q policy %q: relay %v, want %v", tc.mode, tc.policy, relay, tc.relay)
+		}
+	}
+}
+
+// The transport a lease gets and the pre-acceptance check both follow the
+// validated plan and the operator's opt-in, never the plan alone.
+func TestXTransportAndOfferCheckFollowPlanAndOptIn(t *testing.T) {
+	c := config.Config{Prover: "p", Verifier: "v:1", VerifierCA: "/ca"}
+	relay := xPlan{ProofMode: "relay", ProofPolicy: xRelayPolicy}
+	if got := xTransport(c, relay, "t"); got.Relay || got.Prover != "p" || got.Verifier != "v:1" || got.VerifierCA != "/ca" || got.Token != "t" {
+		t.Fatalf("relay plan without opt-in built %+v", got)
+	}
+	c.XRelay = true
+	if !xTransport(c, relay, "t").Relay || xTransport(c, xPlan{}, "t").Relay || xTransport(c, xPlan{ProofMode: "relay", ProofPolicy: "other"}, "t").Relay {
+		t.Fatal("transport relay flag does not follow the plan")
+	}
+	for _, tc := range []struct {
+		payload string
+		optIn   bool
+		ok      bool
+	}{
+		{``, false, true},
+		{`{"type":"x.read"}`, false, true},
+		{`{"proof_mode":"mpc"}`, false, true},
+		{`{"proof_mode":"relay","proof_policy":"x-relay-v1"}`, false, false},
+		{`{"proof_mode":"relay","proof_policy":"x-relay-v1"}`, true, true},
+		{`{"proof_mode":"relay"}`, true, false},
+		{`{"proof_mode":"relay","proof_policy":"x-relay-v2"}`, true, false},
+		{`{"proof_policy":"x-relay-v1"}`, true, false},
+		{`not json`, true, false},
+	} {
+		c.XRelay = tc.optIn
+		if got := XOfferServable(c, json.RawMessage(tc.payload)); got != tc.ok {
+			t.Fatalf("offer %q opt-in %v: servable %v, want %v", tc.payload, tc.optIn, got, tc.ok)
+		}
+	}
+}
+
+// A caught verifier misuse is a node-wide trust break, not an account fault:
+// it is classified on its own, halts relay for the whole process, and from
+// then on relay offers are declined while MPC-TLS keeps being served.
+func TestCaughtVerifierMisuseHaltsRelayNodeWide(t *testing.T) {
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	ctx := context.Background()
+	c := config.Config{Prover: "p", Verifier: "v:1", XRelay: true}
+	relayOffer := json.RawMessage(`{"proof_mode":"relay","proof_policy":"x-relay-v1"}`)
+	mpcOffer := json.RawMessage(`{"proof_mode":"mpc"}`)
+	relayPlan := xPlan{ProofMode: "relay", ProofPolicy: xRelayPolicy}
+
+	// An ordinary helper failure neither halts nor is mistaken for misuse.
+	if code := xFailure(ctx, errors.New("prover: exit status 1: Error: verifier closed the connection")); code != "x_request_failed" || RelayHalted() {
+		t.Fatalf("ordinary failure: code %q halted %v", code, RelayHalted())
+	}
+	if !XOfferServable(c, relayOffer) || !xTransport(c, relayPlan, "t").Relay {
+		t.Fatal("relay not served before any misuse")
+	}
+
+	// The marker arrives the way xproof wraps the helper's stderr.
+	wrapped := errors.New("prover: exit status 1: Error: " + relayMisuseMarker + ": the record it sealed was not this node's request")
+	if code := xFailure(ctx, wrapped); code != "relay_misuse" {
+		t.Fatalf("misuse classified as %q", code)
+	}
+	if !RelayHalted() {
+		t.Fatal("misuse did not halt relay")
+	}
+	// From here on: relay offers declined, MPC still accepted, an in-flight
+	// relay plan falls back to the stronger mode rather than running relay.
+	if XOfferServable(c, relayOffer) {
+		t.Fatal("relay offer accepted after a halt")
+	}
+	if !XOfferServable(c, mpcOffer) || !XOfferServable(c, nil) {
+		t.Fatal("MPC offers declined after a relay halt")
+	}
+	if xTransport(c, relayPlan, "t").Relay {
+		t.Fatal("transport still ran relay after a halt")
+	}
+	// Sticky and idempotent: a second report changes nothing and a later
+	// ordinary failure does not clear it.
+	HaltRelay("again")
+	if code := xFailure(ctx, errors.New("prover: timeout")); code != "x_request_failed" || !RelayHalted() {
+		t.Fatalf("after second report: code %q halted %v", code, RelayHalted())
+	}
+	// Misuse is recognised even when the lease has already expired; any other
+	// error under a cancelled context is expiry.
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	ResetRelayHaltForTests()
+	if code := xFailure(cancelled, wrapped); code != "relay_misuse" || !RelayHalted() {
+		t.Fatalf("misuse under an expired lease classified as %q, halted %v", code, RelayHalted())
+	}
+	if code := xFailure(cancelled, errors.New("prover: timeout")); code != "expired" {
+		t.Fatalf("expired context classified as %q", code)
+	}
+	// A relay lease is refused at validation once relay is halted, so it is
+	// never run over MPC-TLS and never spends the attempt.
+	raw, e := os.ReadFile("../../api/fixtures/lease-x.json")
+	if e != nil {
+		t.Fatal(e)
+	}
+	var l coordinator.Lease
+	if e := json.Unmarshal(raw, &l); e != nil {
+		t.Fatal(e)
+	}
+	var payload map[string]any
+	if e := json.Unmarshal(l.XPayload, &payload); e != nil {
+		t.Fatal(e)
+	}
+	payload["proof_mode"], payload["proof_policy"] = "relay", xRelayPolicy
+	l.XPayload, _ = json.Marshal(payload)
+	lc, _, _ := xFixture(t, *l.XRequest)
+	lc.XRelay = true
+	if _, _, code := validateXLease(lc, l); code != "invalid_lease" {
+		t.Fatalf("halted node validated a relay lease: %q", code)
+	}
+	ResetRelayHaltForTests()
+	if _, _, code := validateXLease(lc, l); code != "" {
+		t.Fatalf("relay lease refused with relay available: %q", code)
+	}
+}
+
 func TestTypedXQuotaCarriesOnlyCooldownIntoLocalScheduler(t *testing.T) {
 	observed := time.Duration(0)
 	w := X{Config: config.Config{AccountCooldown: func(wait time.Duration) { observed = wait }}}
