@@ -1427,6 +1427,61 @@ mod tests {
             Ok(json!({"status": "exists"}))
         );
     }
+    // Regression for the installed Windows round trip: a paired identity beside
+    // an attempt left pending by an earlier process must read as paired, with the
+    // node's real status and account commands answering under the desktop's env.
+    #[tokio::test]
+    async fn snapshot_recognizes_identity_beside_an_inherited_pending_attempt() {
+        let Some(binary) = test_node_helper() else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::new(temp.path().join("state"), binary.clone(), binary.clone());
+        node.prepare().unwrap();
+        let cookies = format!(
+            r#"{{"auth_token":"{}","ct0":"{}"}}"#,
+            "a".repeat(40),
+            "b".repeat(64)
+        );
+        for id in ["browser-firefox", "browser-paste"] {
+            node.call(
+                &["accounts", "connect", "x_read", id, "1"],
+                Some(cookies.clone().into_bytes()),
+                10,
+            )
+            .await
+            .unwrap();
+        }
+        std::fs::write(
+            node.state.join("identity.json"),
+            r#"{"node_id":"synthetic-node","supplier_pubkey":"synthetic-wallet","credential":"synthetic-credential"}"#,
+        )
+        .unwrap();
+        let journal = node.state.join("attempts");
+        private_dir_with_helper(&journal, &binary).unwrap();
+        std::fs::write(
+            journal.join("synthetic-pending.json"),
+            json!({
+                "job_id": "synthetic-upgrade-job", "attempt": "synthetic-upgrade-attempt",
+                "fence": "synthetic-upgrade-fence", "fingerprint": "a".repeat(64),
+                "deadline": "2099-01-01T02:00:00Z", "updated_at": "2099-01-01T00:00:00Z", "state": "started",
+                "provider_account_id": "browser-firefox", "provider_service": "x_read"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let began = Instant::now();
+        let snapshot = node.snapshot().await;
+        assert!(snapshot.paired, "paired identity was not recognized");
+        assert!(snapshot.accounts_available, "account inventory failed");
+        assert_eq!(snapshot.accounts.len(), 2);
+        assert!(snapshot.observation.is_some(), "local status failed");
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "snapshot took {:?}",
+            began.elapsed()
+        );
+    }
     #[test]
     fn projection_drops_secret_paths_and_unknown_fields() {
         let raw=br#"[{"id":"work","service":"codex","concurrency":1,"path":"SECRET_PATH","token":"SECRET"}]"#;
