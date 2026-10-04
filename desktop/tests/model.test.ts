@@ -164,6 +164,13 @@ test("An X account that is checking its login reads as warming up, not an error"
   assert.equal(accountHealth(withX("configured"), base.accounts[0]), "configured");
   // Without any node status, local configuration is still not verified access.
   assert.equal(accountHealth(withX(undefined), xAccount), "Configured · access not verified");
+  // A stopped node, or a status too old to trust, is not checking a login.
+  for (const state of ["offline", "stopped"])
+    assert.equal(accountHealth(withX("configured", { state }), xAccount), "Configured · access not verified");
+  assert.equal(accountHealth(withX("configured", { state: "draining" }), xAccount), "Warming up · checking login");
+  // A dead session stays visible while the node is stopped: re-import does not need it running.
+  assert.equal(accountHealth(withX("auth_required", { state: "offline" }), xAccount), X_SESSION_EXPIRED);
+  assert.equal(needsXReimport(withX("auth_required", { state: "offline" }), xAccount), true);
 });
 test("Account states written before a re-import are treated as stale", () => {
   const at = Date.parse("2026-10-03T12:00:00Z");

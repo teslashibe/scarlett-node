@@ -22,7 +22,7 @@ const app = document.querySelector<HTMLDivElement>("#app")!;
 app.innerHTML = `<header><span class="brand">SCARLETT <small>Node</small></span><div class="actions"><button id="dashboard" class="quiet">Open dashboard ↗</button><button id="quit" class="quiet">Quit Scarlett</button></div></header>
 <main><div class="intro"><p class="eyebrow">YOUR SUPPLIER NODE</p><h1>Put your accounts to work</h1><p>Connect Codex and X on this device, then choose when your node serves jobs</p></div>
 <p id="notice" role="status" aria-live="polite" hidden></p>
-<section id="relay-banner" class="relay-banner" aria-labelledby="relay-heading" hidden><h2 id="relay-heading">Keyed relay is paused on this node</h2><p id="relay-detail"></p><div class="actions"><button id="relay-resume" type="button">Resume relay</button></div></section>
+<section id="relay-banner" class="relay-banner" aria-labelledby="relay-heading" hidden><h2 id="relay-heading">Keyed relay is paused on this node</h2><p id="relay-detail" tabindex="-1"></p><div class="actions"><button id="relay-resume" type="button">Resume relay</button></div></section>
 <section aria-labelledby="runtime-heading"><div class="section-head"><h2 id="runtime-heading">Your node</h2><strong id="status">Checking local runtime</strong></div><p id="runtime-note">Connecting to the installed node</p><div class="actions"><button id="start">Start node</button><button id="pause" class="secondary">Pause</button><button id="resume" class="secondary">Resume</button><button id="stop" class="quiet">Stop</button></div><p id="work" class="muted"></p><p id="x-proofs" class="muted" hidden></p></section>
 <section aria-labelledby="pair-heading"><div class="section-head"><h2 id="pair-heading">Pair with Scarlett</h2><button id="setup" class="quiet">Open setup ↗</button></div><p>Sign in, redeem your invite and bind your wallet in your browser. Then paste the one-time pairing code here</p><form id="pair-form"><label>Pairing code<input id="pair-code" type="password" autocomplete="off" spellcheck="false" maxlength="64" required></label><button type="submit">Pair node</button></form></section>
 <section aria-labelledby="accounts-heading"><div class="section-head"><h2 id="accounts-heading">Connected accounts</h2><span id="account-note" class="muted"></span></div><div id="accounts"></div><div class="account-forms">
@@ -134,12 +134,16 @@ function render(s: Snapshot) {
     endReimport();
   for (const [id, at] of reimported)
     if (!statusPredates(s, at)) reimported.delete(id);
-  $("accounts").replaceChildren();
+  // Rows are rebuilt off-screen and swapped in only when they changed, so the
+  // 3 s poll does not drop keyboard focus or a click that is in progress.
+  const rows = document.createElement("div");
   for (const a of s.accounts) {
     const row = document.createElement("div");
     row.className = "account-row";
+    row.dataset.account = `${a.service}:${a.id}:${a.concurrency}`;
     const text = document.createElement("div");
     const title = document.createElement("strong");
+    title.id = `account-${a.service}-${a.id}`;
     title.textContent = `${a.service === "codex" ? "Codex" : "X"} · ${a.id}`;
     const state = document.createElement("p");
     const waiting = a.service === "x_read" && reimported.has(a.id);
@@ -156,6 +160,8 @@ function render(s: Snapshot) {
       const again = document.createElement("button");
       again.type = "button";
       again.textContent = "Import X account again";
+      // Several rows can offer this; the row title tells them apart.
+      again.setAttribute("aria-describedby", title.id);
       again.disabled = busy;
       again.addEventListener("click", () => startReimport(a));
       actions.append(again);
@@ -178,7 +184,7 @@ function render(s: Snapshot) {
     });
     actions.append(remove);
     row.append(text, actions);
-    $("accounts").append(row);
+    rows.append(row);
   }
   for (const health of drainingAccounts(s)) {
     const row = document.createElement("div");
@@ -186,8 +192,10 @@ function render(s: Snapshot) {
     const text = document.createElement("p");
     text.textContent = `${health.service === "codex" ? "Codex" : "X"} · ${health.id} · removed from new work · ${health.in_flight ?? 0} jobs finishing`;
     row.append(text);
-    $("accounts").append(row);
+    rows.append(row);
   }
+  if (rows.innerHTML !== $("accounts").innerHTML)
+    $("accounts").replaceChildren(...rows.childNodes);
   $("account-note").textContent = s.accounts_available
     ? `${s.accounts.length} local ${s.accounts.length === 1 ? "account" : "accounts"}`
     : "Unavailable in this node build";
@@ -250,7 +258,10 @@ $("relay-resume").addEventListener("click", () => {
     )
   )
     return;
-  void act(() => api.resumeRelay(), "Relay resume saved");
+  void act(() => api.resumeRelay(), "Relay resume saved").then(() => {
+    // The button is gone once the resume is saved; keep keyboard focus in the banner.
+    if ($("relay-resume").hidden && !$("relay-banner").hidden) $("relay-detail").focus();
+  });
 });
 $("pair-form").addEventListener("submit", (event) => {
   event.preventDefault();
@@ -454,6 +465,8 @@ function startReimport(a: Account) {
   $<HTMLInputElement>("x-consent").checked = false;
   $("x-reimport-title").textContent = `Re-import X · ${a.id}`;
   $("x-reimport").hidden = false;
+  for (const field of ["x-profile", "x-token"])
+    $(field).setAttribute("aria-describedby", "x-reimport-title");
   $("x-form").scrollIntoView({ block: "start" });
   const profile = $<HTMLSelectElement>("x-profile");
   (profile.disabled ? $("x-token") : profile).focus();
@@ -470,12 +483,19 @@ function endReimport() {
   capacity.value = reimport.capacity_before;
   reimport = undefined;
   $("x-reimport").hidden = true;
+  for (const field of ["x-profile", "x-token"]) $(field).removeAttribute("aria-describedby");
 }
 function finishReimport(id: string) {
   reimported.set(id, Date.now());
   endReimport();
 }
 $("x-reimport-cancel").addEventListener("click", () => {
+  const id = reimport?.id;
   endReimport();
   if (snapshot) render(snapshot);
+  // Return focus to the row button that started the re-import.
+  const origin = $("accounts").querySelector<HTMLButtonElement>(
+    `button[aria-describedby="account-x_read-${id}"]`,
+  );
+  (origin ?? $("x-id")).focus();
 });

@@ -154,7 +154,14 @@ const X_STATES: Record<string, string> = {
 export function accountHealth(s: Snapshot, a: Account): string {
   const state = observedHealth(s, a)?.state;
   if (!state) return "Configured · access not verified";
+  // A stopped node or stale status is not checking anything.
+  if (a.service === "x_read" && state === "configured" && !nodeLive(s))
+    return "Configured · access not verified";
   return (a.service === "x_read" && X_STATES[state]) || state.replaceAll("_", " ");
+}
+// The node wrote this status recently and is still running.
+function nodeLive(s: Snapshot): boolean {
+  return s.observation?.state === "running" || s.observation?.state === "draining";
 }
 export function needsXReimport(s: Snapshot, a: Account): boolean {
   return a.service === "x_read" && observedHealth(s, a)?.state === "auth_required";
@@ -174,8 +181,7 @@ export function relayState(s: Snapshot): "halted" | "resume_saved" | "" {
 // What the running node advertises for X proofs. Empty while it is not
 // running or has no X account, since nothing is being offered then.
 export function xProofModes(s: Snapshot): string {
-  const state = s.observation?.state;
-  if (state !== "running" && state !== "draining") return "";
+  if (!nodeLive(s)) return "";
   if (!s.accounts.some((a) => a.service === "x_read")) return "";
   const x = s.observation?.services?.find((v) => v.kind === "x_read");
   if (!x) return "";
