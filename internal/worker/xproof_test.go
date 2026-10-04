@@ -24,9 +24,9 @@ func fakeXProver(mode string) {
 	_ = json.Unmarshal(data, &in)
 	raw, err := base64.StdEncoding.DecodeString(in.Request)
 	req := string(raw)
-	// "xrelay" stands in for the helper's keyed relay command; every other mode for MPC-TLS.
+	// "xrelay..." stands in for the helper's keyed relay command; every other mode for MPC-TLS.
 	command := "prove-x"
-	if mode == "xrelay" {
+	if strings.HasPrefix(mode, "xrelay") {
 		command = "relay-x"
 	}
 	if mode == "xfail" || err != nil || len(os.Args) != 2 || os.Args[1] != command || in.Verifier != "verifier:7047" || len(in.Token) != 64 ||
@@ -40,7 +40,14 @@ func fakeXProver(mode string) {
 	fmt.Fprintf(zw, `{"echo":%q}`, strings.SplitN(req, "\r\n", 2)[0])
 	zw.Close()
 	resp := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n0\r\n\r\n", gz.Len(), gz.String())
-	out, _ := json.Marshal(map[string]any{"status": "proof_sent", "response": base64.StdEncoding.EncodeToString([]byte(resp))})
+	summary := map[string]any{"status": "proof_sent", "response": base64.StdEncoding.EncodeToString([]byte(resp))}
+	// "...traffic" adds the verifier counters both X helpers flatten into their summary.
+	if strings.HasSuffix(mode, "traffic") {
+		summary["verifier_sent_bytes"] = 41
+		summary["verifier_received_bytes"] = 71
+		summary["verifier_transport_layer"] = "tcp_payload"
+	}
+	out, _ := json.Marshal(summary)
 	fmt.Println(string(out))
 	os.Exit(0)
 }

@@ -81,7 +81,7 @@ jobs:
           suffix=""
           if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
           go build -trimpath -o "$RUNNER_TEMP/scarlett-runtime/scarlett-node$suffix" .
-          GOBIN="$RUNNER_TEMP/scarlett-runtime" go install github.com/teslashibe/open-agent-api/cmd/open-agent-api@v0.1.30
+          GOBIN="$RUNNER_TEMP/scarlett-runtime" go install github.com/teslashibe/open-agent-api/cmd/open-agent-api@v0.1.31
           cargo +1.95 build --release --locked --manifest-path prover/Cargo.toml
       - name: Validate native Windows proof runtime fixtures
         if: runner.os == 'Windows'
@@ -135,10 +135,14 @@ jobs:
         run: python3 -m unittest discover -s desktop/scripts -p 'test_macos_signing.py'
       - name: Desktop tests and native checks
         run: |
+          suffix=""
+          if [[ "$RUNNER_OS" == "Windows" ]]; then suffix=".exe"; fi
           npm --prefix desktop ci --ignore-scripts
           npm --prefix desktop test
           npm --prefix desktop run build
-          cargo +1.95 test --locked --manifest-path desktop/src-tauri/Cargo.toml
+          # Windows Codex login profiles are created only by the built node
+          # helper. Its profile tests require it there; macOS cross-checks it.
+          SCARLETT_TEST_NODE_BINARY="$RUNNER_TEMP/scarlett-runtime/scarlett-node$suffix" cargo +1.95 test --locked --manifest-path desktop/src-tauri/Cargo.toml
           cargo +1.95 clippy --locked --all-targets --manifest-path desktop/src-tauri/Cargo.toml -- -D warnings
       - name: Validate native desktop API supervision without account login
         env:

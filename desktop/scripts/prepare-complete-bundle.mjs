@@ -36,8 +36,8 @@ for (const [binary, expectedPath] of [[node,'github.com/teslashibe/scarlett-node
   if (!info.includes(`\tpath\t${expectedPath}\n`) ||
       !info.includes(`\tbuild\tGOOS=${process.platform === 'win32' ? 'windows' : 'darwin'}\n`) ||
       !info.includes(`\tbuild\tGOARCH=${process.arch === 'x64' ? 'amd64' : 'arm64'}\n`)) throw new Error('Go sidecar package or native target mismatch');
-  if (binary === api && !info.includes('\tmod\tgithub.com/teslashibe/open-agent-api\tv0.1.30\th1:UM4oL2z5RFDsSrtZhjwq8xCd4ThbgISwzL2J8DF04H4=\n') &&
-      !(info.includes('\tbuild\tvcs.revision=a30136769855947a7614f30b5c792fc5f6dc7d49\n') && info.includes('\tbuild\tvcs.modified=false\n'))) throw new Error('The model API must come from the reviewed v0.1.30 source');
+  if (binary === api && !info.includes('\tmod\tgithub.com/teslashibe/open-agent-api\tv0.1.31\th1:lqbbVo5+DbarrMqYdpk/NxPByXjw0aTRYFL6hwlgh48=\n') &&
+      !(info.includes('\tbuild\tvcs.revision=56b9a6960d2c8b820bfb9e76fe5c1aa4e74faa40\n') && info.includes('\tbuild\tvcs.modified=false\n'))) throw new Error('The model API must come from the reviewed v0.1.31 source');
 }
 for (const path of [codexPackage, claudePackage]) checkTree(path);
 const codexMeta = JSON.parse(readFileSync(join(codexPackage,'package.json'),'utf8'));
@@ -52,8 +52,8 @@ if (execFileSync(codexExe, ['--version'], {encoding:'utf8', timeout:10000}).trim
     execFileSync(claudeExe, ['--version'], {encoding:'utf8', timeout:10000}).trim() !== '2.1.286 (Claude Code)') throw new Error('Native provider executable version mismatch');
 
 const module = execFileSync('go', ['list', '-m', '-f', '{{.Version}} {{.Dir}}', 'github.com/teslashibe/open-agent-api'], {cwd:resolve(desktop,'..'),encoding:'utf8'}).trim();
-if (!module.startsWith('v0.1.30 ')) throw new Error('The shared Codex package must be pinned to v0.1.30');
-const moduleDir = module.slice('v0.1.30 '.length);
+if (!module.startsWith('v0.1.31 ')) throw new Error('The shared Codex package must be pinned to v0.1.31');
+const moduleDir = module.slice('v0.1.31 '.length);
 const runtime = join(desktop, 'src-tauri', 'runtime');
 if (existsSync(runtime)) throw new Error('Generated runtime already exists; preserve it or remove only this generated directory before preparing a new build');
 mkdirSync(runtime, {recursive:true});
@@ -89,7 +89,7 @@ function record(directory) {
 }
 record(runtime);
 writeFileSync(join(runtime,'COMPONENTS.json'),JSON.stringify({schemaVersion:1,target:triple,
-  codexVersion:'0.159.2',claudeVersion:'2.1.286',modelApiVersion:'0.1.30',sidecars,files},null,2)+'\n');
+  codexVersion:'0.159.2',claudeVersion:'2.1.286',modelApiVersion:'0.1.31',sidecars,files},null,2)+'\n');
 const config = {bundle:{targets: suffix ? ['nsis'] : ['app','dmg'],
   externalBin:['binaries/scarlett-node','binaries/scarlett-prover','binaries/open-agent-api'],
   resources:{'runtime/':'runtime/'}}};

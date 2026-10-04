@@ -53,18 +53,19 @@ type Capacity struct {
 }
 
 type Record struct {
-	ProviderAccountID string    `json:"provider_account_id,omitempty"`
-	ProviderService   string    `json:"provider_service,omitempty"`
-	JobID             string    `json:"job_id"`
-	Attempt           string    `json:"attempt"`
-	Fence             string    `json:"fence"`
-	Fingerprint       string    `json:"fingerprint"`
-	Deadline          time.Time `json:"deadline"`
-	State             string    `json:"state"` // started, ready, terminal
-	Kind              string    `json:"kind,omitempty"`
-	Body              []byte    `json:"body,omitempty"` // base64 on disk preserves exact report bytes
-	SubmissionSHA256  string    `json:"submission_sha256,omitempty"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	ProviderAccountID string        `json:"provider_account_id,omitempty"`
+	ProviderService   string        `json:"provider_service,omitempty"`
+	JobID             string        `json:"job_id"`
+	Attempt           string        `json:"attempt"`
+	Fence             string        `json:"fence"`
+	Fingerprint       string        `json:"fingerprint"`
+	Deadline          time.Time     `json:"deadline"`
+	State             string        `json:"state"` // started, ready, terminal
+	Kind              string        `json:"kind,omitempty"`
+	Body              []byte        `json:"body,omitempty"` // base64 on disk preserves exact report bytes
+	SubmissionSHA256  string        `json:"submission_sha256,omitempty"`
+	UpdatedAt         time.Time     `json:"updated_at"`
+	ProofTraffic      *ProofTraffic `json:"proof_traffic,omitempty"`
 }
 
 type Journal struct {
@@ -144,6 +145,9 @@ func validHash(s string) bool {
 	return e == nil && len(b) == 32 && hex.EncodeToString(b) == s
 }
 func valid(r Record) bool {
+	if r.ProofTraffic != nil && !r.ProofTraffic.valid(r.Fingerprint) {
+		return false
+	}
 	if r.ProviderAccountID != "" && (!validField(r.ProviderAccountID) || (r.ProviderService != "codex" && r.ProviderService != "x_read")) || r.ProviderAccountID == "" && r.ProviderService != "" {
 		return false
 	}

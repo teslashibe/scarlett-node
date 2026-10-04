@@ -216,6 +216,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	}()
 	var mu sync.Mutex
 	var restUntil time.Time
+	legacyCodexBlocked := false
 	// legacyHeartbeat is set once the coordinator has rejected a heartbeat that
 	// carried proof_modes; from then on the node sends the older shape.
 	legacyHeartbeat := false
@@ -248,6 +249,17 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			state = "exhausted"
 		}
 		mu.Unlock()
+		// Legacy reports have no typed service health and node-v1 requires
+		// their capacity to stay positive; exhausted alone stops dispatch.
+		if blocked := legacyCodexAdmissionBlocked(c, time.Now()); blocked != legacyCodexBlocked {
+			legacyCodexBlocked = blocked
+			if blocked {
+				fmt.Fprintln(os.Stderr, "codex: local credential cannot cover a funded offer; advertising exhausted until it is renewed")
+			}
+		}
+		if legacyCodexBlocked {
+			state = "exhausted"
+		}
 		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: nodeID, Profile: c.Profile, State: state, Bid: c.Bid, Capacity: capacity}
 		if services != nil {
 			h.Services = services.health()
@@ -357,7 +369,13 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 				var err error
 				if !serviceAvailable {
 					code = "service_unavailable"
-					err = rejectLease(workCtx, client, journal, l, code)
+					if l.AcceptanceRequired && l.ServiceType == "codex" {
+						// No selected valid profile: leave the unaccepted offer to
+						// expire rather than funding it through rejectLease.
+						err = errors.New("Codex offer has no locally valid account")
+					} else {
+						err = rejectLease(workCtx, client, journal, l, code)
+					}
 				} else {
 					code, err = submitLease(workCtx, client, selected, l, local, journal)
 					if services != nil {
@@ -414,11 +432,35 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 		return "", err
 	}
 	if l.AcceptanceRequired {
+		if l.ServiceType == "codex" && !codexAdmissionValid(c.CodexHome, l.LeaseDeadline) {
+			// No acceptance HTTP or provider execution has happened. Keep terminal
+			// replay metadata for this pinned attempt; let its offer expire remotely.
+			// rejectLease cannot be used here because it performs funded acceptance.
+			if err := journal.Terminal(record); err != nil {
+				return "auth_required", err
+			}
+			return "auth_required", errors.New("Codex credential validity is insufficient for the offered deadline")
+		}
 		// Persist uncertainty before acceptance HTTP. A lost acknowledgement
 		// keeps this journal pending; recovery never re-executes the provider.
 		l, err = client.Accept(ctx, l)
 		if err != nil {
 			return "", err
+		}
+	}
+	provenExecutor := c.Executor == config.ExecutorCodexTLSN || c.Executor == config.ExecutorServices
+	if l.AcceptanceRequired && provenExecutor {
+		if limit := worker.ProofSampleLimit(c, l); limit > 0 {
+			ctx = worker.WithProofObserver(ctx, func() (func(attempts.ProofSample) error, error) {
+				ordinal, err := journal.BeginProof(record, limit)
+				if err != nil {
+					return nil, err
+				}
+				return func(sample attempts.ProofSample) error {
+					sample.Ordinal = ordinal
+					return journal.CompleteProof(record, sample)
+				}, nil
+			})
 		}
 	}
 	var body any
@@ -454,6 +496,11 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	}
 	// Persist the exact report before touching the coordinator. Recovery may
 	// retry only after the authenticated replay-safe contract is confirmed.
+	if l.AcceptanceRequired && provenExecutor {
+		if err := journal.FinishProofTraffic(record); err != nil {
+			return code, err
+		}
+	}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return code, err
