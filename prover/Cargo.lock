@@ -2245,15 +2245,23 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 name = "scarlett-prover"
 version = "0.1.0"
 dependencies = [
+ "aes 0.8.4",
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "bincode",
  "flate2",
  "futures",
+ "itybity 0.3.3",
  "libc",
+ "mpz-common",
+ "mpz-core",
+ "mpz-fields",
+ "mpz-ot-core",
  "percent-encoding",
  "rand 0.9.5",
  "rcgen",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

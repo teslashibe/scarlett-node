@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
+	"github.com/teslashibe/scarlett-node/internal/worker"
 )
 
 func TestLocalDrainPersistsAcrossRestartAndStatusExcludesPrivateIdentity(t *testing.T) {
@@ -112,5 +113,49 @@ func TestGracefulShutdownLetsAcceptedWorkFinishAndBoundsCancellation(t *testing.
 			t.Fatal("shutdown exceeded grace without cancellation")
 		}
 		cancel()
+	}
+}
+
+// A relay halt survives the process: a restart restores it from the state
+// directory, status reports it, and only the operator's relay-resume clears it.
+func TestRelayHaltPersistsUntilRelayResume(t *testing.T) {
+	dir := privateTestDir(t)
+	t.Setenv("SCARLETT_STATE_DIR", dir)
+	worker.ResetRelayHaltForTests()
+	t.Cleanup(worker.ResetRelayHaltForTests)
+	if e := worker.LoadRelayHalt(dir); e != nil || worker.RelayHalted() {
+		t.Fatal("fresh state directory reported a halt", e)
+	}
+	worker.HaltRelay("verifier misused this node's X session")
+	if raw, e := os.ReadFile(filepath.Join(dir, worker.RelayHaltFile)); e != nil || !bytes.Contains(raw, []byte("misused")) {
+		t.Fatal("halt not recorded", e)
+	}
+	// "Restart": forget the in-memory latch, load the directory again.
+	worker.ResetRelayHaltForTests()
+	if e := worker.LoadRelayHalt(dir); e != nil || !worker.RelayHalted() || worker.RelayHaltReason() == "" {
+		t.Fatal("halt not restored after restart", e)
+	}
+	s := runtimeStatus{Version: coordinator.Version, State: "running", NodeID: "synthetic-node", Services: []coordinator.ServiceHealth{{Kind: "x_read", State: "ready", Capacity: 1}}, RelayHalted: worker.RelayHalted()}
+	if e := saveRuntimeStatus(dir, s); e != nil {
+		t.Fatal(e)
+	}
+	var output bytes.Buffer
+	if e := localCommand("status", &output); e != nil || !bytes.Contains(output.Bytes(), []byte(`"relay_halted":true`)) {
+		t.Fatal("status does not show the halt", e, output.String())
+	}
+	output.Reset()
+	if e := localCommand("relay-resume", &output); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := os.Stat(filepath.Join(dir, worker.RelayHaltFile)); !os.IsNotExist(e) {
+		t.Fatal("relay-resume left the marker", e)
+	}
+	worker.ResetRelayHaltForTests()
+	if e := worker.LoadRelayHalt(dir); e != nil || worker.RelayHalted() {
+		t.Fatal("halt came back after relay-resume", e)
+	}
+	// Resuming when nothing is halted is harmless.
+	if e := localCommand("relay-resume", &output); e != nil {
+		t.Fatal(e)
 	}
 }

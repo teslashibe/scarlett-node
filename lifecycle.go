@@ -14,6 +14,7 @@ import (
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
 	"github.com/teslashibe/scarlett-node/internal/localfs"
+	"github.com/teslashibe/scarlett-node/internal/worker"
 )
 
 // Local observations contain no credentials, prompts, outputs or proof tokens.
@@ -30,6 +31,9 @@ type runtimeStatus struct {
 	UnresolvedAttempts int                         `json:"unresolved_attempts"`
 	Services           []coordinator.ServiceHealth `json:"services"`
 	DrainRequested     bool                        `json:"drain_requested"`
+	// RelayHalted is set while this node refuses keyed relay after catching
+	// its verifier misusing a session; cleared by `scarlett-node relay-resume`.
+	RelayHalted bool `json:"relay_halted,omitempty"`
 }
 
 func localCommand(command string, output io.Writer) error {
@@ -57,6 +61,15 @@ func localCommand(command string, output io.Writer) error {
 			return err
 		}
 		if err := os.Remove(filepath.Join(dir, "drain")); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if err := syncDirectory(dir); err != nil {
+			return err
+		}
+	case "relay-resume":
+		// The operator has checked the verifier. A running node picks this
+		// up at its next restart; the status below says whether one is running.
+		if err := os.Remove(filepath.Join(dir, worker.RelayHaltFile)); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 		if err := syncDirectory(dir); err != nil {

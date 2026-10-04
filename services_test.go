@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
+	"github.com/teslashibe/scarlett-node/internal/worker"
 )
 
 func poolFixture(t *testing.T, selected ...string) *servicePool {
@@ -56,6 +58,39 @@ func TestMissingProofHelperNeverAdvertisesConfiguredCapacity(t *testing.T) {
 	}
 	p.finish("codex", "")
 	p.finish("x_read", "")
+}
+
+// After the node catches its verifier misusing a session, the heartbeat stops
+// offering relay but keeps offering MPC, and the account that carried the
+// relay session stays ready rather than being penalised for the verifier.
+func TestRelayHaltDropsRelayFromHeartbeatAndKeepsAccountReady(t *testing.T) {
+	worker.ResetRelayHaltForTests()
+	t.Cleanup(worker.ResetRelayHaltForTests)
+	p := poolFixture(t, "x_read")
+	p.config.XRelay = true
+	if got := healthKind(t, p, "x_read").ProofModes; !reflect.DeepEqual(got, []string{"mpc", "relay"}) {
+		t.Fatalf("opted-in heartbeat advertises %v", got)
+	}
+	if !p.acquire("x_read") {
+		t.Fatal("ready account refused work")
+	}
+	worker.HaltRelay("test")
+	p.finish("x_read", "relay_misuse")
+	h := healthKind(t, p, "x_read")
+	if !reflect.DeepEqual(h.ProofModes, []string{"mpc"}) {
+		t.Fatalf("halted heartbeat advertises %v", h.ProofModes)
+	}
+	if h.State != "ready" || h.LastErrorCode != "relay_misuse" {
+		t.Fatalf("account after misuse: state %q code %q, want ready with the code recorded", h.State, h.LastErrorCode)
+	}
+	if !p.acquire("x_read") {
+		t.Fatal("account unavailable for MPC work after a relay halt")
+	}
+	p.finish("x_read", "")
+	// The halt survives an ordinary success; only a restart clears it.
+	if got := healthKind(t, p, "x_read").ProofModes; !reflect.DeepEqual(got, []string{"mpc"}) {
+		t.Fatalf("halt cleared by a later success: %v", got)
+	}
 }
 func healthKind(t *testing.T, p *servicePool, kind string) coordinator.ServiceHealth {
 	t.Helper()

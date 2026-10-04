@@ -50,6 +50,12 @@ type Config struct {
 	AccountCooldown  func(time.Duration) // private provider quota observation
 	LocalAccountID   string              // private attempt identity; never sent to the coordinator
 	XSession         string
+	// XRelay lets this node take X jobs proven by keyed relay, where the
+	// verifier holds the TLS session keys. On by default: relay cuts a node's
+	// upload per read from tens of megabytes to tens of kilobytes, and the
+	// node already trusts the operator-run verifier with its session (see
+	// README). SCARLETT_X_RELAY=0 opts out; the node then serves MPC-TLS only.
+	XRelay           bool
 	CodexConcurrency int
 	XConcurrency     int
 	LocalFixture     bool
@@ -123,6 +129,12 @@ func Load() (Config, error) {
 	}
 	if c.Executor == ExecutorServices {
 		c.XSession = os.Getenv("SCARLETT_X_SESSION")
+		switch strings.ToLower(strings.TrimSpace(os.Getenv("SCARLETT_X_RELAY"))) {
+		case "0", "false", "off", "no":
+			c.XRelay = false
+		default:
+			c.XRelay = true
+		}
 		c.AccountsFile = os.Getenv("SCARLETT_ACCOUNTS_FILE")
 		c.AccountsRequired = c.AccountsFile != ""
 		if c.AccountsFile == "" {
