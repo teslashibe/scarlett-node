@@ -17,7 +17,7 @@ The new output directory receives:
 
   release-manifest.py check-version 0.1.1
   release-manifest.py assemble --version 0.1.1 --channel stable \\
-      --node-commit <GITHUB_SHA> --model-api-commit <open-agent-api v0.1.31 commit> \\
+      --node-commit <GITHUB_SHA> --model-api-commit <open-agent-api v0.1.32 commit> \\
       --workflow-run https://github.com/<owner>/<repo>/actions/runs/<id>/attempts/<n> \\
       --darwin-arm64 DIR --darwin-amd64 DIR --windows-amd64 DIR --output NEW_DIR
 """
@@ -44,9 +44,9 @@ PUBLISHER = 'Scarlett (self-signed)'
 # Reviewed native runtime pins; test_version_pins.py keeps every copy in agreement.
 CODEX_VERSION = '0.159.2'
 CLAUDE_VERSION = '2.1.286'
-MODEL_API_VERSION = '0.1.31'
-# open-agent-api refs/tags/v0.1.31^{}: the revision prepare-complete-bundle.mjs accepts.
-MODEL_API_COMMIT = '56b9a6960d2c8b820bfb9e76fe5c1aa4e74faa40'
+MODEL_API_VERSION = '0.1.32'
+# open-agent-api refs/tags/v0.1.32^{}: the revision prepare-complete-bundle.mjs accepts.
+MODEL_API_COMMIT = '3a2559dbe65c85a051de40e2bbafc2639fb99e73'
 COMPONENTS = ['claude-cli', 'codex-cli', 'desktop', 'model-api', 'node', 'prover']
 SIDECARS = {'scarlett-node', 'scarlett-prover', 'open-agent-api'}
 UNTRUSTED_ROOT = '0x800B0109'
@@ -240,7 +240,7 @@ def assemble(version, channel, node_commit, model_api_commit, workflow_run, inpu
     if not isinstance(node_commit, str) or not COMMIT.fullmatch(node_commit):
         raise ValueError('The node source is an exact lowercase commit')
     if model_api_commit != MODEL_API_COMMIT:
-        raise ValueError('The model API source must be the reviewed open-agent-api v0.1.31 commit')
+        raise ValueError('The model API source must be the reviewed open-agent-api v0.1.32 commit')
     if not isinstance(workflow_run, str) or not WORKFLOW_RUN.fullmatch(workflow_run):
         raise ValueError('Name the exact workflow run attempt that signed this release')
     if set(inputs) != set(PLATFORMS):

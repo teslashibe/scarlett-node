@@ -28,7 +28,7 @@ if [[ -n "$suffix" ]]; then root=$(pwd -W); else root=$(pwd); fi
 
 mkdir -p "$out/codex" "$out/claude"
 go build -trimpath -o "$out/scarlett-node$suffix" .
-GOBIN="$out" go install github.com/teslashibe/open-agent-api/cmd/open-agent-api@v0.1.31
+GOBIN="$out" go install github.com/teslashibe/open-agent-api/cmd/open-agent-api@v0.1.32
 cargo +1.95 build --release --locked --manifest-path prover/Cargo.toml
 
 fetch() {

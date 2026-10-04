@@ -241,7 +241,7 @@ try {
     Copy-Item -LiteralPath $binary -Destination $provider
     $providerHash = (Get-FileHash -LiteralPath $provider -Algorithm SHA256).Hash
     $metadata = @{ schemaVersion = 1; target = 'x86_64-pc-windows-msvc'; codexVersion = '0.159.2'
-        claudeVersion = '2.1.286'; modelApiVersion = '0.1.31'
+        claudeVersion = '2.1.286'; modelApiVersion = '0.1.32'
         releaseSigning = @{ scheme = 'self-signed-stable'; publisherThumbprint = $publisher; certificateSha256 = $rawSha256
             vendorBytesPreserved = $true }
         files = @(@{ path = 'codex/bin/codex.exe'; bytes = (Get-Item -LiteralPath $provider).Length; sha256 = $providerHash }) }
@@ -263,12 +263,12 @@ try {
     if ((Get-FileHash -LiteralPath $providerDLL -Algorithm SHA256).Hash -cne $providerDLLHash) {
         throw 'Provider DLL preservation callback changed the fixture'
     }
-    foreach ($oldApiVersion in @('0.1.29', '0.1.30')) {
+    foreach ($oldApiVersion in @('0.1.29', '0.1.30', '0.1.31')) {
         $metadata.modelApiVersion = $oldApiVersion
         $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifest
         Require-Rejection { Resolve-WindowsSigningTarget $provider }
     }
-    $metadata.modelApiVersion = '0.1.31'
+    $metadata.modelApiVersion = '0.1.32'
     $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifest
     # The finalized inventory must name the same scheme and certificate pin.
     $env:SCARLETT_SIGNING_SCHEME = 'authenticode'

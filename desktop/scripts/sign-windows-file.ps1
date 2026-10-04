@@ -61,7 +61,7 @@ function Assert-PreservedProviderResource([string]$Path, [string]$Root, [string]
     $release = $metadata.releaseSigning
     if ($metadata.schemaVersion -ne 1 -or $metadata.target -cne 'x86_64-pc-windows-msvc' -or
         $metadata.codexVersion -cne '0.159.2' -or $metadata.claudeVersion -cne '2.1.286' -or
-        $metadata.modelApiVersion -cne '0.1.31' -or
+        $metadata.modelApiVersion -cne '0.1.32' -or
         $release.vendorBytesPreserved -ne $true -or
         ([string]$release.scheme -cne 'self-signed-stable' -and [string]$release.scheme -cne 'authenticode') -or
         [string]$release.scheme -cne $env:SCARLETT_SIGNING_SCHEME -or

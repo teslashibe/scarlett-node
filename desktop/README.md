@@ -2,7 +2,7 @@
 
 Tauri 2 with bundled vanilla TypeScript. The native bridge delegates execution and account scheduling to the independently built Go node and its Rust proof helper. It does not embed the private Scarlett application.
 
-The desktop provides pairing, status, start/drain/resume/stop, a menu-bar/tray supervisor and account controls. Account management requires the native pool release; older node binaries show it as unavailable. Automatic Codex token refresh for the proof-only runtime, automatic updates and full installed Windows GUI acceptance remain separate release gates. Release installers are signed with Scarlett's own stable self-signed certificates by the release workflow (see [Release signing](#release-signing)); they are not notarized by Apple and Windows shows an unknown publisher. The Mac development app is unsigned and is not a community release.
+The desktop provides pairing, status, start/drain/resume/stop, a menu-bar/tray supervisor and account controls. Account management requires the native pool release; older node binaries show it as unavailable. Real-account acceptance of automatic Codex token renewal, automatic updates and full installed Windows GUI acceptance remain separate release gates. Release installers are signed with Scarlett's own stable self-signed certificates by the release workflow (see [Release signing](#release-signing)); they are not notarized by Apple and Windows shows an unknown publisher. The Mac development app is unsigned and is not a community release.
 
 ## Build
 
@@ -34,7 +34,7 @@ Then run `npm run tauri build -- --bundles app` from `desktop` on Mac. The sidec
 
 The native pool contract landed in [node PR 27](https://github.com/teslashibe/scarlett-node/pull/27), merged at `5ea00650`. This desktop branch includes that main revision. Rebuild both sidecars from the reviewed combined checkout before real account testing. An explicit missing app-owned registry lists no accounts and fails closed for new work; unrelated host profiles are not inherited.
 
-Codex admission requires a known access-token expiry beyond the job deadline plus 30 seconds. Expired, malformed or unknown expiry blocks new work before funded acceptance; it does not prevent existing accepted attempts from reconciling. This guard does not establish provider entitlement or renew credentials. Network work and the local API remain mutually exclusive. To renew through the existing gateway writer, drain and stop network work, start the local API and allow its account monitor to refresh the private profile, then stop the API and resume network work. Refresh occurs only within the gateway's 60-second refresh window; starting the API earlier does not force renewal, and API readiness alone does not prove it. Automatic renewal during network service remains a launch requirement.
+Codex admission requires a known access-token expiry beyond the job deadline plus 30 seconds. Expired, malformed or unknown expiry blocks new work before funded acceptance; it does not prevent existing accepted attempts from reconciling. This guard does not establish provider entitlement. While network work runs, the node renews the app's own login profiles itself: the desktop sets `SCARLETT_CODEX_MANAGED_ROOT` to the `codex-logins` directory, and a profile is renewed only between its jobs, once its token expires within 30 minutes. Network work and the local API remain mutually exclusive, so only one process writes a profile at a time. A state path the node would reject as a managed root leaves renewal off rather than stopping the node. A profile the provider has rejected still requires a new login.
 
 ## Local release validation
 
@@ -96,7 +96,7 @@ Tests use synthetic credentials and disposable temporary directories/fake execut
 
 ## Complete runtime package
 
-The complete bundle contains the desktop shell, native Go node, Rust proof helper, `open-agent-api` v0.1.31, Codex CLI 0.159.2 and Claude CLI 2.1.286. Users do not need a development toolchain to run these packaged binaries. The desktop starts and stops the local model API through its native supervisor. The node's verified network services remain Codex and X; packaging Claude does not add a verified Claude network service.
+The complete bundle contains the desktop shell, native Go node, Rust proof helper, `open-agent-api` v0.1.32, Codex CLI 0.159.2 and Claude CLI 2.1.286. Users do not need a development toolchain to run these packaged binaries. The desktop starts and stops the local model API through its native supervisor. The node's verified network services remain Codex and X; packaging Claude does not add a verified Claude network service.
 
 Build on the target OS and architecture. Prepare the three reviewed native binaries and the official unpacked native provider packages, then run:
 

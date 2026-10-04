@@ -53,7 +53,7 @@ class ReleaseFixture(unittest.TestCase):
             signing = {'scheme': 'self-signed-stable', 'publisherThumbprint': identity['sha1'].upper(),
                        'certificateSha256': identity['sha256'], 'vendorBytesPreserved': True}
         components = {'schemaVersion': 1, 'target': release.PLATFORMS[platform]['target'], 'codexVersion': '0.159.2',
-                      'claudeVersion': '2.1.286', 'modelApiVersion': '0.1.31', 'sidecars': sidecars,
+                      'claudeVersion': '2.1.286', 'modelApiVersion': '0.1.32', 'sidecars': sidecars,
                       'files': [{'path': 'codex/bin/codex', 'bytes': 1, 'sha256': sha(b'x')}], 'releaseSigning': signing}
         self.write(directory / 'COMPONENTS.json', components)
         components_sha256 = release.digest(directory / 'COMPONENTS.json')
@@ -158,7 +158,7 @@ class ReleaseManifestTests(ReleaseFixture):
                              release.digest(self.output / 'evidence' / ('%s.evidence.json' % platform)))
         self.assertEqual(set(provenance), {'version', 'source', 'workflowRun', 'components', 'signing'})
         self.assertEqual((provenance['version'], provenance['source'], provenance['workflowRun']), (VERSION, manifest['source'], RUN))
-        self.assertEqual(provenance['components'], {'codex': '0.159.2', 'claude': '2.1.286', 'modelApi': '0.1.31'})
+        self.assertEqual(provenance['components'], {'codex': '0.159.2', 'claude': '2.1.286', 'modelApi': '0.1.32'})
         self.assertEqual(set(provenance['signing']), set(release.PLATFORMS))
         self.assertLess((self.output / 'release/manifest.json').stat().st_size, 16384)
 
@@ -226,6 +226,7 @@ class ReleaseManifestTests(ReleaseFixture):
             ('darwin-arm64', lambda c: c.update(target='x86_64-apple-darwin'), 'another platform'),
             ('windows-amd64', lambda c: c.update(codexVersion='0.159.1'), 'reviewed provider'),
             ('darwin-amd64', lambda c: c.update(modelApiVersion='0.1.30'), 'reviewed provider'),
+            ('darwin-amd64', lambda c: c.update(modelApiVersion='0.1.31'), 'reviewed provider'),
             ('darwin-arm64', lambda c: c['sidecars'].pop(), 'three signed sidecars'),
             ('darwin-arm64', lambda c: c['sidecars'][0].update(sha256=c['sidecars'][0]['unsignedSha256']), 'three signed sidecars'),
             ('darwin-arm64', lambda c: c.pop('releaseSigning'), 'finalized'),

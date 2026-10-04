@@ -225,7 +225,7 @@ jobs:
           path: ${{ runner.temp }}/signed
       - name: Assemble the release from pinned signing evidence
         run: |
-          model_api=$(git ls-remote https://github.com/teslashibe/open-agent-api.git 'refs/tags/v0.1.31^{}' | cut -f1)
+          model_api=$(git ls-remote https://github.com/teslashibe/open-agent-api.git 'refs/tags/v0.1.32^{}' | cut -f1)
           python3 desktop/scripts/release-manifest.py assemble --version "$RELEASE_VERSION" --channel stable \
             --node-commit "$GITHUB_SHA" --model-api-commit "$model_api" \
             --workflow-run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" \
