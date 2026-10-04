@@ -192,7 +192,7 @@ jobs:
   windows_ui_recheck:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.installer_run_id != '' }}
     runs-on: windows-2025
-    timeout-minutes: 35
+    timeout-minutes: 20
     permissions:
       contents: read
       actions: read
@@ -252,7 +252,7 @@ jobs:
           $version = ([System.IO.File]::ReadAllText('desktop/src-tauri/tauri.conf.json') | ConvertFrom-Json).version
           $installers = @(Get-ChildItem -LiteralPath "$env:RUNNER_TEMP/scarlett-recheck-package" -Filter ('*_' + $version + '_*.exe') -Recurse)
           if ($installers.Count -ne 1) { throw 'Expected exactly one previously built baseline installer' }
-          & desktop/scripts/check-windows-install.ps1 -Installer $installers[0].FullName -EvidenceDirectory "$env:RUNNER_TEMP/scarlett-installed-evidence" -Preferences -BrowserFixture "$env:RUNNER_TEMP/scarlett-browser-fixtures/fixture.json" -QuitExperiment
+          & desktop/scripts/check-windows-install.ps1 -Installer $installers[0].FullName -EvidenceDirectory "$env:RUNNER_TEMP/scarlett-installed-evidence" -Preferences -BrowserFixture "$env:RUNNER_TEMP/scarlett-browser-fixtures/fixture.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
