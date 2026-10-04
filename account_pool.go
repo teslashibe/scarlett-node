@@ -58,7 +58,7 @@ func validHealth(state, code string) bool {
 		return false
 	}
 	switch code {
-	case "", "auth_required", "capacity_unavailable", "x_rate_limited", "prover_error", "x_request_failed", "report_pending", "expired", "invalid_lease", "service_unavailable", "x_incomplete", "execution_uncertain":
+	case "", "auth_required", "capacity_unavailable", "x_rate_limited", "prover_error", "x_request_failed", "report_pending", "expired", "invalid_lease", "service_unavailable", "x_incomplete", "execution_uncertain", "relay_misuse":
 		return true
 	}
 	return false
@@ -389,6 +389,13 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 	s.lastError = code
 	switch code {
 	case "":
+		if s.state != "auth_required" && s.restUntil.IsZero() {
+			s.state = "ready"
+		}
+	case "relay_misuse":
+		// The verifier misbehaved, not this account. Keep the account ready
+		// for MPC-TLS work; the node-wide halt (worker.HaltRelay) is what
+		// stops relay, and the code stays in lastError so status shows why.
 		if s.state != "auth_required" && s.restUntil.IsZero() {
 			s.state = "ready"
 		}

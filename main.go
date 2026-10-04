@@ -40,13 +40,13 @@ func start(args []string) error {
 		return accountsCommand(args[1:], os.Stdin, os.Stdout)
 	}
 	if len(args) != 1 {
-		return errors.New("usage: scarlett-node pair|run|status|drain|resume|accounts")
+		return errors.New("usage: scarlett-node pair|run|status|drain|resume|relay-resume|accounts")
 	}
-	if args[0] == "status" || args[0] == "drain" || args[0] == "resume" {
+	if args[0] == "status" || args[0] == "drain" || args[0] == "resume" || args[0] == "relay-resume" {
 		return localCommand(args[0], os.Stdout)
 	}
 	if args[0] != "pair" && args[0] != "run" {
-		return errors.New("usage: scarlett-node pair|run|status|drain|resume|accounts")
+		return errors.New("usage: scarlett-node pair|run|status|drain|resume|relay-resume|accounts")
 	}
 	c, err := config.Load()
 	if err != nil {
@@ -125,6 +125,11 @@ func run(c config.Config) error {
 }
 func runWithOwner(c config.Config, owner io.Reader) error {
 	if err := prepareStateDir(c.StateDir); err != nil {
+		return err
+	}
+	// A relay halt from an earlier run stays in force until the operator
+	// clears it; a restart alone must not re-arm relay.
+	if err := worker.LoadRelayHalt(c.StateDir); err != nil {
 		return err
 	}
 	journal, err := attempts.OpenWithLimits(filepath.Join(c.StateDir, "attempts"), c.JournalLimits)
@@ -212,6 +217,9 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	var mu sync.Mutex
 	var restUntil time.Time
 	legacyCodexBlocked := false
+	// legacyHeartbeat is set once the coordinator has rejected a heartbeat that
+	// carried proof_modes; from then on the node sends the older shape.
+	legacyHeartbeat := false
 	lastRecovery := time.Now()
 	for ctx.Err() == nil {
 		drained, err := drainRequested(c.StateDir)
@@ -255,6 +263,9 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: nodeID, Profile: c.Profile, State: state, Bid: c.Bid, Capacity: capacity}
 		if services != nil {
 			h.Services = services.health()
+			if legacyHeartbeat {
+				h.Services, _ = coordinator.WithoutProofModes(h.Services)
+			}
 			h.Capacity = 0
 			for _, service := range h.Services {
 				h.Capacity += service.Capacity
@@ -294,10 +305,24 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 		} else {
 			status.UnresolvedAttempts = len(records)
 		}
+		status.RelayHalted = worker.RelayHalted()
 		if err := saveRuntimeStatus(c.StateDir, status); err != nil {
 			return err
 		}
 		reply, err := client.Poll(ctx, h)
+		if errors.Is(err, coordinator.ErrHeartbeatRejected) && !legacyHeartbeat {
+			// A coordinator older than proof_modes rejects the whole heartbeat.
+			// Send it the heartbeat it knows, and keep doing so: it cannot
+			// offer relay work anyway. Without this a coordinator rollback
+			// would take every node that advertises relay offline.
+			if stripped, removed := coordinator.WithoutProofModes(h.Services); removed {
+				h.Services = stripped
+				if reply, err = client.Poll(ctx, h); err == nil {
+					legacyHeartbeat = true
+					fmt.Fprintln(os.Stderr, "heartbeat: coordinator rejected proof_modes; advertising MPC-TLS only until restart")
+				}
+			}
+		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "heartbeat:", err)
 		} else if reply.Lease != nil {
@@ -391,6 +416,10 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	}
 	if _, err := coordinator.JobPath(l.JobID, "result"); err != nil {
 		return "invalid_lease", err
+	}
+	// Decline a proof mode this node does not serve before accepting funds for it.
+	if l.ServiceType == "x_read" && !worker.XOfferServable(c, l.XPayload) {
+		return "invalid_lease", errors.New("x_read offer asks for a proof mode this node does not serve")
 	}
 	record, err := attemptRecord(l)
 	if err != nil {
