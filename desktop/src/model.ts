@@ -13,6 +13,15 @@ export type AccountHealth = {
   rest_until?: string;
   last_error_code?: string;
 };
+export type ServiceHealth = {
+  kind?: string;
+  state?: string;
+  capacity?: number;
+  in_flight?: number;
+  last_error_code?: string;
+  // Absent means MPC-TLS only, as for every node before the field existed.
+  proof_modes?: string[];
+};
 export type Snapshot = {
   local_api?: { available: boolean; running: boolean; ready: boolean; base_url?: string | null; claude_enabled: boolean; claude?: { available: boolean; connected: boolean; pending: boolean; error?: string | null } };
   runtime_available: boolean;
@@ -24,13 +33,18 @@ export type Snapshot = {
   login_pending: boolean;
   login_error?: string | null;
   accounts: Account[];
+  // The node's saved keyed-relay halt is still on disk.
+  relay_halt_marker?: boolean;
   observation?: {
     state?: string;
+    updated_at?: string;
     in_flight?: number;
     unresolved_attempts?: number;
     last_heartbeat_at?: string;
     accounts?: AccountHealth[];
+    services?: ServiceHealth[];
     drain_requested?: boolean;
+    relay_halted?: boolean;
   } | null;
 };
 // The node accepts at most eight accounts per provider (node.rs MAX_CODEX_ACCOUNTS).
@@ -124,13 +138,49 @@ export function statusText(s: Snapshot): string {
     ? "Paused · finishing accepted work"
     : "Running";
 }
-export function accountHealth(s: Snapshot, a: Account): string {
-  const health = s.observation?.accounts?.find(
+function observedHealth(s: Snapshot, a: Account): AccountHealth | undefined {
+  return s.observation?.accounts?.find(
     (h) => h.id === a.id && h.service === a.service,
   );
-  return health?.state
-    ? health.state.replaceAll("_", " ")
-    : "Configured · access not verified";
+}
+export const X_SESSION_EXPIRED =
+  "X session expired or revoked. Re-import the account";
+// X reports configured until the account's client has checked its login with
+// X, then ready. A failed check reports auth_required, like a dead session.
+const X_STATES: Record<string, string> = {
+  configured: "Warming up · checking login",
+  auth_required: X_SESSION_EXPIRED,
+};
+export function accountHealth(s: Snapshot, a: Account): string {
+  const state = observedHealth(s, a)?.state;
+  if (!state) return "Configured · access not verified";
+  return (a.service === "x_read" && X_STATES[state]) || state.replaceAll("_", " ");
+}
+export function needsXReimport(s: Snapshot, a: Account): boolean {
+  return a.service === "x_read" && observedHealth(s, a)?.state === "auth_required";
+}
+// The node has not written a status since `since` (ms), so its account states
+// predate whatever changed then, such as a re-imported X session.
+export function statusPredates(s: Snapshot, since: number): boolean {
+  return !(Date.parse(s.observation?.updated_at ?? "") > since);
+}
+// "halted": the saved halt is on disk and nobody has resumed it.
+// "resume_saved": relay-resume removed it, but the node still reports the halt
+// it holds in memory until it picks the change up.
+export function relayState(s: Snapshot): "halted" | "resume_saved" | "" {
+  if (s.relay_halt_marker) return "halted";
+  return s.observation?.relay_halted === true ? "resume_saved" : "";
+}
+// What the running node advertises for X proofs. Empty while it is not
+// running or has no X account, since nothing is being offered then.
+export function xProofModes(s: Snapshot): string {
+  const state = s.observation?.state;
+  if (state !== "running" && state !== "draining") return "";
+  if (!s.accounts.some((a) => a.service === "x_read")) return "";
+  const x = s.observation?.services?.find((v) => v.kind === "x_read");
+  if (!x) return "";
+  if (x.proof_modes?.includes("relay")) return "MPC + relay";
+  return relayState(s) ? "MPC only · relay paused" : "MPC only";
 }
 export function drainingAccounts(s: Snapshot): AccountHealth[] {
   return (s.observation?.accounts ?? []).filter(

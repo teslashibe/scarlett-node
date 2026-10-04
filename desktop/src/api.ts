@@ -17,6 +17,13 @@ export const api = {
   browserProfiles: () => invoke<BrowserProfile[]>("browser_profiles"),
   importX: (profile: string, id: string, concurrency: number, consent: boolean) =>
     invoke<void>("import_x_profile", { profile, id, concurrency, consent }),
+  // Re-import replaces only the saved session of an existing X account ID.
+  reconnectX: (id: string, authToken: string, ct0: string) =>
+    invoke<void>("reconnect_x", { id, authToken, ct0 }),
+  reimportX: (profile: string, id: string, consent: boolean) =>
+    invoke<void>("reimport_x_profile", { profile, id, consent }),
+  // Runs only the bundled node's relay-resume; never drains or restarts it.
+  resumeRelay: () => invoke<void>("resume_relay"),
   connectCodex: () => invoke<void>("connect_codex"),
   remove: (service: string, id: string) =>
     invoke<void>("remove_account", { service, id }),

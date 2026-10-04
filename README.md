@@ -247,6 +247,7 @@ scarlett-node relay-resume                 # clear a keyed-relay halt after chec
 scarlett-node accounts add codex work /absolute/private/codex-home 1
 scarlett-node accounts add x_read research /absolute/private/x-session.json 1
 scarlett-node accounts list
+scarlett-node accounts reconnect x_read research   # replace an expired X session; cookie JSON on stdin
 ```
 
 ## Development

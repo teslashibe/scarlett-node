@@ -308,6 +308,38 @@ async fn import_x_profile(
     node.import_x(profile, id, concurrency).await
 }
 #[tauri::command]
+async fn reconnect_x(
+    window: WebviewWindow,
+    node: State<'_, Arc<Node>>,
+    id: String,
+    auth_token: String,
+    ct0: String,
+) -> node::Result<()> {
+    local_window(&window)?;
+    node.reconnect_x(id, auth_token, ct0).await
+}
+#[tauri::command]
+async fn reimport_x_profile(
+    window: WebviewWindow,
+    node: State<'_, Arc<Node>>,
+    profile: String,
+    id: String,
+    consent: bool,
+) -> node::Result<()> {
+    local_window(&window)?;
+    if !consent {
+        return Err(Error::InvalidInput);
+    }
+    node.reimport_x(profile, id).await
+}
+/// Runs only the bundled node's `relay-resume`. The renderer confirms first;
+/// the supervised node is neither drained nor restarted.
+#[tauri::command]
+async fn resume_relay(window: WebviewWindow, node: State<'_, Arc<Node>>) -> node::Result<()> {
+    local_window(&window)?;
+    node.resume_relay().await
+}
+#[tauri::command]
 fn open_network(
     window: WebviewWindow,
     node: State<'_, Arc<Node>>,
@@ -416,6 +448,9 @@ fn main() {
             cancel_login,
             browser_profiles,
             import_x_profile,
+            reconnect_x,
+            reimport_x_profile,
+            resume_relay,
             control_local_api,
             control_claude,
             local_api_key,
