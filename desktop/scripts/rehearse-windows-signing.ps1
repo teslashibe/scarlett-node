@@ -14,21 +14,20 @@
 # key and the key files are removed on exit; no trust root is ever added.
 #
 # usage: rehearse-windows-signing.ps1 -Desktop <absolute desktop checkout>
-#   -WorkDirectory <new absolute directory> -ControlBinary <absolute unsigned exe>
+#   -WorkDirectory <new absolute directory>
 param(
     [string]$Desktop = '',
-    [string]$WorkDirectory = '',
-    [string]$ControlBinary = ''
+    [string]$WorkDirectory = ''
 )
 $ErrorActionPreference = 'Stop'
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows') {
     throw 'The Windows signing rehearsal requires a disposable Windows CI runner'
 }
-foreach ($path in @($Desktop, $WorkDirectory, $ControlBinary)) {
+foreach ($path in @($Desktop, $WorkDirectory)) {
     if ($path -notmatch '^[a-zA-Z]:[\\/]' -or $path.Substring(2).Contains(':')) { throw 'Supply absolute local paths' }
 }
 if (-not (Test-Path -LiteralPath (Join-Path $Desktop 'src-tauri\target\release\scarlett-node-desktop.exe') -PathType Leaf) -or
-    -not (Test-Path -LiteralPath $ControlBinary -PathType Leaf) -or (Test-Path -LiteralPath $WorkDirectory)) {
+    (Test-Path -LiteralPath $WorkDirectory)) {
     throw 'Build the release executable first and supply a new work directory'
 }
 $scripts = $PSScriptRoot
@@ -74,30 +73,6 @@ function New-RandomHex([int]$Bytes) {
     return -join ($buffer | ForEach-Object { $_.ToString('x2') })
 }
 
-function Invoke-LegacySignerControl([string]$Root, [string]$Target, [hashtable]$Values) {
-    # TEMPORARY diagnostic (removed before merge): the previous release signer
-    # function, unchanged, on this identity, from the prepared root as cwd.
-    $saved = @{}
-    foreach ($name in $Values.Keys) {
-        $saved[$name] = [Environment]::GetEnvironmentVariable($name)
-        [Environment]::SetEnvironmentVariable($name, $Values[$name])
-    }
-    $location = [Environment]::CurrentDirectory
-    try {
-        [Environment]::CurrentDirectory = $Root
-        $command = "`$ErrorActionPreference = 'Stop'; Set-Location -LiteralPath '" + $Root + "'; . '" + $env:SCARLETT_REHEARSAL_LEGACY_SIGNER + "'; " +
-            "try { Sign-WindowsReleaseFile '" + $Target + "' | Out-Null; 'succeeded' } " +
-            "catch { 'threw ' + `$_.Exception.GetType().Name + ': ' + `$_.Exception.Message + ' (line ' + `$_.InvocationInfo.ScriptLineNumber + ')' }"
-        $preference = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'
-        try { return @(& powershell.exe -NoProfile -NonInteractive -Command $command 2>&1 | ForEach-Object { [string]$_ }) -join ' / ' }
-        finally { $ErrorActionPreference = $preference }
-    } finally {
-        [Environment]::CurrentDirectory = $location
-        foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
-    }
-}
-
 New-Item -ItemType Directory -Path $WorkDirectory | Out-Null
 $keys = New-Item -ItemType Directory -Path (Join-Path $WorkDirectory 'key')
 $sha1 = ''
@@ -141,7 +116,6 @@ try {
     $sha256 = [string](Invoke-RehearsalNative 'python' @((Join-Path $scripts 'signing_identities.py'), 'get', 'windows.sha256'))
     if ($sha1 -cnotmatch '^[0-9a-f]{40}$' -or $sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Rehearsal pins unavailable' }
     $upper = $sha1.ToUpperInvariant()
-    $signtool = Find-WindowsSdkSignTool
 
     # The release import, unchanged: import-windows-identity.ps1 deletes the file.
     $global:LASTEXITCODE = 0
@@ -149,45 +123,6 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'The rehearsal identity import failed' }
     if (Test-Path -LiteralPath $pfx) { throw 'The importer left the PKCS#12 file behind' }
     $env:SCARLETT_WINDOWS_PFX_PASSWORD = $null
-
-    if ($env:SCARLETT_REHEARSAL_LEGACY_SIGNER) {
-        # TEMPORARY diagnostic (removed before merge): Tauri 2.12.1 passes sidecars
-        # to the sign callback as binaries/<name>-<triple>.exe relative to src-tauri.
-        $legacyRoot = Join-Path $WorkDirectory 'legacy-root'
-        New-Item -ItemType Directory -Path (Join-Path $legacyRoot 'binaries') | Out-Null
-        foreach ($name in @('open-agent-api', 'scarlett-prover', 'scarlett-node')) {
-            Copy-Item -LiteralPath $ControlBinary -Destination (Join-Path $legacyRoot ('binaries\' + $name + '-x86_64-pc-windows-msvc.exe'))
-        }
-        $values = @{ SCARLETT_SIGNING_SCHEME = 'self-signed-stable'; SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT = $upper
-            SCARLETT_WINDOWS_CERT_SHA256 = $sha256; SCARLETT_WINDOWS_TIMESTAMP_URL = 'http://timestamp.digicert.com'
-            SCARLETT_WINDOWS_SIGNTOOL = $signtool; SCARLETT_WINDOWS_SIGNING_ROOT = $legacyRoot }
-        Write-Output ('Control (legacy signer, absolute sidecar path): ' +
-            (Invoke-LegacySignerControl $legacyRoot (Join-Path $legacyRoot 'binaries\open-agent-api-x86_64-pc-windows-msvc.exe') $values))
-        Write-Output ('Control (legacy signer, Tauri relative sidecar path): ' +
-            (Invoke-LegacySignerControl $legacyRoot 'binaries/scarlett-prover-x86_64-pc-windows-msvc.exe' $values))
-        $saved = @{}
-        foreach ($name in $values.Keys) { $saved[$name] = [Environment]::GetEnvironmentVariable($name); [Environment]::SetEnvironmentVariable($name, $values[$name]) }
-        $location = [Environment]::CurrentDirectory
-        try {
-            [Environment]::CurrentDirectory = $legacyRoot
-            $info = New-Object System.Diagnostics.ProcessStartInfo
-            $info.FileName = 'powershell.exe'
-            $info.Arguments = '-NoProfile -NonInteractive -File "' + (Join-Path $scripts 'sign-windows-file.ps1') + '" -File binaries/scarlett-node-x86_64-pc-windows-msvc.exe'
-            $info.WorkingDirectory = $legacyRoot
-            $info.UseShellExecute = $false
-            $info.RedirectStandardError = $true
-            $info.RedirectStandardOutput = $true
-            $process = [System.Diagnostics.Process]::Start($info)
-            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-            $stderrText = $process.StandardError.ReadToEnd()
-            $process.WaitForExit()
-            Write-Output ('Control (current signer, Tauri relative sidecar path): exit ' + $process.ExitCode + ' ' + ($stderrText -replace "`r?`n", ' / '))
-        } finally {
-            [Environment]::CurrentDirectory = $location
-            foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
-        }
-        Remove-Item -LiteralPath $legacyRoot -Recurse -Force
-    }
 
     # The release workflow's signing step, with only the evidence location changed.
     $env:SCARLETT_SIGNING_SCHEME = 'self-signed-stable'
