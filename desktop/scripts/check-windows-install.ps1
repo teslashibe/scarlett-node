@@ -911,6 +911,15 @@ function Node-Probe([string[]]$Arguments, [hashtable]$Environment) {
         okJSON = ([string]$stdout.Result).Trim() -ceq '{"ok":true}'; stderrBytes = $errorText.Length; stderrClasses = $classes }
 }
 function Identity-Diagnostics([string]$Name) {
+    # The check has already failed; its result stands. Distinguish a late
+    # status from none, then record what the app shows and what its node
+    # commands do under the desktop's own environment.
+    $late = $null
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($watch.Elapsed.TotalSeconds -lt 45) {
+        if ($null -eq (Find-Button 'Pair node')) { $late = [int]$watch.Elapsed.TotalSeconds; break }
+        Start-Sleep -Milliseconds 500
+    }
     $statuses = @{}
     foreach ($text in @('Node not installed', 'Not paired', 'Running outside this app', 'Stopped', 'Waiting for node status')) {
         $statuses[$text] = UI-Contains $text
@@ -928,17 +937,15 @@ function Identity-Diagnostics([string]$Name) {
         SCARLETT_COORDINATOR = 'https://network.scarlett.ai'; SCARLETT_VERIFIER = 'verifier.scarlett.ai:7047'
         SCARLETT_EXECUTOR = 'services'; SCARLETT_SERVICES = 'codex,x_read'; SCARLETT_PROFILE = 'standard'
         SCARLETT_PROVER = (Join-Path $install 'scarlett-prover.exe')
-        SCARLETT_CODEX_HOME = (Join-Path $root 'unused-legacy-codex'); SCARLETT_X_SESSION = (Join-Path $root 'unused-legacy-x.json') }
-    $managed = $desktop.Clone()
-    $managed['SCARLETT_CODEX_MANAGED_ROOT'] = Join-Path $root 'codex-logins'
-    $diagnostic = @{ check = $Name; statuses = $statuses; notices = $notices
+        SCARLETT_CODEX_HOME = (Join-Path $root 'unused-legacy-codex'); SCARLETT_X_SESSION = (Join-Path $root 'unused-legacy-x.json')
+        SCARLETT_CODEX_MANAGED_ROOT = (Join-Path $root 'codex-logins') }
+    $diagnostic = @{ check = $Name; recognizedSecondsAfterFailure = $late; statuses = $statuses; notices = $notices
         identityRegular = Test-Path -LiteralPath (Join-Path $root 'identity.json') -PathType Leaf
         appStateIsImportState = [System.IO.Path]::GetFullPath($root) -ieq [System.IO.Path]::GetFullPath($state)
         accountsRendered = UI-Contains 'browser-firefox'; observationRendered = UI-Contains 'jobs in flight'
         appRunning = -not $application.HasExited
         privateDir = Node-Probe @('desktop', 'private-dir', $root) $base
-        accountsManaged = Node-Probe @('accounts', 'list') $managed; statusManaged = Node-Probe @('status') $managed
-        accountsPlain = Node-Probe @('accounts', 'list') $desktop; statusPlain = Node-Probe @('status') $desktop
+        accounts = Node-Probe @('accounts', 'list') $desktop; status = Node-Probe @('status') $desktop
         realProviderJobs = 0 }
     New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
     $diagnostic | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-identity-failure.json')

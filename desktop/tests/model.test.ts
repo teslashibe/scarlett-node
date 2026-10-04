@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   canConnectCodex,
   canStart,
+  claudeStatusText,
   codexAccountLimitReached,
   codexNote,
   MAX_CODEX_ACCOUNTS,
@@ -122,4 +123,13 @@ test("Connect Codex is disabled at the node's eight-account limit with a clear r
     assert.equal(canConnectCodex({ ...below, [key]: false }), false);
   assert.equal(canConnectCodex({ ...below, login_pending: true }), false);
   assert.equal(codexNote({ ...full, login_pending: true }), "Finish login in your browser");
+});
+test("Claude status is checked separately and is never mistaken for a missing runtime", () => {
+  assert.equal(claudeStatusText(undefined), "Checking the bundled Claude runtime");
+  const idle = { available: true, connected: false, pending: false };
+  assert.equal(claudeStatusText(idle), "Claude subscription not connected");
+  assert.equal(claudeStatusText({ ...idle, available: false }), "Claude login is unavailable in this build");
+  assert.equal(claudeStatusText({ ...idle, pending: true }), "Finish Claude login in your browser");
+  assert.equal(claudeStatusText({ ...idle, connected: true }), "Claude subscription connected on this device");
+  assert.equal(claudeStatusText({ ...idle, error: "claude_login_failed" }), errorMessage("claude_login_failed"));
 });
