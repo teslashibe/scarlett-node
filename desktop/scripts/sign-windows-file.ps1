@@ -78,6 +78,18 @@ function Assert-PreservedProviderResource([string]$Path, [string]$Root, [string]
     }
 }
 
+function Resolve-CallbackPath([string]$Path) {
+    # Tauri 2.12.1 passes sidecars as config-relative paths (binaries/<name>-<triple>.exe)
+    # from its working directory, src-tauri. Only a plain relative path is
+    # made absolute; rooted, drive-relative, UNC and stream forms are left as
+    # given, so Assert-RegularLocalFile still refuses them. The result must
+    # still pass every prepared-root and allowlist check below.
+    if ($Path -and $Path -notmatch '^[\\/]' -and -not $Path.Contains(':')) {
+        return [System.IO.Path]::GetFullPath([System.IO.Path]::Combine([System.Environment]::CurrentDirectory, $Path))
+    }
+    return $Path
+}
+
 function Resolve-WindowsSigningTarget([string]$Path, $PreservedProvider = $null) {
     # Windows PowerShell cannot bind an omitted [ref] parameter to null.
     # Omission is allowed; an explicitly supplied flag must remain a reference.
@@ -87,7 +99,7 @@ function Resolve-WindowsSigningTarget([string]$Path, $PreservedProvider = $null)
         }
         $PreservedProvider.Value = $false
     }
-    $resolved = Assert-RegularLocalFile $Path
+    $resolved = Assert-RegularLocalFile (Resolve-CallbackPath $Path)
     if ($env:SCARLETT_WINDOWS_SIGNING_ROOT -notmatch '^[a-zA-Z]:[\\/]' -or
         $env:SCARLETT_WINDOWS_SIGNING_ROOT.Substring(2).Contains(':')) {
         throw 'Explicit local prepared release directory required'

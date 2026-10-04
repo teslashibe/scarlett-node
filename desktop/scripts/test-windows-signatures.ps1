@@ -171,6 +171,22 @@ try {
             throw 'Existing Scarlett signing target was rejected'
         }
     }
+    # Tauri 2.12.1 passes sidecars relative to its working directory, src-tauri.
+    # They resolve inside the prepared release; escapes are still refused.
+    $savedDirectory = [System.Environment]::CurrentDirectory
+    try {
+        [System.Environment]::CurrentDirectory = $signingRoot
+        foreach ($relative in @('binaries/scarlett-node-x86_64-pc-windows-msvc.exe', 'binaries\scarlett-node-x86_64-pc-windows-msvc.exe')) {
+            if ((Resolve-WindowsSigningTarget $relative) -cne [System.IO.Path]::GetFullPath($signingInput)) {
+                throw 'Tauri relative sidecar path was not resolved inside the prepared release'
+            }
+        }
+        Require-Rejection { Resolve-WindowsSigningTarget '..\scarlett-node-desktop.exe' }
+        Require-Rejection { Resolve-WindowsSigningTarget 'binaries\..\..\scarlett-node-desktop.exe' }
+        Require-Rejection { Resolve-WindowsSigningTarget '\binaries\scarlett-node-x86_64-pc-windows-msvc.exe' }
+    } finally {
+        [System.Environment]::CurrentDirectory = $savedDirectory
+    }
     # A real unsigned Go executable cannot substitute for the trusted SDK tool.
     # Reject it before opening any publisher key or invoking a signing command.
     $env:SCARLETT_WINDOWS_SIGNTOOL = $binary
