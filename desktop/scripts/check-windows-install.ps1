@@ -270,6 +270,7 @@ function Wait-KeyboardTarget([System.Windows.Automation.AutomationElement]$Eleme
         Wait-Check { $Element.Current.HasKeyboardFocus } 10 $Failure
         if (-not [ScarlettAcceptanceWindow]::WebViewHasInputFocus($Handle)) {
             [ScarlettAcceptanceWindow]::RestoreWebViewInputFocus($Handle)
+            $script:nativeFocusRestores++
         }
         Wait-Check {
             return $Element.Current.HasKeyboardFocus -and
@@ -1104,6 +1105,7 @@ if (-not [System.IO.Path]::IsPathRooted($script:pythonExe) -or
 $previousPath = $env:PATH
 $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
 $application = $null
+$script:nativeFocusRestores = 0
 $script:ownsLoginRegistration = $false
 $key = $null
 try {
@@ -1148,6 +1150,7 @@ try {
         if (-not $UpgradeFixture -or -not $UpgradeInstaller) { throw 'Both installation fixture and upgrade installer are required' }
         Check-InstallationRoundTrip
     }
+    Write-Output "Installed acceptance: WebView native input focus restored after UIA focus $($script:nativeFocusRestores) times"
 } catch {
     # Record source line numbers for failures hidden by the workflow wrapper,
     # without publishing stack paths, UI values or native exception messages.
