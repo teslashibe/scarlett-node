@@ -14,6 +14,8 @@ use tokio::{
     sync::Mutex,
 };
 
+/// The supervised API process only. Claude subscription state is polled on its
+/// own, because it verifies and launches the bundled Claude runtime.
 #[derive(Clone, Default, Serialize)]
 pub struct Snapshot {
     pub available: bool,
@@ -21,7 +23,6 @@ pub struct Snapshot {
     pub ready: bool,
     pub base_url: Option<String>,
     pub claude_enabled: bool,
-    pub claude: crate::claude_auth::Snapshot,
 }
 struct Running {
     child: Child,
@@ -255,7 +256,6 @@ impl LocalApi {
     pub async fn snapshot(&self) -> Snapshot {
         let mut result = Snapshot {
             available: self.available(),
-            claude: self.claude.snapshot().await,
             ..Default::default()
         };
         let mut running = self.running.lock().await;
@@ -661,8 +661,9 @@ mod tests {
         let status = api.snapshot().await;
         assert!(status.ready && status.running);
         assert!(!status.claude_enabled);
-        assert!(status.claude.available);
-        assert!(!status.claude.connected && !status.claude.pending);
+        let claude = api.claude.snapshot().await;
+        assert!(claude.available);
+        assert!(!claude.connected && !claude.pending);
         assert_eq!(
             api.start(port, &[], String::new()).await,
             Err(Error::AlreadyRunning)

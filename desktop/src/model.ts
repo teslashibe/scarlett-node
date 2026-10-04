@@ -13,8 +13,9 @@ export type AccountHealth = {
   rest_until?: string;
   last_error_code?: string;
 };
+export type ClaudeStatus = { available: boolean; connected: boolean; pending: boolean; error?: string | null };
 export type Snapshot = {
-  local_api?: { available: boolean; running: boolean; ready: boolean; base_url?: string | null; claude_enabled: boolean; claude?: { available: boolean; connected: boolean; pending: boolean; error?: string | null } };
+  local_api?: { available: boolean; running: boolean; ready: boolean; base_url?: string | null; claude_enabled: boolean };
   runtime_available: boolean;
   accounts_available: boolean;
   helper_available: boolean;
@@ -106,6 +107,15 @@ export function codexNote(s: Snapshot): string {
   return s.login_error
     ? errorMessage(s.login_error)
     : "Provider access is checked when it serves work";
+}
+export function claudeStatusText(c: ClaudeStatus | undefined): string {
+  if (!c) return "Checking the bundled Claude runtime";
+  if (c.pending) return "Finish Claude login in your browser";
+  if (c.connected) return "Claude subscription connected on this device";
+  if (c.error) return errorMessage(c.error);
+  return c.available
+    ? "Claude subscription not connected"
+    : "Claude login is unavailable in this build";
 }
 export function externalRuntime(s: Snapshot): boolean {
   return (

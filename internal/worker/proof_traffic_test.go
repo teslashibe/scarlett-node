@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -188,5 +189,47 @@ func TestXHelperPaginationBoundAndBootstrapExcluded(t *testing.T) {
 		if s.Ordinal != i+1 || s.State != "complete" || s.SentBytes == nil || *s.SentBytes != 41 || *s.ReceivedBytes != 71 {
 			t.Fatal("missing actual helper bytes", s)
 		}
+	}
+}
+
+// A keyed relay read reserves its sample under the same signed bound as
+// MPC-TLS, and relay-x carries the same verifier counters as prove-x. A relay
+// plan the node may not serve reserves nothing; validation refuses it first.
+func TestRelayHelperTrafficIsBoundedAndJournaledLikeMPC(t *testing.T) {
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	c, l, plan := xFixture(t, coordinator.XRequest{Operation: "post", PostID: "20"})
+	plan.ProofMode, plan.ProofPolicy = "relay", xRelayPolicy
+	l.XPayload, _ = json.Marshal(plan)
+	if got := ProofSampleLimit(c, l); got != 0 {
+		t.Fatal("relay lease without opt-in reserved samples", got)
+	}
+	c.XRelay = true
+	if got := ProofSampleLimit(c, l); got != 1 {
+		t.Fatal("relay lease sample bound", got)
+	}
+	HaltRelay("synthetic misuse")
+	if got := ProofSampleLimit(c, l); got != 0 {
+		t.Fatal("halted relay lease reserved samples", got)
+	}
+	ResetRelayHaltForTests()
+	var observed []attempts.ProofSample
+	ctx := WithProofObserver(context.Background(), func() (func(attempts.ProofSample) error, error) {
+		return func(s attempts.ProofSample) error { observed = append(observed, s); return nil }, nil
+	})
+	c.Prover, c.Verifier = os.Args[0], "verifier:7047"
+	transport := xTransport(c, plan, l.VerifierToken)
+	if !transport.Relay {
+		t.Fatal("opted-in relay plan built an MPC-TLS transport")
+	}
+	t.Setenv("SCARLETT_FAKE_PROVER", "xrelaytraffic")
+	resp, err := transport.RoundTrip(mustRequest(t, http.MethodGet, "https://x.com/i/api/graphql/q/TweetResultByRestId?variables=%7B%7D").WithContext(ctx))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if len(observed) != 1 || observed[0].State != "complete" || observed[0].SentBytes == nil || *observed[0].SentBytes != 41 || observed[0].ReceivedBytes == nil || *observed[0].ReceivedBytes != 71 {
+		t.Fatalf("relay helper observation %+v", observed)
 	}
 }
