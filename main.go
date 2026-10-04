@@ -190,6 +190,12 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	if c.Executor == config.ExecutorServices {
 		services = newServicePool(c)
 		capacity = services.capacity()
+		// Build each X account's client now, one at a time, so the first job
+		// does only its proven read; a failure here leaves it to the job path.
+		if c.Enabled("x_read") {
+			go worker.DefaultXClients().Warm(workCtx, c, services.xAccounts())
+		}
+		defer worker.DefaultXClients().Stop()
 	}
 	slots := make(chan struct{}, capacity)
 	var running sync.WaitGroup

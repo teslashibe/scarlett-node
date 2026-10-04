@@ -23,10 +23,15 @@ import (
 	x "github.com/teslashibe/x-go"
 )
 
+// X serves x_read leases. Base carries the unproven bootstrap fetches of
+// client construction (nil: http.DefaultTransport); Proof replaces the
+// per-lease proving transport in tests; Clients is the warm client cache
+// (nil: DefaultXClients).
 type X struct {
-	Config config.Config
-	Base   http.RoundTripper
-	Proof  http.RoundTripper
+	Config  config.Config
+	Base    http.RoundTripper
+	Proof   http.RoundTripper
+	Clients *XClients
 }
 type xSpec struct {
 	Operation    string         `json:"operation"`
@@ -180,20 +185,25 @@ func ResetRelayHaltForTests() {
 	relayHalt.Unlock()
 }
 
-func privateJSON(path string, out any) error {
+// privateBytes reads a small private credential file; its callers never log
+// the content. Errors carry no content either.
+func privateBytes(path string) ([]byte, error) {
 	f, e := localfs.OpenPrivate(path)
 	if e != nil {
-		return errors.New("local provider credential file unavailable")
+		return nil, errors.New("local provider credential file unavailable")
 	}
 	defer f.Close()
 	info, e := f.Stat()
 	if e != nil || info.Size() > 8192 {
-		return errors.New("provider credential file must be private, regular and bounded")
+		return nil, errors.New("provider credential file must be private, regular and bounded")
 	}
 	raw, e := io.ReadAll(io.LimitReader(f, 8193))
 	if e != nil || len(raw) > 8192 {
-		return errors.New("provider credential file unreadable")
+		return nil, errors.New("provider credential file unreadable")
 	}
+	return raw, nil
+}
+func decodePrivateJSON(raw []byte, out any) error {
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.DisallowUnknownFields()
 	if d.Decode(out) != nil || d.Decode(new(any)) != io.EOF {
@@ -212,18 +222,26 @@ func safeSecret(s string, max int, required bool) bool {
 	}
 	return true
 }
-func XConfigured(path string) bool { _, err := readXSession(path); return err == nil }
+func XConfigured(path string) bool { _, _, err := readXSession(path); return err == nil }
 
-func readXSession(path string) (x.Session, error) {
+// readXSession reads and checks a session file. The stamp is the SHA-256 of
+// the file's content: a warm client built from one stamp is dropped when the
+// file no longer hashes to it. The hash reveals nothing about the content and
+// is never logged.
+func readXSession(path string) (x.Session, string, error) {
 	var session x.Session
-	if e := privateJSON(path, &session); e != nil {
-		return session, e
+	raw, e := privateBytes(path)
+	if e != nil {
+		return session, "", e
+	}
+	if e := decodePrivateJSON(raw, &session); e != nil {
+		return session, "", e
 	}
 	// A local proxy option would replace the proof-aware transport in x-go.
 	if session.Proxy != "" || session.Validate() != nil || !safeSecret(session.AuthToken, 64, true) || !safeSecret(session.CT0, 160, true) || !safeSecret(session.KDT, 64, false) || len(session.Twid) > 64 || strings.ContainsAny(session.Twid, "\r\n;") || len(session.UserAgent) > 512 || strings.ContainsAny(session.UserAgent, "\r\n") {
-		return x.Session{}, errors.New("invalid or unsupported X session")
+		return x.Session{}, "", errors.New("invalid or unsupported X session")
 	}
-	return session, nil
+	return session, SHA(string(raw)), nil
 }
 
 // Unique integer JSON matches the verifier policy and rejects ambiguous keys.
@@ -389,94 +407,16 @@ func validateXLease(c config.Config, l coordinator.Lease) (xPlan, time.Time, str
 	return plan, deadline, ""
 }
 
-type xBoundTransport struct {
-	base, proof http.RoundTripper
-	bootstrap   bool
-	specs       []xSpec
-	next        int
-}
-
-func (t *xBoundTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	if r.Method != http.MethodGet || r.URL.Scheme != "https" || r.URL.User != nil {
-		return nil, errUnprovenXCall
-	}
-	if t.bootstrap {
-		if r.URL.Host == "x.com" && strings.HasPrefix(r.URL.Path, "/i/api/") {
-			parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/i/api/graphql/"), "/")
-			if len(parts) != 2 || parts[1] != "Viewer" && parts[1] != "UserByRestId" {
-				return nil, errUnprovenXCall
-			}
-		} else if !(r.URL.Host == "x.com" && !strings.HasPrefix(r.URL.Path, "/i/api/") || r.URL.Host == "abs.twimg.com") {
-			return nil, errUnprovenXCall
-		}
-		return t.base.RoundTrip(r)
-	}
-	if r.URL.Host != "x.com" || t.next >= len(t.specs) {
-		return nil, errUnprovenXCall
-	}
-	s := t.specs[t.next]
-	if r.URL.Path != "/i/api/graphql/"+s.QueryID+"/"+s.Operation || r.URL.Fragment != "" {
-		return nil, errUnprovenXCall
-	}
-	q := r.URL.Query()
-	for k, v := range q {
-		if len(v) != 1 || k != "variables" && k != "features" && k != "fieldToggles" {
-			return nil, errUnprovenXCall
-		}
-	}
-	v, e := uniqueJSON([]byte(q.Get("variables")))
-	if e != nil {
-		return nil, errUnprovenXCall
-	}
-	vars, ok := v.(map[string]any)
-	if !ok {
-		return nil, errUnprovenXCall
-	}
-	if s.CursorFrom != nil {
-		cursor, ok := vars["cursor"].(string)
-		if !ok || cursor == "" || len(cursor) > 4096 {
-			return nil, errUnprovenXCall
-		}
-		delete(vars, "cursor")
-	}
-	f, e := uniqueJSON([]byte(q.Get("features")))
-	if e != nil || !reflect.DeepEqual(vars, s.Variables) || !reflect.DeepEqual(f, s.Features) {
-		return nil, errUnprovenXCall
-	}
-	if s.FieldToggles != nil {
-		f, e := uniqueJSON([]byte(q.Get("fieldToggles")))
-		if e != nil || !reflect.DeepEqual(f, s.FieldToggles) {
-			return nil, errUnprovenXCall
-		}
-	} else if _, present := q["fieldToggles"]; present {
-		return nil, errUnprovenXCall
-	}
-	response, e := t.proof.RoundTrip(r)
-	if e == nil {
-		t.next++
-	}
-	return response, e
-}
+// Run serves one x_read lease on the account's warm client (see XClients).
+// The lease is validated first, and acquire checks the session file before
+// building, so invalid work never builds a client. A job waits for a build
+// only when no usable client exists: the first job after a dropped client,
+// or a lease pinning a query ID the client was not built with.
 func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 	plan, deadline, code := validateXLease(w.Config, l)
 	if code != "" {
 		return code
 	}
-	session, e := readXSession(w.Config.XSession)
-	if e != nil {
-		return "auth_required"
-	}
-	ctx, cancel := context.WithDeadline(ctx, deadline)
-	defer cancel()
-	base := w.Base
-	if base == nil {
-		base = http.DefaultTransport
-	}
-	proof := w.Proof
-	if proof == nil {
-		proof = xTransport(w.Config, plan, l.VerifierToken)
-	}
-	transport := &xBoundTransport{base: base, proof: proof, bootstrap: true, specs: plan.Exchanges}
 	ids := map[string]string{}
 	for _, s := range plan.Exchanges {
 		if previous, ok := ids[s.Operation]; ok && previous != s.QueryID {
@@ -484,12 +424,49 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 		}
 		ids[s.Operation] = s.QueryID
 	}
-	client, e := session.NewClient(ctx, x.WithHTTPClient(&http.Client{Transport: transport, Timeout: w.Config.InferenceTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}), x.WithRetry(1, time.Millisecond), x.WithQueryIDs(ids), x.WithMinRequestGap(time.Second))
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	clients := w.Clients
+	if clients == nil {
+		clients = defaultXClients
+	}
+	account := clients.account(w.Config, w.Config.LocalAccountID, w.Config.XSession, w.Base)
+	proof := w.Proof
+	if proof == nil {
+		proof = xTransport(w.Config, plan, l.VerifierToken)
+	}
+	warm, e := account.acquire(ctx, ids, false)
 	if e != nil {
 		return w.failure(ctx, e)
 	}
-	transport.bootstrap = false
-	request := l.XRequest
+	for attempt := 0; ; attempt++ {
+		binding := &xBinding{specs: plan.Exchanges, proof: proof}
+		code, e = w.read(withXBinding(ctx, binding), warm.client, *l.XRequest)
+		if e == nil && code == "" && binding.proven() != len(plan.Exchanges) {
+			code = "x_incomplete"
+		}
+		if e == nil {
+			return code
+		}
+		// The client built its request with another query ID than the lease
+		// pins, so the switchboard refused it before any proof was spent.
+		// Build once with the lease's override and try again.
+		if attempt == 0 && binding.wasStale() && binding.proven() == 0 {
+			if warm, e = account.acquire(ctx, ids, true); e == nil {
+				continue
+			}
+			return w.failure(ctx, e)
+		}
+		if xAuthFailure(e) {
+			account.drop(warm)
+		}
+		return w.failure(ctx, e)
+	}
+}
+
+// read performs the lease's reads on client; ctx carries the job binding.
+func (w X) read(ctx context.Context, client *x.Client, request coordinator.XRequest) (string, error) {
+	var e error
 	switch request.Operation {
 	case "profile":
 		_, e = client.GetProfile(ctx, request.Username)
@@ -506,19 +483,13 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 				break
 			}
 			if i+1 < request.Pages && page.NextCursor == "" {
-				return "x_incomplete"
+				return "x_incomplete", nil
 			}
 			cursor = page.NextCursor
 		}
 	}
-	if e != nil {
-		return w.failure(ctx, e)
-	}
-	if transport.next != len(plan.Exchanges) {
-		return "x_incomplete"
-	}
 	// The coordinator reads the verifier's own response copies; none are submitted.
-	return ""
+	return "", e
 }
 func xFailure(ctx context.Context, e error) string {
 	// The relay helper caught the verifier sealing something other than this
@@ -538,10 +509,18 @@ func xFailure(ctx context.Context, e error) string {
 	if errors.Is(e, x.ErrRateLimited) {
 		return "x_rate_limited"
 	}
-	if errors.Is(e, x.ErrUnauthorized) || errors.Is(e, x.ErrInvalidAuth) {
+	if xAuthFailure(e) || errors.Is(e, errXSession) {
 		return "auth_required"
 	}
 	return "x_request_failed"
+}
+
+// xAuthFailure reports whether X refused the session. x-go wraps any failure
+// of its validation read as ErrUnauthorized, including a transport failure
+// (ErrRequestFailed); that one is not X refusing the session and must not
+// park the account until its session file changes.
+func xAuthFailure(e error) bool {
+	return (errors.Is(e, x.ErrUnauthorized) || errors.Is(e, x.ErrInvalidAuth)) && !errors.Is(e, x.ErrRequestFailed)
 }
 
 // Only a typed rate-limit observation affects scheduling. Raw provider errors

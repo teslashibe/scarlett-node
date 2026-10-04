@@ -191,17 +191,23 @@ func TestXExactRequestFenceAndNoRetries(t *testing.T) {
 	if code := (X{Config: c, Base: roundTripFunc(xBootstrap), Proof: proof}).Run(context.Background(), l); code != "x_rate_limited" || proofs.Load() != 1 {
 		t.Fatal("rate limited job retried or misclassified", code, proofs.Load())
 	}
-	transport := &xBoundTransport{base: roundTripFunc(xBootstrap), proof: proof, specs: plan.Exchanges}
+	board := &xSwitchboard{base: roundTripFunc(xBootstrap)}
+	bound := withXBinding(context.Background(), &xBinding{specs: plan.Exchanges, proof: proof})
 	s := plan.Exchanges[0]
 	v, _ := json.Marshal(s.Variables)
 	f, _ := json.Marshal(s.Features)
 	query := url.Values{"variables": {string(v)}, "features": {string(f)}}
 	path := "https://x.com/i/api/graphql/" + s.QueryID + "/" + s.Operation
 	for _, bad := range []string{"https://other.example/i/api/graphql/q/UserByScreenName", path + "?" + query.Encode() + "&variables=%7B%7D", path + "?variables=%7B%22screen_name%22%3A%22other%22%7D&features=" + url.QueryEscape(string(f))} {
-		r, _ := http.NewRequest("GET", bad, nil)
-		if _, e := transport.RoundTrip(r); e == nil {
+		r, _ := http.NewRequestWithContext(bound, "GET", bad, nil)
+		if _, e := board.RoundTrip(r); e == nil {
 			t.Fatal("accepted changed request")
 		}
+	}
+	// The exact pinned request is refused too when its context carries no job.
+	r, _ := http.NewRequest("GET", path+"?"+query.Encode(), nil)
+	if _, e := board.RoundTrip(r); !errors.Is(e, errUnprovenXCall) {
+		t.Fatal("unbound request reached a transport", e)
 	}
 	if proofs.Load() != 1 {
 		t.Fatal("fenced request consumed another proof")
