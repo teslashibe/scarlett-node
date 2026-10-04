@@ -166,6 +166,35 @@ try {
         $outcome = Invoke-SignToolControl $signtool $upper $controlTarget
         Write-Output ('Control (informational): Import-PfxCertificate put the OpenSSL 3 PKCS#12 key in ' + $provider +
             '; SignTool SHA-256 signing with it ' + $outcome)
+        if ($env:SCARLETT_REHEARSAL_LEGACY_SIGNER) {
+            # Temporary diagnostic: the previous release signer function, unchanged,
+            # with this Import-PfxCertificate identity, on an unsigned sidecar.
+            $legacyRoot = Join-Path $WorkDirectory 'legacy-root'
+            $legacyTarget = Join-Path $legacyRoot 'binaries\open-agent-api-x86_64-pc-windows-msvc.exe'
+            New-Item -ItemType Directory -Path (Split-Path -Parent $legacyTarget) -Force | Out-Null
+            Copy-Item -LiteralPath $ControlBinary -Destination $legacyTarget
+            $saved = @{}
+            $values = @{ SCARLETT_SIGNING_SCHEME = 'self-signed-stable'; SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT = $upper
+                SCARLETT_WINDOWS_CERT_SHA256 = $sha256; SCARLETT_WINDOWS_TIMESTAMP_URL = 'http://timestamp.digicert.com'
+                SCARLETT_WINDOWS_SIGNTOOL = $signtool; SCARLETT_WINDOWS_SIGNING_ROOT = $legacyRoot }
+            foreach ($name in $values.Keys) {
+                $saved[$name] = [Environment]::GetEnvironmentVariable($name)
+                [Environment]::SetEnvironmentVariable($name, $values[$name])
+            }
+            try {
+                $command = "`$ErrorActionPreference = 'Stop'; . '" + $env:SCARLETT_REHEARSAL_LEGACY_SIGNER + "'; " +
+                    "try { Sign-WindowsReleaseFile '" + $legacyTarget + "' | Out-Null; 'Legacy signer: succeeded' } " +
+                    "catch { 'Legacy signer threw: ' + `$_.Exception.GetType().Name + ': ' + `$_.Exception.Message + ' (line ' + `$_.InvocationInfo.ScriptLineNumber + ')' }"
+                $preference = $ErrorActionPreference
+                $ErrorActionPreference = 'Continue'
+                try {
+                    $legacyOutput = @(& powershell.exe -NoProfile -NonInteractive -Command $command 2>&1 | ForEach-Object { [string]$_ })
+                } finally { $ErrorActionPreference = $preference }
+                $legacyOutput | ForEach-Object { Write-Output ('Control (legacy signer): ' + $_) }
+            } finally {
+                foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
+            }
+        }
     } finally {
         Remove-Item -LiteralPath ('Cert:\CurrentUser\My\' + $upper) -DeleteKey -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $controlPfx, $controlTarget -Force -ErrorAction SilentlyContinue

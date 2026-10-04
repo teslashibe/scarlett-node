@@ -226,10 +226,18 @@ jobs:
       - name: Build the unsigned Windows release executable
         working-directory: desktop
         run: npm run tauri build -- --no-bundle --config src-tauri/tauri.complete.generated.json
+      - name: Fetch the previous release signer for a temporary control
+        run: |
+          git fetch --no-tags --depth=1 https://github.com/teslashibe/scarlett-node.git e80e2904485c65a71bd067e3bb01f9fc545253c5
+          mkdir -p "$RUNNER_TEMP/legacy/desktop/scripts" "$RUNNER_TEMP/legacy/desktop/signing"
+          for file in desktop/scripts/sign-windows-file.ps1 desktop/scripts/check-windows-signatures.ps1 desktop/signing/identities.json; do
+            git show "e80e2904485c65a71bd067e3bb01f9fc545253c5:$file" > "$RUNNER_TEMP/legacy/$file"
+          done
       - name: Rehearse Windows release import, signing, packaging and installed acceptance, without secrets
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
+          $env:SCARLETT_REHEARSAL_LEGACY_SIGNER = Join-Path $env:RUNNER_TEMP 'legacy\desktop\scripts\sign-windows-file.ps1'
           & desktop/scripts/rehearse-windows-signing.ps1 -Desktop (Join-Path $env:GITHUB_WORKSPACE 'desktop') `
             -WorkDirectory (Join-Path $env:RUNNER_TEMP 'scarlett-windows-rehearsal') `
             -ControlBinary (Join-Path $env:RUNNER_TEMP 'scarlett-runtime\scarlett-node.exe')

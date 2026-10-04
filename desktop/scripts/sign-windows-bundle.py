@@ -155,7 +155,8 @@ def nsis_signing_environment(root, env):
 # Failure output is diagnosable without disclosing secrets or local paths: only
 # our own literal strings, operation names, exit codes, line numbers, HRESULTs
 # and exception class names are ever printed.
-POWERSHELL_REASON_SOURCES = ('sign-windows-file.ps1', 'check-windows-signatures.ps1', 'import-windows-identity.ps1')
+POWERSHELL_REASON_SOURCES = ('sign-windows-file.ps1', 'check-windows-signatures.ps1', 'import-windows-identity.ps1',
+                             'check-windows-install.ps1')
 PYTHON_REASON_SOURCES = ('sign-windows-bundle.py', 'signing_identities.py')
 PYTHON_CHILD_SOURCES = ('check-complete-bundle.py', 'prepare-browser-fixtures.py', 'windows_pe_imports.py')
 LITERAL_THROW = re.compile(r"\bthrow '((?:[^']|'')+)'")
@@ -258,6 +259,11 @@ def failure_reason(error):
     return type(error).__name__
 
 
+def progress(message):
+    # Fixed milestones; the CI log timestamps show how far a run got.
+    print(message, flush=True)
+
+
 def check_prepared_payload(desktop, root, env):
     # The established checker expects installed names, not target-suffixed
     # build inputs. Copy only the three sidecars into disposable staging.
@@ -282,6 +288,7 @@ def main():
     root = desktop / 'src-tauri'
     identities = signing_identities.load()
     scheme, publisher, certificate, timestamp = release_identity(os.environ, identities)
+    progress('Pinned publisher identity and signing scheme accepted')
     # Children (the Tauri callback and the checker) receive the validated pins.
     env = dict(os.environ, SCARLETT_WINDOWS_SIGNING_ROOT=str(root), SCARLETT_SIGNING_SCHEME=scheme,
                SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT=publisher, SCARLETT_WINDOWS_CERT_SHA256=certificate,
@@ -289,18 +296,23 @@ def main():
     if run('Source checkout status', ['git', 'status', '--porcelain', '--untracked-files=no'], desktop, env).strip():
         raise ValueError('Sign only a clean reviewed source checkout')
     source = run('Source commit lookup', ['git', 'rev-parse', 'HEAD'], desktop, env).decode().strip()
+    progress('Source checkout is clean')
     metadata = verify_inputs(root)
+    progress('Unsigned inputs match the component inventory')
     check_prepared_payload(desktop, root, env)
+    progress('Unsigned payload check passed')
     cli = regular(desktop / 'node_modules/@tauri-apps/cli/tauri.js')
     if run('Tauri CLI version', ['node.exe', str(cli), '--version'], desktop, env).decode().strip() != 'tauri-cli 2.12.1':
         raise ValueError('Use the pinned Tauri CLI')
     setup_dir = root / 'target/release/bundle/nsis'
     if setup_dir.exists() and any(setup_dir.iterdir()):
         raise ValueError('Preserve previous installers and prepare a fresh NSIS destination')
+    progress('Pinned Tauri CLI and a fresh NSIS destination confirmed')
     signer = desktop / 'scripts/sign-windows-file.ps1'
     for name in sorted(SIDECARS) + ['scarlett-node-desktop']:
         file = sidecar(root, name) if name in SIDECARS else root / 'target/release/scarlett-node-desktop.exe'
         run('Signing ' + name, ['powershell.exe', '-NoProfile', '-NonInteractive', '-File', str(signer), '-File', str(file)], desktop, env)
+        progress('Signed and verified ' + name)
     final = finalize_metadata(root, metadata, release_signing(scheme, publisher, certificate, identities['rehearsal']))
     manifest = root / 'runtime/COMPONENTS.json'
     temporary = manifest.with_name('COMPONENTS.signing.tmp')
@@ -308,6 +320,7 @@ def main():
         json.dump(final, file, indent=2); file.write('\n')
     temporary.replace(manifest)
     check_prepared_payload(desktop, root, env)
+    progress('Signed payload check passed')
     with tempfile.TemporaryDirectory(prefix='scarlett-windows-signing-') as folder:
         configuration = Path(folder) / 'signing.json'
         configuration.write_text(json.dumps(signing_config(signer)))
@@ -320,6 +333,7 @@ def main():
     installers = list(setup_dir.glob('*.exe'))
     if len(installers) != 1:
         raise ValueError('Expected exactly one signed native release installer')
+    progress('Packaged the NSIS installer with callback signing')
     installer = installers[0]
     installer_hash = digest(installer)
     runner = Path(env['RUNNER_TEMP'])
@@ -331,6 +345,7 @@ def main():
     run('Browser fixture preparation', [sys.executable, str(desktop / 'scripts/prepare-browser-fixtures.py'), str(fixture)], desktop, env)
     run('Installed acceptance', ['powershell.exe', '-NoProfile', '-NonInteractive', '-File', str(desktop / 'scripts/check-windows-install.ps1'),
          '-Installer', str(installer), '-EvidenceDirectory', str(acceptance), '-Preferences', '-BrowserFixture', str(fixture / 'fixture.json')], desktop, env, 900)
+    progress('Installed lifecycle, preferences and browser-import acceptance passed')
     installed = runner / 'Scarlett Installed UI Acceptance'
     run('Signature acceptance', ['powershell.exe', '-NoProfile', '-NonInteractive', '-File', str(desktop / 'scripts/check-windows-signatures.ps1'),
          '-Installer', str(installer), '-InstalledDirectory', str(installed), '-ExpectedPublisherThumbprint', publisher,
