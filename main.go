@@ -154,9 +154,12 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	if c.LocalFixture {
 		client.EchoUnqualifiedHTTP = true
 	}
-	wait := 5 * time.Second
+	// The heartbeat is a long poll: while idle the coordinator holds it for
+	// HeartbeatWaitSeconds and answers the moment a job is funded, so the loop
+	// adds no delay of its own. backoff is the pause after a failed heartbeat.
+	backoff := 5 * time.Second
 	if c.LocalFixture {
-		wait = time.Second
+		backoff = time.Second
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	if owner != nil {
@@ -216,6 +219,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	}()
 	var mu sync.Mutex
 	var restUntil time.Time
+	inFlight := map[string]struct{}{}
 	legacyCodexBlocked := false
 	// legacyHeartbeat is set once the coordinator has rejected a heartbeat that
 	// carried proof_modes; from then on the node sends the older shape.
@@ -260,7 +264,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 		if legacyCodexBlocked {
 			state = "exhausted"
 		}
-		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: nodeID, Profile: c.Profile, State: state, Bid: c.Bid, Capacity: capacity}
+		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: nodeID, Profile: c.Profile, State: state, Bid: c.Bid, Capacity: capacity, WaitSeconds: coordinator.HeartbeatWaitSeconds}
 		if services != nil {
 			h.Services = services.health()
 			if legacyHeartbeat {
@@ -340,8 +344,23 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 				select {
 				case <-ctx.Done():
 					return nil
-				case <-time.After(wait):
+				case <-time.After(backoff):
 				}
+				continue
+			}
+			l := *reply.Lease
+			// The node heartbeats again the instant it holds an offer, while the
+			// attempt is still being accepted. The coordinator leaves a
+			// just-delivered offer out of that heartbeat, but another API process
+			// may hand it over once more; an attempt already running here is
+			// never started twice.
+			mu.Lock()
+			_, duplicate := inFlight[l.JobID]
+			if !duplicate {
+				inFlight[l.JobID] = struct{}{}
+			}
+			mu.Unlock()
+			if duplicate {
 				continue
 			}
 			// The coordinator counts this node's open leases against its capacity,
@@ -349,9 +368,11 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			select {
 			case slots <- struct{}{}:
 			case <-ctx.Done():
+				mu.Lock()
+				delete(inFlight, l.JobID)
+				mu.Unlock()
 				return nil
 			}
-			l := *reply.Lease
 			selected := c
 			var account *accountLease
 			serviceAvailable := true
@@ -365,6 +386,11 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			go func() {
 				defer running.Done()
 				defer func() { <-slots }()
+				defer func() {
+					mu.Lock()
+					delete(inFlight, l.JobID)
+					mu.Unlock()
+				}()
 				var code string
 				var err error
 				if !serviceAvailable {
@@ -397,14 +423,18 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 					fmt.Printf("fixture job %s: %s\n", l.JobID, map[bool]string{true: "failed (" + code + ")", false: "submitted"}[code != ""])
 				}
 			}()
+			// Heartbeat again at once: the coordinator may hold more work.
 			continue
 		} else {
+			// An idle hold ended with nothing to do; the next long poll is the
+			// wait, so loop straight into it.
 			status.LastHeartbeatAt = time.Now().UTC()
+			continue
 		}
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-time.After(wait):
+		case <-time.After(backoff):
 		}
 	}
 	return nil
