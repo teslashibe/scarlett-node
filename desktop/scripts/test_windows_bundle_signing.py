@@ -9,6 +9,8 @@ import unittest
 spec = importlib.util.spec_from_file_location('windows_signing', Path(__file__).with_name('sign-windows-bundle.py'))
 signing = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(signing)
+PINNED = signing.signing_identities.load({})['windows']
+SELF_SIGNED = signing.release_signing('self-signed-stable', PINNED['sha1'], PINNED['sha256'])
 
 
 class WindowsSigningContracts(unittest.TestCase):
@@ -95,7 +97,7 @@ class WindowsSigningContracts(unittest.TestCase):
         for name in signing.SIDECARS:
             with signing.sidecar(self.root, name).open('ab') as file:
                 file.write(b'synthetic signature bytes')
-        result = signing.finalize_metadata(self.root, original, 'a' * 40)
+        result = signing.finalize_metadata(self.root, original, SELF_SIGNED)
         self.assertEqual(original, self.metadata)
         self.assertEqual(result['files'], original['files'])
         for entry in result['sidecars']:
@@ -103,12 +105,15 @@ class WindowsSigningContracts(unittest.TestCase):
             self.assertEqual(entry['unsignedSha256'], previous['sha256'])
             self.assertEqual(entry['unsignedBytes'], previous['bytes'])
             self.assertEqual(entry['sha256'], signing.digest(signing.sidecar(self.root, entry['name'])))
-        self.assertTrue(result['releaseSigning']['vendorBytesPreserved'])
+        self.assertEqual(result['releaseSigning'], {
+            'scheme': 'self-signed-stable', 'publisherThumbprint': PINNED['sha1'].upper(),
+            'certificateSha256': PINNED['sha256'], 'vendorBytesPreserved': True})
+        self.assertIsNot(result['releaseSigning'], SELF_SIGNED)
 
     def test_vendor_mutation_blocks_hash_refresh(self):
         (self.root / 'runtime/claude/provider.exe').write_bytes(b'tampered')
         with self.assertRaisesRegex(ValueError, 'runtime bytes'):
-            signing.finalize_metadata(self.root, self.metadata, 'a' * 40)
+            signing.finalize_metadata(self.root, self.metadata, SELF_SIGNED)
 
     def test_sign_callback_keeps_spaces_as_one_argument(self):
         file = Path('C:/Scarlett Release/scripts/sign-windows-file.ps1')
@@ -168,6 +173,66 @@ class WindowsSigningContracts(unittest.TestCase):
                 directory.rmdir()
                 directory.symlink_to(outside, target_is_directory=True)
         self.assertEqual(retained.read_bytes(), b'external file')
+
+
+class WindowsReleaseIdentityContracts(unittest.TestCase):
+    """The scheme and both pins come from the environment and must equal identities.json."""
+
+    def identity(self, **values):
+        environ = {'SCARLETT_SIGNING_SCHEME': 'self-signed-stable', 'SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT': PINNED['sha1']}
+        environ.update(values)
+        environ = {k: v for k, v in environ.items() if v is not None}
+        return signing.release_identity(environ, signing.signing_identities.load({}))
+
+    def test_self_signed_identity_comes_from_the_pinned_file(self):
+        for thumbprint in (PINNED['sha1'], PINNED['sha1'].upper()):
+            for supplied in (None, PINNED['sha256']):
+                with self.subTest(thumbprint=thumbprint, supplied=supplied):
+                    self.assertEqual(self.identity(SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT=thumbprint, SCARLETT_WINDOWS_CERT_SHA256=supplied),
+                                     ('self-signed-stable', PINNED['sha1'].upper(), PINNED['sha256'], 'http://timestamp.digicert.com'))
+
+    def test_mismatched_environment_and_file_pins_rejected(self):
+        for values in ({'SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT': 'f' * 40},
+                       {'SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT': signing.signing_identities.load({})['macos']['sha1']},
+                       {'SCARLETT_WINDOWS_CERT_SHA256': '0' * 64},
+                       {'SCARLETT_WINDOWS_CERT_SHA256': signing.signing_identities.load({})['macos']['sha256']}):
+            with self.subTest(values=values):
+                with self.assertRaisesRegex(ValueError, 'pinned self-signed'):
+                    self.identity(**values)
+
+    def test_malformed_pins_rejected(self):
+        for values in ({'SCARLETT_WINDOWS_CERT_SHA256': PINNED['sha256'].upper()},
+                       {'SCARLETT_WINDOWS_CERT_SHA256': PINNED['sha256'][:63]},
+                       {'SCARLETT_WINDOWS_CERT_SHA256': PINNED['sha256'] + '0'},
+                       {'SCARLETT_WINDOWS_CERT_SHA256': PINNED['sha256'][:62] + 'zz'},
+                       {'SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT': PINNED['sha1'][:39]},
+                       {'SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT': None}):
+            with self.subTest(values=values):
+                with self.assertRaises(ValueError):
+                    self.identity(**values)
+
+    def test_scheme_has_no_default(self):
+        for scheme in (None, '', 'unsigned', 'developer-id', 'Self-Signed-Stable'):
+            with self.subTest(scheme=scheme):
+                with self.assertRaisesRegex(ValueError, 'SCARLETT_SIGNING_SCHEME'):
+                    self.identity(SCARLETT_SIGNING_SCHEME=scheme)
+
+    def test_authenticode_names_a_different_trusted_certificate(self):
+        other = ('ab' * 20, 'cd' * 32)
+        self.assertEqual(self.identity(SCARLETT_SIGNING_SCHEME='authenticode', SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT=other[0],
+                                       SCARLETT_WINDOWS_CERT_SHA256=other[1]),
+                         ('authenticode', other[0].upper(), other[1], 'http://timestamp.digicert.com'))
+        for thumbprint, certificate in ((other[0], None), (PINNED['sha1'], other[1]), (other[0], PINNED['sha256'])):
+            with self.subTest(thumbprint=thumbprint, certificate=certificate):
+                with self.assertRaises(ValueError):
+                    self.identity(SCARLETT_SIGNING_SCHEME='authenticode', SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT=thumbprint,
+                                  SCARLETT_WINDOWS_CERT_SHA256=certificate)
+
+    def test_release_signing_shape_and_rehearsal_marker(self):
+        self.assertEqual(signing.release_signing('self-signed-stable', PINNED['sha1'], PINNED['sha256']), {
+            'scheme': 'self-signed-stable', 'publisherThumbprint': PINNED['sha1'].upper(),
+            'certificateSha256': PINNED['sha256'], 'vendorBytesPreserved': True})
+        self.assertIs(signing.release_signing('self-signed-stable', PINNED['sha1'], PINNED['sha256'], True)['rehearsal'], True)
 
 
 if __name__ == '__main__':

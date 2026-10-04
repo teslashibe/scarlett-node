@@ -2,7 +2,10 @@
 """Sign prepared release inputs, package NSIS, then test that exact installer.
 
 Requires a disposable native Windows CI runner and an existing publisher
-identity. Provider binaries stay unchanged; no provider login or work occurs.
+identity. SCARLETT_SIGNING_SCHEME has no default: self-signed-stable uses the
+certificate pinned in desktop/signing (Windows reports an untrusted root, and
+trust roots are never added); authenticode uses a Windows-trusted publisher.
+Provider binaries stay unchanged; no provider login or work occurs.
 """
 import argparse
 import copy
@@ -18,6 +21,11 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import signing_identities  # noqa: E402
+
+SCHEMES = ('self-signed-stable', 'authenticode')
+UNTRUSTED_ROOT = '0x800B0109'
 SIDECARS = {'scarlett-node', 'scarlett-prover', 'open-agent-api'}
 TARGET = 'x86_64-pc-windows-msvc'
 
@@ -66,7 +74,40 @@ def verify_inputs(root):
     return metadata
 
 
-def finalize_metadata(root, original, publisher):
+def release_identity(environ, identities):
+    """Return the scheme, publisher thumbprint, certificate SHA-256 and timestamp URL."""
+    scheme = environ.get('SCARLETT_SIGNING_SCHEME', '')
+    if scheme not in SCHEMES:
+        raise ValueError('Set SCARLETT_SIGNING_SCHEME to self-signed-stable or authenticode')
+    publisher = environ.get('SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT', '')
+    if not re.fullmatch('[a-fA-F0-9]{40}', publisher):
+        raise ValueError('Existing reviewed Windows publisher identity required')
+    supplied = environ.get('SCARLETT_WINDOWS_CERT_SHA256', '')
+    if supplied and not re.fullmatch('[a-f0-9]{64}', supplied):
+        raise ValueError('Certificate SHA-256 pins are lowercase hex')
+    pinned = identities['windows']
+    if scheme == 'self-signed-stable':
+        if publisher.lower() != pinned['sha1'] or (supplied and supplied != pinned['sha256']):
+            raise ValueError('Windows publisher differs from the pinned self-signed certificate')
+        certificate = pinned['sha256']
+    else:
+        if not supplied:
+            raise ValueError('An authenticode release names its certificate SHA-256')
+        if publisher.lower() == pinned['sha1'] or supplied == pinned['sha256']:
+            raise ValueError('The self-signed certificate is not an authenticode publisher')
+        certificate = supplied
+    return scheme, publisher.upper(), certificate, pinned['timestampUrl']
+
+
+def release_signing(scheme, publisher, certificate, rehearsal=False):
+    record = {'scheme': scheme, 'publisherThumbprint': publisher.upper(), 'certificateSha256': certificate,
+              'vendorBytesPreserved': True}
+    if rehearsal:
+        record['rehearsal'] = True
+    return record
+
+
+def finalize_metadata(root, original, signing):
     result = copy.deepcopy(original)
     for entry in result['files']:
         file = regular(root / 'runtime' / entry['path'])
@@ -76,7 +117,7 @@ def finalize_metadata(root, original, publisher):
         file = regular(sidecar(root, entry['name']))
         entry['unsignedSha256'], entry['unsignedBytes'] = entry['sha256'], entry['bytes']
         entry['sha256'], entry['bytes'] = digest(file), file.stat().st_size
-    result['releaseSigning'] = {'publisherThumbprint': publisher.upper(), 'vendorBytesPreserved': True}
+    result['releaseSigning'] = dict(signing)
     return result
 
 
@@ -140,10 +181,12 @@ def main():
     if not desktop.is_absolute() or not evidence.is_absolute() or evidence.exists() or evidence.is_symlink() or not evidence.parent.is_dir():
         raise ValueError('Supply the prepared desktop checkout and a new evidence destination')
     root = desktop / 'src-tauri'
-    publisher = os.environ.get('SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT', '')
-    if not re.fullmatch('[a-fA-F0-9]{40}', publisher):
-        raise ValueError('Existing reviewed Windows publisher identity required')
-    env = dict(os.environ, SCARLETT_WINDOWS_SIGNING_ROOT=str(root))
+    identities = signing_identities.load()
+    scheme, publisher, certificate, timestamp = release_identity(os.environ, identities)
+    # Children (the Tauri callback and the checker) receive the validated pins.
+    env = dict(os.environ, SCARLETT_WINDOWS_SIGNING_ROOT=str(root), SCARLETT_SIGNING_SCHEME=scheme,
+               SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT=publisher, SCARLETT_WINDOWS_CERT_SHA256=certificate,
+               SCARLETT_WINDOWS_TIMESTAMP_URL=timestamp)
     if run(['git', 'status', '--porcelain', '--untracked-files=no'], desktop, env).strip():
         raise ValueError('Sign only a clean reviewed source checkout')
     source = run(['git', 'rev-parse', 'HEAD'], desktop, env).decode().strip()
@@ -158,7 +201,7 @@ def main():
     signer = desktop / 'scripts/sign-windows-file.ps1'
     for file in [sidecar(root, name) for name in sorted(SIDECARS)] + [root / 'target/release/scarlett-node-desktop.exe']:
         run(['powershell.exe', '-NoProfile', '-NonInteractive', '-File', str(signer), '-File', str(file)], desktop, env)
-    final = finalize_metadata(root, metadata, publisher)
+    final = finalize_metadata(root, metadata, release_signing(scheme, publisher, certificate, identities['rehearsal']))
     manifest = root / 'runtime/COMPONENTS.json'
     temporary = manifest.with_name('COMPONENTS.signing.tmp')
     with temporary.open('x') as file:
@@ -190,8 +233,12 @@ def main():
     installed = runner / 'Scarlett Installed UI Acceptance'
     run(['powershell.exe', '-NoProfile', '-NonInteractive', '-File', str(desktop / 'scripts/check-windows-signatures.ps1'),
          '-Installer', str(installer), '-InstalledDirectory', str(installed), '-ExpectedPublisherThumbprint', publisher,
-         '-EvidenceFile', str(signature_file)], desktop, env)
+         '-Scheme', scheme, '-CertificateSha256', certificate, '-EvidenceFile', str(signature_file)], desktop, env)
     signatures = json.loads(signature_file.read_text())
+    if signatures['signature'] != scheme or signatures['publisherThumbprint'] != publisher or \
+            signatures['certificateSha256'] != certificate or \
+            (scheme == 'self-signed-stable' and signatures['trustResult'] != UNTRUSTED_ROOT):
+        raise ValueError('Native signature evidence differs from the selected pins')
     if digest(installer) != installer_hash or signatures['installer']['sha256'] != installer_hash:
         raise ValueError('Installer changed during installed acceptance')
     if digest(installed / 'runtime/COMPONENTS.json') != digest(manifest):
@@ -202,12 +249,17 @@ def main():
             raise ValueError('Installed signed executable differs from the signed build')
     for filename in ('windows-installed-ui.json', 'windows-preferences-ui.json', 'windows-browser-import-ui.json'):
         regular(acceptance / filename)
-    record = {'schemaVersion': 1, 'sourceCommit': source, 'signature': 'authenticode',
-              'publisherThumbprint': publisher.upper(), 'installerSha256': installer_hash,
+    record = {'schemaVersion': 1, 'sourceCommit': source, 'signature': scheme,
+              'publisherThumbprint': publisher, 'certificateSha1': publisher.lower(), 'certificateSha256': certificate,
+              'installerSha256': installer_hash,
               'componentManifestSha256': digest(manifest), 'installedFromThisInstaller': True,
               'nativeInstalledLifecyclePreferencesAndBrowserAcceptance': True,
               'vendorBytesPreserved': True, 'providerJobs': 0,
               'realAccountLoginAndUpgradeAcceptance': 'separate gates required'}
+    if scheme == 'self-signed-stable':
+        record['trustResult'] = UNTRUSTED_ROOT
+    if identities['rehearsal']:
+        record['rehearsal'] = True
     with evidence.open('x') as file:
         json.dump(record, file, indent=2); file.write('\n')
     print('Signed Windows installer passed native signature and installed payload/UI acceptance')

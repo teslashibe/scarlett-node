@@ -1,0 +1,13 @@
+# Release signing is owner-reviewed. A change to a workflow, a signing or
+# release script, or the pinned public certificates needs @teslashibe's review
+# (enforced when the main branch ruleset requires code owner review).
+/.github/CODEOWNERS @teslashibe
+/.github/workflows/ @teslashibe
+/desktop/signing/ @teslashibe
+/desktop/scripts/sign-* @teslashibe
+/desktop/scripts/signing_identities.py @teslashibe
+/desktop/scripts/release-manifest.py @teslashibe
+/desktop/scripts/import-macos-identity.sh @teslashibe
+/desktop/scripts/rehearse-macos-signing.sh @teslashibe
+/desktop/scripts/build-complete-runtime.sh @teslashibe
+/desktop/scripts/check-windows-signatures.ps1 @teslashibe

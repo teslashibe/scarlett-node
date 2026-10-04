@@ -113,7 +113,7 @@ For X there are two ways to run step 2. **MPC-TLS** is the standard TLSNotary mo
 
 ### Desktop
 
-Desktop builds are not yet published. The Mac development app is unsigned and is not a community release, and the Windows installer remains a release gate. To run it from source you need Node 26, Rust 1.95 and the Tauri prerequisites; see [`desktop/README.md`](desktop/README.md#build).
+Desktop builds are not yet published. Release installers are signed with Scarlett's own pinned self-signed certificates, so they are not notarized by Apple and Windows shows an unknown publisher; see [release signing](desktop/README.md#release-signing). The Mac development app is unsigned and is not a community release, and the Windows installer remains a release gate. To run it from source you need Node 26, Rust 1.95 and the Tauri prerequisites; see [`desktop/README.md`](desktop/README.md#build).
 
 ### Headless
 
