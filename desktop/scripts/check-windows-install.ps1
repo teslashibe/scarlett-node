@@ -5,7 +5,8 @@ param(
     [switch]$Preferences,
     [string]$BrowserFixture = '',
     [string]$UpgradeFixture = '',
-    [string]$UpgradeInstaller = ''
+    [string]$UpgradeInstaller = '',
+    [switch]$QuitExperiment
 )
 $ErrorActionPreference = 'Stop'
 $script:apiPort = 8088
@@ -92,6 +93,30 @@ public static class ScarlettAcceptanceWindow {
     public static void SelectAllAndClear() {
         Send(new Input[] { Key(0x11, false), Key(0x41, false), Key(0x41, true), Key(0x11, true),
             Key(0x08, false), Key(0x08, true) });
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct Bounds { public int left, top, right, bottom; }
+    [StructLayout(LayoutKind.Sequential)] private struct GuiThreadInfo {
+        public int size; public uint flags;
+        public IntPtr active, focus, capture, menuOwner, moveSize, caret;
+        public Bounds caretBounds;
+    }
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
+    [DllImport("user32.dll")] private static extern bool GetGUIThreadInfo(uint thread, ref GuiThreadInfo info);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassNameW(IntPtr window, System.Text.StringBuilder name, int size);
+    // Native keyboard focus of the foreground input queue: framework window
+    // class and owning process id only, never window text or control values.
+    public static string FocusClass(IntPtr foreground, out uint process) {
+        process = 0;
+        uint ignored;
+        uint thread = GetWindowThreadProcessId(foreground, out ignored);
+        GuiThreadInfo info = new GuiThreadInfo();
+        info.size = Marshal.SizeOf(typeof(GuiThreadInfo));
+        if (thread == 0 || !GetGUIThreadInfo(thread, ref info)) return "unavailable";
+        if (info.focus == IntPtr.Zero) return "none";
+        GetWindowThreadProcessId(info.focus, out process);
+        System.Text.StringBuilder name = new System.Text.StringBuilder(128);
+        if (GetClassNameW(info.focus, name, name.Capacity) == 0) return "unknown";
+        return name.ToString();
     }
     public static void SelectAllClearAndTab() {
         Send(new Input[] { Key(0x11, false), Key(0x41, false), Key(0x41, true), Key(0x11, true),
@@ -309,6 +334,100 @@ function Verify-KeyboardDelivery {
     Write-Output 'Installed acceptance: text and native control-key delivery verified'
 }
 
+
+function Focus-Owner {
+    $process = [uint32]0
+    $class = [ScarlettAcceptanceWindow]::FocusClass([ScarlettAcceptanceWindow]::GetForegroundWindow(), [ref]$process)
+    $owner = 'other'
+    if ($process -eq 0) { $owner = 'none' }
+    elseif ($script:application -and $process -eq $script:application.Id) { $owner = 'app' }
+    elseif ((Get-Process -Id $process -ErrorAction SilentlyContinue).ProcessName -eq 'msedgewebview2') { $owner = 'webview' }
+    return "$owner/$class"
+}
+function WebView-Topology([int]$Previous) {
+    $processes = @(Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'")
+    $browsers = @($processes | Where-Object { [string]$_.CommandLine -notmatch '--type=' })
+    $current = 0
+    if ($script:application -and -not $script:application.HasExited) { $current = $script:application.Id }
+    return [ordered]@{
+        webview = $processes.Count; browsers = $browsers.Count
+        ofCurrent = @($browsers | Where-Object { $current -ne 0 -and $_.ParentProcessId -eq $current }).Count
+        ofPrevious = @($browsers | Where-Object { $Previous -ne 0 -and $_.ParentProcessId -eq $Previous }).Count
+        anyOfPrevious = @($processes | Where-Object { $Previous -ne 0 -and $_.ParentProcessId -eq $Previous }).Count
+    }
+}
+function Quit-Trial([string]$Variant) {
+    # TEMPORARY experiment: compares the shortcut after kill, kill plus orphan
+    # wait and a drained button quit. Synthetic profile only; no provider jobs.
+    Start-App
+    Click-Button 'Start local API'
+    Wait-Check { (Api-Status '/health') -eq 200 } 30 'Experiment API did not start'
+    $previous = $script:application.Id
+    $result = [ordered]@{ variant = $Variant }
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    if ($Variant -eq 'button') {
+        Click-Button 'Quit Scarlett'
+        if (-not $script:application.WaitForExit(135000)) { throw 'Experiment button quit did not exit' }
+    } else {
+        $script:application.Kill()
+        if (-not $script:application.WaitForExit(10000)) { throw 'Experiment kill did not exit' }
+    }
+    Wait-Check { (Api-Status '/health') -eq 0 } 30 'Experiment API survived'
+    $result.apiDownMs = $timer.ElapsedMilliseconds
+    $result.atRelaunch = WebView-Topology $previous
+    if ($Variant -eq 'killwait') {
+        $deadline = [DateTime]::UtcNow.AddSeconds(30)
+        while ([DateTime]::UtcNow -lt $deadline -and (WebView-Topology $previous).anyOfPrevious -gt 0) { Start-Sleep -Milliseconds 200 }
+        $result.orphanWaitMs = $timer.ElapsedMilliseconds
+    }
+    $result.relaunchMs = $timer.ElapsedMilliseconds
+    Start-App
+    Click-Button 'Start local API'
+    Wait-Check { (Api-Status '/health') -eq 200 } 30 'Experiment relaunch API did not start'
+    $result.afterStart = WebView-Topology $previous
+    Focus-QuitShortcut | Out-Null
+    $result.focusBefore = Focus-Owner
+    [ScarlettAcceptanceWindow]::ControlKey(0x51)
+    $result.exited = $script:application.WaitForExit(20000)
+    if (-not $result.exited) {
+        $result.focusAfter = Focus-Owner
+        $result.apiAfter = Api-Status '/health'
+        $result.atFailure = WebView-Topology $previous
+        try { Verify-KeyboardDelivery | Out-Null; $result.textAfter = $true } catch { $result.textAfter = $false }
+        # The same chord in an empty editable field shows a lost Control as typed text.
+        try {
+            $field = Find-Input 'Local account ID'
+            if ($null -eq $field) { $field = Find-Input 'Local X account ID' }
+            $value = $null
+            $field.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$value) | Out-Null
+            $field.SetFocus()
+            Start-Sleep -Milliseconds 300
+            $result.fieldFocusBefore = Focus-Owner
+            [ScarlettAcceptanceWindow]::ControlKey(0x51)
+            $result.fieldChordExited = $script:application.WaitForExit(10000)
+            if (-not $result.fieldChordExited) { $result.fieldChordTyped = ([string]$value.Current.Value).Length }
+        } catch { $result.fieldChordError = $true }
+        if (-not $script:application.HasExited) {
+            Click-Button 'Quit Scarlett'
+            $result.buttonExited = $script:application.WaitForExit(135000)
+            if (-not $result.buttonExited) { $script:application.Kill(); $script:application.WaitForExit(10000) | Out-Null }
+        }
+    }
+    Wait-Check { (Api-Status '/health') -eq 0 } 30 'Experiment API survived trial'
+    Write-Host ('Quit experiment: ' + ($result | ConvertTo-Json -Compress -Depth 4))
+    return $result
+}
+function Run-QuitExperiment {
+    $results = @()
+    for ($round = 0; $round -lt 5; $round++) {
+        foreach ($variant in @('kill', 'button', 'killwait')) { $results += ,(Quit-Trial $variant) }
+    }
+    foreach ($variant in @('kill', 'button', 'killwait')) {
+        $trials = @($results | Where-Object { $_.variant -eq $variant })
+        Write-Host ("Quit experiment summary: $variant exited " + @($trials | Where-Object { $_.exited }).Count + ' of ' + $trials.Count)
+    }
+    throw 'Temporary quit experiment complete'
+}
 
 function Find-Input([string]$Name) {
     $condition = [System.Windows.Automation.AndCondition]::new(
@@ -1010,6 +1129,7 @@ $application = $null
 $script:ownsLoginRegistration = $false
 $key = $null
 try {
+    if ($QuitExperiment) { Run-QuitExperiment }
     Start-App
     Click-Button 'Start local API'
     Wait-Check { (Api-Status '/health') -eq 200 } 30 'Installed UI did not start the local API'
