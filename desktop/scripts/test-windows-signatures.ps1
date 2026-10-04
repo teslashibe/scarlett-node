@@ -27,7 +27,9 @@ function Invoke-ScriptForDiagnostics([string]$Script, [string[]]$Arguments) {
     $stderr = $process.StandardError.ReadToEnd()
     $process.WaitForExit()
     [void]$stdout.Result
-    return @{ Code = $process.ExitCode; Lines = @($stderr -split "`r?`n" | Where-Object { $_ }) }
+    # Windows PowerShell may serialize module-loading progress as CLIXML records.
+    $lines = @($stderr -split "`r?`n" | Where-Object { $_ -and $_ -notmatch '^(#< CLIXML|<Objs )' })
+    return @{ Code = $process.ExitCode; Lines = $lines }
 }
 
 function Assert-DiagnosticLines($Result, [string[]]$Expected) {
