@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   canConnectCodex,
   canStart,
+  claudeStatusText,
   codexAccountLimitReached,
   codexNote,
   MAX_CODEX_ACCOUNTS,
@@ -207,4 +208,13 @@ test("X proof modes come from what the running node advertises", () => {
   // A stopped node offers nothing, and a node without X accounts has no X service to show.
   assert.equal(xProofModes(advertised(["mpc", "relay"], {}, "offline")), "");
   assert.equal(xProofModes({ ...advertised(["mpc", "relay"]), accounts: base.accounts }), "");
+});
+test("Claude status is checked separately and is never mistaken for a missing runtime", () => {
+  assert.equal(claudeStatusText(undefined), "Checking the bundled Claude runtime");
+  const idle = { available: true, connected: false, pending: false };
+  assert.equal(claudeStatusText(idle), "Claude subscription not connected");
+  assert.equal(claudeStatusText({ ...idle, available: false }), "Claude login is unavailable in this build");
+  assert.equal(claudeStatusText({ ...idle, pending: true }), "Finish Claude login in your browser");
+  assert.equal(claudeStatusText({ ...idle, connected: true }), "Claude subscription connected on this device");
+  assert.equal(claudeStatusText({ ...idle, error: "claude_login_failed" }), errorMessage("claude_login_failed"));
 });

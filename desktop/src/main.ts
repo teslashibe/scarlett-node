@@ -5,6 +5,7 @@ import {
   accountHealth,
   canConnectCodex,
   canStart,
+  claudeStatusText,
   codexNote,
   errorMessage,
   statusText,
@@ -15,6 +16,7 @@ import {
   statusPredates,
   xProofModes,
   type Account,
+  type ClaudeStatus,
   type Snapshot,
 } from "./model.ts";
 const app = document.querySelector<HTMLDivElement>("#app")!;
@@ -34,8 +36,10 @@ app.innerHTML = `<header><span class="brand">SCARLETT <small>Node</small></span>
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T;
 let snapshot: Snapshot | undefined;
+let claudeStatus: ClaudeStatus | undefined;
 let busy = false;
 let polling = false;
+let claudePolling = false;
 let browserProfilesAvailable = false;
 let preferencesAvailable = false;
 let autostartAvailable = false;
@@ -83,8 +87,8 @@ function render(s: Snapshot) {
   $("api-stop").toggleAttribute("disabled", busy || !local?.running);
   $("api-show-key").toggleAttribute("disabled", busy || !local?.available);
   $("api-port").toggleAttribute("disabled", busy || !!local?.running);
-  const claude = local?.claude;
-  $("claude-status").textContent = claude?.pending ? "Finish Claude login in your browser" : claude?.connected ? "Claude subscription connected on this device" : claude?.error ? errorMessage(claude.error) : claude?.available ? "Claude subscription not connected" : "Claude login is unavailable in this build";
+  const claude = claudeStatus;
+  setText($("claude-status"), claudeStatusText(claude));
   $("claude-connect").toggleAttribute("disabled", busy || !claude?.available || !!claude?.pending || !!claude?.connected);
   $("claude-cancel").hidden = !claude?.pending;
   $("claude-cancel").toggleAttribute("disabled", busy);
@@ -209,6 +213,7 @@ function render(s: Snapshot) {
   $("codex-note").textContent = codexNote(s);
 }
 async function refresh() {
+  void refreshClaude();
   if (polling) return;
   polling = true;
   try {
@@ -217,6 +222,22 @@ async function refresh() {
     notice(errorMessage(e), true);
   } finally {
     polling = false;
+  }
+}
+// Claude status verifies the bundled runtime and launches its CLI. Poll it on
+// its own so that cost never delays node status, such as a paired identity.
+// Its result re-renders through render(), which swaps account rows only when
+// they changed, so it never drops focus between the two polls either.
+async function refreshClaude() {
+  if (claudePolling) return;
+  claudePolling = true;
+  try {
+    claudeStatus = await api.claudeStatus();
+    if (snapshot) render(snapshot);
+  } catch (e) {
+    notice(errorMessage(e), true);
+  } finally {
+    claudePolling = false;
   }
 }
 async function act(fn: () => Promise<void>, success: string) {

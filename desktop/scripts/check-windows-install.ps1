@@ -879,6 +879,78 @@ function Durable-Hashes {
     }
     return $hashes
 }
+function Node-Probe([string[]]$Arguments, [hashtable]$Environment) {
+    # Failure evidence only: exit status, duration and output size. Never record
+    # node output; error text is reduced to its fixed node classification.
+    $start = New-Object System.Diagnostics.ProcessStartInfo
+    $start.FileName = Join-Path $install 'scarlett-node.exe'
+    $start.Arguments = ($Arguments | ForEach-Object { '"' + $_ + '"' }) -join ' '
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardInput = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $start.EnvironmentVariables.Clear()
+    foreach ($name in $Environment.Keys) { if ($Environment[$name]) { $start.EnvironmentVariables[$name] = [string]$Environment[$name] } }
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $process = [System.Diagnostics.Process]::Start($start)
+    $process.StandardInput.Close()
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    $exited = $process.WaitForExit(20000)
+    if (-not $exited) { $process.Kill(); $process.WaitForExit(5000) | Out-Null }
+    $watch.Stop()
+    $errorText = [string]$stderr.Result
+    $known = @('desktop private storage unavailable', 'invalid private directory', 'state directory must be absolute',
+        'accounts directory must be private', 'cannot lock account configuration', 'cannot read private account configuration',
+        'invalid local status', 'invalid local account status', 'invalid journal capacity status', 'Access is denied',
+        'The process cannot access the file', 'private file', 'requires', 'NTFS')
+    $classes = @($known | Where-Object { $errorText.Contains($_) })
+    return @{ exited = $exited; exitCode = $(if ($exited) { $process.ExitCode } else { $null })
+        milliseconds = $watch.ElapsedMilliseconds; stdoutBytes = ([string]$stdout.Result).Length
+        okJSON = ([string]$stdout.Result).Trim() -ceq '{"ok":true}'; stderrBytes = $errorText.Length; stderrClasses = $classes }
+}
+function Identity-Diagnostics([string]$Name) {
+    # The check has already failed; its result stands. Distinguish a late
+    # status from none, then record what the app shows and what its node
+    # commands do under the desktop's own environment.
+    $late = $null
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($watch.Elapsed.TotalSeconds -lt 45) {
+        if ($null -eq (Find-Button 'Pair node')) { $late = [int]$watch.Elapsed.TotalSeconds; break }
+        Start-Sleep -Milliseconds 500
+    }
+    $statuses = @{}
+    foreach ($text in @('Node not installed', 'Not paired', 'Running outside this app', 'Stopped', 'Waiting for node status')) {
+        $statuses[$text] = UI-Contains $text
+    }
+    $notices = @{}
+    foreach ($text in @('Scarlett could not open its private local storage', 'The node could not complete that action',
+        'The action timed out', 'Scarlett could not complete that action', 'The node or proof helper is missing')) {
+        $notices[$text] = UI-Contains $text
+    }
+    $root = $script:importState
+    $base = @{ SystemRoot = $env:SystemRoot; WINDIR = $env:WINDIR }
+    $desktop = @{ HOME = $env:HOME; USERPROFILE = $env:USERPROFILE; APPDATA = $env:APPDATA; LOCALAPPDATA = $env:LOCALAPPDATA
+        SystemRoot = $env:SystemRoot; WINDIR = $env:WINDIR; TEMP = $env:TEMP; TMP = $env:TMP; TMPDIR = $env:TMPDIR; LANG = $env:LANG
+        SCARLETT_STATE_DIR = $root; SCARLETT_ACCOUNTS_FILE = (Join-Path $root 'accounts.json')
+        SCARLETT_COORDINATOR = 'https://network.scarlett.ai'; SCARLETT_VERIFIER = 'verifier.scarlett.ai:7047'
+        SCARLETT_EXECUTOR = 'services'; SCARLETT_SERVICES = 'codex,x_read'; SCARLETT_PROFILE = 'standard'
+        SCARLETT_PROVER = (Join-Path $install 'scarlett-prover.exe')
+        SCARLETT_CODEX_HOME = (Join-Path $root 'unused-legacy-codex'); SCARLETT_X_SESSION = (Join-Path $root 'unused-legacy-x.json')
+        SCARLETT_CODEX_MANAGED_ROOT = (Join-Path $root 'codex-logins') }
+    $diagnostic = @{ check = $Name; recognizedSecondsAfterFailure = $late; statuses = $statuses; notices = $notices
+        identityRegular = Test-Path -LiteralPath (Join-Path $root 'identity.json') -PathType Leaf
+        appStateIsImportState = [System.IO.Path]::GetFullPath($root) -ieq [System.IO.Path]::GetFullPath($state)
+        accountsRendered = UI-Contains 'browser-firefox'; observationRendered = UI-Contains 'jobs in flight'
+        appRunning = -not $application.HasExited
+        privateDir = Node-Probe @('desktop', 'private-dir', $root) $base
+        accounts = Node-Probe @('accounts', 'list') $desktop; status = Node-Probe @('status') $desktop
+        realProviderJobs = 0 }
+    New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+    $diagnostic | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-identity-failure.json')
+    Write-Output ($diagnostic | ConvertTo-Json -Depth 4 -Compress)
+}
 function Check-InstallationRoundTrip {
     if (-not $BrowserFixture -or -not $script:importState -or
         @(([System.IO.File]::ReadAllText((Join-Path $script:importState 'accounts.json')) | ConvertFrom-Json).accounts).Count -ne 2) {
@@ -925,7 +997,12 @@ function Check-InstallationRoundTrip {
         Start-App
         $version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($executable).ProductVersion
         if ($version -notin @($fixture.baselineVersion, ($fixture.baselineVersion + '.0'))) { throw 'Baseline executable has the wrong product version' }
-        Wait-Check { $null -eq (Find-Button 'Pair node') } 15 'Baseline app did not recognize its private synthetic identity'
+        try { Wait-Check { $null -eq (Find-Button 'Pair node') } 15 'Baseline app did not recognize its private synthetic identity' }
+        catch {
+            $failure = $_
+            try { Identity-Diagnostics 'baseline' } catch { Write-Output 'Identity failure diagnostics were unavailable' }
+            throw $failure
+        }
         Set-Number 'Saved local API port' 18088
         Click-Button 'Save device preferences'
         Wait-Check { Saved-Preferences 18088 $false } 15 'Baseline app did not retain its test port'
@@ -949,7 +1026,12 @@ function Check-InstallationRoundTrip {
             if ($after.Count -ne $before.Count) { throw 'Installation changed private account/identity/journal files' }
             foreach ($path in $before.Keys) { if ($after[$path] -cne $before[$path]) { throw 'Installation changed private retained bytes' } }
             Start-App
-            Wait-Check { $null -eq (Find-Button 'Pair node') } 15 'Installed app lost its synthetic node identity'
+            try { Wait-Check { $null -eq (Find-Button 'Pair node') } 15 'Installed app lost its synthetic node identity' }
+            catch {
+                $failure = $_
+                try { Identity-Diagnostics $candidate.direction } catch { Write-Output 'Identity failure diagnostics were unavailable' }
+                throw $failure
+            }
             Wait-Check { UI-Contains 'browser-firefox' } 15 'Installed app lost the connected X account'
             if ((Api-Status '/health') -ne 0 -or -not (Saved-Preferences 18088 $false)) { throw 'Opening replaced app started API or lost saved preferences' }
             Click-Button 'Start local API'

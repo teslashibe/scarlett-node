@@ -350,3 +350,38 @@ func TestProviderAccountBindingSurvivesRestartAndCannotBeReassigned(t *testing.T
 		t.Fatal("terminal account audit lost", e)
 	}
 }
+
+func TestNoProviderBindingIsExplicitDurableAndExclusive(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "attempts")
+	j := open(t, dir)
+	r := fixture()
+	r.NoProvider = true
+	bound := r
+	bound.ProviderAccountID, bound.ProviderService = "one", "codex"
+	if e := j.Begin(bound); e == nil {
+		t.Fatal("a no-provider record accepted a provider binding")
+	}
+	if e := j.Begin(r); e != nil {
+		t.Fatal(e)
+	}
+	unbound := r
+	unbound.NoProvider = false
+	if e := j.Begin(unbound); !errors.Is(e, ErrConflict) {
+		t.Fatal("binding change not a conflict", e)
+	}
+	if _, e := j.Ready(unbound, "fail", []byte(`{}`)); !errors.Is(e, ErrConflict) {
+		t.Fatal("report under a different binding", e)
+	}
+	if _, err := os.Stat(filepath.Join(dir, r.Key()+".json")); err != nil {
+		t.Fatal("key does not name the record file", err)
+	}
+	j.Close()
+	j = open(t, dir)
+	pending, e := j.Pending()
+	if e != nil || len(pending) != 1 || !pending[0].NoProvider || pending[0].Key() != r.Key() {
+		t.Fatal("no-provider binding lost across restart", e)
+	}
+	if e = j.Terminal(pending[0]); e != nil {
+		t.Fatal(e)
+	}
+}

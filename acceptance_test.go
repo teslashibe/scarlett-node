@@ -229,7 +229,7 @@ func TestCodexAdmissionRechecksSelectedProfileBeforeAcceptance(t *testing.T) {
 				t.Fatal(err)
 			}
 			code, err := submitLease(context.Background(), client, c, l, nil, j)
-			if code != "auth_required" || err == nil || calls.Load() != 0 {
+			if code != codexLocalAuthExpired || err == nil || calls.Load() != 0 {
 				t.Fatal("invalid selected profile funded or submitted an offer")
 			}
 			if _, err := os.Stat(marker); !os.IsNotExist(err) {

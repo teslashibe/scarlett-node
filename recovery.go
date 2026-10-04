@@ -4,7 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
+	"sync"
+	"time"
 
 	"github.com/teslashibe/scarlett-node/internal/attempts"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
@@ -79,10 +83,20 @@ func rejectLease(ctx context.Context, client *coordinator.Client, journal *attem
 	if err != nil {
 		return err
 	}
+	// A rejection never runs a provider. Say so explicitly, so its pending
+	// record is not mistaken for unbound provider work on some profile.
+	r.NoProvider = true
 	if err = journal.Begin(r); err != nil {
 		return err
 	}
 	if l.AcceptanceRequired {
+		if err = coordinator.ValidOffer(l, time.Now()); err != nil {
+			// No acceptance HTTP was sent; the offer expires remotely.
+			if terminalErr := journal.Terminal(r); terminalErr != nil {
+				return terminalErr
+			}
+			return err
+		}
 		if _, err = client.Accept(ctx, l); err != nil {
 			return err
 		}
@@ -96,4 +110,55 @@ func rejectLease(ctx context.Context, client *coordinator.Client, journal *attem
 		return err
 	}
 	return submitRecord(ctx, client, journal, r)
+}
+
+// activeAttempts counts attempt keys whose worker goroutine has not returned.
+type activeAttempts struct {
+	mu   sync.Mutex
+	keys map[string]int
+}
+
+func (a *activeAttempts) add(key string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.keys == nil {
+		a.keys = map[string]int{}
+	}
+	a.keys[key]++
+}
+func (a *activeAttempts) done(key string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.keys[key]--; a.keys[key] <= 0 {
+		delete(a.keys, key)
+	}
+}
+func (a *activeAttempts) snapshot() map[string]bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make(map[string]bool, len(a.keys))
+	for key := range a.keys {
+		out[key] = true
+	}
+	return out
+}
+
+// reconcileIdle retries ready reports and resolves started records that no
+// running worker owns, such as one left by a lost acceptance acknowledgement
+// or a failed report write. That is the same uncertainty a restart reconciles,
+// through the same recovery: no provider call is ever repeated. active must be
+// taken before the journal is read, by the only goroutine that adds keys.
+func reconcileIdle(ctx context.Context, client *coordinator.Client, journal *attempts.Journal, active map[string]bool) error {
+	records, err := journal.Pending()
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		if record.State == "ready" || record.State == "started" && !active[record.Key()] {
+			if err := recoverAttempt(ctx, client, journal, record); err != nil {
+				fmt.Fprintln(os.Stderr, "reconcile:", err)
+			}
+		}
+	}
+	return nil
 }
