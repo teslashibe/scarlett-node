@@ -103,9 +103,15 @@ public static class ScarlettAcceptanceWindow {
     [DllImport("user32.dll")] private static extern bool GetGUIThreadInfo(uint thread, ref GuiThreadInfo info);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassNameW(IntPtr window, System.Text.StringBuilder name, int size);
     [DllImport("user32.dll")] private static extern bool IsChild(IntPtr parent, IntPtr window);
+    [DllImport("user32.dll")] private static extern IntPtr GetParent(IntPtr window);
     [DllImport("user32.dll")] private static extern IntPtr SetFocus(IntPtr window);
     [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint attach, uint to, bool enable);
     [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
+    private static string ClassOf(IntPtr window) {
+        System.Text.StringBuilder name = new System.Text.StringBuilder(128);
+        if (window == IntPtr.Zero || GetClassNameW(window, name, name.Capacity) == 0) return "";
+        return name.ToString();
+    }
     private static IntPtr KeyboardFocus(IntPtr window) {
         uint process;
         uint thread = GetWindowThreadProcessId(window, out process);
@@ -114,38 +120,44 @@ public static class ScarlettAcceptanceWindow {
         if (thread == 0 || !GetGUIThreadInfo(thread, ref info)) return IntPtr.Zero;
         return info.focus;
     }
-    // Fixed framework window class of the native keyboard focus; never text.
-    public static string FocusClass(IntPtr window) {
-        IntPtr focus = KeyboardFocus(window);
-        System.Text.StringBuilder name = new System.Text.StringBuilder(128);
-        if (focus == IntPtr.Zero || GetClassNameW(focus, name, name.Capacity) == 0) return "";
-        return name.ToString();
-    }
     // UIA can report a WebView2 element focused while native keyboard focus is
     // on Chromium's accessibility-only Chrome_RenderWidgetHostHWND, which drops
-    // injected keys. Input reaches the page only through this app window's
+    // every injected key. Input reaches the page only through this app window's
     // WebView2 input widget (Chrome_WidgetWin_*) in the msedgewebview2 process.
-    public static bool WebViewHasInputFocus(IntPtr window) {
-        IntPtr focus = KeyboardFocus(window);
-        if (focus == IntPtr.Zero || !IsChild(window, focus) || !FocusClass(window).StartsWith("Chrome_WidgetWin_", StringComparison.Ordinal))
-            return false;
+    private static bool IsWebViewInput(IntPtr window, IntPtr candidate) {
+        if (candidate == IntPtr.Zero || !IsChild(window, candidate) ||
+            !ClassOf(candidate).StartsWith("Chrome_WidgetWin_", StringComparison.Ordinal)) return false;
         uint process;
-        GetWindowThreadProcessId(focus, out process);
+        GetWindowThreadProcessId(candidate, out process);
         try {
             using (System.Diagnostics.Process owner = System.Diagnostics.Process.GetProcessById((int)process))
                 return String.Equals(owner.ProcessName, "msedgewebview2", StringComparison.OrdinalIgnoreCase);
         } catch (ArgumentException) { return false; } catch (InvalidOperationException) { return false; }
     }
-    // Native focus on the app window runs its own WebView host focus handling,
-    // which moves focus into WebView2 and restores the focused element exactly
-    // as a user activating the window does.
-    public static void FocusAppWindow(IntPtr window) {
+    public static bool WebViewHasInputFocus(IntPtr window) { return IsWebViewInput(window, KeyboardFocus(window)); }
+    public static bool AccessibilityWindowFocused(IntPtr window) {
+        IntPtr focus = KeyboardFocus(window);
+        return focus != IntPtr.Zero && IsChild(window, focus) && ClassOf(focus) == "Chrome_RenderWidgetHostHWND";
+    }
+    public static bool FocusInWindow(IntPtr window) {
+        IntPtr focus = KeyboardFocus(window);
+        return focus == window || (focus != IntPtr.Zero && IsChild(window, focus));
+    }
+    // Hand native focus from the accessibility window to the WebView2 input
+    // widget that owns it, as Chromium's own pointer input does; from anywhere
+    // else, focus the app window, whose WebView host moves focus into WebView2.
+    public static void RestoreWebViewInputFocus(IntPtr window) {
+        IntPtr target = window;
+        if (AccessibilityWindowFocused(window)) {
+            IntPtr owner = GetParent(KeyboardFocus(window));
+            if (IsWebViewInput(window, owner)) target = owner;
+        }
         uint process;
-        uint thread = GetWindowThreadProcessId(window, out process);
+        uint thread = GetWindowThreadProcessId(target, out process);
         uint self = GetCurrentThreadId();
         if (thread == 0 || !AttachThreadInput(self, thread, true))
-            throw new InvalidOperationException("App window input queue unavailable");
-        try { SetFocus(window); } finally { AttachThreadInput(self, thread, false); }
+            throw new InvalidOperationException("Native input queue unavailable");
+        try { SetFocus(target); } finally { AttachThreadInput(self, thread, false); }
     }
     public static void SelectAllClearAndTab() {
         Send(new Input[] { Key(0x11, false), Key(0x41, false), Key(0x41, true), Key(0x11, true),
@@ -250,13 +262,37 @@ function Start-App {
     $script:application = Start-Process -FilePath $script:executable -WorkingDirectory $script:install -PassThru
     Wait-AppWindow
 }
-function Ensure-WebViewInputFocus([IntPtr]$Handle) {
-    # UIA SetFocus selects the page element but can leave native keyboard focus
-    # on the WebView's accessibility window, where every injected key is lost.
-    if (-not [ScarlettAcceptanceWindow]::WebViewHasInputFocus($Handle)) {
-        [ScarlettAcceptanceWindow]::FocusAppWindow($Handle)
+function Wait-KeyboardTarget([System.Windows.Automation.AutomationElement]$Element, [IntPtr]$Handle, [string]$Failure) {
+    # UIA focus selects the page element but can leave native keyboard focus on
+    # the WebView's accessibility window, where every injected key is lost.
+    # Let the element focus land first, then require WebView2 native input.
+    try {
+        Wait-Check { $Element.Current.HasKeyboardFocus } 10 $Failure
+        if (-not [ScarlettAcceptanceWindow]::WebViewHasInputFocus($Handle)) {
+            [ScarlettAcceptanceWindow]::RestoreWebViewInputFocus($Handle)
+        }
+        Wait-Check {
+            return $Element.Current.HasKeyboardFocus -and
+                [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $Handle -and
+                [ScarlettAcceptanceWindow]::WebViewHasInputFocus($Handle)
+        } 10 $Failure
+    } catch {
+        $originalFailure = $_
+        # Fixed booleans only: never UI text, values or window titles.
+        $diagnostic = @{ elementFocused = $false; foregroundOwned = $false; webViewNativeInputFocus = $false
+            accessibilityWindowNativeFocus = $false; nativeFocusInWindow = $false; realProviderJobs = 0 }
+        try {
+            $diagnostic.elementFocused = $Element.Current.HasKeyboardFocus
+            $diagnostic.foregroundOwned = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $Handle
+            $diagnostic.webViewNativeInputFocus = [ScarlettAcceptanceWindow]::WebViewHasInputFocus($Handle)
+            $diagnostic.accessibilityWindowNativeFocus = [ScarlettAcceptanceWindow]::AccessibilityWindowFocused($Handle)
+            $diagnostic.nativeFocusInWindow = [ScarlettAcceptanceWindow]::FocusInWindow($Handle)
+        } catch { }
+        New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+        $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-native-focus-failure.json')
+        Write-Output ($diagnostic | ConvertTo-Json -Compress)
+        throw $originalFailure
     }
-    Wait-Check { [ScarlettAcceptanceWindow]::WebViewHasInputFocus($Handle) } 10 'Installed WebView did not acquire native keyboard input focus'
 }
 function Focus-QuitShortcut {
     Verify-KeyboardDelivery
@@ -282,7 +318,7 @@ function Focus-QuitShortcut {
         $scroll.ScrollIntoView()
     }
     $target.SetFocus()
-    Ensure-WebViewInputFocus $handle
+    Wait-KeyboardTarget $target $handle 'Installed desktop control did not acquire keyboard focus for Quit'
     Wait-Check {
         $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
         return $null -ne $focused -and $focused.Current.ProcessId -eq $target.Current.ProcessId -and
@@ -318,7 +354,7 @@ function Check-QuitShortcut([string]$Failure) {
         $application.Refresh()
         $foregroundMatches = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $application.MainWindowHandle
         $nativeInput = [ScarlettAcceptanceWindow]::WebViewHasInputFocus($application.MainWindowHandle)
-        $nativeAccessibilityFocus = [ScarlettAcceptanceWindow]::FocusClass($application.MainWindowHandle) -ceq 'Chrome_RenderWidgetHostHWND'
+        $nativeAccessibilityFocus = [ScarlettAcceptanceWindow]::AccessibilityWindowFocused($application.MainWindowHandle)
     } catch { }
     $diagnostic = @{
         shortcutExited = $false; shutdownErrorVisible = $shutdownError
@@ -364,20 +400,12 @@ function Verify-KeyboardDelivery {
     [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
     [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
     $target.SetFocus()
-    Ensure-WebViewInputFocus $handle
-    Wait-Check {
-        return $target.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle -and
-            [ScarlettAcceptanceWindow]::WebViewHasInputFocus($handle)
-    } 10 'Keyboard probe did not acquire foreground and field focus'
+    Wait-KeyboardTarget $target $handle 'Keyboard probe did not acquire foreground and field focus'
     [ScarlettAcceptanceWindow]::UnicodeTextAndTab('keyboard-probe')
     Wait-Check { Input-Advanced $name 'Concurrent jobs' $handle } 10 'Keyboard probe text was not acknowledged by successor focus'
     Wait-Check { $value.Current.Value -ceq 'keyboard-probe' } 10 'CI keyboard injection did not reach the editable control'
     $target.SetFocus()
-    Ensure-WebViewInputFocus $handle
-    Wait-Check {
-        $target.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle -and
-            [ScarlettAcceptanceWindow]::WebViewHasInputFocus($handle)
-    } 10 'Keyboard probe did not reacquire field focus'
+    Wait-KeyboardTarget $target $handle 'Keyboard probe did not reacquire field focus'
     [ScarlettAcceptanceWindow]::SelectAllClearAndTab()
     Wait-Check { Input-Advanced $name 'Concurrent jobs' $handle } 10 'Keyboard probe clear was not acknowledged by successor focus'
     Wait-Check { $value.Current.Value -ceq '' } 10 'Native control-key input did not clear the disposable field'
@@ -670,11 +698,7 @@ function Set-Text([string]$Name, [string]$Value, [string]$NextName) {
     if (-not $control -or -not $control.Current.IsEnabled) { throw "Text input unavailable: $Name" }
     $handle = $application.MainWindowHandle
     Click-Control $control
-    Ensure-WebViewInputFocus $handle
-    Wait-Check {
-        return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle -and
-            [ScarlettAcceptanceWindow]::WebViewHasInputFocus($handle)
-    } 10 'Synthetic input did not acquire keyboard focus'
+    Wait-KeyboardTarget $control $handle 'Synthetic input did not acquire keyboard focus'
     [ScarlettAcceptanceWindow]::SelectAllClearAndTab()
     # An initially empty value is not evidence that queued clear events ran.
     Wait-InputAdvanced $Name $NextName $handle $true 'Synthetic clear input was not acknowledged by successor focus'
@@ -688,11 +712,7 @@ function Set-Text([string]$Name, [string]$Value, [string]$NextName) {
     }
     $control = Find-Input $Name
     Click-Control $control
-    Ensure-WebViewInputFocus $handle
-    Wait-Check {
-        return $control.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle -and
-            [ScarlettAcceptanceWindow]::WebViewHasInputFocus($handle)
-    } 10 'Synthetic input did not reacquire keyboard focus'
+    Wait-KeyboardTarget $control $handle 'Synthetic input did not reacquire keyboard focus'
     [ScarlettAcceptanceWindow]::UnicodeTextAndTab($Value)
     Wait-InputAdvanced $Name $NextName $handle $false 'Synthetic text input was not acknowledged by successor focus'
     # Masked cookie fields may refuse value readback. Exact persistence is
@@ -732,11 +752,7 @@ function Select-Browser([int]$Index, [string]$ExpectedBrowser) {
     [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
     [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
     $target.SetFocus()
-    Ensure-WebViewInputFocus $handle
-    Wait-Check {
-        return $target.Current.HasKeyboardFocus -and [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle -and
-            [ScarlettAcceptanceWindow]::WebViewHasInputFocus($handle)
-    } 10 'Browser chooser did not acquire input focus'
+    Wait-KeyboardTarget $target $handle 'Browser chooser did not acquire input focus'
     [System.Windows.Forms.SendKeys]::SendWait('{HOME}')
     # PowerShell variable names are case-insensitive; the loop counter must
     # not overwrite the requested Index before sending its navigation keys.
