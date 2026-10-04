@@ -12,7 +12,9 @@ test('complete bundle overlay inherits the actual base identity and security pol
   const overlay = { bundle: { targets: ['nsis'], externalBin: ['node', 'prover', 'api'], resources: { 'runtime/': 'runtime/' } } };
   const before = structuredClone({ base, overlay });
   const next = completeUpgradeConfig(base, overlay);
-  assert.equal(next.version, '0.1.1');
+  // The upgrade fixture is always one patch above whatever the app ships as.
+  const [major, minor, patch] = base.version.split('.').map(Number);
+  assert.equal(next.version, `${major}.${minor}.${patch + 1}`);
   assert.equal(next.identifier, base.identifier);
   assert.deepEqual(next.app, base.app);
   assert.deepEqual(next.build, base.build);
