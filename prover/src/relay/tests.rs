@@ -202,7 +202,9 @@ where
                         }
                         Verdict::Skip => {}
                         Verdict::Pass => { let _ = wire::send(&mut to_node, kind, &payload).await; }
-                        Verdict::Replace(bytes) | Verdict::Last(bytes) => { let _ = wire::send(&mut to_node, kind, &bytes).await; }
+                        Verdict::Replace(bytes) => { let _ = wire::send(&mut to_node, kind, &bytes).await; }
+                        // The verifier's side of the link goes away after this frame.
+                        Verdict::Last(bytes) => { let _ = wire::send(&mut to_node, kind, &bytes).await; let _ = to_node.shutdown().await; break; }
                     }
                 }
             }
@@ -343,7 +345,10 @@ async fn altered_dropped_or_truncated_server_records_are_rejected() {
         let (node_end, verifier_end) = link(|_, _, _| Verdict::Pass);
         let (response_at_node, outcome) = run(server.roots.clone(), node_end, verifier_end, to_server).await;
         assert!(outcome.is_err(), "{attack}: verifier accepted a tampered response");
-        assert!(response_at_node.is_err(), "{attack}: supplier reported a result");
+        let error = response_at_node.expect_err(attack);
+        // The verifier failed honestly after the record went out; it still
+        // opened the record, so the supplier does not report misuse.
+        assert!(!format!("{error:#}").contains(node::MISUSE), "{attack}: honest failure reported as misuse: {error:#}");
     }
 }
 
@@ -617,6 +622,24 @@ async fn a_supplier_reports_no_result_unless_the_verifier_opens_its_record_corre
         let error = response_at_node.expect_err(attack);
         assert!(format!("{error:#}").starts_with(node::MISUSE), "{attack}: {error:#}");
     }
+}
+
+#[tokio::test]
+async fn a_verifier_that_seals_and_then_vanishes_is_reported_as_misuse() {
+    // The verifier had the node send a record with its session values and
+    // then dropped the connection without ever opening the record. The node
+    // cannot tell that from a hidden request, so it must not pass quietly.
+    let server = server(response(), |_| {}).await;
+    let (node_end, verifier_end) = link(|from_node, kind, payload| {
+        if !from_node && kind == wire::MATERIAL {
+            return Verdict::Last(payload.to_vec());
+        }
+        Verdict::Pass
+    });
+    let tcp = TcpStream::connect(server.addr).await.unwrap();
+    let (response_at_node, _) = run(server.roots.clone(), node_end, verifier_end, tcp).await;
+    let error = response_at_node.expect_err("record sent, verifier gone");
+    assert!(format!("{error:#}").contains(node::MISUSE), "{error:#}");
 }
 
 #[tokio::test]

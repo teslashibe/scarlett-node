@@ -129,7 +129,12 @@ func Load() (Config, error) {
 	}
 	if c.Executor == ExecutorServices {
 		c.XSession = os.Getenv("SCARLETT_X_SESSION")
-		c.XRelay = os.Getenv("SCARLETT_X_RELAY") != "0"
+		switch strings.ToLower(strings.TrimSpace(os.Getenv("SCARLETT_X_RELAY"))) {
+		case "0", "false", "off", "no":
+			c.XRelay = false
+		default:
+			c.XRelay = true
+		}
 		c.AccountsFile = os.Getenv("SCARLETT_ACCOUNTS_FILE")
 		c.AccountsRequired = c.AccountsFile != ""
 		if c.AccountsFile == "" {

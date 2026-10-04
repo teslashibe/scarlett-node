@@ -134,6 +134,11 @@ where
     // The ClientHello does not depend on the server, so it goes out first.
     flush_handshake(tls.as_mut().expect("handshake is in progress"), &mut writer, &mut to_server).await?;
 
+    // Whatever ends the session after a record was sealed, success or any
+    // failure, the supplier gets the client key and so can always check what
+    // it was made to send. A verifier that sealed and then went quiet would
+    // otherwise be indistinguishable from one hiding a request of its own.
+    let outcome: Result<()> = async {
     loop {
         let (kind, payload) = wire::recv(&mut reader).await?;
         match kind {
@@ -240,11 +245,23 @@ where
             break;
         }
     }
-    // The response is recorded and this connection is finished, so the client
-    // key has no further use to us. Handing it over lets the supplier check
-    // that the record it completed was its own request and nothing else.
-    let ((key, iv, seq), _) = keys.as_ref().expect("keys exist once a request was sent");
-    wire::send(&mut writer, wire::OPENING, &[&key[..], &iv[..], &seq.to_be_bytes()[..]].concat()).await?;
+    Ok(())
+    }
+    .await;
+    // The client key has no further use to us once a record is sealed:
+    // there is no second material for it. Hand it over, on success or
+    // failure, so the supplier can check that the record it completed was
+    // its own request and nothing else. Best effort on failure: the supplier
+    // treats a sealed record that is never opened as misuse.
+    if sent.is_some()
+        && let Some(((key, iv, seq), _)) = keys.as_ref()
+    {
+        let opening = wire::send(&mut writer, wire::OPENING, &[&key[..], &iv[..], &seq.to_be_bytes()[..]].concat()).await;
+        if outcome.is_ok() {
+            opening?;
+        }
+    }
+    outcome?;
     wire::send(&mut writer, wire::DONE, b"{\"status\":\"complete\"}").await?;
     // The supplier may still be forwarding X's close. Dropping the socket
     // with those frames unread can reset it and lose the result on its way

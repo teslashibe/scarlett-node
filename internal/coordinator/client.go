@@ -135,11 +135,35 @@ type HeartbeatReply struct {
 	Challenge *Challenge `json:"challenge,omitempty"`
 }
 
+// ErrHeartbeatRejected is a heartbeat the coordinator refused as invalid. A
+// coordinator older than a heartbeat field rejects the whole report, so the
+// caller may retry with the fields that coordinator knows.
+var ErrHeartbeatRejected = errors.New("coordinator rejected the heartbeat")
+
+// WithoutProofModes returns a copy of the services with proof_modes removed,
+// and whether anything was removed: the heartbeat a coordinator that predates
+// the field accepts.
+func WithoutProofModes(services []ServiceHealth) ([]ServiceHealth, bool) {
+	out := make([]ServiceHealth, len(services))
+	removed := false
+	for i, s := range services {
+		if s.ProofModes != nil {
+			removed = true
+			s.ProofModes = nil
+		}
+		out[i] = s
+	}
+	return out, removed
+}
+
 // Poll echoes an app-issued challenge before returning any lease to inference.
 // The app owns single-use validation and RTT timing; the node supplies no duration.
 func (c *Client) Poll(ctx context.Context, h Heartbeat) (HeartbeatReply, error) {
 	var reply HeartbeatReply
 	status, err := c.Post(ctx, "/api/node/v1/heartbeat", h, &reply)
+	if status == http.StatusBadRequest {
+		return HeartbeatReply{}, ErrHeartbeatRejected
+	}
 	if err != nil {
 		return HeartbeatReply{}, err
 	}

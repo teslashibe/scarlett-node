@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -104,6 +105,33 @@ var relayHalt struct {
 	halted bool
 	reason string
 	at     time.Time
+	// file, when set, makes the halt durable: it is written on halt and read
+	// at startup, so a restart (the desktop app restarts the node on its own)
+	// cannot quietly re-arm relay. `scarlett-node relay-resume` removes it.
+	file string
+}
+
+// RelayHaltFile is the marker's name inside the node's state directory.
+const RelayHaltFile = "relay-halt"
+
+// LoadRelayHalt makes the halt durable under dir and restores one left by an
+// earlier run. Call once at startup, before any heartbeat.
+func LoadRelayHalt(dir string) error {
+	path := filepath.Join(dir, RelayHaltFile)
+	raw, err := os.ReadFile(path)
+	relayHalt.Lock()
+	defer relayHalt.Unlock()
+	relayHalt.file = path
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	relayHalt.halted = true
+	relayHalt.reason = strings.TrimSpace(string(raw))
+	fmt.Fprintf(os.Stderr, "keyed relay stays halted from an earlier run (%s); run `scarlett-node relay-resume` once the verifier has been checked\n", relayHalt.reason)
+	return nil
 }
 
 // HaltRelay stops this node from offering or accepting keyed-relay work and
@@ -112,10 +140,28 @@ func HaltRelay(reason string) {
 	relayHalt.Lock()
 	first := !relayHalt.halted
 	relayHalt.halted, relayHalt.reason, relayHalt.at = true, reason, time.Now()
+	file := relayHalt.file
 	relayHalt.Unlock()
-	if first {
-		fmt.Fprintf(os.Stderr, "ALERT keyed relay halted: %s — this node will serve no more relay jobs until restarted; investigate the verifier before re-enabling SCARLETT_X_RELAY\n", reason)
+	if !first {
+		return
 	}
+	fmt.Fprintf(os.Stderr, "ALERT keyed relay halted: %s — this node serves no more relay jobs until `scarlett-node relay-resume`; investigate the verifier first\n", reason)
+	if file != "" {
+		// Best effort: the in-memory halt holds for this run regardless.
+		if err := localfs.WriteAtomic(file, []byte(reason+"\n"), true); err != nil {
+			fmt.Fprintln(os.Stderr, "keyed relay halt could not be recorded:", err)
+		}
+	}
+}
+
+// RelayHaltReason is the recorded reason, or empty when relay is not halted.
+func RelayHaltReason() string {
+	relayHalt.Lock()
+	defer relayHalt.Unlock()
+	if !relayHalt.halted {
+		return ""
+	}
+	return relayHalt.reason
 }
 
 // RelayHalted reports whether a caught verifier misuse has stopped relay on
@@ -126,11 +172,11 @@ func RelayHalted() bool {
 	return relayHalt.halted
 }
 
-// ResetRelayHaltForTests clears the latch. There is deliberately no runtime
-// reset: a halted node stays halted until an operator restarts it.
+// ResetRelayHaltForTests clears the latch and forgets the marker path. The
+// only runtime reset is the operator's `scarlett-node relay-resume`.
 func ResetRelayHaltForTests() {
 	relayHalt.Lock()
-	relayHalt.halted, relayHalt.reason, relayHalt.at = false, "", time.Time{}
+	relayHalt.halted, relayHalt.reason, relayHalt.at, relayHalt.file = false, "", time.Time{}, ""
 	relayHalt.Unlock()
 }
 
@@ -475,18 +521,19 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 	return ""
 }
 func xFailure(ctx context.Context, e error) string {
+	// The relay helper caught the verifier sealing something other than this
+	// node's own request. The request has already gone out; what the node can
+	// still do is refuse to be used that way again and make the operator look.
+	// That holds even when the lease has meanwhile expired.
+	if e != nil && strings.Contains(e.Error(), relayMisuseMarker) {
+		HaltRelay(relayMisuseMarker)
+		return "relay_misuse"
+	}
 	if ctx.Err() != nil {
 		return "expired"
 	}
 	if errors.Is(e, errUnprovenXCall) {
 		return "invalid_lease"
-	}
-	// The relay helper caught the verifier sealing something other than this
-	// node's own request. The request has already gone out; what the node can
-	// still do is refuse to be used that way again and make the operator look.
-	if e != nil && strings.Contains(e.Error(), relayMisuseMarker) {
-		HaltRelay(relayMisuseMarker)
-		return "relay_misuse"
 	}
 	if errors.Is(e, x.ErrRateLimited) {
 		return "x_rate_limited"

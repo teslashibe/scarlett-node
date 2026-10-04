@@ -162,7 +162,7 @@ func TestKeyedRelayDefaultsOnWithExplicitOptOut(t *testing.T) {
 		value string
 		set   bool
 		relay bool
-	}{{"", false, true}, {"1", true, true}, {"0", true, false}, {"yes", true, true}, {"", true, true}} {
+	}{{"", false, true}, {"1", true, true}, {"0", true, false}, {"false", true, false}, {"OFF", true, false}, {" no ", true, false}, {"yes", true, true}, {"", true, true}} {
 		if tc.set {
 			t.Setenv("SCARLETT_X_RELAY", tc.value)
 		} else {

@@ -58,7 +58,7 @@ func validHealth(state, code string) bool {
 		return false
 	}
 	switch code {
-	case "", "auth_required", "capacity_unavailable", "x_rate_limited", "prover_error", "x_request_failed", "report_pending", "expired", "invalid_lease", "service_unavailable", "x_incomplete", "execution_uncertain":
+	case "", "auth_required", "capacity_unavailable", "x_rate_limited", "prover_error", "x_request_failed", "report_pending", "expired", "invalid_lease", "service_unavailable", "x_incomplete", "execution_uncertain", "relay_misuse":
 		return true
 	}
 	return false

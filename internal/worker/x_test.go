@@ -391,11 +391,41 @@ func TestCaughtVerifierMisuseHaltsRelayNodeWide(t *testing.T) {
 	if code := xFailure(ctx, errors.New("prover: timeout")); code != "x_request_failed" || !RelayHalted() {
 		t.Fatalf("after second report: code %q halted %v", code, RelayHalted())
 	}
-	// A context that is already cancelled still reports expiry first.
+	// Misuse is recognised even when the lease has already expired; any other
+	// error under a cancelled context is expiry.
 	cancelled, cancel := context.WithCancel(ctx)
 	cancel()
-	if code := xFailure(cancelled, wrapped); code != "expired" {
+	ResetRelayHaltForTests()
+	if code := xFailure(cancelled, wrapped); code != "relay_misuse" || !RelayHalted() {
+		t.Fatalf("misuse under an expired lease classified as %q, halted %v", code, RelayHalted())
+	}
+	if code := xFailure(cancelled, errors.New("prover: timeout")); code != "expired" {
 		t.Fatalf("expired context classified as %q", code)
+	}
+	// A relay lease is refused at validation once relay is halted, so it is
+	// never run over MPC-TLS and never spends the attempt.
+	raw, e := os.ReadFile("../../api/fixtures/lease-x.json")
+	if e != nil {
+		t.Fatal(e)
+	}
+	var l coordinator.Lease
+	if e := json.Unmarshal(raw, &l); e != nil {
+		t.Fatal(e)
+	}
+	var payload map[string]any
+	if e := json.Unmarshal(l.XPayload, &payload); e != nil {
+		t.Fatal(e)
+	}
+	payload["proof_mode"], payload["proof_policy"] = "relay", xRelayPolicy
+	l.XPayload, _ = json.Marshal(payload)
+	lc, _, _ := xFixture(t, *l.XRequest)
+	lc.XRelay = true
+	if _, _, code := validateXLease(lc, l); code != "invalid_lease" {
+		t.Fatalf("halted node validated a relay lease: %q", code)
+	}
+	ResetRelayHaltForTests()
+	if _, _, code := validateXLease(lc, l); code != "" {
+		t.Fatalf("relay lease refused with relay available: %q", code)
 	}
 }
 

@@ -231,7 +231,12 @@ where
     let mut response = Vec::new();
     while let Some(event) = inbox.recv().await {
         match event {
-            Event::Failed(e) => return Err(e),
+            Event::Failed(e) => {
+                if record_sent && !checked {
+                    return Err(e.context(format!("{MISUSE}: the session ended before it opened the request record")));
+                }
+                return Err(e);
+            }
             // Once the response is whole the verifier stops reading, so a late
             // write to it may fail while its result is still on the way here.
             Event::Server(bytes) => {
@@ -302,6 +307,12 @@ where
             }
             Event::Frame(kind, _) => bail!("unexpected relay frame {kind}"),
         }
+    }
+    // The verifier went away. If it had this node send a record and never
+    // showed what was in it, that is the one thing the node must not accept
+    // quietly: it cannot tell a dropped connection from a hidden request.
+    if record_sent && !checked {
+        bail!("{MISUSE}: the session ended before it opened the request record");
     }
     bail!("relay session ended without a result")
 }

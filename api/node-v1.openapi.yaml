@@ -346,8 +346,9 @@ components:
           description: >-
             How each read is proven. Absent or mpc is MPC-TLS. relay makes the verifier the TLS
             client through the node's connection, so the node holds no session key and adds only
-            its session cookie and CSRF values; a node serves it only when its operator set
-            SCARLETT_X_RELAY=1, and only with proof_policy x-relay-v1.
+            its session cookie and CSRF values; a node serves it unless its operator opted out
+            with SCARLETT_X_RELAY=0 (relay is on by default), and only with proof_policy x-relay-v1.
+            A relay node trusts its verifier with its session; see the repository README.
         proof_policy:
           type: string
           enum: [x-relay-v1]
@@ -419,4 +420,4 @@ components:
         version: {type: string, enum: [node-v1]}
         attempt: {type: string}
         fence: {type: string}
-        code: {type: string, enum: [invalid_lease, expired, gateway_error, capacity_unavailable, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds, prover_error, execution_uncertain, auth_required, service_unavailable, x_rate_limited, x_incomplete, x_request_failed], description: execution_uncertain means a provider call might have occurred before interruption and must not automatically requeue paid work. Transport failure alone does not prove a call never ran; capacity_unavailable must not authorize an ambiguous provider retry.}
+        code: {type: string, enum: [invalid_lease, expired, gateway_error, capacity_unavailable, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds, prover_error, execution_uncertain, auth_required, service_unavailable, x_rate_limited, x_incomplete, x_request_failed, relay_misuse], description: relay_misuse means the node caught its verifier sealing something other than the node's own request in a keyed-relay session, or closing the session without opening the record; the node then stops serving relay until its operator clears the halt. execution_uncertain means a provider call might have occurred before interruption and must not automatically requeue paid work. Transport failure alone does not prove a call never ran; capacity_unavailable must not authorize an ambiguous provider retry.}
