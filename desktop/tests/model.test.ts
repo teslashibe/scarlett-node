@@ -12,6 +12,11 @@ import {
   validId,
   accountHealth,
   drainingAccounts,
+  needsXReimport,
+  relayState,
+  statusPredates,
+  xProofModes,
+  X_SESSION_EXPIRED,
   type Snapshot,
 } from "../src/model.ts";
 const base: Snapshot = {
@@ -123,6 +128,86 @@ test("Connect Codex is disabled at the node's eight-account limit with a clear r
     assert.equal(canConnectCodex({ ...below, [key]: false }), false);
   assert.equal(canConnectCodex({ ...below, login_pending: true }), false);
   assert.equal(codexNote({ ...full, login_pending: true }), "Finish login in your browser");
+});
+
+const xAccount = { id: "personal-x", service: "x_read" as const, concurrency: 2 };
+const withX = (
+  state: string | undefined,
+  observation: Snapshot["observation"] = {},
+): Snapshot => ({
+  ...base,
+  accounts: [...base.accounts, xAccount],
+  observation: {
+    state: "running",
+    ...observation,
+    accounts: state
+      ? [
+          { id: "work", service: "codex", state },
+          { id: xAccount.id, service: "x_read", state },
+        ]
+      : [],
+  },
+});
+test("A dead X session asks for a re-import of that account only", () => {
+  const dead = withX("auth_required");
+  assert.equal(accountHealth(dead, xAccount), X_SESSION_EXPIRED);
+  assert.equal(X_SESSION_EXPIRED, "X session expired or revoked. Re-import the account");
+  assert.equal(needsXReimport(dead, xAccount), true);
+  // Codex keeps its own wording and is never offered an X re-import.
+  assert.equal(accountHealth(dead, base.accounts[0]), "auth required");
+  assert.equal(needsXReimport(dead, base.accounts[0]), false);
+  for (const state of ["configured", "ready", "exhausted", undefined])
+    assert.equal(needsXReimport(withX(state), xAccount), false);
+});
+test("An X account that is checking its login reads as warming up, not an error", () => {
+  assert.equal(accountHealth(withX("configured"), xAccount), "Warming up · checking login");
+  assert.equal(accountHealth(withX("ready"), xAccount), "ready");
+  assert.equal(accountHealth(withX("configured"), base.accounts[0]), "configured");
+  // Without any node status, local configuration is still not verified access.
+  assert.equal(accountHealth(withX(undefined), xAccount), "Configured · access not verified");
+  // A stopped node, or a status too old to trust, is not checking a login.
+  for (const state of ["offline", "stopped"])
+    assert.equal(accountHealth(withX("configured", { state }), xAccount), "Configured · access not verified");
+  assert.equal(accountHealth(withX("configured", { state: "draining" }), xAccount), "Warming up · checking login");
+  // A dead session stays visible while the node is stopped: re-import does not need it running.
+  assert.equal(accountHealth(withX("auth_required", { state: "offline" }), xAccount), X_SESSION_EXPIRED);
+  assert.equal(needsXReimport(withX("auth_required", { state: "offline" }), xAccount), true);
+});
+test("Account states written before a re-import are treated as stale", () => {
+  const at = Date.parse("2026-10-03T12:00:00Z");
+  assert.equal(statusPredates(withX("auth_required", { updated_at: "2026-10-03T11:59:59Z" }), at), true);
+  assert.equal(statusPredates(withX("configured", { updated_at: "2026-10-03T12:00:03Z" }), at), false);
+  assert.equal(statusPredates({ ...base, observation: null }, at), true);
+});
+test("A relay halt stays visible until the node itself reports it cleared", () => {
+  // Saved halt on disk: nobody has resumed it, whatever the status says.
+  assert.equal(relayState({ ...base, relay_halt_marker: true }), "halted");
+  assert.equal(
+    relayState({ ...base, relay_halt_marker: true, observation: { relay_halted: true } }),
+    "halted",
+  );
+  // relay-resume removed the marker; the running node has not picked it up.
+  assert.equal(
+    relayState({ ...base, relay_halt_marker: false, observation: { relay_halted: true } }),
+    "resume_saved",
+  );
+  // Only the node's own status clears the banner.
+  assert.equal(relayState({ ...base, observation: { relay_halted: false } }), "");
+  assert.equal(relayState(base), "");
+});
+test("X proof modes come from what the running node advertises", () => {
+  const advertised = (proof_modes?: string[], extra: Partial<Snapshot> = {}, state = "running") => ({
+    ...withX("ready", { state, services: [{ kind: "codex", state: "ready" }, { kind: "x_read", state: "ready", proof_modes }] }),
+    ...extra,
+  });
+  assert.equal(xProofModes(advertised(["mpc", "relay"])), "MPC + relay");
+  assert.equal(xProofModes(advertised(["mpc"])), "MPC only");
+  assert.equal(xProofModes(advertised(undefined)), "MPC only");
+  assert.equal(xProofModes(advertised(["mpc"], { relay_halt_marker: true })), "MPC only · relay paused");
+  assert.equal(xProofModes(advertised(["mpc", "relay"], {}, "draining")), "MPC + relay");
+  // A stopped node offers nothing, and a node without X accounts has no X service to show.
+  assert.equal(xProofModes(advertised(["mpc", "relay"], {}, "offline")), "");
+  assert.equal(xProofModes({ ...advertised(["mpc", "relay"]), accounts: base.accounts }), "");
 });
 test("Claude status is checked separately and is never mistaken for a missing runtime", () => {
   assert.equal(claudeStatusText(undefined), "Checking the bundled Claude runtime");

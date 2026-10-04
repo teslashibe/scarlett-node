@@ -16,6 +16,10 @@ const COORDINATOR: &str = "https://network.scarlett.ai";
 const VERIFIER: &str = "verifier.scarlett.ai:7047";
 const CLI_VERSION: &str = "codex-cli 0.159.2";
 const OUTPUT_LIMIT: usize = 32768;
+/// The node's durable keyed-relay halt marker (worker.RelayHaltFile). It exists
+/// from the moment the node catches its verifier misusing an X session until
+/// `scarlett-node relay-resume` removes it.
+const RELAY_HALT_FILE: &str = "relay-halt";
 
 #[derive(Clone)]
 struct Endpoints {
@@ -205,6 +209,10 @@ pub struct Snapshot {
     pub login_error: Option<Error>,
     pub observation: Option<Value>,
     pub accounts: Vec<Account>,
+    /// Whether the saved relay halt is still on disk. With the status's
+    /// `relay_halted`, this tells a pending resume (marker gone, node not yet
+    /// caught up) from a halt nobody has resumed.
+    pub relay_halt_marker: bool,
 }
 struct Login {
     child: Child,
@@ -232,6 +240,13 @@ pub fn valid_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+/// One X cookie value as the node's session validation accepts it.
+fn x_cookie(v: &str, max: usize) -> bool {
+    !v.is_empty()
+        && v.len() <= max
+        && v.bytes()
+            .all(|b| (33..=126).contains(&b) && !b";=\\\"".contains(&b))
 }
 fn valid_selection(service: &str, id: &str, concurrency: u8) -> Result<()> {
     if (service != "codex" && service != "x_read")
@@ -414,6 +429,22 @@ pub(crate) fn private_helper(binary: &Path, action: &str, path: &Path) -> Result
 pub(crate) fn regular(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
 }
+/// The node's fixed `{"status":"updated"}` acknowledgement of an account write.
+fn updated(raw: &[u8]) -> Result<()> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Updated {
+        status: String,
+    }
+    if serde_json::from_slice::<Updated>(raw)
+        .map_err(|_| Error::CommandFailed)?
+        .status
+        != "updated"
+    {
+        return Err(Error::CommandFailed);
+    }
+    Ok(())
+}
 fn account_projection(raw: &[u8]) -> Result<Vec<Account>> {
     let records: Vec<Value> = serde_json::from_slice(raw).map_err(|_| Error::CommandFailed)?;
     if records.len() > 16 {
@@ -440,6 +471,7 @@ fn observation_projection(raw: &[u8]) -> Result<Value> {
         "in_flight",
         "unresolved_attempts",
         "drain_requested",
+        "relay_halted",
     ] {
         if let Some(value) = source.get(key)
             && (value.is_string() || value.is_boolean() || value.is_number())
@@ -450,7 +482,14 @@ fn observation_projection(raw: &[u8]) -> Result<Value> {
     for (key, allowed) in [
         (
             "services",
-            &["type", "state", "capacity", "in_flight", "last_error_code"][..],
+            &[
+                "kind",
+                "state",
+                "capacity",
+                "in_flight",
+                "last_error_code",
+                "proof_modes",
+            ][..],
         ),
         (
             "accounts",
@@ -476,9 +515,14 @@ fn observation_projection(raw: &[u8]) -> Result<Value> {
                         let obj = item.as_object()?;
                         let mut safe = serde_json::Map::new();
                         for field in allowed {
-                            if let Some(value) = obj.get(*field)
-                                && (value.is_string() || value.is_number() || value.is_null())
-                            {
+                            let Some(value) = obj.get(*field) else {
+                                continue;
+                            };
+                            if *field == "proof_modes" {
+                                if let Some(modes) = proof_modes(value) {
+                                    safe.insert((*field).into(), modes);
+                                }
+                            } else if value.is_string() || value.is_number() || value.is_null() {
                                 safe.insert((*field).into(), value.clone());
                             }
                         }
@@ -490,6 +534,19 @@ fn observation_projection(raw: &[u8]) -> Result<Value> {
         out.insert(key.into(), Value::Array(items));
     }
     Ok(Value::Object(out))
+}
+/// Proof modes a service advertises, reduced to the ones this app can name.
+/// Absent means MPC-TLS only, as for every node before the field existed.
+fn proof_modes(value: &Value) -> Option<Value> {
+    let modes = value
+        .as_array()?
+        .iter()
+        .take(8)
+        .filter_map(Value::as_str)
+        .filter(|mode| matches!(*mode, "mpc" | "relay"))
+        .map(|mode| Value::String(mode.into()))
+        .collect::<Vec<_>>();
+    Some(Value::Array(modes))
 }
 impl Node {
     pub fn new(state: PathBuf, binary: PathBuf, helper: PathBuf) -> Self {
@@ -635,7 +692,9 @@ impl Node {
                 .map_err(|_| Error::CommandFailed)?
                 .success()
             {
-                if args.first() == Some(&"accounts") && args.get(1) == Some(&"import-x") {
+                if args.first() == Some(&"accounts")
+                    && matches!(args.get(1), Some(&"import-x" | &"reimport-x"))
+                {
                     return Err(browser_import_error(&output));
                 }
                 return Err(Error::CommandFailed);
@@ -686,13 +745,7 @@ impl Node {
     ) -> Result<()> {
         let _guard = self.mutation.lock().await;
         valid_selection("x_read", &id, concurrency)?;
-        fn secret(v: &str, max: usize) -> bool {
-            !v.is_empty()
-                && v.len() <= max
-                && v.bytes()
-                    .all(|b| (33..=126).contains(&b) && !b";=\\\"".contains(&b))
-        }
-        if !secret(&auth_token, 64) || !secret(&ct0, 160) {
+        if !x_cookie(&auth_token, 64) || !x_cookie(&ct0, 160) {
             return Err(Error::InvalidInput);
         }
         self.accounts().await?;
@@ -738,19 +791,60 @@ impl Node {
                 45,
             )
             .await?;
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Updated {
-            status: String,
-        }
-        if serde_json::from_slice::<Updated>(&raw)
-            .map_err(|_| Error::CommandFailed)?
-            .status
-            != "updated"
+        updated(&raw)
+    }
+    /// A re-import only targets an X account the node already has.
+    async fn registered_x(&self, id: &str) -> Result<()> {
+        valid_selection("x_read", id, 1)?;
+        if !self
+            .accounts()
+            .await?
+            .iter()
+            .any(|a| a.service == "x_read" && a.id == id)
         {
+            return Err(Error::InvalidInput);
+        }
+        Ok(())
+    }
+    /// Re-import for an X account whose session X expired or revoked: the same
+    /// local ID keeps its concurrency and only its saved session is replaced.
+    pub async fn reconnect_x(&self, id: String, auth_token: String, ct0: String) -> Result<()> {
+        let _guard = self.mutation.lock().await;
+        if !x_cookie(&auth_token, 64) || !x_cookie(&ct0, 160) {
+            return Err(Error::InvalidInput);
+        }
+        self.registered_x(&id).await?;
+        let input = serde_json::to_vec(&json!({"auth_token":auth_token,"ct0":ct0}))
+            .map_err(|_| Error::InvalidInput)?;
+        self.call(&["accounts", "reconnect", "x_read", &id], Some(input), 5)
+            .await?;
+        Ok(())
+    }
+    pub async fn reimport_x(&self, profile: String, id: String) -> Result<()> {
+        let _guard = self.mutation.lock().await;
+        if !browser_profile_id(&profile) {
+            return Err(Error::InvalidInput);
+        }
+        self.registered_x(&id).await?;
+        let raw = self
+            .call(&["accounts", "reimport-x", &profile, &id], None, 45)
+            .await?;
+        updated(&raw)
+    }
+    /// Clears a saved keyed-relay halt with the bundled node's `relay-resume`,
+    /// which only removes `<state>/relay-halt` and syncs the directory. It is
+    /// safe while the supervised node runs, so this never drains, stops or
+    /// restarts it: that would drop every warm X client and interrupt accepted
+    /// work. A running node keeps relay paused until it picks the change up.
+    pub async fn resume_relay(&self) -> Result<()> {
+        self.call(&["relay-resume"], None, 5).await?;
+        if self.relay_halt_marker() {
             return Err(Error::CommandFailed);
         }
         Ok(())
+    }
+    fn relay_halt_marker(&self) -> bool {
+        std::fs::symlink_metadata(self.state.join(RELAY_HALT_FILE)).is_ok()
     }
     pub async fn remove(&self, service: String, id: String) -> Result<()> {
         let _guard = self.mutation.lock().await;
@@ -1033,6 +1127,7 @@ impl Node {
         if let Ok(raw) = self.call(&["status"], None, 5).await {
             s.observation = observation_projection(&raw).ok();
         }
+        s.relay_halt_marker = self.relay_halt_marker();
         let mut run = self.running.lock().await;
         if let Some(p) = run.as_mut() {
             s.supervised = p.try_wait().ok().flatten().is_none();
@@ -1434,6 +1529,241 @@ mod tests {
         assert!(!safe.contains("SECRET"));
         let status=observation_projection(br#"{"state":"running","credential":"SECRET","services":[{"type":"x_read","state":"configured","token":"SECRET"}],"accounts":[{"id":"work","service":"codex","path":"SECRET"}]}"#).unwrap();
         assert!(!status.to_string().contains("SECRET"));
+    }
+    #[test]
+    fn projection_keeps_relay_state_and_only_known_proof_modes() {
+        let status = observation_projection(
+            br#"{"state":"running","relay_halted":true,"services":[{"kind":"x_read","state":"configured","capacity":1,"proof_modes":["mpc","relay","SECRET"],"models":["SECRET"]},{"kind":"codex","state":"ready","proof_modes":"SECRET"}],"accounts":[{"id":"one","service":"x_read","state":"auth_required","last_error_code":"auth_required","path":"SECRET"}]}"#,
+        )
+        .unwrap();
+        assert!(!status.to_string().contains("SECRET"));
+        assert_eq!(status["relay_halted"], json!(true));
+        assert_eq!(status["services"][0]["kind"], json!("x_read"));
+        assert_eq!(status["services"][0]["state"], json!("configured"));
+        assert_eq!(
+            status["services"][0]["proof_modes"],
+            json!(["mpc", "relay"])
+        );
+        assert!(status["services"][1].get("proof_modes").is_none());
+        assert_eq!(status["accounts"][0]["state"], json!("auth_required"));
+        assert_eq!(
+            status["accounts"][0]["last_error_code"],
+            json!("auth_required")
+        );
+        let unhalted = observation_projection(br#"{"state":"running","services":[]}"#).unwrap();
+        assert!(unhalted.get("relay_halted").is_none());
+    }
+    /// A fake bundled node that records each invocation and serves a halted,
+    /// running status. `relay-resume` removes the marker unless told not to.
+    #[cfg(unix)]
+    fn relay_fixture(temp: &tempfile::TempDir) -> Node {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = temp.path().join("node");
+        let script = r##"#!/bin/sh
+printf '%s\n' "$*" >> "$SCARLETT_STATE_DIR/calls"
+case "$1 $2" in
+'accounts list') printf '[{"id":"one","service":"x_read","concurrency":1}]';;
+'desktop run') cat >/dev/null;;
+'drain ') ;;
+'status ') printf '{"state":"running","relay_halted":true,"services":[{"kind":"x_read","state":"ready","proof_modes":["mpc"]}]}';;
+'relay-resume ') [ -e "$SCARLETT_STATE_DIR/keep-halt" ] || rm -f "$SCARLETT_STATE_DIR/relay-halt"; printf '{"state":"running"}';;
+*) exit 1;;
+esac
+"##;
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let helper = temp.path().join("helper");
+        std::fs::write(&helper, "synthetic helper fixture").unwrap();
+        let node = Node::new(temp.path().join("state"), binary, helper);
+        node.prepare().unwrap();
+        std::fs::write(node.state.join("identity.json"), "{}").unwrap();
+        node
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relay_resume_runs_only_the_bundled_command_and_never_restarts_the_node() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = relay_fixture(&temp);
+        let marker = node.state.join(RELAY_HALT_FILE);
+        std::fs::write(&marker, "verifier misused this node's X session\n").unwrap();
+        node.start().await.unwrap();
+        let calls = node.state.join("calls");
+        let began = Instant::now();
+        while !std::fs::read_to_string(&calls).is_ok_and(|c| c.contains("desktop run")) {
+            assert!(began.elapsed() < Duration::from_secs(5));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let halted = node.snapshot().await;
+        assert!(halted.supervised && halted.relay_halt_marker);
+        assert_eq!(halted.observation.unwrap()["relay_halted"], json!(true));
+        // The fixed bundled binary with a cleared environment: never PATH.
+        let command = node.command(&["relay-resume"]).unwrap();
+        assert_eq!(command.as_std().get_program(), node.binary.as_os_str());
+        assert!(
+            !command
+                .as_std()
+                .get_envs()
+                .any(|(name, _)| name == std::ffi::OsStr::new("PATH"))
+        );
+        std::fs::write(node.state.join("calls"), "").unwrap();
+        node.resume_relay().await.unwrap();
+        assert!(!marker.exists());
+        assert_eq!(
+            std::fs::read_to_string(node.state.join("calls")).unwrap(),
+            "relay-resume\n"
+        );
+        // The supervised node keeps running; it picks the change up itself, so
+        // the status may still say halted while the saved halt is gone.
+        let pending = node.snapshot().await;
+        assert!(pending.supervised);
+        assert!(!pending.relay_halt_marker);
+        assert_eq!(pending.observation.unwrap()["relay_halted"], json!(true));
+        assert!(
+            !std::fs::read_to_string(node.state.join("calls"))
+                .unwrap()
+                .lines()
+                .any(|call| call == "drain" || call.starts_with("desktop"))
+        );
+        // A marker the command did not remove is reported, not assumed gone.
+        std::fs::write(&marker, "verifier misused this node's X session\n").unwrap();
+        std::fs::write(node.state.join("keep-halt"), "").unwrap();
+        assert_eq!(node.resume_relay().await, Err(Error::CommandFailed));
+        assert!(node.snapshot().await.relay_halt_marker);
+        node.stop().await.unwrap();
+    }
+    #[tokio::test]
+    async fn relay_resume_clears_the_real_node_marker_and_is_repeatable() {
+        let Some(binary) = test_node_helper() else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::new(
+            temp.path().join("state"),
+            binary,
+            temp.path().join("prover"),
+        );
+        node.prepare().unwrap();
+        let marker = node.state.join(RELAY_HALT_FILE);
+        std::fs::write(&marker, "verifier misused this node's X session\n").unwrap();
+        assert!(node.snapshot().await.relay_halt_marker);
+        node.resume_relay().await.unwrap();
+        assert!(!marker.exists());
+        assert!(!node.snapshot().await.relay_halt_marker);
+        node.resume_relay().await.unwrap();
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn x_reimport_replaces_only_a_registered_account_through_fixed_commands() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("node");
+        let script = r##"#!/bin/sh
+case "$1 $2" in
+'accounts list') printf '[{"id":"one","service":"x_read","concurrency":2},{"id":"work","service":"codex","concurrency":1}]';;
+'accounts reconnect') cat > "$SCARLETT_STATE_DIR/captured.json"; printf '%s\n' "$@" > "$SCARLETT_STATE_DIR/args"; printf '{"status":"updated"}';;
+'accounts reimport-x') printf '%s\n' "$@" > "$SCARLETT_STATE_DIR/args"; printf 'synthetic-private-provider-error' >&2; printf '{"status":"error","code":"browser_busy"}'; exit 1;;
+*) exit 1;;
+esac
+"##;
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let node = Node::new(
+            temp.path().join("state"),
+            binary,
+            temp.path().join("helper"),
+        );
+        node.reconnect_x(
+            "one".into(),
+            "synthetic_token".into(),
+            "synthetic_ct0".into(),
+        )
+        .await
+        .unwrap();
+        let args = std::fs::read_to_string(node.state.join("args")).unwrap();
+        assert_eq!(args, "accounts\nreconnect\nx_read\none\n");
+        let input: Value =
+            serde_json::from_slice(&std::fs::read(node.state.join("captured.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            input,
+            json!({"auth_token":"synthetic_token","ct0":"synthetic_ct0"})
+        );
+        std::fs::remove_file(node.state.join("args")).unwrap();
+        // Unknown, Codex and malformed IDs never reach the node's write path.
+        for id in ["missing", "work", "../one"] {
+            assert_eq!(
+                node.reconnect_x(id.into(), "token".into(), "csrf".into())
+                    .await,
+                Err(Error::InvalidInput)
+            );
+        }
+        assert_eq!(
+            node.reconnect_x("one".into(), "bad;token".into(), "csrf".into())
+                .await,
+            Err(Error::InvalidInput)
+        );
+        assert!(!node.state.join("args").exists());
+        let profile = "firefox_0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            node.reimport_x(profile.into(), "one".into()).await,
+            Err(Error::BrowserBusy)
+        );
+        assert_eq!(
+            std::fs::read_to_string(node.state.join("args")).unwrap(),
+            format!("accounts\nreimport-x\n{profile}\none\n")
+        );
+        assert_eq!(
+            node.reimport_x("/private/arbitrary-path".into(), "one".into())
+                .await,
+            Err(Error::InvalidInput)
+        );
+        assert_eq!(
+            node.reimport_x(profile.into(), "missing".into()).await,
+            Err(Error::InvalidInput)
+        );
+    }
+    #[tokio::test]
+    async fn x_reconnect_replaces_the_real_node_session_for_the_same_id() {
+        let Some(binary) = test_node_helper() else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::new(
+            temp.path().join("state"),
+            binary,
+            temp.path().join("prover"),
+        );
+        node.connect_x(
+            "one".into(),
+            2,
+            "synthetic-expired-auth".into(),
+            "synthetic-expired-csrf".into(),
+        )
+        .await
+        .unwrap();
+        node.reconnect_x(
+            "one".into(),
+            "synthetic-fresh-auth".into(),
+            "synthetic-fresh-csrf".into(),
+        )
+        .await
+        .unwrap();
+        let accounts = node.accounts().await.unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].concurrency, 2);
+        assert_eq!(
+            node.reconnect_x("two".into(), "synthetic-a".into(), "synthetic-b".into())
+                .await,
+            Err(Error::InvalidInput)
+        );
+        let session = std::fs::read_to_string(
+            node.state
+                .join("accounts")
+                .join("x_read-one")
+                .join("session.json"),
+        )
+        .unwrap();
+        assert!(session.contains("synthetic-fresh-auth") && !session.contains("synthetic-expired"));
     }
     #[test]
     fn unrecognized_registry_is_not_mocked_ready() {

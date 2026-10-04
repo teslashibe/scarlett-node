@@ -24,9 +24,9 @@ Then run `npm run tauri build -- --bundles app` from `desktop` on Mac. The sidec
 ## Native dependency contract
 
 - Coordinator: `https://network.scarlett.ai`; verifier: `verifier.scarlett.ai:7047`, with normal public TLS verification. These public defaults were supplied by the release owner. There is no plaintext test transport or browser networking bridge.
-- Node commands: `pair`, `status`, `run`, `drain`, `resume`.
-- Pool commands: `accounts list`; `accounts connect SERVICE ID CONCURRENCY` with credential JSON on stdin; `accounts add codex ID ABSOLUTE_PROFILE CONCURRENCY`; `accounts remove SERVICE ID`.
-- Pool list: an array of `{id,service,concurrency}`. Local status can contain `accounts[{id,service,state,capacity,in_flight,last_error_code,rest_until}]`. Only bounded selected metadata reaches JS.
+- Node commands: `pair`, `status`, `run`, `drain`, `resume`, `relay-resume`.
+- Pool commands: `accounts list`; `accounts connect SERVICE ID CONCURRENCY` with credential JSON on stdin; `accounts reconnect x_read ID` with cookie JSON on stdin; `accounts import-x PROFILE_ID ID CONCURRENCY`; `accounts reimport-x PROFILE_ID ID`; `accounts add codex ID ABSOLUTE_PROFILE CONCURRENCY`; `accounts remove SERVICE ID`.
+- Pool list: an array of `{id,service,concurrency}`. Local status can contain `relay_halted`, `services[{kind,state,capacity,in_flight,last_error_code,proof_modes}]` and `accounts[{id,service,state,capacity,in_flight,last_error_code,rest_until}]`. Proof modes are reduced to `mpc` and `relay`. Only bounded selected metadata reaches JS.
 - Services: `codex` and `x_read`. IDs use lowercase letters/digits/underscore/hyphen, 1–32 characters; `legacy` is reserved. The binary owns maximum eight accounts/provider, concurrency, cooldown and pinned-attempt recovery.
 - Press **Connect Codex** and sign in with your ChatGPT account in the browser. Scarlett assigns a local name such as `codex-1`, reserves a new private profile and registers it after successful login, with one concurrent job per account. Repeat to connect another account, up to eight Codex accounts; at eight, Connect Codex is disabled until you remove one. Existing profiles, including cancelled login directories, are never reused. On Windows the profile is created by the fixed `desktop private-dir-new` helper with its current-user/SYSTEM protected ACL applied at creation; an existing name, including an older unprotected directory, is skipped and never adopted or repaired. No OpenAI account ID or local nickname is required. The native CLI is fixed to the bundled `codex-cli 0.159.2`, with file credential storage explicitly selected; it does not reuse `~/.codex` or discover a CLI on PATH. Missing or incompatible bundled CLI disables Connect Codex. Login and model entitlement remain distinct.
 - X connects only the two approved cookie fields through protected stdin, preserving node validation and storage. Remove updates the private registry; the running node stops new admission on its next scheduling observation and retains credentials until safe explicit disposal after drain; it does not revoke the upstream session.
@@ -160,7 +160,15 @@ Profile discovery reads directory/file metadata only. It returns opaque profile 
 
 The helper uses a bundled, cgo-free SQLite reader, opens stores read-only and immutable, and refuses populated WAL/journal files. It neither copies nor changes a browser database. Cookie-store changes during import fail with a retry message. Unsupported or inaccessible stores do not add an account. Linux CLI builds support standard Firefox profiles only; the desktop release targets remain Mac and Windows.
 
-Tests use disposable synthetic databases, encrypted cookie fixtures and malformed Safari records. Windows native tests generate their own current-user DPAPI fixture. These checks do not establish compatibility with every installed browser version or prove real X access. Imported accounts remain **Configured · access not verified** until their existing provider execution path verifies access.
+Tests use disposable synthetic databases, encrypted cookie fixtures and malformed Safari records. Windows native tests generate their own current-user DPAPI fixture. These checks do not establish compatibility with every installed browser version or prove real X access. Imported accounts remain **Configured · access not verified** until the node reports on them. While the running node checks an X account's login it shows **Warming up · checking login**.
+
+### Re-import an expired X session
+
+When X expires or revokes a session, the account shows **X session expired or revoked. Re-import the account** with an **Import X account again** button. The button opens the same import form for that account: its ID and job limit are fixed, and either a browser profile import (with the same consent tick) or cookie paste replaces only its saved session through `accounts reimport-x` or `accounts reconnect`. Import and Connect X still never overwrite an account. The node validates the new session before replacing the old one, and the running node picks it up on its next scheduling check without a restart. Until the node writes a newer status, the row says it is waiting for the node to check the new login.
+
+## Keyed relay halt
+
+When the node catches its verifier misusing an X session it stops serving keyed relay and keeps serving MPC-TLS. The app shows a red **Keyed relay is paused on this node** banner. **Resume relay** asks for confirmation, then runs only the bundled node's `relay-resume`, which removes the saved `relay-halt` marker. It never drains, stops or restarts the supervised node, so warm X clients and accepted work continue. A running node keeps relay paused until it picks the change up; until its status stops reporting `relay_halted`, the banner says the resume is saved. The node section shows what the running node advertises for X: **MPC + relay** or **MPC only**.
 
 ## Device preferences
 

@@ -134,6 +134,17 @@ private account storage, refuses overwrite or ambiguous sessions, and returns
 no credentials. Protected or unsupported stores can use cookie paste. See the
 [desktop browser support matrix](../desktop/README.md#import-an-x-browser-account).
 
+When X expires or revokes a connected session, the account reports
+`auth_required`. Replace its session under the same ID with
+`scarlett-node accounts reimport-x PROFILE_ID ACCOUNT_ID` or
+`scarlett-node accounts reconnect x_read ACCOUNT_ID` (cookie JSON on protected
+stdin). Only an existing account whose session the node saved through `connect`
+or `import-x` can be re-imported; its ID, path and concurrency stay the same.
+The new session is validated in a private staging file first, so a rejected
+re-import leaves the previous one in place. A running node sees the changed file
+on its next scheduling check and reports the account `configured` again;
+attempts already in flight keep the session they started with.
+
 The CLI writes `SCARLETT_STATE_DIR/accounts.json`, or the absolute private path
 in `SCARLETT_ACCOUNTS_FILE`. Its bounded schema is:
 
