@@ -150,9 +150,21 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
     def test_keys_are_imported_without_export_or_trust(self):
         windows = named(self.release, 'Import the Windows signing key without export rights')
-        self.assertIn('Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\\CurrentUser\\My -Password $password', windows)
-        self.assertNotRegex(windows, r'Import-PfxCertificate[^\n]*-Exportable')
+        self.assertIn('& desktop/scripts/import-windows-identity.ps1 -Pfx $pfx -Thumbprint $pin', windows)
+        self.assertIn("if ($LASTEXITCODE -ne 0) { throw 'The Windows signing identity was not imported' }", windows)
+        self.assertNotIn('Import-PfxCertificate', windows)
+        self.assertNotIn('-Exportable', windows)
         self.assertIn('Remove-Item -LiteralPath $pfx', windows)
+        importer = (ROOT / 'desktop/scripts/import-windows-identity.ps1').read_text()
+        # A CNG software key: an OpenSSL PKCS#12 key imported by
+        # Import-PfxCertificate lands in a CryptoAPI provider that cannot sign SHA-256.
+        self.assertIn('PFXImportCertStore(ref blob, password, CRYPT_USER_KEYSET | PKCS12_ALWAYS_CNG_KSP)', importer)
+        self.assertNotIn('CRYPT_EXPORTABLE =', importer)
+        self.assertNotIn('Import-PfxCertificate -', importer)
+        self.assertIn("'Microsoft Software Key Storage Provider'", importer)
+        self.assertIn('AllowPlaintextExport', importer)
+        self.assertIn("Remove-Item -LiteralPath $Path -Force", importer)
+        self.assertIn("'Cert:\\CurrentUser\\Root\\', 'Cert:\\LocalMachine\\Root\\'", importer)
         mac = named(self.release, 'Import the Mac signing key into a temporary keychain')
         self.assertIn('desktop/scripts/import-macos-identity.sh', mac)
         importer = (ROOT / 'desktop/scripts/import-macos-identity.sh').read_text()
@@ -172,8 +184,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
             self.assertIn('SCARLETT_SIGNING_SCHEME: self-signed-stable', named(self.release, name))
         self.assertNotIn('SCARLETT_SIGNING_REHEARSAL', self.release)
         self.assertNotIn('SCARLETT_SIGNING_IDENTITIES', self.release)
-        for workflow in (self.release, self.complete):
-            self.assertEqual(workflow.count('desktop/scripts/build-complete-runtime.sh "$NATIVE_PLATFORM" "$RUNNER_TEMP/scarlett-runtime"'), 1)
+        # PR CI builds the runtime once for its native checks and once for the
+        # Windows release rehearsal; both use the release workflow's command.
+        for workflow, count in ((self.release, 1), (self.complete, 2)):
+            self.assertEqual(workflow.count('desktop/scripts/build-complete-runtime.sh "$NATIVE_PLATFORM" "$RUNNER_TEMP/scarlett-runtime"'), count)
             self.assertNotIn('npm pack', workflow)
             self.assertNotIn('prepare-complete-bundle.mjs', workflow)
         assemble = named(self.release, 'Assemble the release from pinned signing evidence')
@@ -193,6 +207,46 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('New-SelfSignedCertificate -Type CodeSigningCert', fixture)
         self.assertIn('-CertStoreLocation Cert:\\CurrentUser\\My -KeyAlgorithm RSA -KeyLength 3072', fixture)
         self.assertIn('-DeleteKey', fixture)
+
+    def test_pr_ci_rehearses_the_windows_release_job(self):
+        jobs = {}
+        for job, body in steps(self.complete):
+            jobs.setdefault(job, []).append(body)
+        rehearsal = '\n'.join(jobs['windows_release_rehearsal'])
+        release = '\n'.join(body for job, body in steps(self.release) if job == 'sign')
+        self.assertNotIn('secrets.', rehearsal)
+        self.assertNotRegex(rehearsal, r'cache: (?!false)')
+        self.assertNotIn('rust-cache', rehearsal)
+        self.assertIn('persist-credentials: false', rehearsal)
+        # The same build commands as the release Windows job.
+        for name in ('Install pinned Rust', 'Build reviewed components and prepare the complete native runtime',
+                     'Install desktop build dependencies', 'Build the unsigned Windows release executable'):
+            with self.subTest(step=name):
+                ours = [b for b in jobs['windows_release_rehearsal'] if re.search(r'^      - name: ' + re.escape(name) + '$', b, re.MULTILINE)]
+                theirs = [b for j, b in steps(self.release) if j == 'sign' and re.search(r'^      - name: ' + re.escape(name) + '$', b, re.MULTILINE)]
+                self.assertEqual(len(ours), 1)
+                self.assertEqual(len(theirs), 1)
+                run = lambda body: re.search(r'^        run: (.*)$', body, re.MULTILINE).group(1)
+                self.assertEqual(run(ours[0]), run(theirs[0]))
+        self.assertIn('desktop/scripts/rehearse-windows-signing.ps1', rehearsal)
+        self.assertIn('desktop/scripts/import-windows-identity.ps1', release)
+        script = (ROOT / 'desktop/scripts/rehearse-windows-signing.ps1').read_text()
+        # The release importer and signer, an OpenSSL 3 default PKCS#12 export and
+        # pins injected only through the rehearsal override.
+        self.assertIn("& (Join-Path $scripts 'import-windows-identity.ps1') -Pfx $pfx -Thumbprint $sha1", script)
+        self.assertIn("python (Join-Path $scripts 'sign-windows-bundle.py') $Desktop $evidence", script)
+        self.assertIn("$env:SCARLETT_SIGNING_REHEARSAL = '1'", script)
+        self.assertIn("'rsa_keygen_bits:3072'", script)
+        for extension in ('basicConstraints = critical,CA:FALSE', 'keyUsage = critical,digitalSignature',
+                          'extendedKeyUsage = critical,codeSigning'):
+            self.assertIn(extension, script)
+        self.assertIn("'pkcs12', '-export'", script)
+        for option in ('-legacy', '-keypbe', '-certpbe', '-macalg'):
+            self.assertNotIn("'%s'" % option, script)
+        self.assertIn("$record.rehearsal -ne $true", script)
+        self.assertIn("$record.trustResult -cne '0x800B0109'", script)
+        self.assertIn('-DeleteKey', script)
+        self.assertNotRegex(script, r'(?i)CertStoreLocation\s+Cert:\\\w+\\Root')
 
 
 if __name__ == '__main__':

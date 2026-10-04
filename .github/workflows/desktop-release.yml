@@ -116,26 +116,21 @@ jobs:
           }
           $pin = [string](python desktop/scripts/signing_identities.py get windows.sha1)
           if ($LASTEXITCODE -ne 0 -or $pin -cnotmatch '^[0-9a-f]{40}$') { throw 'Pinned Windows thumbprint unavailable' }
-          # Certificate store paths use the uppercase thumbprint Windows reports.
-          $pin = $pin.ToUpperInvariant()
-          if (Test-Path -LiteralPath ('Cert:\CurrentUser\My\' + $pin)) { throw 'A Scarlett signing identity is already installed' }
           $folder = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP 'signing')
           $pfx = Join-Path $folder.FullName 'identity.pfx'
           try {
             [System.IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SCARLETT_WINDOWS_PFX_BASE64))
-            $password = ConvertTo-SecureString -String $env:SCARLETT_WINDOWS_PFX_PASSWORD -AsPlainText -Force
-            # Imported as non-exportable: the private key cannot leave this certificate store.
-            $imported = @(Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password)
+            $env:SCARLETT_WINDOWS_PFX_BASE64 = $null
+            # The PR rehearsal runs this same importer. It puts the key in the CNG
+            # software key storage provider without export rights (a key from an
+            # OpenSSL PKCS#12 file would otherwise land in a legacy CryptoAPI
+            # provider that cannot sign SHA-256), deletes the file, checks the
+            # pin and that the certificate is not a trusted root.
+            & desktop/scripts/import-windows-identity.ps1 -Pfx $pfx -Thumbprint $pin
+            if ($LASTEXITCODE -ne 0) { throw 'The Windows signing identity was not imported' }
           } finally {
             Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
           }
-          if ($imported.Count -ne 1 -or $imported[0].Thumbprint -ine $pin -or -not $imported[0].HasPrivateKey) {
-            throw 'The imported identity does not match the pinned thumbprint'
-          }
-          foreach ($root in @('Cert:\CurrentUser\Root\', 'Cert:\LocalMachine\Root\')) {
-            if (Test-Path -LiteralPath ($root + $pin)) { throw 'The release certificate must never be a trusted root' }
-          }
-          Write-Output 'Imported the pinned Windows code-signing identity into CurrentUser\My'
 
       - name: Sign the Mac app and disk image
         if: runner.os == 'macOS'

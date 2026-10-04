@@ -12,6 +12,46 @@ param(
     [string]$EvidenceFile = ''
 )
 $ErrorActionPreference = 'Stop'
+$ScarlettSigningScriptRoot = $PSScriptRoot
+
+function Get-ScarlettLiteralReasons {
+    # The only failure reasons ever written: single-quoted literal throw
+    # statements in these signing scripts, read from their own source. Native
+    # exception text, paths, certificate details and values never qualify.
+    $reasons = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+    foreach ($name in @('check-windows-signatures.ps1', 'sign-windows-file.ps1', 'import-windows-identity.ps1')) {
+        $path = Join-Path $ScarlettSigningScriptRoot $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$parseErrors)
+        $throws = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.ThrowStatementAst] }, $true)
+        foreach ($statement in $throws) {
+            if (-not $statement.Pipeline) { continue }
+            $expression = $statement.Pipeline.GetPureExpression()
+            if ($expression -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+                $expression.StringConstantType -eq [System.Management.Automation.Language.StringConstantType]::SingleQuoted) {
+                [void]$reasons.Add($expression.Value)
+            }
+        }
+    }
+    return ,$reasons
+}
+
+function Write-LiteralFailureReason($ErrorRecord, [string]$Summary) {
+    # For callers that capture stderr: the fixed summary, then the specific
+    # reason only when a literal throw above raised it. A SignTool HRESULT
+    # (eight hex digits, no text) may follow that reason.
+    [Console]::Error.WriteLine($Summary)
+    $reason = $ErrorRecord.TargetObject
+    $exception = $ErrorRecord.Exception
+    if ($exception -is [System.Management.Automation.RuntimeException] -and $exception.WasThrownFromThrowStatement -and
+        $reason -is [string] -and (Get-ScarlettLiteralReasons).Contains($reason)) {
+        $code = [string]$script:ScarlettNativeFailureCode
+        if ($code -cmatch '^0x[0-9A-F]{8}$') { $reason = $reason + ' (' + $code + ')' }
+        [Console]::Error.WriteLine($reason)
+    }
+}
 
 function Assert-SigningScheme([string]$Scheme) {
     if ($Scheme -cne 'self-signed-stable' -and $Scheme -cne 'authenticode') {
@@ -249,7 +289,9 @@ if ($MyInvocation.InvocationName -ne '.') {
             -Scheme $Scheme -CertificateSha256 $CertificateSha256 -Output $EvidenceFile
         Write-Output 'Windows installer and installed Scarlett executables passed pinned publisher and timestamp checks'
     } catch {
-        # Never echo native certificate errors, paths or configuration values
-        throw 'Windows release signature acceptance failed; artifact is not approved for publication'
+        # Never echo native certificate errors, paths or configuration values:
+        # only the summary and, when one raised it, a literal reason above.
+        Write-LiteralFailureReason $_ 'Windows release signature acceptance failed; artifact is not approved for publication'
+        exit 1
     }
 }

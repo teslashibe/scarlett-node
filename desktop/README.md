@@ -80,6 +80,15 @@ written only after installed payload, lifecycle, preferences and browser tests
 pass. Real account login, signed upgrade/downgrade and publication remain
 separate gates; contract tests and unsigned rejection do not prove real signing.
 
+A failed run prints the fixed summary and one `Reason:` line built only from our
+own literal strings: the operation (for example `Signing scarlett-node`), its exit
+code and, when one raised it, the literal `throw` reason from
+`sign-windows-file.ps1`, `check-windows-signatures.ps1` or
+`import-windows-identity.ps1`, optionally followed by SignTool's eight-digit
+HRESULT. Python checker failures add the script line and exception class, and
+installed acceptance adds its script line numbers. Native messages, paths,
+certificate details and secrets are never printed.
+
 The Tauri callback permits exactly its five copied x86 NSIS plugin DLL paths.
 Generated x86 uninstallers must match NSIS 3.11's `nst<hex>.tmp` filename inside
 a fresh `target/release/nsis-signing-temp` directory. Only the packaging child
@@ -343,11 +352,27 @@ secrets. It runs `release-manifest.py`, which checks every evidence file and com
 darwin-amd64.dmg,windows-amd64.exe}`, the set the publisher accepts) beside
 `SHA256SUMS` and `evidence/`.
 
+On Windows the key is imported by `desktop/scripts/import-windows-identity.ps1`
+into the current user's CNG Microsoft Software Key Storage Provider without
+export rights; the PKCS#12 file is deleted and the pin and trust stores are
+checked. `Import-PfxCertificate` is not used: an OpenSSL PKCS#12 file names no
+key provider, so Windows would place the key in the legacy CryptoAPI
+"Microsoft Enhanced Cryptographic Provider v1.0", which cannot make the SHA-256
+signatures SignTool `/fd SHA256` needs.
+
 PR CI rehearses both platforms with no secrets.
 `desktop/scripts/rehearse-macos-signing.sh` makes a throwaway certificate with the
 release extensions, imports it with the release import script and runs the
 `self-signed-stable` signer over a copy of the complete debug app, then the launch
-smoke runs on the rehearsal DMG. The Windows fixture is described above.
+smoke runs on the rehearsal DMG. The `windows_release_rehearsal` job repeats the
+release Windows job's build steps, then `desktop/scripts/rehearse-windows-signing.ps1`
+makes a throwaway RSA-3072 certificate with the release extensions, exports it as
+PKCS#12 with OpenSSL 3 defaults (AES-256-CBC, PBKDF2, SHA-256 MAC) like the release
+key, imports it with `import-windows-identity.ps1` and runs
+`sign-windows-bundle.py`: signing, NSIS packaging, installed acceptance and the
+pinned signature checks on the complete release build. A control reports which
+provider `Import-PfxCertificate` would have chosen and whether SignTool could sign
+with it. The ephemeral fixture described above also still runs.
 A rehearsal may substitute its own identities file through
 `SCARLETT_SIGNING_IDENTITIES`, which is honoured only with
 `SCARLETT_SIGNING_REHEARSAL=1`. Everything signed that way records
