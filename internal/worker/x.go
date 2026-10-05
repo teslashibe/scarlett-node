@@ -410,8 +410,9 @@ func validateXLease(c config.Config, l coordinator.Lease) (xPlan, time.Time, str
 // Run serves one x_read lease on the account's warm client (see XClients).
 // The lease is validated first, and acquire checks the session file before
 // building, so invalid work never builds a client. A job waits for a build
-// only when no usable client exists: the first job after a dropped client,
-// or a lease pinning a query ID the client was not built with.
+// only when no usable client exists: the background has not built one yet
+// (or its build failed), or the lease pins a query ID the client was not
+// built with.
 func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 	plan, deadline, code := validateXLease(w.Config, l)
 	if code != "" {
@@ -439,8 +440,26 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 	if e != nil {
 		return w.failure(ctx, e)
 	}
+	// X's last reported quota on this account makes x-go hold the next read
+	// back. When that wait cannot fit in the lease, the job would only burn its
+	// deadline and leave its reserved slot behind: rest the account instead,
+	// before any proof is spent.
+	if wait, reset := warm.pacingWait(clients.gap()); wait > 0 {
+		if wait >= time.Until(deadline) {
+			return w.limited(reset)
+		}
+		if warm.exhausted() > 0 {
+			// The reset fits in the lease. x-go would let the read through before
+			// it, so the node waits here.
+			select {
+			case <-ctx.Done():
+				return w.limited(warm.exhausted())
+			case <-time.After(wait):
+			}
+		}
+	}
 	for attempt := 0; ; attempt++ {
-		binding := &xBinding{specs: plan.Exchanges, proof: proof}
+		binding := &xBinding{specs: plan.Exchanges, proof: proof, warm: warm}
 		code, e = w.read(withXBinding(ctx, binding), warm.client, *l.XRequest)
 		if e == nil && code == "" && binding.proven() != len(plan.Exchanges) {
 			code = "x_incomplete"
@@ -459,9 +478,27 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 		}
 		if xAuthFailure(e) {
 			account.drop(warm)
+		} else if ctx.Err() != nil && binding.idle() {
+			// The job ended while x-go held its read back. When X's quota is used
+			// up the client is kept, because a replacement would forget that, and
+			// the account rests until the reset. Otherwise the slot the job
+			// reserved stays on the shared client, which is replaced.
+			if reset := warm.exhausted(); reset > 0 {
+				return w.limited(reset)
+			}
+			account.replace(warm)
 		}
 		return w.failure(ctx, e)
 	}
+}
+
+// limited is a job that cannot be served before X's quota window resets: the
+// account rests until then.
+func (w X) limited(reset time.Duration) string {
+	if w.Config.AccountCooldown != nil {
+		w.Config.AccountCooldown(reset)
+	}
+	return "x_rate_limited"
 }
 
 // read performs the lease's reads on client; ctx carries the job binding.

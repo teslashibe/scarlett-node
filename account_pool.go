@@ -419,11 +419,65 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 	if s.inFlight > 0 {
 		s.inFlight--
 	}
+	p.settle(l.account, code, false)
+}
+
+// xValidated applies the outcome of an X client build that asked X to
+// validate the session at path: "" when the client was installed, otherwise
+// the failure code. A failure moves the account exactly as a failed job
+// would, so a session the node already knows is refused or unreachable is not
+// advertised until a funded job finds out again.
+func (p *servicePool) xValidated(path, code string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.refresh(time.Now())
+	if p.healthError || p.accountsError || !p.entries["x_read"].enabled {
+		return
+	}
+	for _, a := range p.accounts {
+		if a.spec.Service == "x_read" && !a.removed && a.spec.Path == path {
+			p.settle(a, code, true)
+			return
+		}
+	}
+}
+
+// xSessionPaths is every X session path the pool still holds, including
+// accounts that are removed but still draining, so a client is only evicted
+// once no job can be using it.
+func (p *servicePool) xSessionPaths() map[string]bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.refresh(time.Now())
+	keep := map[string]bool{}
+	for _, a := range p.accounts {
+		if a.spec.Service == "x_read" {
+			keep[a.spec.Path] = true
+		}
+	}
+	return keep
+}
+
+// settle moves an account's state for one outcome: a finished job's result
+// code or, with validation set, an X client build's. Caller holds p.mu.
+func (p *servicePool) settle(a *pooledAccount, code string, validation bool) {
+	s := a.entry
+	if validation && code == "" {
+		// A validated session is ready for work. It repairs nothing a job
+		// reported: an authentication failure waits for a changed session file
+		// and a rest runs its time. The keeper repeats this on every check, so
+		// only a change is written.
+		if s.state == "configured" && s.restUntil.IsZero() {
+			s.state = "ready"
+			p.saveHealth()
+		}
+		return
+	}
 	if code == codexLocalAuthExpired {
 		// Local evidence only, so renewal may repair it. It never overrides a
 		// provider denial already recorded for this credential.
 		if s.state != "auth_required" {
-			s.state, s.lastError, s.localAuthInvalid = "auth_required", "auth_required", l.account.spec.Service == "codex"
+			s.state, s.lastError, s.localAuthInvalid = "auth_required", "auth_required", a.spec.Service == "codex"
 		}
 		p.saveHealth()
 		return

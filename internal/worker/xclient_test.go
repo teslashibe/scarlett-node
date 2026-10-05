@@ -29,15 +29,32 @@ const (
 
 // xFakeX stands in for X behind Base: it answers the construction-time reads
 // and bootstrap fetches and counts them. brokenHome makes the home page 404,
-// which leaves a client without transaction-ID material.
+// which leaves a client without transaction-ID material. viewerStatus makes
+// the Viewer read answer that HTTP status instead (-1: a transport failure),
+// and down fails every request at the transport.
 type xFakeX struct {
-	validation, bootstrap atomic.Int32
-	brokenHome            atomic.Bool
+	validation, viewer, bootstrap atomic.Int32
+	brokenHome, down              atomic.Bool
+	viewerStatus                  atomic.Int32
 }
 
 func (f *xFakeX) RoundTrip(r *http.Request) (*http.Response, error) {
+	if f.down.Load() {
+		return nil, errors.New("synthetic dial failure")
+	}
 	if r.URL.Host == "x.com" && strings.Contains(r.URL.Path, "/i/api/graphql/") {
 		f.validation.Add(1)
+		if strings.HasSuffix(r.URL.Path, "/Viewer") {
+			f.viewer.Add(1)
+			switch status := int(f.viewerStatus.Load()); {
+			case status < 0:
+				return nil, errors.New("synthetic dial failure")
+			case status == 401:
+				return xResponse(r, 401, `{"errors":[{"code":32,"message":"Could not authenticate you"}]}`), nil
+			case status > 0:
+				return xResponse(r, status, ""), nil
+			}
+		}
 		return xBootstrap(r)
 	}
 	f.bootstrap.Add(1)
@@ -331,8 +348,10 @@ func TestXRefreshNeitherBlocksNorRebindsInFlightJob(t *testing.T) {
 	if e := account.refreshNow(); e != nil {
 		t.Fatal("refresh failed", e)
 	}
-	if v, b := fake.counts(); v != 2 || b != 4 {
-		t.Fatalf("refresh made %d validation reads and %d bootstrap fetches in total, want 2 and 4", v, b)
+	// The timer's refresh asks X once whether the session still holds: one
+	// Viewer read, while UserByRestId is answered from the last validated build.
+	if v, b := fake.counts(); v != 3 || fake.viewer.Load() != 2 || b != 4 {
+		t.Fatalf("refresh made %d validation reads (%d Viewer) and %d bootstrap fetches in total, want 3 (2) and 4", v, fake.viewer.Load(), b)
 	}
 	if account.generation() != 2 || account.current == old || account.current.client.TransactionInitErr() != nil {
 		t.Fatal("refresh did not swap in a fresh client with transaction material")
@@ -350,7 +369,7 @@ func TestXRefreshNeitherBlocksNorRebindsInFlightJob(t *testing.T) {
 	if code := xRun(c, l, clients, fake, next); code != "" || next.proofs.Load() != 1 {
 		t.Fatal("job after refresh failed", code)
 	}
-	if v, b := fake.counts(); v != 2 || b != 4 || account.generation() != 2 {
+	if v, b := fake.counts(); v != 3 || b != 4 || account.generation() != 2 {
 		t.Fatal("job after refresh made unproven requests", v, b)
 	}
 	// A refresh that would lose the transaction material keeps the current client.
@@ -411,7 +430,7 @@ func TestXRefreshNeitherBlocksNorRebindsInFlightJob(t *testing.T) {
 	if code := (X{Config: c, Base: gate, Proof: &xProfileProof{}, Clients: slowClients}).Run(context.Background(), l); code != "" {
 		t.Fatal(code)
 	}
-	if v, _ := slow.counts(); v != 4 {
+	if v, _ := slow.counts(); v != 5 || slow.viewer.Load() != 3 {
 		t.Fatal("rebuild after a dropped refresh did not validate", v)
 	}
 	// The timer drives the same refresh.
@@ -429,8 +448,11 @@ func TestXRefreshNeitherBlocksNorRebindsInFlightJob(t *testing.T) {
 	for ticking.generation() < 3 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if v, _ := tickFake.counts(); ticking.generation() < 3 || v != 2 {
-		t.Fatal("timer refresh did not run, or revalidated", ticking.generation(), v)
+	// Each timer refresh makes its one Viewer read and never repeats UserByRestId.
+	refreshes := ticking.generation()
+	timed.Stop()
+	if v, _ := tickFake.counts(); refreshes < 3 || tickFake.viewer.Load() < 3 || v-tickFake.viewer.Load() != 1 {
+		t.Fatal("timer refresh did not run, did not ask X, or repeated the profile read", refreshes, v, tickFake.viewer.Load())
 	}
 }
 

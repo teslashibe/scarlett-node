@@ -89,7 +89,8 @@ func (p *servicePool) health() []coordinator.ServiceHealth {
 }
 
 // xAccounts lists the X accounts whose session files are usable right now,
-// for warming their clients at start.
+// for keeping their clients warm. An account that is resting or that X
+// refused is left out, so the background does not ask X about it either.
 func (p *servicePool) xAccounts() []worker.XAccount {
 	p.mu.Lock()
 	defer p.mu.Unlock()

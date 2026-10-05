@@ -30,6 +30,11 @@ const DefaultXRefresh = 30 * time.Minute
 // carries no inference timeout (tests and warm-ups without a full config).
 const xBuildTimeout = 30 * time.Second
 
+// xRetryBase is the first delay before the background retries something that
+// failed: a client build, or the transaction-ID bootstrap of an installed
+// client. It doubles per failure up to the account's refresh interval.
+const xRetryBase = time.Minute
+
 // errXSession is a session file that cannot be used: missing, not private,
 // or not a valid x-go session. It classifies as auth_required.
 var errXSession = errors.New("local X session unavailable")
@@ -41,15 +46,26 @@ var errXDropped = errors.New("x client dropped during refresh")
 // proven reads. The account key is the session file path, which is the
 // natural key in both single-session and managed-accounts mode. A client is
 // built lazily (or by Warm at node start) and reused until the session file's
-// content changes, a proven read fails with an auth error, or Stop; a timer
-// also rebuilds its transaction-ID material in the background without
-// repeating the session-validation reads. Dropping or replacing a client is
-// an atomic pointer swap: in-flight jobs keep the pointer they hold.
+// content changes, a proven read fails with an auth error, Retain evicts its
+// account, or Stop; a timer also rebuilds its transaction-ID material in the
+// background and asks X once whether the session still holds. Dropping or
+// replacing a client is an atomic pointer swap: in-flight jobs keep the
+// pointer they hold.
 type XClients struct {
+	// Base carries the unproven construction requests of accounts created
+	// without a transport of their own; nil means http.DefaultTransport. Set
+	// it before first use.
+	Base http.RoundTripper
+
 	mu       sync.Mutex
 	accounts map[string]*xAccount
+	// observe is told the outcome of each build that asked X to validate a
+	// session; see Observe.
+	observe func(path, code string)
 	// minGap overrides x-go's request pacing; zero means xMinGap. Tests only.
 	minGap time.Duration
+	// retry overrides xRetryBase. Tests only.
+	retry time.Duration
 	// log receives one line per build outcome; nil means os.Stderr. Lines
 	// name the local account ID, never the session path or its contents.
 	log io.Writer
@@ -67,21 +83,79 @@ func DefaultXClients() *XClients { return defaultXClients }
 // log line) and its session file path (the cache key).
 type XAccount struct{ ID, Path string }
 
+// Observe sets the function told the outcome of every build that asked X to
+// validate a session: the account's session path and "" when the client was
+// installed, otherwise the failure code (auth_required, x_rate_limited or
+// x_request_failed). It is called with none of the cache's locks held, never
+// for a build whose validation was only replayed, and never with an outcome
+// for file content the session file no longer holds. Ensure also reports ""
+// for an account that already has a validated client. Set it before the first
+// build.
+func (c *XClients) Observe(f func(path, code string)) {
+	c.mu.Lock()
+	c.observe = f
+	c.mu.Unlock()
+}
+
 // Warm builds the client of each account in turn, so the first job on it is
-// fast, and prints one line per account. A failure leaves the account to the
-// job path, which builds on demand. It returns when every account has been
-// tried or ctx ends.
+// fast, and prints one line per account. A failure leaves the account to
+// Ensure, which retries in the background, and to the job path as the last
+// resort. It returns when every account has been tried or ctx ends.
 func (c *XClients) Warm(ctx context.Context, cfg config.Config, accounts []XAccount) {
 	for _, acct := range accounts {
 		if ctx.Err() != nil {
 			return
 		}
 		a := c.account(cfg, acct.ID, acct.Path, nil)
-		if _, err := a.acquire(ctx, nil, false); err != nil {
+		warm, err := a.acquire(ctx, nil, false)
+		if err != nil {
 			a.logf("x client warm-up failed for account %s: %s", a.id, xFailure(context.Background(), err))
 			continue
 		}
-		a.logf("x client ready for account %s", a.id)
+		// A client without transaction-ID material has already logged that its
+		// bootstrap will be retried; it is not ready for gated reads.
+		if warm.client.TransactionInitErr() == nil {
+			a.logf("x client ready for account %s", a.id)
+		}
+	}
+}
+
+// Ensure keeps accounts warm after start without blocking: it starts a
+// validated background build for the first account that has no current client
+// built from its session file as it is now, has no build running and is past
+// its failure backoff. One build per call keeps a node with many cold accounts
+// from bursting at X; the caller's next tick takes the next account. A failed
+// background build backs off from xRetryBase, doubling up to the refresh
+// interval, and a session X refused is not tried again until its file changes.
+// It reads session files only, unless a build is due. An account whose client
+// was built from its session file as it is now is reported to the observer as
+// validated, so an account whose rest ended or whose file was only rewritten
+// does not look as if it were still warming.
+func (c *XClients) Ensure(cfg config.Config, accounts []XAccount) {
+	observe := c.observer()
+	for started, i := false, 0; i < len(accounts); i++ {
+		warm, built := c.account(cfg, accounts[i].ID, accounts[i].Path, nil).ensure(!started)
+		started = started || built
+		if warm && observe != nil {
+			observe(accounts[i].Path, "")
+		}
+	}
+}
+
+// Retain closes and forgets every account whose session path is not in keep,
+// so an account removed from the node stops being refreshed against X.
+func (c *XClients) Retain(keep map[string]bool) {
+	c.mu.Lock()
+	var gone []*xAccount
+	for path, a := range c.accounts {
+		if !keep[path] {
+			delete(c.accounts, path)
+			gone = append(gone, a)
+		}
+	}
+	c.mu.Unlock()
+	for _, a := range gone {
+		a.close()
 	}
 }
 
@@ -104,9 +178,22 @@ func (c *XClients) gap() time.Duration {
 	return xMinGap
 }
 
+func (c *XClients) retryBase() time.Duration {
+	if c.retry > 0 {
+		return c.retry
+	}
+	return xRetryBase
+}
+
+func (c *XClients) observer() func(path, code string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.observe
+}
+
 // account returns the cache entry for path, creating it on first use. base,
 // the timeout and the refresh interval are fixed by whoever creates the entry:
-// in production always http.DefaultTransport and the node's configuration.
+// in production always c.Base and the node's configuration.
 func (c *XClients) account(cfg config.Config, id, path string, base http.RoundTripper) *xAccount {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -114,12 +201,15 @@ func (c *XClients) account(cfg config.Config, id, path string, base http.RoundTr
 		return a
 	}
 	if base == nil {
+		base = c.Base
+	}
+	if base == nil {
 		base = http.DefaultTransport
 	}
 	if id == "" {
 		id = "x_read"
 	}
-	a := &xAccount{clients: c, id: id, path: path, board: &xSwitchboard{base: base}, timeout: cfg.InferenceTimeout, refresh: cfg.XRefresh, stop: make(chan struct{})}
+	a := &xAccount{clients: c, id: id, path: path, board: &xSwitchboard{base: base}, timeout: cfg.InferenceTimeout, refresh: cfg.XRefresh, stop: make(chan struct{}), kick: make(chan struct{}, 1)}
 	if a.timeout <= 0 {
 		a.timeout = xBuildTimeout
 	}
@@ -145,6 +235,19 @@ type xAccount struct {
 	gen     uint64
 	stop    chan struct{}
 	stopped bool
+	// kick tells the refresher that a client without transaction-ID material
+	// was installed, so it retries the bootstrap soon.
+	kick chan struct{}
+	// ids are the overrides of the last installed client, kept across a drop
+	// so a background build serves the same leases.
+	ids map[string]string
+	// What the background remembers of the last failed build, for the session
+	// file content (failed is its stamp) that build read: whether X refused
+	// that session, and when the next background build may start.
+	failed  string
+	refused bool
+	backoff time.Duration
+	retryAt time.Time
 }
 
 // xWarm is one built client with what it was built from.
@@ -154,6 +257,42 @@ type xWarm struct {
 	ids    map[string]string // query ID overrides it was built with
 	replay *xValidation      // its construction-time validation answers
 	gen    uint64
+	// lastReq is when this client last sent a request, in Unix nanoseconds:
+	// the end of its construction, then each read handed to a proof transport.
+	lastReq atomic.Int64
+}
+
+// pacingWait is the least time x-go would hold this client's next request
+// back because of the rate-limit state X last reported, and the time until
+// that window resets. With quota left it mirrors x-go's adaptive gap, which
+// spreads what is left over the window; a gap no wider than the fixed request
+// gap is ordinary pacing and counts as no wait. With no quota left the wait is
+// the whole time to the reset: x-go measures its hold from the last request, so
+// it lets a read through once half the window has passed, and X would only
+// answer that read with a rate limit.
+func (w *xWarm) pacingWait(minGap time.Duration) (wait, reset time.Duration) {
+	rs := w.client.RateLimit()
+	reset = rs.ResetIn()
+	if reset <= 0 {
+		return 0, 0
+	}
+	if rs.Remaining <= 0 {
+		return reset, reset
+	}
+	gap := reset / time.Duration(max(int64(float64(rs.Remaining)*0.9), 1))
+	if gap <= minGap {
+		return 0, reset
+	}
+	return max(time.Until(time.Unix(0, w.lastReq.Load()).Add(gap)), 0), reset
+}
+
+// exhausted is the time until X's quota window resets when X last reported no
+// request left in it, and zero otherwise.
+func (w *xWarm) exhausted() time.Duration {
+	if rs := w.client.RateLimit(); rs.Remaining <= 0 {
+		return rs.ResetIn()
+	}
+	return 0
 }
 
 // serves reports whether this client builds the requests a lease pins. An
@@ -171,9 +310,12 @@ func (w *xWarm) serves(ids map[string]string, strict bool) bool {
 }
 
 // xBuild is one construction in progress; done closes when warm or err is
-// set. kind is "" for a build a job waits for, "refresh" for the timer's
-// transaction-ID refresh and "rebuild" for the background rebuild after an
-// authentication failure; the last two log their outcome, since no job sees it.
+// set. kind is "" for a build a job (or Warm) waits for, "rebuild" for the
+// background rebuild after an authentication failure, "warm" for Ensure's
+// background build, "refresh" for the timer's refresh, which lets the Viewer
+// read go to X, and "replay" for a background replacement that only fetches
+// the transaction-ID material again. The background kinds log their outcome,
+// since no job sees it.
 type xBuild struct {
 	done chan struct{}
 	kind string
@@ -181,12 +323,25 @@ type xBuild struct {
 	err  error
 }
 
+// xSwap reports whether kind replaces a serving client in the background. Such
+// a build's failure belongs to nobody: the current client keeps serving.
+func xSwap(kind string) bool { return kind == "refresh" || kind == "replay" }
+
+// xRefused reports whether a build failed because X refused the session
+// itself. A rate limit or a transport failure is not a refusal, and neither is
+// a not-found answer, which is what a rotated query ID looks like.
+func xRefused(e error) bool {
+	return xAuthFailure(e) && !errors.Is(e, x.ErrRateLimited) && !errors.Is(e, x.ErrNotFound)
+}
+
 // acquire returns a client for a job: the current one when it was built from
 // the session file as it is now and serves ids, otherwise the one the build
 // in progress produces (starting one when needed), waiting at most until ctx
-// ends. Only a job that finds no usable client waits.
+// ends. Only a job that finds no usable client waits. The failure of a
+// background swap the job happened to wait on is not the job's: it starts a
+// build of its own instead, at most twice.
 func (a *xAccount) acquire(ctx context.Context, ids map[string]string, strict bool) (*xWarm, error) {
-	for {
+	for inherited := 0; ; {
 		_, stamp, err := readXSession(a.path)
 		if err != nil {
 			return nil, errXSession
@@ -213,6 +368,10 @@ func (a *xAccount) acquire(ctx context.Context, ids map[string]string, strict bo
 			return nil, ctx.Err()
 		}
 		if b.err != nil {
+			if xSwap(b.kind) && inherited < 2 {
+				inherited++
+				continue
+			}
 			return nil, b.err
 		}
 		// A build that read another version of the file, or lacks an override
@@ -237,6 +396,72 @@ func (a *xAccount) drop(warm *xWarm) {
 	if a.build == nil {
 		a.startBuild(nil, warm.ids, "rebuild")
 	}
+}
+
+// replace swaps warm for a client with fresh pacing state, in the background
+// and without asking X anything but the bootstrap pages. A job that ended
+// while x-go held its request back leaves the slot it reserved on the shared
+// client; later jobs would wait behind it.
+func (a *xAccount) replace(warm *xWarm) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.current != warm || a.build != nil || a.stopped {
+		return
+	}
+	a.logf("x client for account %s is being replaced after a job ended waiting for its request slot", a.id)
+	a.startBuild(warm, nil, "replay")
+}
+
+// ensure reports whether the account has a client built from its session file
+// as it is now. When it has none, one is due and start allows it, ensure starts
+// a validated background build and reports that as built.
+func (a *xAccount) ensure(start bool) (warm, built bool) {
+	_, stamp, err := readXSession(a.path)
+	if err != nil {
+		return false, false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.stopped {
+		return false, false
+	}
+	if a.current != nil && a.current.stamp == stamp {
+		return true, false
+	}
+	if !start || a.build != nil {
+		return false, false
+	}
+	if a.failed != stamp {
+		// What an earlier build learned was about other file content.
+		a.failed, a.refused, a.backoff, a.retryAt = "", false, 0, time.Time{}
+	}
+	if a.refused || time.Now().Before(a.retryAt) {
+		return false, false
+	}
+	if a.current != nil {
+		a.logf("x session for account %s changed; rebuilding its client", a.id)
+	}
+	a.startBuild(a.current, a.ids, "warm")
+	return false, true
+}
+
+// noteFailure backs the background off after a failed build of the session
+// file content stamp names. Caller holds a.mu.
+func (a *xAccount) noteFailure(stamp string, err error) {
+	if a.failed != stamp || a.backoff <= 0 {
+		a.backoff = a.clients.retryBase()
+	} else {
+		a.backoff *= 2
+	}
+	a.backoff = min(a.backoff, a.refresh)
+	a.failed = stamp
+	wait := a.backoff
+	// X said when it will answer again; asking sooner only extends the limit.
+	var limited *x.RateLimitError
+	if errors.As(err, &limited) && limited.Wait > wait {
+		wait = limited.Wait
+	}
+	a.retryAt = time.Now().Add(wait)
 }
 
 // startBuild starts constructing a client with the overrides of prior plus
@@ -269,50 +494,109 @@ func (a *xAccount) run(b *xBuild, prior *xWarm, ids map[string]string) {
 		case <-ctx.Done():
 		}
 	}()
-	warm, err := a.construct(ctx, prior, ids)
+	warm, stamp, asked, err := a.construct(ctx, prior, ids, b.kind)
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.build = nil
-	if err == nil && b.kind == "refresh" {
+	if err == nil && xSwap(b.kind) {
 		switch {
 		case a.current == nil:
-			// Dropped while the refresh ran: its validation was replayed, not
-			// repeated, so it must not stand in for the validated rebuild the
-			// next job starts.
+			// Dropped while the swap ran: it must not stand in for the validated
+			// rebuild the next job, or Ensure, starts.
 			err = errXDropped
 		case warm.client.TransactionInitErr() != nil && a.current.client.TransactionInitErr() == nil:
-			// A refresh that lost the transaction-ID material the current
-			// client has would make gated reads 404; keep serving that one.
+			// A swap that lost the transaction-ID material the current client
+			// has would make gated reads 404; keep serving that one.
 			err = fmt.Errorf("%w: transaction bootstrap failed: %v", x.ErrRequestFailed, warm.client.TransactionInitErr())
 		}
 	}
+	// Stop and eviction cancel a build; its error says nothing about X.
+	report := asked && !a.stopped && !errors.Is(err, errXDropped)
+	code := ""
 	if err != nil {
 		b.err = err
-		if b.kind == "rebuild" {
-			a.logf("x client rebuild for account %s failed: %s", a.id, xFailure(context.Background(), err))
+		code = xFailure(context.Background(), err)
+		if code == "auth_required" && asked && !xRefused(err) {
+			// X answered the validation, but not with a refusal (a not-found is
+			// what a rotated query ID looks like). The account must not be parked
+			// until its session file changes, or the retry below could never run.
+			code = "x_request_failed"
 		}
+		switch {
+		case a.stopped || errors.Is(err, errXDropped):
+		case xRefused(err):
+			// X refused this session: nothing asks again until the file changes.
+			// That includes the refresher, so a client built from other file
+			// content goes too; it would send cookies the file no longer holds.
+			a.failed, a.refused = stamp, true
+			if a.current != nil && (a.current.stamp != stamp || b.kind == "refresh" && a.current == prior) {
+				a.current = nil
+			}
+		case b.kind == "refresh":
+			// X did not refuse the session and the current client keeps serving:
+			// a refresh that could not reach X is no news about the account.
+			report = false
+		case !xSwap(b.kind):
+			a.noteFailure(stamp, err)
+		}
+		switch b.kind {
+		case "rebuild":
+			a.logf("x client rebuild for account %s failed: %s", a.id, code)
+		case "warm":
+			a.logf("x client warm-up failed for account %s: %s", a.id, code)
+		}
+	} else {
+		a.gen++
+		warm.gen = a.gen
+		if !a.stopped {
+			a.current = warm
+		}
+		b.warm = warm
+		a.ids = warm.ids
+		a.failed, a.refused, a.backoff, a.retryAt = "", false, 0, time.Time{}
+		degraded := warm.client.TransactionInitErr() != nil
+		if degraded && !xSwap(b.kind) {
+			// Ungated reads work on this client, so it serves; the refresher
+			// owns the retry (a swap is already one of its retries).
+			a.logf("x client for account %s has no transaction-ID material; the bootstrap will be retried", a.id)
+			select {
+			case a.kick <- struct{}{}:
+			default:
+			}
+		}
+		switch {
+		case b.kind == "rebuild":
+			a.logf("x client rebuilt for account %s", a.id)
+		case b.kind == "warm" && !degraded:
+			a.logf("x client ready for account %s", a.id)
+		}
+	}
+	a.mu.Unlock()
+	observe := a.clients.observer()
+	if !report || observe == nil {
 		return
 	}
-	a.gen++
-	warm.gen = a.gen
-	if !a.stopped {
-		a.current = warm
+	// The outcome is about the file content this build read. When the session
+	// file was replaced while X answered, it says nothing about the new one.
+	if _, now, e := readXSession(a.path); e != nil || now != stamp {
+		return
 	}
-	b.warm = warm
-	if b.kind == "rebuild" {
-		a.logf("x client rebuilt for account %s", a.id)
-	}
+	// Reported before done closes, so whoever waited on this build finds the
+	// outcome already applied.
+	observe(a.path, code)
 }
 
 // construct builds one x-go client. Its validation reads and bootstrap
 // fetches are the only unproven requests the switchboard lets through, and
-// only while this construction runs.
-func (a *xAccount) construct(ctx context.Context, prior *xWarm, ids map[string]string) (*xWarm, error) {
+// only while this construction runs. It also returns the stamp of the session
+// file it read and whether it asked X to validate that session.
+func (a *xAccount) construct(ctx context.Context, prior *xWarm, ids map[string]string, kind string) (*xWarm, string, bool, error) {
 	session, stamp, err := readXSession(a.path)
 	if err != nil {
-		return nil, errXSession
+		return nil, "", false, errXSession
 	}
-	con := &xConstruction{}
+	// Only the timer's refresh repeats the Viewer read: once per interval is
+	// the light check that notices a session X revoked while the node was idle.
+	con := &xConstruction{revalidate: kind == "refresh"}
 	if prior != nil && prior.stamp == stamp && prior.replay != nil && prior.replay.complete() {
 		con.replay = prior.replay
 	}
@@ -320,59 +604,99 @@ func (a *xAccount) construct(ctx context.Context, prior *xWarm, ids map[string]s
 	hc := &http.Client{Transport: a.board, Timeout: a.timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	client, err := session.NewClient(withXConstruction(ctx, con), x.WithHTTPClient(hc), x.WithRetry(1, time.Millisecond), x.WithQueryIDs(ids), x.WithMinRequestGap(a.clients.gap()))
 	if err != nil {
-		return nil, err
+		return nil, stamp, con.asked.Load(), err
 	}
 	replay := con.replay
 	if replay == nil {
 		replay = &con.captured
 	}
-	return &xWarm{client: client, stamp: stamp, ids: ids, replay: replay}, nil
+	warm := &xWarm{client: client, stamp: stamp, ids: ids, replay: replay}
+	warm.lastReq.Store(time.Now().UnixNano())
+	return warm, stamp, con.asked.Load(), nil
 }
 
-// refreshNow rebuilds the current client's transaction-ID material while it
-// keeps serving, then swaps. Nothing to do without a current client or while
+// refreshNow is the timer's refresh: it rebuilds the current client's
+// transaction-ID material and asks X once whether the session still holds,
+// while the current client keeps serving, then swaps.
+func (a *xAccount) refreshNow() error { return a.swap("refresh") }
+
+// swap builds a replacement of the current client in the background kind
+// names and waits for it. Nothing to do without a current client or while
 // another build runs.
-func (a *xAccount) refreshNow() error {
+func (a *xAccount) swap(kind string) error {
 	a.mu.Lock()
 	cur := a.current
 	if cur == nil || a.build != nil {
 		a.mu.Unlock()
 		return nil
 	}
-	b := a.startBuild(cur, nil, "refresh")
+	b := a.startBuild(cur, nil, kind)
 	a.mu.Unlock()
 	<-b.done
 	if b.err == nil {
-		a.logf("x client refreshed for account %s", a.id)
+		if b.warm.client.TransactionInitErr() != nil {
+			a.logf("x client for account %s still has no transaction-ID material; the bootstrap will be retried", a.id)
+		} else {
+			a.logf("x client refreshed for account %s", a.id)
+		}
 		return nil
 	}
 	a.mu.Lock()
 	if errors.Is(b.err, errXSession) && a.current == cur {
-		// The session file is gone or unusable: nothing to keep warm. A later
-		// job finds no client and builds from whatever the file is by then.
+		// The session file is gone or unusable: nothing to keep warm. Ensure, or
+		// a later job, builds from whatever the file is by then.
 		a.current = nil
 	}
 	kept := a.current != nil
 	a.mu.Unlock()
-	if kept {
+	switch {
+	case xRefused(b.err):
+		a.logf("x session for account %s was refused by X; its client is dropped until the session file changes", a.id)
+	case kept:
 		a.logf("x client refresh failed for account %s: %s; keeping the current client", a.id, xFailure(context.Background(), b.err))
-	} else {
-		a.logf("x client refresh for account %s discarded: %s; the next job rebuilds the client", a.id, xFailure(context.Background(), b.err))
+	default:
+		a.logf("x client refresh for account %s discarded: %s; the client is rebuilt in the background or by the next job", a.id, xFailure(context.Background(), b.err))
 	}
 	return b.err
 }
 
+// degraded reports whether the current client lacks transaction-ID material.
+func (a *xAccount) degraded() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.current != nil && a.current.client.TransactionInitErr() != nil
+}
+
+// refresher refreshes the client every refresh interval. While the current
+// client has no transaction-ID material it retries the bootstrap sooner, from
+// xRetryBase and doubling up to the interval; those retries replay the
+// validation, so each costs only the two bootstrap fetches.
 func (a *xAccount) refresher() {
-	timer := time.NewTimer(a.refresh)
+	wait, next := a.refresh, a.clients.retryBase()
+	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	for {
 		select {
 		case <-a.stop:
 			return
+		case <-a.kick:
+			next = a.clients.retryBase()
 		case <-timer.C:
-			_ = a.refreshNow()
-			timer.Reset(a.refresh)
+			kind := "refresh"
+			if wait < a.refresh && a.degraded() {
+				kind = "replay"
+			}
+			_ = a.swap(kind)
+			if !a.degraded() {
+				next = a.clients.retryBase()
+				wait = a.refresh
+				timer.Reset(wait)
+				continue
+			}
 		}
+		wait = min(next, a.refresh)
+		next = min(next*2, a.refresh)
+		timer.Reset(wait)
 	}
 }
 
@@ -427,8 +751,12 @@ func (s *xSwitchboard) RoundTrip(r *http.Request) (*http.Response, error) {
 type xBinding struct {
 	specs []xSpec
 	proof http.RoundTripper
-	mu    sync.Mutex
-	next  int
+	// warm is the client the job reads on; it learns when a read was sent.
+	warm *xWarm
+	mu   sync.Mutex
+	next int
+	// sent counts the reads handed to the proof transport, proven or not.
+	sent int
 	// stale is set when the first request used another query ID for the
 	// pinned operation: the client lacks the lease's override. No proof was
 	// spent, so the job rebuilds with the override and tries once more.
@@ -491,11 +819,24 @@ func (b *xBinding) roundTrip(r *http.Request) (*http.Response, error) {
 	} else if _, present := q["fieldToggles"]; present {
 		return nil, errUnprovenXCall
 	}
+	b.sent++
+	if b.warm != nil {
+		b.warm.lastReq.Store(time.Now().UnixNano())
+	}
 	response, e := b.proof.RoundTrip(r)
 	if e == nil {
 		b.next++
 	}
 	return response, e
+}
+
+// idle reports whether every read the job handed to the proof transport was
+// proven. A job that failed while idle never had its failing read sent: with
+// an ended context, x-go was still holding that read back for pacing.
+func (b *xBinding) idle() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sent == b.next
 }
 
 func (b *xBinding) proven() int {
@@ -514,12 +855,16 @@ func (b *xBinding) wasStale() bool {
 // the switchboard lets x-go's two session-validation reads (Viewer and
 // UserByRestId, each once) and its transaction-ID bootstrap fetches through
 // Base unproven. With replay set, the validation reads are answered from the
-// account's earlier validated construction and never leave the node: a
-// refresh fetches only the bootstrap pages. Once done is set nothing more
+// account's earlier validated construction and never leave the node, except
+// that revalidate lets the Viewer read go to X: the timer's refresh asks X
+// once whether the session still holds. Once done is set nothing more
 // passes, so a kept context cannot reopen the door.
 type xConstruction struct {
-	done     atomic.Bool
-	replay   *xValidation
+	done       atomic.Bool
+	replay     *xValidation
+	revalidate bool
+	// asked is set once a validation read was sent to X rather than replayed.
+	asked    atomic.Bool
 	mu       sync.Mutex
 	served   map[string]bool
 	captured xValidation
@@ -552,14 +897,17 @@ func (c *xConstruction) roundTrip(base http.RoundTripper, r *http.Request) (*htt
 		if repeated {
 			return nil, errUnprovenXCall
 		}
-		if c.replay != nil {
+		if c.replay != nil && !(c.revalidate && op == "Viewer") {
 			return c.replay.answer(op).response(r), nil
 		}
+		c.asked.Store(true)
 		response, err := base.RoundTrip(r)
 		if err != nil {
 			return nil, err
 		}
-		c.captured.capture(op, response)
+		if c.replay == nil {
+			c.captured.capture(op, response)
+		}
 		return response, nil
 	}
 	if r.URL.Host == "x.com" || r.URL.Host == "abs.twimg.com" {
