@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -212,5 +214,67 @@ func TestPollWithoutChallenge(t *testing.T) {
 	reply, err := New(server.URL, "demo").Poll(context.Background(), Heartbeat{Version: Version, NodeID: "node"})
 	if err != nil || reply.Lease == nil {
 		t.Fatalf("legacy/demo poll: %v", err)
+	}
+}
+
+// The heartbeat is a long poll. It carries the hold it asks for, runs under its
+// own deadline of that hold plus the grace rather than the client's 10-second
+// timeout, and ctx cancellation ends it at once.
+func TestPollLongPollDeadlineIsWaitPlusGrace(t *testing.T) {
+	c := New("https://coordinator.example", "cred")
+	for wait, want := range map[int]time.Duration{0: 10 * time.Second, 20: 30 * time.Second, -3: 10 * time.Second} {
+		if got := c.heartbeatTimeout(wait); got != want {
+			t.Fatalf("wait %d: deadline %v, want %v", wait, got, want)
+		}
+	}
+	var firstHold atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var h Heartbeat
+		if json.NewDecoder(r.Body).Decode(&h) != nil {
+			t.Error("bad heartbeat body")
+		}
+		firstHold.CompareAndSwap(0, int32(h.WaitSeconds))
+		// Hold the request for most of the asked wait, then answer idle.
+		select {
+		case <-time.After(300 * time.Millisecond):
+			io.WriteString(w, `{"lease":null}`)
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+	c = New(server.URL, "cred")
+	c.HTTP.Timeout = 50 * time.Millisecond // Far shorter than the hold.
+	c.heartbeatGrace = 200 * time.Millisecond
+	started := time.Now()
+	if _, err := c.Poll(context.Background(), Heartbeat{Version: Version, NodeID: "node", WaitSeconds: 1}); err != nil {
+		t.Fatalf("held heartbeat failed under the client timeout: %v", err)
+	}
+	if time.Since(started) < 300*time.Millisecond {
+		t.Fatal("heartbeat did not wait for the hold")
+	}
+	if firstHold.Load() != 1 {
+		t.Fatalf("wait_seconds on the wire: %d", firstHold.Load())
+	}
+	// The client timeout still bounds every other call.
+	if _, err := c.Post(context.Background(), "/api/node/v1/heartbeat", Heartbeat{Version: Version, WaitSeconds: 1}, nil); err == nil {
+		t.Fatal("an ordinary post outlived the client timeout")
+	}
+	// A hold the coordinator does not honour ends at wait plus grace.
+	started = time.Now()
+	if _, err := c.Poll(context.Background(), Heartbeat{Version: Version, NodeID: "node", WaitSeconds: 0}); err == nil {
+		t.Fatal("heartbeat outlived wait plus grace")
+	}
+	if elapsed := time.Since(started); elapsed < 200*time.Millisecond || elapsed > 290*time.Millisecond {
+		t.Fatalf("heartbeat deadline fired after %v, want about 200ms", elapsed)
+	}
+	// Cancellation aborts a held heartbeat promptly.
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
+	started = time.Now()
+	if _, err := c.Poll(ctx, Heartbeat{Version: Version, NodeID: "node", WaitSeconds: 20}); err == nil {
+		t.Fatal("cancelled heartbeat returned a reply")
+	}
+	if time.Since(started) > 250*time.Millisecond {
+		t.Fatal("cancellation did not abort the held heartbeat", time.Since(started))
 	}
 }

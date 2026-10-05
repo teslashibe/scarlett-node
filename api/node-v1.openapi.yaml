@@ -32,7 +32,14 @@ paths:
   /api/node/v1/heartbeat:
     post:
       security: [{nodeBearer: []}]
-      summary: Report availability and poll for at most one lease
+      summary: Report availability and long-poll for at most one lease
+      description: >-
+        The coordinator records the report first, then answers with an offer as soon as one
+        exists. While nothing is offerable it holds the request open for up to wait_seconds
+        (clamped to 20, under its 30-second heartbeat staleness rule) and answers the moment a
+        job for this node is funded, or with a null lease at the deadline. The node heartbeats
+        again immediately after any answer; the hold is its only idle wait. A node must bound
+        the request by wait_seconds plus a transport grace, never by a short fixed timeout.
       requestBody:
         required: true
         content:
@@ -204,13 +211,14 @@ components:
         credential: {type: string}
     Heartbeat:
       type: object
-      required: [version, node_id, profile, state]
+      required: [version, node_id, profile, state, wait_seconds]
       description: Legacy nodes share catalog capacity. Services-mode nodes report independently enabled Codex/X capacities and states; all health is node-reported, not verifier acceptance or payment evidence.
       properties:
         version: {type: string, enum: [node-v1]}
         node_id: {type: string}
         profile: {type: string}
         state: {type: string, enum: [available, exhausted], description: exhausted means the node's gateway recently had no capacity; the coordinator offers it no lease until it reports available again.}
+        wait_seconds: {type: integer, minimum: 0, maximum: 20, description: "How long the coordinator may hold this heartbeat open while it has nothing to offer. The node sends 20; the coordinator clamps the value to [0, 20] and answers early the moment an offer exists. Zero asks for an immediate answer."}
         bid: {type: integer, minimum: 0, maximum: 1000000000, description: Standing assignment bid. Lower wins, then least assigned work, then node_id. Missing is treated as 100. Not an on-chain quote.}
         capacity: {type: integer, minimum: 0, maximum: 64, description: "Typed services report the exact sum of their capacities, including zero only when exhausted with all services blocked or not_added. Configured and ready services require positive capacity. Legacy untyped reports require positive capacity; omitted legacy capacity defaults to 1. The coordinator keeps open leases within this bound."}
         services:
