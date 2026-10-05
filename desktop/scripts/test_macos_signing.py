@@ -156,6 +156,22 @@ class MacSigningTests(AppFixture):
             with self.assertRaises(ValueError) as failure:
                 signing.run(['/usr/bin/codesign', 'fixture'])
         self.assertNotIn('PRIVATE_DETAIL', str(failure.exception))
+        self.assertEqual(signing.failure_summary(failure.exception), '[phase=validation] Native release operation failed: codesign (exit 1)')
+
+    def test_validation_diagnostic_does_not_echo_exception_payload(self):
+        for error in (ValueError('PRIVATE_DETAIL'), KeyError('PRIVATE_DETAIL'), OSError('PRIVATE_DETAIL'), TypeError('PRIVATE_DETAIL')):
+            diagnostic = signing.failure_summary(error)
+            self.assertNotIn('PRIVATE_DETAIL', diagnostic)
+            self.assertIn(type(error).__name__, diagnostic)
+
+    def test_phase_preserves_inner_operation_without_private_payload(self):
+        with self.assertRaises(ValueError) as failure:
+            with signing.release_phase('inventory'):
+                with signing.release_phase('vendor-signature'):
+                    raise ValueError('PRIVATE_DETAIL')
+        self.assertEqual(signing.failure_summary(failure.exception), '[phase=vendor-signature] Release validation failed: ValueError')
+        failure.exception.release_phase = 'PRIVATE_DETAIL'
+        self.assertEqual(signing.failure_summary(failure.exception), '[phase=validation] Release validation failed: ValueError')
 
     def test_final_ticket_failure_never_writes_release_evidence(self):
         dmg = Path(self.temporary.name) / 'Scarlett-Node.dmg'
