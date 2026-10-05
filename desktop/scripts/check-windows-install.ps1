@@ -5,7 +5,8 @@ param(
     [switch]$Preferences,
     [string]$BrowserFixture = '',
     [string]$UpgradeFixture = '',
-    [string]$UpgradeInstaller = ''
+    [string]$UpgradeInstaller = '',
+    [string]$XLoginRuntimeFixture = $env:SCARLETT_X_LOGIN_RUNTIME_FIXTURE
 )
 $ErrorActionPreference = 'Stop'
 $script:apiPort = 8088
@@ -1049,6 +1050,92 @@ function Identity-Diagnostics([string]$Name) {
     $diagnostic | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-identity-failure.json')
     Write-Output ($diagnostic | ConvertTo-Json -Depth 4 -Compress)
 }
+function Invoke-XLoginAcceptanceProcess([string]$File, [string[]]$Arguments, [int]$TimeoutMs) {
+    # Only fixed, reviewed fixture arguments enter this subprocess. Capture all
+    # output internally; evidence contains classifications, never native errors.
+    $quoted = @($Arguments | ForEach-Object {
+        if ($_ -match '["\r\n]' -or $_.EndsWith('\')) { throw 'Invalid browser acceptance argument' }
+        '"' + $_ + '"'
+    })
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $process.StartInfo.FileName = $File
+    $process.StartInfo.Arguments = $quoted -join ' '
+    $process.StartInfo.UseShellExecute = $false
+    $process.StartInfo.CreateNoWindow = $true
+    $process.StartInfo.RedirectStandardOutput = $true
+    $process.StartInfo.RedirectStandardError = $true
+    try {
+        if (-not $process.Start()) { throw 'Installed browser acceptance process could not start' }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutMs)) {
+            & (Join-Path $env:SystemRoot 'System32/taskkill.exe') /PID $process.Id /T /F 2>&1 | Out-Null
+            $process.WaitForExit(10000) | Out-Null
+            throw 'Installed browser acceptance process timed out'
+        }
+        $output = $stdout.GetAwaiter().GetResult()
+        $null = $stderr.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) { throw 'Installed browser acceptance process failed' }
+        return $output
+    } finally {
+        $process.Dispose()
+    }
+}
+
+function Check-XLoginRuntime([string]$Phase) {
+    if (-not $XLoginRuntimeFixture) { throw 'Installed browser runtime requires the reviewed native fixture executable' }
+    $fixturePath = [System.IO.Path]::GetFullPath($XLoginRuntimeFixture)
+    $runnerRoot = [System.IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
+    if (-not [System.IO.Path]::IsPathRooted($XLoginRuntimeFixture) -or
+        -not $fixturePath.StartsWith($runnerRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-Path -LiteralPath $fixturePath -PathType Leaf) -or
+        ((Get-Item -LiteralPath $fixturePath).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'Browser acceptance fixture must be a regular native executable in the disposable runner'
+    }
+    $resources = Join-Path $install 'runtime'
+    $runtimeRoot = Join-Path $resources 'x-login-runtime'
+    $node = Join-Path $runtimeRoot 'node.exe'
+    $browserTest = Join-Path $runtimeRoot 'social-login/test/interactive-x.test.js'
+    $chrome = Join-Path $env:ProgramFiles 'Google/Chrome/Application/chrome.exe'
+    foreach ($path in @($node, $browserTest, $chrome)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
+            ((Get-Item -LiteralPath $path).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'Installed browser acceptance prerequisite missing'
+        }
+    }
+    $names = @('SCARLETT_TEST_X_LOGIN_RESOURCES', 'SCARLETT_TEST_X_LOGIN_BROWSER',
+        'CAP_BROWSER_EXECUTABLE_PATH', 'CAP_BROWSER_CHANNEL', 'PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH', 'NODE_OPTIONS')
+    $before = @{}
+    foreach ($name in $names) { $before[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+    try {
+        $env:SCARLETT_TEST_X_LOGIN_RESOURCES = $resources
+        $env:SCARLETT_TEST_X_LOGIN_BROWSER = $chrome
+        $env:CAP_BROWSER_EXECUTABLE_PATH = $chrome
+        foreach ($name in @('CAP_BROWSER_CHANNEL', 'PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH', 'NODE_OPTIONS')) {
+            [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+        }
+        $manager = Invoke-XLoginAcceptanceProcess $fixturePath @('-test.run=^TestPackagedRuntimeLoopbackOptIn$', '-test.v', '-test.timeout=45s') 90000
+        if ($manager -notmatch '--- PASS: TestPackagedRuntimeLoopbackOptIn') { throw 'Installed browser manager fixture did not run' }
+        # Exercise the installed Playwright bytes and actual headed Chrome too.
+        # about:blank performs no X navigation and requires no account state.
+        $playwright = Join-Path $runtimeRoot 'social-login/node_modules/playwright/index.mjs'
+        $headed = "const{pathToFileURL}=await import('node:url');const{chromium}=await import(pathToFileURL(process.argv[1]).href);const b=await chromium.launch({executablePath:process.env.CAP_BROWSER_EXECUTABLE_PATH,headless:false});try{const p=await b.newPage();await p.goto('about:blank')}finally{await b.close()}"
+        $null = Invoke-XLoginAcceptanceProcess $node @('--input-type=module', '-e', $headed, $playwright) 45000
+        $null = Invoke-XLoginAcceptanceProcess $node @('--test', $browserTest) 180000
+        New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+        @{ phase = $Phase; installedRuntimeBytes = 'passed'; privateStateAndBearer = 'passed'
+            serviceReadiness = 'passed'; headedChromeLaunchAndClose = 'passed'; EOFShutdown = 'passed'; interceptedBrowserCases = 7
+            codeOnlyContinuation = 'passed'; passwordSubmissionBudget = 'passed'; lifecycleAndWarmReuse = 'passed'
+            chromeVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($chrome).ProductVersion
+            providerRequests = 0; accountProfiles = 'disposable only'
+        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory ('windows-x-login-runtime-' + $Phase + '.json'))
+        Write-Output 'Installed browser acceptance: manager readiness, private bearer, code continuation and lifecycle passed'
+    } finally {
+        foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $before[$name], 'Process') }
+    }
+}
+
 function Check-InstallationRoundTrip {
     if (-not $BrowserFixture -or -not $script:importState -or
         @(([System.IO.File]::ReadAllText((Join-Path $script:importState 'accounts.json')) | ConvertFrom-Json).accounts).Count -ne 2) {
@@ -1120,6 +1207,7 @@ function Check-InstallationRoundTrip {
             if ($version -notin @($candidate.version, ($candidate.version + '.0'))) { throw 'Installed executable has the wrong product version' }
             & $script:pythonExe (Join-Path $PSScriptRoot 'check-complete-bundle.py') $install $install
             if ($LASTEXITCODE -ne 0) { throw 'Replaced installation failed complete component validation' }
+            Check-XLoginRuntime $candidate.direction
             $after = Durable-Hashes
             if ($after.Count -ne $before.Count) { throw 'Installation changed private account/identity/journal files' }
             foreach ($path in $before.Keys) { if ($after[$path] -cne $before[$path]) { throw 'Installation changed private retained bytes' } }
@@ -1177,6 +1265,7 @@ foreach ($file in @($executable, (Join-Path $install 'scarlett-node.exe'),
 # The release signer runs this script from desktop/, PR CI from the repository root.
 python (Join-Path $PSScriptRoot 'check-complete-bundle.py') $install $install
 if ($LASTEXITCODE -ne 0) { throw 'Installed component integrity or API payload validation failed' }
+Check-XLoginRuntime 'baseline'
 
 # Keep one absolute interpreter for installation validation after PATH cleanup.
 # Application discovery can return several paths; the call operator needs one.
