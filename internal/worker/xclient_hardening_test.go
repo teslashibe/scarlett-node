@@ -24,7 +24,7 @@ type xObserved struct {
 	paths []string
 }
 
-func (o *xObserved) observe(path, code string) {
+func (o *xObserved) observe(path, stamp, code string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.paths, o.codes = append(o.paths, path), append(o.codes, code)
@@ -61,10 +61,10 @@ func xEventually(t *testing.T, what string, ok func() bool) {
 func TestXObserverSeesValidatedBuildOutcomes(t *testing.T) {
 	c, l, clients, fake := xWarmFixture(t, "fixture")
 	seen := &xObserved{}
-	clients.Observe(func(path, code string) {
+	clients.Observe(func(path, stamp, code string) {
 		// Taking both locks here deadlocks if the caller still holds either.
 		clients.account(c, c.LocalAccountID, c.XSession, nil).generation()
-		seen.observe(path, code)
+		seen.observe(path, stamp, code)
 	})
 	if code := xRun(c, l, clients, fake, &xProfileProof{}); code != "" {
 		t.Fatal(code)

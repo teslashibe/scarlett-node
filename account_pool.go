@@ -427,10 +427,15 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 // the failure code. A failure moves the account exactly as a failed job
 // would, so a session the node already knows is refused or unreachable is not
 // advertised until a funded job finds out again.
-func (p *servicePool) xValidated(path, code string) {
+func (p *servicePool) xValidated(path, stamp, code string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.refresh(time.Now())
+	// A login may replace this path while the observer waits for p.mu. Apply
+	// the old result only to the exact content that produced it.
+	if stamp == "" || worker.XSessionStamp(path) != stamp {
+		return
+	}
 	if p.healthError || p.accountsError || !p.entries["x_read"].enabled {
 		return
 	}

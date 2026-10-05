@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/teslashibe/scarlett-node/internal/localfs"
 	"github.com/teslashibe/scarlett-node/internal/worker"
 )
 
@@ -90,21 +91,21 @@ func TestXValidatedAppliesBuildOutcomesToThePool(t *testing.T) {
 	if !p.acquire("x_read") {
 		t.Fatal("fixture account unavailable")
 	}
-	p.xValidated(session+".other", "auth_required")
+	p.xValidated(session+".other", worker.XSessionStamp(session+".other"), "auth_required")
 	if s := healthKind(t, p, "x_read"); s.State != "configured" {
 		t.Fatal("outcome for an unknown session path applied", s.State)
 	}
-	p.xValidated(session, "")
+	p.xValidated(session, worker.XSessionStamp(session), "")
 	if s := healthKind(t, p, "x_read"); s.State != "ready" || s.InFlight != 1 || s.LastErrorCode != "" {
 		t.Fatalf("validated session: %+v", s)
 	}
 	p.finish("x_read", "")
-	p.xValidated(session, "x_request_failed")
+	p.xValidated(session, worker.XSessionStamp(session), "x_request_failed")
 	if s := healthKind(t, p, "x_read"); s.State != "unreachable" || s.LastErrorCode != "x_request_failed" || s.Capacity != 0 {
 		t.Fatalf("unreachable X at build: %+v", s)
 	}
 	// A validation does not end a rest early.
-	p.xValidated(session, "")
+	p.xValidated(session, worker.XSessionStamp(session), "")
 	if s := healthKind(t, p, "x_read"); s.State != "unreachable" {
 		t.Fatal("validation ended a rest", s.State)
 	}
@@ -116,7 +117,7 @@ func TestXValidatedAppliesBuildOutcomesToThePool(t *testing.T) {
 	}
 
 	limited := poolFixture(t, "x_read")
-	limited.xValidated(limited.config.XSession, "x_rate_limited")
+	limited.xValidated(limited.config.XSession, worker.XSessionStamp(limited.config.XSession), "x_rate_limited")
 	limited.mu.Lock()
 	rest = time.Until(limited.entries["x_read"].restUntil)
 	limited.mu.Unlock()
@@ -125,7 +126,7 @@ func TestXValidatedAppliesBuildOutcomesToThePool(t *testing.T) {
 	}
 
 	refused := poolFixture(t, "x_read")
-	refused.xValidated(refused.config.XSession, "auth_required")
+	refused.xValidated(refused.config.XSession, worker.XSessionStamp(refused.config.XSession), "auth_required")
 	if s := healthKind(t, refused, "x_read"); s.State != "auth_required" || s.Capacity != 0 {
 		t.Fatalf("refused session: %+v", s)
 	}
@@ -133,7 +134,7 @@ func TestXValidatedAppliesBuildOutcomesToThePool(t *testing.T) {
 		t.Fatal("refused session still leasable")
 	}
 	// Success never clears an authentication failure; only a new file does.
-	refused.xValidated(refused.config.XSession, "")
+	refused.xValidated(refused.config.XSession, worker.XSessionStamp(refused.config.XSession), "")
 	if s := healthKind(t, refused, "x_read"); s.State != "auth_required" {
 		t.Fatal("validation cleared an authentication failure", s.State)
 	}
@@ -145,7 +146,7 @@ func TestXValidatedAppliesBuildOutcomesToThePool(t *testing.T) {
 	// Managed accounts are found by their session path.
 	m := multiPool(t)
 	accounts := m.xAccounts()
-	m.xValidated(accounts[1].Path, "")
+	m.xValidated(accounts[1].Path, worker.XSessionStamp(accounts[1].Path), "")
 	states := map[string]string{}
 	for _, a := range m.accountStatus() {
 		states[a.Service+":"+a.ID] = a.State
@@ -321,4 +322,106 @@ func TestXKeeperConfirmsAWarmAccountAfterARest(t *testing.T) {
 	if again := x.requests("synthetic-auth"); again != asked {
 		t.Fatal("confirming a warm account asked X again", asked, again)
 	}
+}
+
+// The observer can finish its provider work before a login but wait for the
+// pool lock until after the session's atomic replacement. Neither an old
+// refusal nor an old success is evidence about the new session.
+func TestXValidatedFencesSessionReplacementUnderPoolLock(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		refused, cached bool
+	}{{"refused build", true, false}, {"successful build", false, false}, {"cached Ensure", false, true}} {
+		t.Run(test.name, func(t *testing.T) {
+			p := poolFixture(t, "x_read")
+			_ = p.health()
+			clients := worker.NewXClients()
+			defer clients.Stop()
+			fake := &keeperX{}
+			fake.refuse.Store(test.refused)
+			clients.Base = fake
+			accounts := []worker.XAccount{{ID: "legacy", Path: p.config.XSession}}
+			if test.cached {
+				clients.Warm(context.Background(), p.config, accounts)
+			}
+			arrived := make(chan struct{})
+			clients.Observe(func(path, stamp, code string) {
+				close(arrived)
+				p.xValidated(path, stamp, code)
+			})
+			p.mu.Lock()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				if test.cached {
+					clients.Ensure(p.config, accounts)
+				} else {
+					clients.Warm(context.Background(), p.config, accounts)
+				}
+			}()
+			select {
+			case <-arrived:
+			case <-time.After(5 * time.Second):
+				p.mu.Unlock()
+				t.Fatal("offline validation did not reach the observer")
+			}
+			err := localfs.WriteAtomic(p.config.XSession, []byte(`{"auth_token":"new-verified-synthetic-session","ct0":"new-synthetic-csrf"}`), true)
+			p.mu.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("observer did not finish")
+			}
+			if h := healthKind(t, p, "x_read"); h.State != "configured" || h.LastErrorCode != "" {
+				t.Fatalf("old validation changed the newly replaced session: %+v", h)
+			}
+		})
+	}
+}
+
+// The cache retains the warm pointer while the pool rests an account. Its
+// autonomous timer must also consult that pool, not merely the keeper's list.
+func TestXRefreshRespectsPoolCooldownAndResumes(t *testing.T) {
+	p := poolFixture(t, "x_read")
+	p.config.XRefresh = 40 * time.Millisecond
+	clients := worker.NewXClients()
+	defer clients.Stop()
+	fake := &keeperX{}
+	clients.Base = fake
+	clients.Observe(p.xValidated)
+	var blocked atomic.Int32
+	clients.RefreshAdmission(func(path string) bool {
+		admitted := p.xRefreshAllowed(path)
+		if !admitted {
+			blocked.Add(1)
+		}
+		return admitted
+	})
+	// Hold pool admission closed during initial warm-up, then prove several
+	// actual timer ticks are denied while the retained client remains idle.
+	p.mu.Lock()
+	p.refresh(time.Now())
+	a := p.accounts["x_read:legacy"]
+	a.entry.state, a.entry.lastError = "exhausted", "x_rate_limited"
+	a.entry.restUntil = time.Now().Add(time.Hour)
+	p.mu.Unlock()
+	clients.Warm(context.Background(), p.config, []worker.XAccount{{ID: "legacy", Path: p.config.XSession}})
+	if len(p.xAccounts()) != 0 {
+		t.Fatal("resting account remained eligible for warm-up")
+	}
+	before := fake.requests("synthetic-auth")
+	if before == 0 {
+		t.Fatal("fixture did not build a warm client")
+	}
+	eventually(t, "autonomous refresh admission during cooldown", func() bool { return blocked.Load() >= 3 })
+	if after := fake.requests("synthetic-auth"); after != before {
+		t.Fatalf("cooldown admitted background requests: %d -> %d", before, after)
+	}
+	p.mu.Lock()
+	a.entry.restUntil = time.Now().Add(-time.Second)
+	p.mu.Unlock()
+	eventually(t, "background refresh after cooldown", func() bool { return fake.requests("synthetic-auth") > before })
 }
