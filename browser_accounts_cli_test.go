@@ -149,3 +149,54 @@ func TestNativeBrowserImportFailureReturnsNonzeroWithoutPrivateOutput(t *testing
 		}
 	}
 }
+
+func TestBrowserAccountReimportReplacesSessionForTheSameID(t *testing.T) {
+	_, path := browserHomeFixture(t)
+	dir := privateTestDir(t)
+	t.Setenv("SCARLETT_STATE_DIR", dir)
+	t.Setenv("SCARLETT_ACCOUNTS_FILE", "")
+	id := browserFixtureID(t)
+	var out bytes.Buffer
+	if err := accountsCommand([]string{"connect", "x_read", "browser-one", "2"}, strings.NewReader(`{"auth_token":"synthetic-expired-auth","ct0":"synthetic-expired-csrf"}`), &out); err != nil {
+		t.Fatal(err)
+	}
+	session := filepath.Join(dir, "accounts", "x_read-browser-one", "session.json")
+	// A busy store reports its fixed code and leaves the old session alone.
+	if err := os.WriteFile(path+"-wal", []byte("synthetic active journal"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	err := accountsCommand([]string{"reimport-x", id, "browser-one"}, nil, &out)
+	if err == nil || err.Error() != "browser_busy" || out.String() != "{\"code\":\"browser_busy\",\"status\":\"error\"}\n" {
+		t.Fatal("busy re-import did not return a fixed failure", err)
+	}
+	if raw, _ := os.ReadFile(session); !bytes.Contains(raw, []byte("synthetic-expired-auth")) {
+		t.Fatal("failed re-import changed the session")
+	}
+	if err := os.Remove(path + "-wal"); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(path)
+	out.Reset()
+	if err := accountsCommand([]string{"reimport-x", id, "browser-one"}, nil, &out); err != nil {
+		t.Fatal("isolated re-import failed", err)
+	}
+	if out.String() != "{\"status\":\"updated\"}\n" {
+		t.Fatal("re-import returned unexpected output")
+	}
+	raw, err := os.ReadFile(session)
+	if err != nil || !bytes.Contains(raw, []byte("synthetic-import-auth")) || bytes.Contains(raw, []byte("synthetic-expired")) {
+		t.Fatal("browser session not installed", err)
+	}
+	f, err := loadAccounts(filepath.Join(dir, "accounts.json"))
+	if err != nil || len(f.Accounts) != 1 || f.Accounts[0].Concurrency != 2 || f.Accounts[0].Path != session {
+		t.Fatal("re-import changed the account registration", err)
+	}
+	if after, _ := os.ReadFile(path); !bytes.Equal(before, after) {
+		t.Fatal("source browser database changed")
+	}
+	out.Reset()
+	if err := accountsCommand([]string{"reimport-x", id, "unknown"}, nil, &out); err == nil {
+		t.Fatal("re-import created a new account")
+	}
+}

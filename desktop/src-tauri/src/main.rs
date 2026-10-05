@@ -54,9 +54,23 @@ async fn desktop_status(
     api: State<'_, Arc<LocalApi>>,
 ) -> node::Result<node::Snapshot> {
     local_window(&window)?;
-    let mut status = node.snapshot().await;
-    status.local_api = api.snapshot().await;
-    Ok(status)
+    Ok(status(&node, &api).await)
+}
+/// Node and local API status only. Claude status is its own command: it hashes
+/// the whole bundled Claude binary and launches its CLI, and waiting on that
+/// kept a freshly launched, paired node showing Pair node.
+async fn status(node: &Node, api: &LocalApi) -> node::Snapshot {
+    let (mut status, local_api) = tokio::join!(node.snapshot(), api.snapshot());
+    status.local_api = local_api;
+    status
+}
+#[tauri::command]
+async fn claude_status(
+    window: WebviewWindow,
+    api: State<'_, Arc<LocalApi>>,
+) -> node::Result<claude_auth::Snapshot> {
+    local_window(&window)?;
+    Ok(api.claude.snapshot().await)
 }
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -308,6 +322,38 @@ async fn import_x_profile(
     node.import_x(profile, id, concurrency).await
 }
 #[tauri::command]
+async fn reconnect_x(
+    window: WebviewWindow,
+    node: State<'_, Arc<Node>>,
+    id: String,
+    auth_token: String,
+    ct0: String,
+) -> node::Result<()> {
+    local_window(&window)?;
+    node.reconnect_x(id, auth_token, ct0).await
+}
+#[tauri::command]
+async fn reimport_x_profile(
+    window: WebviewWindow,
+    node: State<'_, Arc<Node>>,
+    profile: String,
+    id: String,
+    consent: bool,
+) -> node::Result<()> {
+    local_window(&window)?;
+    if !consent {
+        return Err(Error::InvalidInput);
+    }
+    node.reimport_x(profile, id).await
+}
+/// Runs only the bundled node's `relay-resume`. The renderer confirms first;
+/// the supervised node is neither drained nor restarted.
+#[tauri::command]
+async fn resume_relay(window: WebviewWindow, node: State<'_, Arc<Node>>) -> node::Result<()> {
+    local_window(&window)?;
+    node.resume_relay().await
+}
+#[tauri::command]
 fn open_network(
     window: WebviewWindow,
     node: State<'_, Arc<Node>>,
@@ -406,6 +452,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             desktop_status,
+            claude_status,
             quit_desktop,
             pair_node,
             control_node,
@@ -416,6 +463,9 @@ fn main() {
             cancel_login,
             browser_profiles,
             import_x_profile,
+            reconnect_x,
+            reimport_x_profile,
+            resume_relay,
             control_local_api,
             control_claude,
             local_api_key,
@@ -581,5 +631,93 @@ mod tests {
             assert!(!local_url(&url.parse().unwrap()));
         }
         assert!(local_url(&"tauri://localhost".parse().unwrap()));
+    }
+    // Regression for the installed Windows round trip: a fresh app beside a
+    // paired identity, two X accounts and an attempt left pending by an earlier
+    // process must stop showing Pair node promptly. Its first status therefore
+    // never verifies or launches the bundled Claude runtime, even a valid one.
+    #[tokio::test]
+    async fn status_reports_a_paired_identity_without_the_claude_runtime() {
+        use sha2::Digest;
+        // Windows creates private directories only through the real node helper.
+        let supplied = std::env::var_os("SCARLETT_TEST_NODE_BINARY").map(std::path::PathBuf::from);
+        assert!(
+            cfg!(unix) || supplied.is_some(),
+            "set SCARLETT_TEST_NODE_BINARY to the built scarlett-node.exe"
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
+        let binary = supplied.clone().unwrap_or_else(|| {
+            temp.path()
+                .join("absent")
+                .join(format!("scarlett-node{suffix}"))
+        });
+        let state = temp.path().join("state");
+        node::private_dir_with_helper(&state, &binary).unwrap();
+        let node = Node::new(state.clone(), binary.clone(), binary.clone());
+        let resources = temp.path().join("runtime");
+        std::fs::create_dir_all(resources.join("claude")).unwrap();
+        let runtime = b"synthetic bundled claude runtime";
+        std::fs::write(
+            resources.join("claude").join(format!("claude{suffix}")),
+            runtime,
+        )
+        .unwrap();
+        let target = if cfg!(windows) {
+            "x86_64-pc-windows-msvc"
+        } else if cfg!(target_arch = "aarch64") {
+            "aarch64-apple-darwin"
+        } else {
+            "x86_64-apple-darwin"
+        };
+        let manifest = serde_json::json!({"schemaVersion": 1, "target": target, "claudeVersion": "2.1.286",
+            "files": [{"path": format!("claude/claude{suffix}"), "bytes": runtime.len(),
+                "sha256": format!("{:x}", sha2::Sha256::digest(runtime))}]});
+        std::fs::write(resources.join("COMPONENTS.json"), manifest.to_string()).unwrap();
+        // The local API's helper is the node binary beside it, as installed.
+        let api = LocalApi::new(
+            &state,
+            binary.with_file_name(format!("open-agent-api{suffix}")),
+            resources,
+        );
+        if supplied.is_some() {
+            for id in ["browser-firefox", "browser-paste"] {
+                node.connect_x(id.into(), 1, "a".repeat(40), "b".repeat(64))
+                    .await
+                    .unwrap();
+            }
+        }
+        std::fs::write(
+            state.join("identity.json"),
+            r#"{"node_id":"synthetic-node","supplier_pubkey":"synthetic-wallet","credential":"synthetic-credential"}"#,
+        )
+        .unwrap();
+        let journal = state.join("attempts");
+        node::private_dir_with_helper(&journal, &binary).unwrap();
+        std::fs::write(
+            journal.join("synthetic-pending.json"),
+            serde_json::json!({
+                "job_id": "synthetic-upgrade-job", "attempt": "synthetic-upgrade-attempt",
+                "fence": "synthetic-upgrade-fence", "fingerprint": "a".repeat(64),
+                "deadline": "2099-01-01T02:00:00Z", "updated_at": "2099-01-01T00:00:00Z", "state": "started",
+                "provider_account_id": "browser-firefox", "provider_service": "x_read"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let snapshot = status(&node, &api).await;
+        assert!(snapshot.paired, "paired identity was not recognized");
+        assert!(
+            !api.claude.integrity_checked(),
+            "node status waited on the Claude runtime"
+        );
+        if supplied.is_some() {
+            assert!(snapshot.accounts_available, "account inventory failed");
+            assert_eq!(snapshot.accounts.len(), 2);
+            assert!(snapshot.observation.is_some(), "local status failed");
+        }
+        // Claude has its own status, which does verify this valid runtime.
+        assert!(api.claude.snapshot().await.available);
+        assert!(api.claude.integrity_checked());
     }
 }

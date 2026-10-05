@@ -1,0 +1,234 @@
+# Build, sign and assemble one Scarlett Node desktop release from main.
+#
+# Installers are signed with Scarlett's own stable self-signed keys
+# (self-signed-stable; pins in desktop/signing/identities.json). The keys exist
+# only as release-signing environment secrets. They reach the two import steps
+# alone, live in a temporary keychain or the runner user's certificate store
+# while the signing step runs, and are removed by an always() cleanup. Nothing
+# here adds a trust root, uses a cache or publishes: the assembled release is an
+# artifact for the owner to review before the download publisher runs.
+name: desktop release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Desktop version to release; must equal desktop/src-tauri/tauri.conf.json on main'
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: desktop-release
+  cancel-in-progress: false
+jobs:
+  sign:
+    name: sign ${{ matrix.platform }}
+    if: github.ref == 'refs/heads/main'
+    environment: release-signing
+    strategy:
+      # Let every platform report in one run; the assembler needs all three.
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            platform: darwin-arm64
+            native: darwin-arm64
+            python: python3
+          - runner: macos-15-intel
+            platform: darwin-amd64
+            native: darwin-x64
+            python: python3
+          - runner: windows-2025
+            platform: windows-amd64
+            native: win32-x64
+            python: python
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_PLATFORM: ${{ matrix.platform }}
+      NATIVE_PLATFORM: ${{ matrix.native }}
+      PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require the reviewed version on main
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          "$PYTHON" desktop/scripts/release-manifest.py check-version "$RELEASE_VERSION"
+          "$PYTHON" desktop/scripts/signing_identities.py get macos.sha1 > /dev/null
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 26
+          package-manager-cache: false
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.95 --profile minimal
+      - name: Build reviewed components and prepare the complete native runtime
+        run: desktop/scripts/build-complete-runtime.sh "$NATIVE_PLATFORM" "$RUNNER_TEMP/scarlett-runtime"
+      - name: Install desktop build dependencies
+        run: npm --prefix desktop ci --ignore-scripts
+      - name: Build the unsigned Mac release app
+        if: runner.os == 'macOS'
+        working-directory: desktop
+        run: npm run tauri build -- --bundles app --no-sign --config src-tauri/tauri.complete.generated.json
+      - name: Build the unsigned Windows release executable
+        if: runner.os == 'Windows'
+        working-directory: desktop
+        run: npm run tauri build -- --no-bundle --config src-tauri/tauri.complete.generated.json
+
+      # Secrets appear only in these two import steps.
+      - name: Import the Mac signing key into a temporary keychain
+        if: runner.os == 'macOS'
+        env:
+          SCARLETT_MAC_P12_BASE64: ${{ secrets.SCARLETT_MAC_P12_BASE64 }}
+          SCARLETT_MAC_P12_PASSWORD: ${{ secrets.SCARLETT_MAC_P12_PASSWORD }}
+        run: |
+          if [[ -z "$SCARLETT_MAC_P12_BASE64" || -z "$SCARLETT_MAC_P12_PASSWORD" ]]; then
+            echo 'The release-signing Mac secrets are unavailable' >&2
+            exit 1
+          fi
+          umask 077
+          mkdir "$RUNNER_TEMP/signing"
+          printf '%s' "$SCARLETT_MAC_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/signing/identity.p12"
+          unset SCARLETT_MAC_P12_BASE64
+          # Creates the keychain, imports with -T /usr/bin/codesign, deletes the
+          # PKCS#12 file, sets the key partition list and checks the pinned SHA-1.
+          desktop/scripts/import-macos-identity.sh "$RUNNER_TEMP/signing/identity.p12" \
+            "$RUNNER_TEMP/signing/release.keychain-db" "$("$PYTHON" desktop/scripts/signing_identities.py get macos.sha1)"
+      - name: Import the Windows signing key without export rights
+        if: runner.os == 'Windows'
+        shell: powershell
+        env:
+          SCARLETT_WINDOWS_PFX_BASE64: ${{ secrets.SCARLETT_WINDOWS_PFX_BASE64 }}
+          SCARLETT_WINDOWS_PFX_PASSWORD: ${{ secrets.SCARLETT_WINDOWS_PFX_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:SCARLETT_WINDOWS_PFX_BASE64 -or -not $env:SCARLETT_WINDOWS_PFX_PASSWORD) {
+            throw 'The release-signing Windows secrets are unavailable'
+          }
+          $pin = [string](python desktop/scripts/signing_identities.py get windows.sha1)
+          if ($LASTEXITCODE -ne 0 -or $pin -cnotmatch '^[0-9a-f]{40}$') { throw 'Pinned Windows thumbprint unavailable' }
+          $folder = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP 'signing')
+          $pfx = Join-Path $folder.FullName 'identity.pfx'
+          try {
+            [System.IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SCARLETT_WINDOWS_PFX_BASE64))
+            $env:SCARLETT_WINDOWS_PFX_BASE64 = $null
+            # The PR rehearsal runs this same importer: Import-PfxCertificate
+            # without -Exportable, then it requires the pinned certificate with a
+            # non-exportable current-user CNG software key, refuses trusted roots
+            # and deletes the PKCS#12 file.
+            & desktop/scripts/import-windows-identity.ps1 -Pfx $pfx -Thumbprint $pin
+            if ($LASTEXITCODE -ne 0) { throw 'The Windows signing identity was not imported' }
+          } finally {
+            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Sign the Mac app and disk image
+        if: runner.os == 'macOS'
+        env:
+          SCARLETT_SIGNING_SCHEME: self-signed-stable
+        run: |
+          mkdir "$RUNNER_TEMP/release" "$RUNNER_TEMP/signed"
+          # Sign a copy so the unsigned build remains as provenance.
+          ditto "desktop/src-tauri/target/release/bundle/macos/Scarlett Node.app" "$RUNNER_TEMP/release/Scarlett Node.app"
+          SCARLETT_MAC_KEYCHAIN="$RUNNER_TEMP/signing/release.keychain-db" "$PYTHON" desktop/scripts/sign-macos-bundle.py \
+            "$RUNNER_TEMP/release/Scarlett Node.app" "$RUNNER_TEMP/signed/Scarlett-Node-$RELEASE_VERSION-$RELEASE_PLATFORM.dmg"
+          cp "$RUNNER_TEMP/release/Scarlett Node.app/Contents/Resources/runtime/COMPONENTS.json" "$RUNNER_TEMP/signed/COMPONENTS.json"
+      - name: Sign, package and accept the Windows installer
+        if: runner.os == 'Windows'
+        shell: powershell
+        env:
+          SCARLETT_SIGNING_SCHEME: self-signed-stable
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . desktop/scripts/sign-windows-file.ps1
+          $env:SCARLETT_WINDOWS_SIGNTOOL = Find-WindowsSdkSignTool
+          $env:SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT = [string](python desktop/scripts/signing_identities.py get windows.sha1)
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Windows thumbprint unavailable' }
+          $signed = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP 'signed')
+          $evidence = Join-Path $signed.FullName ('Scarlett-Node-' + $env:RELEASE_VERSION + '-windows-amd64.evidence.json')
+          # Signs our executables, packages NSIS, installs that exact installer for
+          # UI, preferences and browser-import acceptance, then checks every
+          # installed executable against the pins (WinVerifyTrust 0x800B0109).
+          python desktop/scripts/sign-windows-bundle.py (Join-Path $env:GITHUB_WORKSPACE 'desktop') $evidence
+          if ($LASTEXITCODE -ne 0) { throw 'Windows release signing failed' }
+          $installers = @(Get-ChildItem -LiteralPath desktop/src-tauri/target/release/bundle/nsis -Filter '*.exe')
+          if ($installers.Count -ne 1) { throw 'Expected exactly one signed Windows installer' }
+          Copy-Item -LiteralPath $installers[0].FullName -Destination $signed.FullName
+          Copy-Item -LiteralPath desktop/src-tauri/runtime/COMPONENTS.json -Destination $signed.FullName
+
+      - name: Remove the Mac signing keychain
+        if: always() && runner.os == 'macOS'
+        run: |
+          keychain="$RUNNER_TEMP/signing/release.keychain-db"
+          if [[ -e "$keychain" ]]; then security delete-keychain "$keychain"; fi
+          rm -rf "$RUNNER_TEMP/signing"
+          # Read the list first: grep -q in a pipeline under pipefail can mask a match.
+          search_list=$(security list-keychains -d user)
+          if grep -qF -- "$keychain" <<< "$search_list"; then
+            echo 'The signing keychain is still in the search list' >&2
+            exit 1
+          fi
+      - name: Remove the Windows signing key
+        if: always() && runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $identities = [System.IO.File]::ReadAllText((Join-Path $env:GITHUB_WORKSPACE 'desktop/signing/identities.json')) | ConvertFrom-Json
+          $path = 'Cert:\CurrentUser\My\' + ([string]$identities.windows.sha1).ToUpperInvariant()
+          if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -DeleteKey }
+          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'signing') -Recurse -Force -ErrorAction SilentlyContinue
+          if (Test-Path -LiteralPath $path) { throw 'The signing identity is still installed' }
+
+      - name: Launch the signed Mac app from its disk image
+        # Exercises hardened runtime and library validation on this architecture.
+        if: runner.os == 'macOS'
+        run: desktop/scripts/smoke-macos-dmg.sh "$RUNNER_TEMP/signed/Scarlett-Node-$RELEASE_VERSION-$RELEASE_PLATFORM.dmg" "$RUNNER_TEMP/smoke"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-${{ matrix.platform }}
+          path: ${{ runner.temp }}/signed/
+          if-no-files-found: error
+
+  assemble:
+    needs: sign
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require the reviewed version on main
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          python3 desktop/scripts/release-manifest.py check-version "$RELEASE_VERSION"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: signed-*
+          path: ${{ runner.temp }}/signed
+      - name: Assemble the release from pinned signing evidence
+        run: |
+          model_api=$(git ls-remote https://github.com/teslashibe/open-agent-api.git 'refs/tags/v0.1.32^{}' | cut -f1)
+          python3 desktop/scripts/release-manifest.py assemble --version "$RELEASE_VERSION" --channel stable \
+            --node-commit "$GITHUB_SHA" --model-api-commit "$model_api" \
+            --workflow-run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" \
+            --darwin-arm64 "$RUNNER_TEMP/signed/signed-darwin-arm64" \
+            --darwin-amd64 "$RUNNER_TEMP/signed/signed-darwin-amd64" \
+            --windows-amd64 "$RUNNER_TEMP/signed/signed-windows-amd64" \
+            --output "$RUNNER_TEMP/scarlett-node-release-$RELEASE_VERSION"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: scarlett-node-release-${{ inputs.version }}
+          path: ${{ runner.temp }}/scarlett-node-release-${{ inputs.version }}/
+          if-no-files-found: error

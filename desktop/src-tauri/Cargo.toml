@@ -27,3 +27,8 @@ winreg = "=0.55.0"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Testing installers are debug builds. Unoptimized SHA-256 over the bundled
+# Claude binary (245 MB on Windows) takes seconds; keep it at release speed.
+[profile.dev.package.sha2]
+opt-level = 3

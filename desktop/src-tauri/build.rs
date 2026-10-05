@@ -2,6 +2,7 @@ fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "desktop_status",
+            "claude_status",
             "quit_desktop",
             "pair_node",
             "control_node",
@@ -9,6 +10,9 @@ fn main() {
             "connect_x",
             "browser_profiles",
             "import_x_profile",
+            "reconnect_x",
+            "reimport_x_profile",
+            "resume_relay",
             "connect_codex",
             "remove_account",
             "cancel_login",

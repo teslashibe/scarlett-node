@@ -112,7 +112,7 @@ func accountsCommand(args []string, input io.Reader, output io.Writer) error {
 		return json.NewEncoder(output).Encode(profiles)
 	}
 	if len(args) < 1 {
-		return errors.New("usage: scarlett-node accounts list|add|connect|remove|browser-profiles|import-x")
+		return errors.New("usage: scarlett-node accounts list|add|connect|reconnect|remove|browser-profiles|import-x|reimport-x")
 	}
 	dir := os.Getenv("SCARLETT_STATE_DIR")
 	if dir == "" {
@@ -144,6 +144,13 @@ func accountsCommand(args []string, input io.Reader, output io.Writer) error {
 	f, e := loadAccounts(path)
 	if e != nil && !os.IsNotExist(e) {
 		return errors.New("cannot read private account configuration")
+	}
+	if (args[0] == "reconnect" && len(args) == 3 && args[1] == "x_read") || (args[0] == "reimport-x" && len(args) == 3) {
+		profile := ""
+		if args[0] == "reimport-x" {
+			profile = args[1]
+		}
+		return replaceXSession(dir, f, args[2], profile, input, output)
 	}
 	if args[0] == "list" && len(args) == 1 {
 		type item struct {
@@ -209,35 +216,15 @@ func accountsCommand(args []string, input io.Reader, output io.Writer) error {
 			if _, e := os.Lstat(filepath.Join(credentialDir, name)); !os.IsNotExist(e) {
 				return errors.New("refusing to overwrite account credentials")
 			}
-			var raw []byte
+			profile := ""
 			if args[0] == "import-x" {
-				browser, path, err := browserx.Resolve(args[1])
-				if err == nil {
-					raw, err = browserx.ReadSession(context.Background(), browser, path)
-				}
-				if err != nil {
-					if encodeErr := json.NewEncoder(output).Encode(map[string]string{"status": "error", "code": browserx.Code(err)}); encodeErr != nil {
-						return encodeErr
-					}
-					return err
-				}
-				defer clear(raw)
-			} else if terminal, ok := input.(*os.File); ok && term.IsTerminal(int(terminal.Fd())) {
-				fmt.Fprintln(os.Stderr, "Enter account credential JSON (hidden):")
-				raw, e = term.ReadPassword(int(terminal.Fd()))
-				fmt.Fprintln(os.Stderr)
-			} else {
-				raw, e = io.ReadAll(io.LimitReader(input, 65537))
+				profile = args[1]
 			}
-			if e != nil || len(raw) == 0 || len(raw) > 65536 || !json.Valid(raw) {
-				return errors.New("invalid credential JSON from protected stdin")
+			raw, e := readCredential(profile, input, output)
+			if e != nil {
+				return e
 			}
-			// Codex owns its authentication schema. Reject non-object JSON, leaving
-			// provider validation to the helper without logging its content.
-			var obj map[string]json.RawMessage
-			if json.Unmarshal(raw, &obj) != nil || len(obj) == 0 {
-				return errors.New("invalid credential object")
-			}
+			defer clear(raw)
 			if e := writeLocalFile(credentialDir, name, raw); e != nil {
 				return errors.New("cannot save private account credentials")
 			}
@@ -248,7 +235,7 @@ func accountsCommand(args []string, input io.Reader, output io.Writer) error {
 		}
 		f = candidate
 	} else {
-		return errors.New("usage: accounts list | browser-profiles | import-x PROFILE_ID ID CONCURRENCY | add SERVICE ID ABSOLUTE_PATH CONCURRENCY | connect SERVICE ID CONCURRENCY (credential JSON on protected stdin) | remove SERVICE ID")
+		return errors.New("usage: accounts list | browser-profiles | import-x PROFILE_ID ID CONCURRENCY | reimport-x PROFILE_ID ID | add SERVICE ID ABSOLUTE_PATH CONCURRENCY | connect SERVICE ID CONCURRENCY (credential JSON on protected stdin) | reconnect x_read ID (credential JSON on protected stdin) | remove SERVICE ID")
 	}
 	raw, e := json.Marshal(f)
 	if e != nil {
@@ -256,6 +243,88 @@ func accountsCommand(args []string, input io.Reader, output io.Writer) error {
 	}
 	if e = writeLocalFile(filepath.Dir(path), filepath.Base(path), raw); e != nil {
 		return errors.New("cannot save private account configuration")
+	}
+	return json.NewEncoder(output).Encode(map[string]string{"status": "updated"})
+}
+
+// readCredential returns one credential JSON object, from the named browser
+// profile or, without one, from protected stdin. A browser failure writes only
+// its fixed code to output; credential content is never echoed.
+func readCredential(profile string, input io.Reader, output io.Writer) ([]byte, error) {
+	var raw []byte
+	var e error
+	if profile != "" {
+		browser, path, err := browserx.Resolve(profile)
+		if err == nil {
+			raw, err = browserx.ReadSession(context.Background(), browser, path)
+		}
+		if err != nil {
+			if encodeErr := json.NewEncoder(output).Encode(map[string]string{"status": "error", "code": browserx.Code(err)}); encodeErr != nil {
+				return nil, encodeErr
+			}
+			return nil, err
+		}
+	} else if terminal, ok := input.(*os.File); ok && term.IsTerminal(int(terminal.Fd())) {
+		fmt.Fprintln(os.Stderr, "Enter account credential JSON (hidden):")
+		raw, e = term.ReadPassword(int(terminal.Fd()))
+		fmt.Fprintln(os.Stderr)
+	} else {
+		raw, e = io.ReadAll(io.LimitReader(input, 65537))
+	}
+	if e != nil || len(raw) == 0 || len(raw) > 65536 || !json.Valid(raw) {
+		clear(raw)
+		return nil, errors.New("invalid credential JSON from protected stdin")
+	}
+	// Codex owns its authentication schema. Reject non-object JSON, leaving
+	// provider validation to the helper without logging its content.
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil || len(obj) == 0 {
+		clear(raw)
+		return nil, errors.New("invalid credential object")
+	}
+	return raw, nil
+}
+
+// replaceXSession is the explicit re-import for an X account whose session X
+// expired or revoked. It keeps the account's local ID, path and concurrency
+// and replaces only the session this node wrote for it; connect and import-x
+// still never overwrite. The new session is validated in a private staging
+// file first, so a failed re-import leaves the previous session untouched. A
+// running node sees the changed file on its next scheduling check and treats
+// the account as configured again; attempts already in flight keep the session
+// they started with.
+func replaceXSession(dir string, f accountFile, id, profile string, input io.Reader, output io.Writer) error {
+	var account *providerAccount
+	for i := range f.Accounts {
+		if f.Accounts[i].Service == "x_read" && f.Accounts[i].ID == id {
+			account = &f.Accounts[i]
+		}
+	}
+	if account == nil {
+		return errors.New("local account not found")
+	}
+	credentialDir := filepath.Join(dir, "accounts", "x_read-"+id)
+	if filepath.Clean(account.Path) != filepath.Join(credentialDir, "session.json") {
+		return errors.New("only an X session this node saved can be re-imported")
+	}
+	if e := localfs.CheckDir(credentialDir); e != nil {
+		return errors.New("account directory must be private")
+	}
+	raw, e := readCredential(profile, input, output)
+	if e != nil {
+		return e
+	}
+	defer clear(raw)
+	const staging = "session.replace.json"
+	defer os.Remove(filepath.Join(credentialDir, staging))
+	if e := writeLocalFile(credentialDir, staging, raw); e != nil {
+		return errors.New("cannot save private account credentials")
+	}
+	if !worker.XConfigured(filepath.Join(credentialDir, staging)) {
+		return errors.New("invalid X session")
+	}
+	if e := writeLocalFile(credentialDir, "session.json", raw); e != nil {
+		return errors.New("cannot save private account credentials")
 	}
 	return json.NewEncoder(output).Encode(map[string]string{"status": "updated"})
 }

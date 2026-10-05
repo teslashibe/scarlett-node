@@ -236,3 +236,25 @@ func TestJournalCapacityEnvironment(t *testing.T) {
 		}
 	}
 }
+
+func TestManagedCodexRootIsExplicitServicesOptIn(t *testing.T) {
+	c := Config{Prover: "scarlett-prover", Profile: "synthetic", Coordinator: "https://example.org", Executor: ExecutorServices, Services: []string{"codex"}, AccountsFile: filepath.Join(t.TempDir(), "accounts.json"), StateDir: filepath.Join(t.TempDir(), "state"), CodexConcurrency: 1, XConcurrency: 1, InferenceTimeout: time.Second, MaxInputBytes: 1, MaxOutputTokens: 1, Verifier: "example.org:7047"}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	c.CodexManagedRoot = filepath.Join(t.TempDir(), "managed")
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, root := range []string{"relative", c.CodexManagedRoot + string(filepath.Separator) + "..", c.CodexManagedRoot + "\n"} {
+		copy := c
+		copy.CodexManagedRoot = root
+		if copy.Validate() == nil {
+			t.Fatal("invalid managedroot accepted")
+		}
+	}
+	c.Executor = ExecutorCodex
+	if c.Validate() == nil {
+		t.Fatal("managed renewal allowed outside services pool")
+	}
+}
