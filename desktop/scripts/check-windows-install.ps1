@@ -1122,7 +1122,12 @@ function Check-XLoginRuntime([string]$Phase) {
         $playwright = Join-Path $runtimeRoot 'social-login/node_modules/playwright/index.mjs'
         $headed = "const{pathToFileURL}=await import('node:url');const{chromium}=await import(pathToFileURL(process.argv[1]).href);const b=await chromium.launch({executablePath:process.env.CAP_BROWSER_EXECUTABLE_PATH,headless:false});try{const p=await b.newPage();await p.goto('about:blank')}finally{await b.close()}"
         $null = Invoke-XLoginAcceptanceProcess $node @('--input-type=module', '-e', $headed, $playwright) 45000
-        $null = Invoke-XLoginAcceptanceProcess $node @('--test', $browserTest) 180000
+        $browserOutput = Invoke-XLoginAcceptanceProcess $node @('--test', '--test-reporter=tap', $browserTest) 180000
+        if ($browserOutput -notmatch '(?m)^# tests 7\r?$' -or
+            $browserOutput -notmatch '(?m)^# pass 7\r?$' -or
+            $browserOutput -notmatch '(?m)^# skipped 0\r?$') {
+            throw 'Installed browser fixtures did not execute all seven cases'
+        }
         New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
         @{ phase = $Phase; installedRuntimeBytes = 'passed'; privateStateAndBearer = 'passed'
             serviceReadiness = 'passed'; headedChromeLaunchAndClose = 'passed'; EOFShutdown = 'passed'; interceptedBrowserCases = 7
