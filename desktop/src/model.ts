@@ -208,3 +208,11 @@ export function drainingAccounts(s: Snapshot): AccountHealth[] {
 export function validId(id: string): boolean {
   return /^[a-z0-9_-]{1,32}$/.test(id) && id !== "legacy";
 }
+
+export type XLoginStatus = { status: "pending" | "updated" | "cancelled" | "error"; id?: string; code?: string; challenge_id?: string; method?: string; destination?: string; expires_at?: string; retry_after?: number };
+export function xLoginMessage(result: XLoginStatus): string {
+ if (result.status === "updated") return "X account verified and saved on this device";
+ if (result.status === "cancelled") return "X login cancelled";
+ if (result.status === "pending") return `Enter the verification code${result.destination ? ` sent to ${result.destination}` : ""}. This login expires at ${new Date(result.expires_at || "").toLocaleTimeString()}`;
+ return ({restart_login:"This login expired or was restarted. Start a new login",cooldown:`X requested a cooldown${result.retry_after ? ` of ${result.retry_after} seconds` : ""}. Wait before starting another login`,verification_failed:"X could not verify the requested account. Your saved session was kept",account_changed:"The account changed during login. Your saved session was kept",runtime_unavailable:"Browser login is unavailable in this build. Use browser import or cookie paste",login_busy:"Another X login is already running",invalid_input:"Check the local account ID, username and verification code"} as Record<string,string>)[result.code || ""] || "X login could not finish. Your saved session was kept";
+}

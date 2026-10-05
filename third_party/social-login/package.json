@@ -1,0 +1,19 @@
+{
+  "name": "@teslashibe/social-login",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Product-neutral persistent browser identity service.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "check": "node --check src/server.js && node --check src/service.js && node --check src/runtime/legacy.js && node --check src/runtime/login-budget.js && node --check src/runtime/challenges.js && node --check src/runtime/browser-holds.js && node --check src/runtime/clock.js && node --check src/runtime/profiles.js && node --check src/platforms/registry.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}

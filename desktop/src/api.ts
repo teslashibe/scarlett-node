@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Snapshot, BrowserProfile, Preferences, ClaudeStatus } from "./model.ts";
+import type { Snapshot, BrowserProfile, Preferences, ClaudeStatus, XLoginStatus } from "./model.ts";
 export const api = {
   preferences: () => invoke<Preferences>("desktop_preferences"),
   savePreferences: (data: Preferences) => invoke<void>("save_desktop_preferences", { data }),
@@ -15,6 +15,11 @@ export const api = {
     invoke<void>("control_node", { action }),
   connectX: (id: string, concurrency: number, authToken: string, ct0: string) =>
     invoke<void>("connect_x", { id, concurrency, authToken, ct0 }),
+  startXLogin: (id: string, concurrency: number, reconnect: boolean, username: string, password: string) =>
+    invoke<XLoginStatus>("start_x_login", { id, concurrency, reconnect, username, password }),
+  continueXLogin: (id: string, challengeId: string, code: string) =>
+    invoke<XLoginStatus>("continue_x_login", { id, challengeId, code }),
+  cancelXLogin: () => invoke<void>("cancel_x_login"),
   browserProfiles: () => invoke<BrowserProfile[]>("browser_profiles"),
   importX: (profile: string, id: string, concurrency: number, consent: boolean) =>
     invoke<void>("import_x_profile", { profile, id, concurrency, consent }),

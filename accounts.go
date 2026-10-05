@@ -104,6 +104,12 @@ func accountFilePath(dir string) string {
 // Account mutations are serialized independently of the running node's attempt
 // lock. No CLI operation cancels or reassigns a provider attempt.
 func accountsCommand(args []string, input io.Reader, output io.Writer) error {
+	if len(args) > 1 && args[0] == "login-x" {
+		return xLoginTerminalCommand(args[1:], input, output)
+	}
+	if len(args) == 1 && args[0] == "login-x" {
+		return xLoginCommand(input, output)
+	}
 	if len(args) == 1 && args[0] == "browser-profiles" {
 		profiles, err := browserx.Profiles()
 		if err != nil {

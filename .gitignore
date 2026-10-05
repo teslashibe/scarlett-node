@@ -1,3 +1,9 @@
 /.worktrees/
 /dist/
 /prover/target/
+
+# Prepared browser runtimes and local fixture dependencies
+/third_party/social-login/node_modules/
+/desktop/src-tauri/resources/x-login-runtime/
+
+/desktop/src-tauri/runtime/x-login-runtime/

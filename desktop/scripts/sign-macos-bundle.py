@@ -32,15 +32,43 @@ SIDECARS = {'scarlett-node', 'scarlett-prover', 'open-agent-api'}
 MACHO = {b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe', b'\xfe\xed\xfa\xcf', b'\xfe\xed\xfa\xce', b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca', b'\xca\xfe\xba\xbf', b'\xbf\xba\xfe\xca'}
 
 
+class NativeOperationError(ValueError):
+    """Only operation and status are safe for unattended signing diagnostics."""
+
+
+RELEASE_PHASES = {'inventory', 'vendor-signature', 'own-signature', 'bundle-seal', 'model-api', 'dmg', 'signing-identity', 'notarization'}
+
+
+@contextmanager
+def release_phase(phase):
+    """Keep the innermost fixed phase without exposing exception payloads."""
+    if phase not in RELEASE_PHASES:
+        raise ValueError('Unknown release phase')
+    try:
+        yield
+    except (ValueError, KeyError, OSError, TypeError) as error:
+        if getattr(error, 'release_phase', None) not in RELEASE_PHASES:
+            error.release_phase = phase
+        raise
+
+
+def failure_summary(error):
+    phase = getattr(error, 'release_phase', None)
+    if phase not in RELEASE_PHASES:
+        phase = 'validation'
+    detail = str(error) if isinstance(error, NativeOperationError) else 'Release validation failed: ' + type(error).__name__
+    return '[phase=' + phase + '] ' + detail
+
+
 def run(args, timeout=60):
     # Native tool output can contain local paths and signing configuration.
     # Return it only to internal parsers; failures disclose the operation name.
     try:
         result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
-        raise ValueError('Native release operation unavailable: ' + Path(args[0]).name) from None
+        raise NativeOperationError('Native release operation unavailable: ' + Path(args[0]).name) from None
     if result.returncode:
-        raise ValueError('Native release operation failed: ' + Path(args[0]).name)
+        raise NativeOperationError('Native release operation failed: ' + Path(args[0]).name + ' (exit ' + str(result.returncode) + ')')
     return result.stdout, result.stderr
 
 
@@ -180,6 +208,7 @@ class SelfSigned:
         return record
 
 
+@release_phase('signing-identity')
 def signing_keychain(value, sha1):
     keychain = Path(value)
     if not value or not keychain.is_absolute() or keychain.is_symlink() or not keychain.is_file() or \
@@ -220,6 +249,7 @@ def keychain_search_list(keychain):
         run(['/usr/bin/security', 'list-keychains', '-d', 'user', '-s'] + original)
 
 
+@release_phase('notarization')
 def notarize(path, profile):
     output, _ = run(['/usr/bin/xcrun', 'notarytool', 'submit', str(path), '--keychain-profile', profile, '--wait', '--output-format', 'json'], timeout=1800)
     try:
@@ -231,17 +261,20 @@ def notarize(path, profile):
     return response['id']
 
 
+@release_phase('inventory')
 def sign_app(app, identity=None, team=None, signer=None):
     signer = signer or DeveloperID(identity, team)
     contents, metadata_path, metadata, vendors = verify_input(app)
     # Vendor objects keep their publishers' Developer ID signatures in every scheme.
-    for path in vendors:
-        verify_signature(path)
+    with release_phase('vendor-signature'):
+        for path in vendors:
+            verify_signature(path)
     for name in sorted(SIDECARS) + ['scarlett-node-desktop']:
         path = contents / 'MacOS' / name
         key = name if name in SIDECARS else 'app'
-        signer.sign(path, key)
-        signer.verify(path, key)
+        with release_phase('own-signature'):
+            signer.sign(path, key)
+            signer.verify(path, key)
     # Only our successfully verified sidecars may receive new signed hashes.
     # Vendor entries remain immutable; preserve the input digests for provenance.
     for item in metadata['sidecars']:
@@ -254,20 +287,23 @@ def sign_app(app, identity=None, team=None, signer=None):
     temporary.replace(metadata_path)
     # Seal only after the signed-byte inventory is final. Never use --deep to sign
     # vendor code: its published identity and notices must remain unchanged.
-    signer.sign(app, 'app')
-    run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(app)])
-    signer.verify(app, 'app')
+    with release_phase('bundle-seal'):
+        signer.sign(app, 'app')
+        run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(app)])
+        signer.verify(app, 'app')
     for item in metadata['files']:
         if digest(contents / 'Resources' / 'runtime' / item['path']) != item['sha256']:
             raise ValueError('Vendor bytes changed during signing')
     return metadata
 
 
+@release_phase('model-api')
 def check_bundle(app):
     # Prove the revised manifest and packaged local API under the new signatures.
     run([sys.executable, str(Path(__file__).with_name('check-complete-bundle.py')), str(app / 'Contents' / 'MacOS'), str(app / 'Contents' / 'Resources')], timeout=90)
 
 
+@release_phase('dmg')
 def stage_disk_image(app, dmg, folder):
     stage = Path(folder) / 'disk'
     stage.mkdir()
@@ -316,10 +352,12 @@ def self_signed_release(app, dmg):
         check_bundle(app)
         with tempfile.TemporaryDirectory(prefix='scarlett-mac-signing-') as folder:
             stage_disk_image(app, dmg, folder)
-            signer.sign(dmg, 'dmg', runtime=False)
+            with release_phase('dmg'):
+                signer.sign(dmg, 'dmg', runtime=False)
     # No notarization, stapling or Gatekeeper assessment exists for this scheme:
     # users approve the unverified developer in Privacy & Security.
-    signer.verify(dmg, 'dmg', runtime=False)
+    with release_phase('dmg'):
+        signer.verify(dmg, 'dmg', runtime=False)
     evidence = {'schemaVersion': 1, 'signature': signer.scheme, 'certificateSha1': identity['sha1'],
                 'certificateSha256': identity['sha256'], 'designatedRequirement': signer.requirement('app'),
                 'notarization': 'not-performed', 'gatekeeper': 'user-approval-required',
@@ -357,7 +395,7 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (ValueError, KeyError, OSError, TypeError):
-        # Do not disclose parser/path/keychain exception payloads.
-        print('Mac release signing failed; artifact is not approved for publication', file=sys.stderr)
+    except (ValueError, KeyError, OSError, TypeError) as error:
+        # Tool output, arguments and parser/path/keychain payloads stay private.
+        print('Mac release signing failed; artifact is not approved for publication. ' + failure_summary(error), file=sys.stderr)
         raise SystemExit(1) from None

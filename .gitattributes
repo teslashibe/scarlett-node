@@ -1,0 +1,3 @@
+# Preserve exact upstream bytes for the snapshot and patch integrity checks.
+third_party/x-go/** -text
+third_party/social-login/** -text

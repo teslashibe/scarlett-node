@@ -1,0 +1,42 @@
+name: X browser runtime fixtures
+on:
+  pull_request:
+    paths:
+      - 'third_party/social-login/**'
+      - 'third_party/x-go/**'
+      - 'x_login*.go'
+      - 'x_browser_contract_test.go'
+      - 'scripts/*x-login*'
+      - 'scripts/verify-social-login.mjs'
+      - 'internal/xloginruntime/**'
+      - 'packaging/x-login*'
+      - '.github/workflows/x-browser-runtime.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  chromium-fixtures:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22.23.3'
+          cache: npm
+          cache-dependency-path: third_party/social-login/package-lock.json
+      - run: node scripts/verify-social-login.mjs
+      - run: npm ci --ignore-scripts
+        working-directory: third_party/social-login
+      # Browser download occurs only in explicit offline fixture preparation.
+      - run: npx playwright install --with-deps chromium
+        working-directory: third_party/social-login
+      - run: npm run check && npm test
+        working-directory: third_party/social-login
+      - run: node --test scripts/verify-x-login-runtime.test.mjs scripts/verify-social-login.test.mjs
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./internal/xloginruntime
+      - name: Go to browser-service contract
+        run: SCARLETT_TEST_X_LOGIN_NODE="$(command -v node)" go test -race -run TestBrowserLoginRuntimeContract -count=1 .

@@ -82,7 +82,7 @@ func (c *Client) validateSession(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return fmt.Errorf("%w: session validation failed: %w", ErrUnauthorized, err)
+		return fmt.Errorf("x: session validation failed: %w", err)
 	}
 
 	var data struct {
@@ -95,17 +95,18 @@ func (c *Client) validateSession(ctx context.Context) error {
 		} `json:"viewer"`
 	}
 	if err := json.Unmarshal(raw, &data); err != nil {
-		return fmt.Errorf("%w: decoding viewer: %v", ErrUnauthorized, err)
+		return fmt.Errorf("%w: invalid viewer response", ErrRequestFailed)
 	}
 
 	viewerID := data.Viewer.UserResults.Result.RestID
 	if viewerID == "" {
-		return ErrUnauthorized
+		return fmt.Errorf("%w: viewer identity missing", ErrRequestFailed)
 	}
 
-	if c.restID == "" {
-		c.restID = viewerID
+	if c.restID != "" && c.restID != viewerID {
+		return fmt.Errorf("%w: viewer identity does not match session", ErrRequestFailed)
 	}
+	c.restID = viewerID
 
 	// Fetch full profile — the Viewer query only returns partial fields.
 	profileVars := map[string]interface{}{

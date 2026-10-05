@@ -43,6 +43,106 @@ export X_TWID="u%3D123456789"
 | `ct0` | `X_CT0` | Yes | CSRF token |
 | `twid` | `X_TWID` | No | User ID (`u=<restId>`); used to derive authenticated user |
 
+### Interactive browser login
+
+Prefer an existing `Session.NewClient` first. A rate limit, challenge, transport
+failure or provider outage does not establish that saved credentials expired.
+Use `errors.Is` to distinguish those failures from `ErrUnauthorized`.
+
+`BrowserLogin` explicitly uses the standalone social-login bounded v1 protocol.
+Its wire contract follows v0.2.20 and requires `interactive_x: 1` in
+`/v1/capabilities`, which identifies support for retained-browser X challenges.
+An older runtime fails before password submission. `Login` with `SidecarURL`
+remains the separate legacy `/login` API and cannot resume interactive challenges.
+There is no automatic protocol or credential retry.
+
+```go
+browser, err := x.NewBrowserLogin(x.BrowserLoginConfig{
+    URL: sidecarURL,
+    BearerToken: sidecarBearer,
+})
+if err != nil { return err }
+
+// Generate fresh cryptographically random, opaque ownership values per login.
+// Retain this operation in private memory until completion or cancellation.
+operation := x.BrowserLoginOperation{
+    ProfileKey: stablePrivateProfileKey,
+    OperationOwner: opaqueOwnerToken, // at least 32 characters
+    ConnectionID: opaqueConnection, Generation: opaqueGeneration,
+    Revision: opaqueRevision, RecoveryClaim: opaqueClaim,
+    Budget: x.BrowserLoginBudget{
+        DeadlineAt: time.Now().Add(180 * time.Second),
+        MaxBrowserAttempts: 1, MaxCredentialAttempts: 1,
+    },
+}
+
+// Run this only after the user chooses to log in. Start may use the browser
+// it launches for the credential flow; there is no preceding harvest attempt.
+result, err := browser.Start(ctx, x.BrowserLoginRequest{
+    Username: username, Password: password, Operation: operation,
+})
+if err != nil { return err }
+if result.Challenge != nil {
+    // Present Method, MaskedDestination and ExpiresAt in the UI. The UI returns
+    // a user-entered code; no authenticator seed is required. A continuation
+    // sends no credentials and authorizes no new browser/password attempts.
+    result, err = browser.Continue(ctx, operation, result.Challenge.ID, userCode)
+    if err != nil { return err }
+    // A repeated challenge must return to the UI, rather than loop here.
+    if result.Challenge != nil { return x.ErrChallenge }
+}
+client, err := result.Session.NewClient(ctx, x.WithRetry(1, 0))
+if err != nil { return err }
+me, err := client.Me(ctx)
+if err != nil { return err }
+// Compare me.ID / me.ScreenName with the intended account before privately
+// saving result.Session. Cookie presence alone is not identity verification.
+```
+
+Credentialless profile recovery is a separate operation:
+
+```go
+// Use a separately bounded recovery operation with zero password allowance.
+harvestOperation.Budget.MaxCredentialAttempts = 0
+result, err := browser.Harvest(ctx, harvestOperation)
+if err != nil {
+    // Record known result.Attempts, or conservatively account for unknown work
+    // when result is nil. Return a logged-out result to the UI for a decision.
+    // Do not automatically call Start or reset the browser allowance here.
+    return err
+}
+// Verify result.Session and the intended identity before saving it, as above.
+```
+
+After a failed harvest, another browser launch requires an explicit user login
+action and a new bounded operation. Account for the harvest's browser work and
+retain any provider cooldown before authorizing it.
+
+Keep the original profile, owner, proxy lease and absolute deadline for every
+continuation and `browser.Cancel(ctx, operation)`. Cancel remains available
+when the login deadline has expired. A proxy, if used, is supplied in
+`ProxyURL` with an opaque `ProxyLease`; its affinity and the browser user agent
+are carried into the candidate session. The service owns profile persistence;
+x-go stores neither passwords nor pending login operations.
+
+Budget limits are explicit, accept only zero or one, and never increase on
+continuation. Continuation requires the same parked browser and reports
+aggregate attempt counts against the original allowance. Harvest authorizes
+zero password submissions. Count harvest browser work before authorizing a
+separate start; creating a new request is not permission for unlimited recovery.
+The absolute deadline is required and may only be shortened by context or
+transport bounds. `BrowserLoginError` exposes a safe classification, HTTP status
+and `RetryAfter` where supplied; provider strings and bodies are discarded.
+Formatting login inputs/results through `fmt` or `slog` redacts secrets.
+Intentionally serializing a Session for private storage still includes cookies.
+
+The default test suite uses synthetic HTTP fixtures and never contacts X.
+Fixture success proves protocol and recovery handling, not live account access.
+An opt-in live check must use one password submission, stop on rejection or
+limits, verify identity and one small read, then restart using the saved session
+without resubmitting a password. Inspect `TransactionReady` /
+`TransactionInitErr` separately before relying on transaction-gated reads.
+
 ## Features
 
 ### Profiles

@@ -79,6 +79,12 @@ jobs:
           go test -race ./...
           go vet ./...
           go build ./...
+      - name: Compile the installed browser runtime acceptance fixture
+        if: runner.os == 'Windows'
+        run: |
+          x_login_fixture="$RUNNER_TEMP/scarlett-x-login-runtime-test.exe"
+          go test -c -o "$x_login_fixture" ./internal/xloginruntime
+          printf 'SCARLETT_X_LOGIN_RUNTIME_FIXTURE=%s\n' "$x_login_fixture" >> "$GITHUB_ENV"
       - name: Build reviewed components and prepare the complete native runtime
         # The release workflow runs this same script, so tested and signed
         # bundles are assembled by one copy of these commands.
@@ -221,6 +227,11 @@ jobs:
         run: rustup toolchain install 1.95 --profile minimal
       - name: Build reviewed components and prepare the complete native runtime
         run: desktop/scripts/build-complete-runtime.sh "$NATIVE_PLATFORM" "$RUNNER_TEMP/scarlett-runtime"
+      - name: Compile the installed browser runtime acceptance fixture
+        run: |
+          x_login_fixture="$RUNNER_TEMP/scarlett-x-login-runtime-test.exe"
+          go test -c -o "$x_login_fixture" ./internal/xloginruntime
+          printf 'SCARLETT_X_LOGIN_RUNTIME_FIXTURE=%s\n' "$x_login_fixture" >> "$GITHUB_ENV"
       - name: Install desktop build dependencies
         run: npm --prefix desktop ci --ignore-scripts
       - name: Build the unsigned Windows release executable
@@ -272,7 +283,8 @@ jobs:
           assert re.fullmatch('[a-f0-9]{40}', source)
           jobs = json.loads(subprocess.check_output(['gh', 'api', 'repos/' + repo + '/actions/runs/' + run_id + '/jobs'], text=True))['jobs']
           native = [job for job in jobs if 'win32-x64' in job['name']]
-          assert len(native) == 1 and any(step['name'] == 'Build installer for testing' and step['conclusion'] == 'success' for step in native[0]['steps'])
+          required = {'Build installer for testing', 'Build the Windows installation-only upgrade variant'}
+          assert len(native) == 1 and required <= {step['name'] for step in native[0]['steps'] if step['conclusion'] == 'success'}
           changed = subprocess.check_output(['git', 'diff', '--name-only', source, 'HEAD'], text=True).splitlines()
           allowed = {'desktop/scripts/check-windows-install.ps1', 'desktop/scripts/check-windows-input.ps1', '.github/workflows/desktop-complete.yml', 'desktop/README.md'}
           assert set(changed) <= allowed, 'Runtime or packaging source changed; run the complete native build'
@@ -290,6 +302,15 @@ jobs:
       - name: Compile native Windows acceptance input
         shell: powershell
         run: '& desktop/scripts/check-windows-input.ps1'
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - name: Compile the installed browser runtime acceptance fixture
+        shell: bash
+        run: |
+          x_login_fixture="$RUNNER_TEMP/scarlett-x-login-runtime-test.exe"
+          go test -c -o "$x_login_fixture" ./internal/xloginruntime
+          printf 'SCARLETT_X_LOGIN_RUNTIME_FIXTURE=%s\n' "$x_login_fixture" >> "$GITHUB_ENV"
       - name: Parse and test the installed Windows app
         shell: powershell
         run: |
@@ -300,12 +321,29 @@ jobs:
           if ($errors.Count -gt 0) { throw 'Installed acceptance script did not parse' }
           python desktop/scripts/prepare-browser-fixtures.py "$env:RUNNER_TEMP/scarlett-browser-fixtures"
           if ($LASTEXITCODE -ne 0) { throw 'Synthetic browser fixture setup failed' }
-          # The build artifact also holds its installation-only upgrade variant;
-          # recheck the reviewed baseline version.
+          # Reuse both installer bytes from the source-verified native build.
+          # Fresh metadata binds the baseline hash; no historical release is inferred.
           $version = ([System.IO.File]::ReadAllText('desktop/src-tauri/tauri.conf.json') | ConvertFrom-Json).version
-          $installers = @(Get-ChildItem -LiteralPath "$env:RUNNER_TEMP/scarlett-recheck-package" -Filter ('*_' + $version + '_*.exe') -Recurse)
-          if ($installers.Count -ne 1) { throw 'Expected exactly one previously built baseline installer' }
-          & desktop/scripts/check-windows-install.ps1 -Installer $installers[0].FullName -EvidenceDirectory "$env:RUNNER_TEMP/scarlett-installed-evidence" -Preferences -BrowserFixture "$env:RUNNER_TEMP/scarlett-browser-fixtures/fixture.json"
+          $parts = @($version.Split('.') | ForEach-Object { [int]$_ })
+          if ($parts.Count -ne 3 -or $parts[2] -ge 65535) { throw 'Invalid installation-only version pair' }
+          $upgradeVersion = '{0}.{1}.{2}' -f $parts[0], $parts[1], ($parts[2] + 1)
+          $installers = @(Get-ChildItem -LiteralPath "$env:RUNNER_TEMP/scarlett-recheck-package" -Filter '*.exe' -Recurse -File)
+          if ($installers.Count -ne 2) { throw 'Expected exactly two source-verified installers' }
+          foreach ($installer in $installers) {
+            if ($installer.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Recheck installers must be regular files' }
+          }
+          $baseline = @($installers | Where-Object { $_.Name -ceq ('Scarlett Node_' + $version + '_x64-setup.exe') })
+          $upgrade = @($installers | Where-Object { $_.Name -ceq ('Scarlett Node_' + $upgradeVersion + '_x64-setup.exe') })
+          if ($baseline.Count -ne 1 -or $upgrade.Count -ne 1) { throw 'Recheck installer versions did not match reviewed source' }
+          $fixtureDirectory = Join-Path $env:RUNNER_TEMP 'scarlett-recheck-upgrade'
+          if (Test-Path -LiteralPath $fixtureDirectory) { throw 'Recheck installation metadata requires a fresh directory' }
+          New-Item -ItemType Directory -Path $fixtureDirectory | Out-Null
+          $fixturePath = Join-Path $fixtureDirectory 'fixture.json'
+          @{ syntheticOnly = $true; baselineVersion = $version; upgradeVersion = $upgradeVersion
+            baselineInstaller = $baseline[0].FullName; baselineSha256 = (Get-FileHash -LiteralPath $baseline[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            sameRuntimeSource = $true; signedInstaller = $false
+          } | ConvertTo-Json | Set-Content -LiteralPath $fixturePath
+          & desktop/scripts/check-windows-install.ps1 -Installer $baseline[0].FullName -EvidenceDirectory "$env:RUNNER_TEMP/scarlett-installed-evidence" -Preferences -BrowserFixture "$env:RUNNER_TEMP/scarlett-browser-fixtures/fixture.json" -UpgradeFixture $fixturePath -UpgradeInstaller $upgrade[0].FullName
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:

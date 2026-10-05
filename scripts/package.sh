@@ -23,13 +23,16 @@ bundle="$stage/$name"
 (cd "$repo" && CGO_ENABLED=0 go build -trimpath -o "$bundle/scarlett-node" .)
 (cd "$repo/prover" && cargo build --release --locked)
 cp "$repo/prover/target/release/scarlett-prover" "$bundle/"
+case "$platform" in linux-amd64) helper_platform=linux-x64;; darwin-amd64) helper_platform=darwin-x64;; *) helper_platform="$platform";; esac
+node "$repo/scripts/prepare-x-login-runtime.mjs" "$helper_platform" "$bundle/x-login-runtime"
+cp "$repo/scripts/verify-x-login-runtime.mjs" "$bundle/verify-x-login-runtime.mjs"
 module=$(cd "$repo" && go list -m -f '{{.Dir}}' github.com/teslashibe/open-agent-api)
 cp "$module/codex_profile.json" "$module/codex_scaffold.json" "$bundle/"
 cp "$repo/scripts/install.sh" "$repo/packaging/node.env.example" "$repo/packaging/scarlett-node.service" "$repo/packaging/INSTALL.md" "$bundle/"
 printf '%s\n' "$version" > "$bundle/VERSION"
 printf '%s\n' "$platform" > "$bundle/PLATFORM"
 chmod 0755 "$bundle/scarlett-node" "$bundle/scarlett-prover" "$bundle/install.sh"
-(cd "$bundle" && for file in scarlett-node scarlett-prover codex_profile.json codex_scaffold.json install.sh node.env.example scarlett-node.service INSTALL.md VERSION PLATFORM; do
+(cd "$bundle" && for file in scarlett-node scarlett-prover codex_profile.json codex_scaffold.json install.sh node.env.example scarlett-node.service INSTALL.md VERSION PLATFORM x-login-runtime/node x-login-runtime/manifest.json verify-x-login-runtime.mjs; do
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$file"; else shasum -a 256 "$file"; fi
 done > SHA256SUMS)
 tar -czf "$out/$name.tar.gz" -C "$stage" "$name"

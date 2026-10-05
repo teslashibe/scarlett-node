@@ -245,8 +245,8 @@ func (c *Client) RateLimit() RateLimitState {
 }
 
 // TransactionInitErr returns the error from X-Client-Transaction-Id bootstrap,
-// if any. A non-nil value means endpoints gated behind CDN validation
-// (Followers, SearchTimeline) will return 404.
+// if any. A non-nil value means transaction headers are unavailable; provider
+// endpoints may reject requests. Session validation does not prove readiness.
 func (c *Client) TransactionInitErr() error {
 	return c.txInitErr
 }

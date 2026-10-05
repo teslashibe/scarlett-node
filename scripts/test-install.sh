@@ -34,6 +34,25 @@ for archive in "$out"/*.tar.gz; do
   "$bundle/install.sh" "$root" "$bin"
   [ "$(cat "$root/current/VERSION")" = "$original" ] || exit 1
   rm -rf "$testdir/upgrade"
+  # Reinstall must reject altered installed executables before invoking them.
+  cp "$root/current/x-login-runtime/node" "$testdir/saved-node"
+  printf '#!/bin/sh\ntouch "%s"\nexit 1\n' "$testdir/unsafe-runtime-executed" > "$root/current/x-login-runtime/node"
+  if "$bundle/install.sh" "$root" "$bin" > /dev/null 2>&1; then echo 'Changed installed runtime accepted' >&2; exit 1; fi
+  [ ! -e "$testdir/unsafe-runtime-executed" ] || { echo 'Changed runtime executed before checksum validation' >&2; exit 1; }
+  cp "$testdir/saved-node" "$root/current/x-login-runtime/node"
+  rm "$testdir/saved-node"
+  # Every native bundle supplies a pinned local helper; neither installation
+  # nor this fixture launches Chrome or contacts a provider.
+  [ -x "$root/current/x-login-runtime/node" ] || exit 1
+  "$root/current/x-login-runtime/node" "$root/current/verify-x-login-runtime.mjs" "$root/current/x-login-runtime" "$(cat "$bundle/PLATFORM")" > /dev/null
+  cp -R "$bundle" "$testdir/runtime-tamper"
+  printf 'changed runtime source\n' >> "$testdir/runtime-tamper/x-login-runtime/social-login/src/server.js"
+  if "$testdir/runtime-tamper/install.sh" "$root" "$bin" > /dev/null 2>&1; then echo 'Changed runtime source installed' >&2; exit 1; fi
+  rm -rf "$testdir/runtime-tamper"
+  cp -R "$bundle" "$testdir/runtime-missing"
+  rm "$testdir/runtime-missing/x-login-runtime/social-login/node_modules/playwright/package.json"
+  if "$testdir/runtime-missing/install.sh" "$root" "$bin" > /dev/null 2>&1; then echo 'Incomplete runtime installed' >&2; exit 1; fi
+  rm -rf "$testdir/runtime-missing"
   # Reinstallation refuses changed bytes; the active version stays intact.
   printf 'corrupted\n' >> "$bundle/scarlett-node"
   if "$bundle/install.sh" "$root" "$bin" > /dev/null 2>&1; then echo 'Corrupt bundle installed' >&2; exit 1; fi

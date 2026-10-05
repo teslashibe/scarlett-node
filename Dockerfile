@@ -13,13 +13,13 @@ COPY prover/ ./
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/* && useradd -m -u 10001 node
-USER node
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates gosu && \
+    rm -rf /var/lib/apt/lists/* && useradd -m -u 10001 node && mkdir -m 755 /run/scarlett-browser
 COPY --from=builder /scarlett-node /usr/local/bin/scarlett-node
 COPY --from=prover-builder /src/prover/target/release/scarlett-prover /usr/local/bin/scarlett-prover
 COPY --from=builder /codex/ /usr/local/share/scarlett-node/
 ENV HOME=/home/node \
     SCARLETT_CODEX_PROFILE=/usr/local/share/scarlett-node/codex_profile.json \
     SCARLETT_CODEX_SCAFFOLD=/usr/local/share/scarlett-node/codex_scaffold.json
-ENTRYPOINT ["scarlett-node"]
+COPY packaging/node-container-entrypoint.sh /usr/local/bin/node-container-entrypoint.sh
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/node-container-entrypoint.sh"]

@@ -2,3 +2,6 @@
 .worktrees
 prover/target
 dist
+
+third_party/social-login/node_modules
+desktop/src-tauri/runtime

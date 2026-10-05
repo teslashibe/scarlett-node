@@ -251,6 +251,8 @@ scarlett-node accounts add codex work /absolute/private/codex-home 1
 scarlett-node accounts add x_read research /absolute/private/x-session.json 1
 scarlett-node accounts list
 scarlett-node accounts reconnect x_read research   # replace an expired X session; cookie JSON on stdin
+scarlett-node accounts login-x research 1        # browser login with hidden prompts and verification code
+scarlett-node accounts login-x research 1 reconnect # verify saved session first, then recover if expired
 ```
 
 ## Development
@@ -291,3 +293,15 @@ There is no separate contributing guide or security policy yet. Open an [issue](
     <a href="https://github.com/teslashibe/scarlett-node/issues/1">Roadmap gaps (issue #1)</a>
   </sub>
 </p>
+
+### Interactive X login
+
+The desktop Sign in to X form and `accounts login-x ID CONCURRENCY` use a local browser helper. Enter the X username and password, then supply any verification code requested by X. There is no authenticator seed field. Passwords and codes stay in the active local operation; only a session verified through Go is saved. An existing account's session is kept when verification fails. New browser sessions save the verified X account ID in the canonical `twid` cookie field. Reconnect checks that ID when available; older imported cookies without it cannot establish historical identity, so replacement follows the operator's chosen local ID and verified username.
+
+Use the reconnect checkbox or the final `reconnect` CLI argument for an existing local account. Reconnect first checks its saved session and retains its proxy. Browser profiles persist on this device; pending challenges expire after at most four minutes. Cancel, close the app or restart the helper to discard a pending login. Restarted challenges require a new login. A cooldown or transient failure does not trigger another password submission.
+
+See [local browser runtime packaging](docs/x-browser-runtime.md) for supported Chrome installations, packaged native resources and the Docker companion service. Builds without that runtime still support browser-profile import and cookie paste.
+
+For trusted native automation, `accounts login-x` without arguments uses protected JSON-lines stdin. Keep the owner pipe open for the conversation; send `start` with account ID, concurrency, username and password, then `continue` with the returned challenge ID and code, or `cancel` with the matching account ID. Never place credentials in arguments, scripts, logs or coordinator payloads. Pending output contains only account and challenge presentation fields.
+
+Offline fixtures cover the operation lifecycle and account replacement. They do not establish live X access; a release smoke test must separately verify login, code continuation and subsequent session reuse on each supported platform.
