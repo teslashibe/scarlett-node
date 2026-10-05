@@ -37,8 +37,6 @@ jobs:
             platform: win32-x64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
-    env:
-      SCARLETT_X_LOGIN_RUNTIME_FIXTURE: ${{ runner.temp }}/scarlett-x-login-runtime-test.exe
     defaults:
       run:
         shell: bash
@@ -83,7 +81,10 @@ jobs:
           go build ./...
       - name: Compile the installed browser runtime acceptance fixture
         if: runner.os == 'Windows'
-        run: go test -c -o "$SCARLETT_X_LOGIN_RUNTIME_FIXTURE" ./internal/xloginruntime
+        run: |
+          x_login_fixture="$RUNNER_TEMP/scarlett-x-login-runtime-test.exe"
+          go test -c -o "$x_login_fixture" ./internal/xloginruntime
+          printf 'SCARLETT_X_LOGIN_RUNTIME_FIXTURE=%s\n' "$x_login_fixture" >> "$GITHUB_ENV"
       - name: Build reviewed components and prepare the complete native runtime
         # The release workflow runs this same script, so tested and signed
         # bundles are assembled by one copy of these commands.
@@ -210,7 +211,6 @@ jobs:
         shell: bash
     env:
       NATIVE_PLATFORM: win32-x64
-      SCARLETT_X_LOGIN_RUNTIME_FIXTURE: ${{ runner.temp }}/scarlett-x-login-runtime-test.exe
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -228,7 +228,10 @@ jobs:
       - name: Build reviewed components and prepare the complete native runtime
         run: desktop/scripts/build-complete-runtime.sh "$NATIVE_PLATFORM" "$RUNNER_TEMP/scarlett-runtime"
       - name: Compile the installed browser runtime acceptance fixture
-        run: go test -c -o "$SCARLETT_X_LOGIN_RUNTIME_FIXTURE" ./internal/xloginruntime
+        run: |
+          x_login_fixture="$RUNNER_TEMP/scarlett-x-login-runtime-test.exe"
+          go test -c -o "$x_login_fixture" ./internal/xloginruntime
+          printf 'SCARLETT_X_LOGIN_RUNTIME_FIXTURE=%s\n' "$x_login_fixture" >> "$GITHUB_ENV"
       - name: Install desktop build dependencies
         run: npm --prefix desktop ci --ignore-scripts
       - name: Build the unsigned Windows release executable
@@ -254,8 +257,6 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.installer_run_id != '' }}
     runs-on: windows-2025
     timeout-minutes: 20
-    env:
-      SCARLETT_X_LOGIN_RUNTIME_FIXTURE: ${{ runner.temp }}/scarlett-x-login-runtime-test.exe
     permissions:
       contents: read
       actions: read
@@ -305,7 +306,10 @@ jobs:
           go-version-file: go.mod
       - name: Compile the installed browser runtime acceptance fixture
         shell: bash
-        run: go test -c -o "$SCARLETT_X_LOGIN_RUNTIME_FIXTURE" ./internal/xloginruntime
+        run: |
+          x_login_fixture="$RUNNER_TEMP/scarlett-x-login-runtime-test.exe"
+          go test -c -o "$x_login_fixture" ./internal/xloginruntime
+          printf 'SCARLETT_X_LOGIN_RUNTIME_FIXTURE=%s\n' "$x_login_fixture" >> "$GITHUB_ENV"
       - name: Parse and test the installed Windows app
         shell: powershell
         run: |

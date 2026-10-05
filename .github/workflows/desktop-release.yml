@@ -52,7 +52,6 @@ jobs:
       RELEASE_PLATFORM: ${{ matrix.platform }}
       NATIVE_PLATFORM: ${{ matrix.native }}
       PYTHON: ${{ matrix.python }}
-      SCARLETT_X_LOGIN_RUNTIME_FIXTURE: ${{ runner.temp }}/scarlett-x-login-runtime-test.exe
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -76,7 +75,10 @@ jobs:
         run: desktop/scripts/build-complete-runtime.sh "$NATIVE_PLATFORM" "$RUNNER_TEMP/scarlett-runtime"
       - name: Compile the installed browser runtime acceptance fixture
         if: runner.os == 'Windows'
-        run: go test -c -o "$SCARLETT_X_LOGIN_RUNTIME_FIXTURE" ./internal/xloginruntime
+        run: |
+          x_login_fixture="$RUNNER_TEMP/scarlett-x-login-runtime-test.exe"
+          go test -c -o "$x_login_fixture" ./internal/xloginruntime
+          printf 'SCARLETT_X_LOGIN_RUNTIME_FIXTURE=%s\n' "$x_login_fixture" >> "$GITHUB_ENV"
       - name: Install desktop build dependencies
         run: npm --prefix desktop ci --ignore-scripts
       - name: Build the unsigned Mac release app
