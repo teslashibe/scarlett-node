@@ -47,6 +47,10 @@ The review found and corrected these defects:
 - Reinstallation could execute an altered installed runtime before checking its
   fixed checksum. Validation now checks executable bytes first and uses the
   verified incoming runtime to inspect the installed inventory.
+- The new login account field duplicated the cookie-import field's accessible
+  name, causing Windows installed acceptance to fill the wrong form. The login
+  field now has a distinct accessible name; cookie import retains its existing
+  label and focus contract.
 
 Both independent reviews report no unresolved confirmed P1/P2 implementation
 findings. This does not replace the platform and provider acceptance below.
@@ -69,9 +73,11 @@ readiness, requires its private bearer and shuts down on EOF. A synthetic browse
 exits before provider work in that startup smoke. The 107 existing desktop
 packaging/signing Python tests also pass.
 
-GitHub Actions did not start the companion Go job because an account Actions
-budget is preventing further use. Local evidence above remains valid; remote
-checks must be rerun after that limit is restored.
+GitHub Actions did not start the companion x-go job because an Actions budget
+is preventing further use. Node's remote checks started normally, and its Go,
+prover, Linux native bundle and real-browser contract jobs passed before this
+documentation update. Native desktop jobs are tracked separately. Rerun x-go
+after its budget limit is restored.
 
 Signed installed macOS and Windows browser continuation, private-file ACLs and
 process containment remain explicit release gates. No installer has been
