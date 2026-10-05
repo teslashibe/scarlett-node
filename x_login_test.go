@@ -466,3 +466,33 @@ func TestInteractiveXInstalledResourceLookup(t *testing.T) {
 		t.Fatal("dangling executable did not fail closed")
 	}
 }
+
+func TestInteractiveXIdleExpiryUsesEarlierBrowserDeadline(t *testing.T) {
+	operation, backend, message := loginFixture(t)
+	now := time.Now()
+	operation.now = func() time.Time { return now }
+	backend.start = func(_ context.Context, r x.BrowserLoginRequest) (*x.BrowserLoginResult, error) {
+		return &x.BrowserLoginResult{Challenge: &x.BrowserLoginChallenge{ID: "early-expiry", Method: "email", ExpiresAt: now.Add(30 * time.Second)}, DeadlineAt: now.Add(30 * time.Second)}, nil
+	}
+	if result := operation.handle(context.Background(), message); result.Status != "pending" {
+		t.Fatal("fixture did not park browser")
+	}
+	originalDeadline := operation.operation.Budget.DeadlineAt
+	now = now.Add(29 * time.Second)
+	if operation.expirePending() {
+		t.Fatal("pending browser expired early")
+	}
+	now = now.Add(2 * time.Second)
+	if !now.Before(originalDeadline) {
+		t.Fatal("fixture did not distinguish browser expiry from original budget")
+	}
+	if !operation.expirePending() || operation.lock != nil || backend.cancels != 1 {
+		t.Fatal("idle challenge kept its browser/profile lock past browser expiry")
+	}
+	if operation.expirePending() || backend.cancels != 1 {
+		t.Fatal("expiry repeated cancellation")
+	}
+	if result := operation.handle(context.Background(), xLoginMessage{Action: "continue", ID: message.ID, ChallengeID: "early-expiry", Code: "synthetic-code"}); result.Code != "restart_login" || backend.continues != 0 {
+		t.Fatal("expired browser continued")
+	}
+}

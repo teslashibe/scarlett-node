@@ -1,6 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import "./styles.css";
 import { api } from "./api.ts";
+import { scheduleXLoginExpiry } from "./x-login-expiry.ts";
 import {
   accountHealth,
   canConnectCodex,
@@ -526,26 +527,37 @@ $("x-reimport-cancel").addEventListener("click", () => {
 let xLoginPending: XLoginStatus | null = null;
 let xLoginBusy = false;
 let xLoginVersion = 0;
+let xLoginCancelling = false;
+let cancelXLoginExpiry = () => {};
 function renderXLogin(result?: XLoginStatus) {
  if (result) {
   xLoginPending = result.status === "pending" ? result : null;
   $("x-login-note").textContent = xLoginMessage(result);
  }
+ cancelXLoginExpiry();
+ const operation = xLoginPending;
+ const version = xLoginVersion;
+ if (operation?.expires_at) {
+  cancelXLoginExpiry = scheduleXLoginExpiry(operation.expires_at,
+   () => { void discardXLogin({status: "error", code: "restart_login"}); },
+   () => version === xLoginVersion && xLoginPending === operation);
+ }
  const pending = !!xLoginPending;
  $("x-challenge-form").hidden = !pending;
  $("x-login-cancel").hidden = !pending && !xLoginBusy;
- $("x-login-start").toggleAttribute("disabled", xLoginBusy || pending);
- $("x-login-continue").toggleAttribute("disabled", xLoginBusy);
- for (const id of ["x-login-id", "x-login-capacity", "x-login-reconnect", "x-login-username", "x-login-password"]) $(id).toggleAttribute("disabled", pending || xLoginBusy);
+ $("x-login-start").toggleAttribute("disabled", xLoginBusy || xLoginCancelling || pending);
+ $("x-login-continue").toggleAttribute("disabled", xLoginBusy || xLoginCancelling);
+ $("x-login-cancel").toggleAttribute("disabled", xLoginCancelling);
+ for (const id of ["x-login-id", "x-login-capacity", "x-login-reconnect", "x-login-username", "x-login-password"]) $(id).toggleAttribute("disabled", pending || xLoginBusy || xLoginCancelling);
 }
 async function runXLogin(action: () => Promise<XLoginStatus>) {
- if (xLoginBusy) return;
+ if (xLoginBusy || xLoginCancelling) return;
  xLoginBusy = true;
  const version = ++xLoginVersion;
  $("x-login-note").textContent = "Waiting for the browser login";
  renderXLogin();
  try { const result = await action(); if (version === xLoginVersion) renderXLogin(result); } catch (error) { if (version === xLoginVersion) { xLoginPending = null; $("x-login-note").textContent = errorMessage(error); } }
- finally { xLoginBusy = false; renderXLogin(); await refresh(); }
+ finally { if (version === xLoginVersion) { xLoginBusy = false; renderXLogin(); await refresh(); } }
 }
 $("x-login-form").addEventListener("submit", (event) => {
  event.preventDefault();
@@ -565,9 +577,19 @@ $("x-challenge-form").addEventListener("submit", (event) => {
  if (!pending?.id || !pending.challenge_id) return;
  void runXLogin(() => api.continueXLogin(pending.id!, pending.challenge_id!, code));
 });
-$("x-login-cancel").addEventListener("click", () => {
-  ++xLoginVersion;
+async function discardXLogin(result: XLoginStatus) {
+ ++xLoginVersion;
+ cancelXLoginExpiry();
+ xLoginPending = null;
+ xLoginCancelling = true;
+ xLoginBusy = false;
  $<HTMLInputElement>("x-login-password").value = "";
  $<HTMLInputElement>("x-login-code").value = "";
- void api.cancelXLogin().then(() => { xLoginPending = null; renderXLogin({ status: "cancelled" }); }).catch((error) => notice(errorMessage(error), true));
+ renderXLogin(result);
+ try { await api.cancelXLogin(); }
+ catch (error) { notice(errorMessage(error), true); }
+ finally { xLoginCancelling = false; renderXLogin(); }
+}
+$("x-login-cancel").addEventListener("click", () => {
+ void discardXLogin({ status: "cancelled" });
 });

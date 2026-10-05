@@ -178,6 +178,24 @@ func (o *xLoginOperation) close() {
 	o.operation = x.BrowserLoginOperation{}
 	o.pending = nil
 }
+
+// A parked browser may expire before the caller's original operation budget.
+// Keep wire identity unchanged while enforcing that earlier local deadline.
+func (o *xLoginOperation) deadline() time.Time {
+	deadline := o.operation.Budget.DeadlineAt
+	if o.pending != nil && o.pending.ExpiresAt.Before(deadline) {
+		deadline = o.pending.ExpiresAt
+	}
+	return deadline
+}
+func (o *xLoginOperation) expirePending() bool {
+	if o.lock == nil || o.now().Before(o.deadline()) {
+		return false
+	}
+	o.close()
+	return true
+}
+
 func (o *xLoginOperation) handle(ctx context.Context, m xLoginMessage) xLoginStatus {
 	fail := func(code string) xLoginStatus { return xLoginStatus{Status: "error", Code: code} }
 	if m.Action == "cancel" {
@@ -198,7 +216,7 @@ func (o *xLoginOperation) handle(ctx context.Context, m xLoginMessage) xLoginSta
 		if len(m.Code) > 128 || strings.TrimSpace(m.Code) == "" {
 			return fail("invalid_input")
 		}
-		bounded, cancel := context.WithDeadline(ctx, o.operation.Budget.DeadlineAt)
+		bounded, cancel := context.WithDeadline(ctx, o.deadline())
 		defer cancel()
 		result, err := o.backend.Continue(bounded, o.operation, m.ChallengeID, m.Code)
 		return o.finish(bounded, result, err)
@@ -303,7 +321,7 @@ func (o *xLoginOperation) handle(ctx context.Context, m xLoginMessage) xLoginSta
 			o.operation.ProxyLease = owner
 		}
 	}
-	bounded, cancel := context.WithDeadline(ctx, o.operation.Budget.DeadlineAt)
+	bounded, cancel := context.WithDeadline(ctx, o.deadline())
 	defer cancel()
 	result, err := o.backend.Start(bounded, x.BrowserLoginRequest{Username: m.Username, Password: m.Password, Operation: o.operation})
 	return o.finish(bounded, result, err)
@@ -376,7 +394,7 @@ func (o *xLoginOperation) commit(ctx context.Context, s x.Session) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if err := ctxDeadline(o.now(), o.operation.Budget.DeadlineAt); err != nil {
+	if err := ctxDeadline(o.now(), o.deadline()); err != nil {
 		return err
 	}
 	path := accountFilePath(o.dir)
@@ -557,8 +575,8 @@ func xLoginCommand(input io.Reader, output io.Writer) error {
 		case <-ctx.Done():
 			return nil
 		case <-time.After(time.Second):
-			if operation != nil && operation.lock != nil && !operation.now().Before(operation.operation.Budget.DeadlineAt) {
-				operation.close()
+			if operation != nil && operation.expirePending() {
+				active.Store("")
 				if err := json.NewEncoder(output).Encode(xLoginStatus{Status: "error", Code: "restart_login"}); err != nil {
 					return nil
 				}
