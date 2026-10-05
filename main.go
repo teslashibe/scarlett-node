@@ -203,6 +203,7 @@ func keepXClientsWarm(ctx context.Context, c config.Config, clients *worker.XCli
 // That function returns only once the keeper has, so a check already under way
 // cannot create a client after the cache is stopped.
 func startXKeeper(ctx context.Context, c config.Config, clients *worker.XClients, pool *servicePool, every time.Duration) (stop func()) {
+	clients.RefreshAdmission(pool.xRefreshAllowed)
 	ctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {

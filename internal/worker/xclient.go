@@ -61,7 +61,9 @@ type XClients struct {
 	accounts map[string]*xAccount
 	// observe is told the outcome of each build that asked X to validate a
 	// session; see Observe.
-	observe func(path, code string)
+	observe func(path, stamp, code string)
+	// refreshAdmission checks pool availability before an autonomous refresh.
+	refreshAdmission func(path string) bool
 	// minGap overrides x-go's request pacing; zero means xMinGap. Tests only.
 	minGap time.Duration
 	// retry overrides xRetryBase. Tests only.
@@ -84,17 +86,35 @@ func DefaultXClients() *XClients { return defaultXClients }
 type XAccount struct{ ID, Path string }
 
 // Observe sets the function told the outcome of every build that asked X to
-// validate a session: the account's session path and "" when the client was
-// installed, otherwise the failure code (auth_required, x_rate_limited or
+// validate a session: the account's session path, validated content stamp and
+// "" when the client was installed, otherwise the failure code (auth_required, x_rate_limited or
 // x_request_failed). It is called with none of the cache's locks held, never
 // for a build whose validation was only replayed, and never with an outcome
-// for file content the session file no longer holds. Ensure also reports ""
+// for file content the session file no longer holds at dispatch. The observer
+// must compare the stamp again while applying the outcome. Ensure also reports ""
 // for an account that already has a validated client. Set it before the first
 // build.
-func (c *XClients) Observe(f func(path, code string)) {
+func (c *XClients) Observe(f func(path, stamp, code string)) {
 	c.mu.Lock()
 	c.observe = f
 	c.mu.Unlock()
+}
+
+// RefreshAdmission sets the pool check for autonomous refreshes. It runs with
+// no cache or account lock held. A denied refresh keeps the serving client and
+// existing retry schedule; explicit job admission remains the pool's decision.
+// A nil check allows refreshes for standalone users. Set before the first build.
+func (c *XClients) RefreshAdmission(f func(path string) bool) {
+	c.mu.Lock()
+	c.refreshAdmission = f
+	c.mu.Unlock()
+}
+
+func (c *XClients) canRefresh(path string) bool {
+	c.mu.Lock()
+	admit := c.refreshAdmission
+	c.mu.Unlock()
+	return admit == nil || admit(path)
 }
 
 // Warm builds the client of each account in turn, so the first job on it is
@@ -134,10 +154,10 @@ func (c *XClients) Warm(ctx context.Context, cfg config.Config, accounts []XAcco
 func (c *XClients) Ensure(cfg config.Config, accounts []XAccount) {
 	observe := c.observer()
 	for started, i := false, 0; i < len(accounts); i++ {
-		warm, built := c.account(cfg, accounts[i].ID, accounts[i].Path, nil).ensure(!started)
+		stamp, built := c.account(cfg, accounts[i].ID, accounts[i].Path, nil).ensure(!started)
 		started = started || built
-		if warm && observe != nil {
-			observe(accounts[i].Path, "")
+		if stamp != "" && observe != nil {
+			observe(accounts[i].Path, stamp, "")
 		}
 	}
 }
@@ -185,7 +205,7 @@ func (c *XClients) retryBase() time.Duration {
 	return xRetryBase
 }
 
-func (c *XClients) observer() func(path, code string) {
+func (c *XClients) observer() func(path, stamp, code string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.observe
@@ -412,37 +432,37 @@ func (a *xAccount) replace(warm *xWarm) {
 	a.startBuild(warm, nil, "replay")
 }
 
-// ensure reports whether the account has a client built from its session file
-// as it is now. When it has none, one is due and start allows it, ensure starts
+// ensure returns the validated stamp when the account has a client built from
+// its session file as it is now. When it has none, one is due and start allows it, ensure starts
 // a validated background build and reports that as built.
-func (a *xAccount) ensure(start bool) (warm, built bool) {
+func (a *xAccount) ensure(start bool) (validatedStamp string, built bool) {
 	_, stamp, err := readXSession(a.path)
 	if err != nil {
-		return false, false
+		return "", false
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.stopped {
-		return false, false
+		return "", false
 	}
 	if a.current != nil && a.current.stamp == stamp {
-		return true, false
+		return stamp, false
 	}
 	if !start || a.build != nil {
-		return false, false
+		return "", false
 	}
 	if a.failed != stamp {
 		// What an earlier build learned was about other file content.
 		a.failed, a.refused, a.backoff, a.retryAt = "", false, 0, time.Time{}
 	}
 	if a.refused || time.Now().Before(a.retryAt) {
-		return false, false
+		return "", false
 	}
 	if a.current != nil {
 		a.logf("x session for account %s changed; rebuilding its client", a.id)
 	}
 	a.startBuild(a.current, a.ids, "warm")
-	return false, true
+	return "", true
 }
 
 // noteFailure backs the background off after a failed build of the session
@@ -582,7 +602,7 @@ func (a *xAccount) run(b *xBuild, prior *xWarm, ids map[string]string) {
 	}
 	// Reported before done closes, so whoever waited on this build finds the
 	// outcome already applied.
-	observe(a.path, code)
+	observe(a.path, stamp, code)
 }
 
 // construct builds one x-go client. Its validation reads and bootstrap
@@ -682,6 +702,10 @@ func (a *xAccount) refresher() {
 		case <-a.kick:
 			next = a.clients.retryBase()
 		case <-timer.C:
+			if !a.clients.canRefresh(a.path) {
+				timer.Reset(wait)
+				continue
+			}
 			kind := "refresh"
 			if wait < a.refresh && a.degraded() {
 				kind = "replay"

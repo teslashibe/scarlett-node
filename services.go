@@ -112,6 +112,18 @@ func (p *servicePool) xAccounts() []worker.XAccount {
 	}
 	return out
 }
+
+// xRefreshAllowed applies the keeper's same availability rules to the cache's
+// autonomous timer, which otherwise retains clients while accounts rest.
+func (p *servicePool) xRefreshAllowed(path string) bool {
+	for _, account := range p.xAccounts() {
+		if account.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *servicePool) acquire(kind string) bool { _, ok := p.acquireAccount(kind); return ok }
 func (p *servicePool) finish(kind, code string) {
 	p.mu.Lock()

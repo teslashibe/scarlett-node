@@ -224,6 +224,16 @@ func safeSecret(s string, max int, required bool) bool {
 }
 func XConfigured(path string) bool { _, _, err := readXSession(path); return err == nil }
 
+// XSessionStamp returns the private, locally valid session content fingerprint.
+// An empty stamp means the session cannot be used. Never log the fingerprint.
+func XSessionStamp(path string) string {
+	_, stamp, err := readXSession(path)
+	if err != nil {
+		return ""
+	}
+	return stamp
+}
+
 // readXSession reads and checks a session file. The stamp is the SHA-256 of
 // the file's content: a warm client built from one stamp is dropped when the
 // file no longer hashes to it. The hash reveals nothing about the content and
