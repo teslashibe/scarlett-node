@@ -76,20 +76,28 @@ func TestBrowserLoginRuntimeContract(t *testing.T) {
 		t.Fatalf("start did not establish a bounded pending challenge: %v", err)
 	}
 	invalid, err := browser.Continue(ctx, operation, first.Challenge.ID, "000000")
-	if err != nil || invalid == nil || invalid.Challenge == nil || !invalid.DeadlineAt.Equal(first.DeadlineAt) {
+	if err != nil || invalid == nil || invalid.Challenge == nil || !invalid.DeadlineAt.Equal(first.DeadlineAt) || invalid.Attempts.Browser != 1 || invalid.Attempts.Credential != 1 || invalid.Attempts.Solver != 0 || !invalid.Attempts.Complete {
 		t.Fatalf("invalid code did not retain the original operation: %v", err)
 	}
+	// The fixture retains the old rejection while the valid response takes three
+	// seconds. An unchanged code field must not return a premature new challenge.
+	started := time.Now()
 	result, err := browser.Continue(ctx, operation, invalid.Challenge.ID, "123456")
-	if err != nil || result == nil || result.Session == nil || result.Challenge != nil || result.Session.AuthToken != "synthetic-auth_token" || result.Session.UserAgent == "" || result.Attempts.Browser != 1 || result.Attempts.Credential != 1 {
+	if err != nil || result == nil || result.Session == nil || result.Challenge != nil || result.Session.AuthToken != "synthetic-auth_token" || result.Session.UserAgent == "" || result.Attempts.Browser != 1 || result.Attempts.Credential != 1 || result.Attempts.Solver != 0 || !result.Attempts.Complete || !result.DeadlineAt.Equal(first.DeadlineAt) {
 		t.Fatalf("same-browser code continuation did not produce a candidate session: %v", err)
+	}
+	if time.Since(started) < 3*time.Second {
+		t.Fatal("code continuation did not await the delayed valid response")
 	}
 	_ = input.Close()
 	var observed struct {
 		Observed *struct {
-			Launches    int      `json:"launches"`
-			Passwords   int      `json:"passwords"`
-			Codes       []string `json:"codes"`
-			Navigations int      `json:"navigations"`
+			Launches                  int      `json:"launches"`
+			Passwords                 int      `json:"passwords"`
+			Codes                     []string `json:"codes"`
+			Navigations               int      `json:"navigations"`
+			RetainedPageContinuations int      `json:"retainedPageContinuations"`
+			ValidAfterStaleRejection  bool     `json:"validAfterStaleRejection"`
 		} `json:"observed"`
 	}
 	for scanner.Scan() {
@@ -102,7 +110,7 @@ func TestBrowserLoginRuntimeContract(t *testing.T) {
 		t.Fatal("fixture failed to shut down cleanly")
 	}
 	stopped = true
-	if scanner.Err() != nil || observed.Observed == nil || observed.Observed.Launches != 1 || observed.Observed.Passwords != 1 || observed.Observed.Navigations != 3 || strings.Join(observed.Observed.Codes, ",") != "000000,123456" {
+	if scanner.Err() != nil || observed.Observed == nil || observed.Observed.Launches != 1 || observed.Observed.Passwords != 1 || observed.Observed.Navigations != 3 || observed.Observed.RetainedPageContinuations != 2 || !observed.Observed.ValidAfterStaleRejection || strings.Join(observed.Observed.Codes, ",") != "000000,123456" {
 		t.Fatal("browser observation did not establish one password and code-only continuation")
 	}
 }

@@ -12,7 +12,7 @@ The reviewed x-go snapshot is pinned to
 | Contract | Implementation and offline evidence |
 | --- | --- |
 | User-entered verification code | Go start/continue/cancel API, hidden CLI prompts and trusted desktop commands; no seed field. Desktop fixture confirms pending copy, cleared password, code submission and cancellation |
-| Same browser throughout verification | Real Chromium fixtures intercept every provider route. Invalid then valid code continues the held page with one browser launch, one password submission and no second login navigation |
+| Same browser throughout verification | Real Chromium fixtures intercept every provider route. Invalid then delayed valid code continues the held page with one browser launch, one password submission and no second login navigation; code continuations use production waits |
 | Wire interoperability | `TestBrowserLoginRuntimeContract` runs the actual Go adapter against the pinned Node service over local HTTP and checks UA/session output and aggregate work observations |
 | Ownership and bounded work | Wrong owner, profile, proxy and challenge tests fail before provider work. Continuation keeps the original deadline and aggregate allowances; a parked browser holds profile ownership and capacity |
 | Lifecycle | Cancel, expiry, browser crash, terminal success and shutdown release holds. Managed helper fixtures exercise bearer enforcement, readiness, EOF and process shutdown |
@@ -60,8 +60,16 @@ The review found and corrected these defects:
   Both now use the earlier browser deadline. Cancellation fences also prevent an
   older invocation's completion from re-enabling a replacement login.
 
-Both independent reviews report no unresolved confirmed P1/P2 implementation
-findings. This does not replace the platform and provider acceptance below.
+- A submitted code could return pending while the provider was still processing
+  it. Continuations now poll within the existing 30-second window and original
+  operation deadline. A prior identical rejection is ignored until it clears,
+  changes, or the window ends. Native-wait Chrome controls cover valid responses
+  after three and twelve seconds, including a stale rejection from an earlier
+  invalid code. Repeated unchanged rejection can conservatively wait until the
+  original deadline; it never triggers another password or code submission.
+
+Independent source reviews cover these fixes. Rebuilt installed acceptance and
+live authenticated verification remain required before merge readiness.
 
 Windows CI also exposed fixture setup errors. Git attributes now preserve the
 vendored source bytes instead of converting them to CRLF during checkout. Login
@@ -128,7 +136,13 @@ Windows acceptance now checks the actual helper bytes, private bearer, readiness
 EOF shutdown, headed Chrome launch and all seven intercepted challenge cases;
 zero or skipped cases cannot pass. The earlier Windows signed installer rehearsal passed real installation, UI
 import, upgrade and downgrade. The strengthened installed browser checks and
-final native/signing checks remain under CI validation. The earlier x-go diagnostic returned provider code 366 before
+final native/signing checks remain under CI validation. Later signed baseline
+rehearsals passed all seven browser cases, but the full three-phase Windows
+gate failed during browser fixtures after upgrade. A guarded recheck also
+failed after upgrade in a different fixture. The evidence does not yet establish
+a production Windows upgrade defect. The delayed-code production fix requires
+fresh baseline, upgrade and downgrade checks with all seven cases passing and
+none skipped. The earlier x-go diagnostic returned provider code 366 before
 sending credentials. The installed macOS attempt did not reproduce 399.
 
 Follow the bounded procedure in [x-browser-runtime.md](x-browser-runtime.md)

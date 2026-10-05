@@ -15,14 +15,17 @@ const launch = chromium.launchPersistentContext.bind(chromium);
 const req = (key = "fixture") => ({ platform: "x", profile_key: key, username: "synthetic-user", password: "synthetic-password", operation_owner: "owner".repeat(10), connection_id: "connection", generation: "1", revision: "1", recovery_claim: "claim", budget: { max_browser_attempts: 1, max_credential_attempts: 1, max_solver_attempts: 0, deadline_at: new Date(Date.now()+40000).toISOString() } });
 const continuation = (input, challenge, code) => ({ ...input, username: "", password: "", challenge_id: challenge.id, verification_code: code, budget: { max_browser_attempts: 0, max_credential_attempts: 0, max_solver_attempts: 0 } });
 
-async function fixture(t) {
- const observed = { navigations: 0, passwords: 0, codes: [], launches: 0, closes: 0, requests: [], context: null, page: null, runtimeFailure: null };
+async function fixture(t, {validDelayMs=0}={}) {
+ const observed = { navigations: 0, passwords: 0, codes: [], launches: 0, closes: 0, requests: [], context: null, page: null, runtimeFailure: null, nativeWait: null };
  t.mock.method(chromium, "launchPersistentContext", async (dir, options) => {
   observed.launches++;
   const context = await launch(dir, options); observed.context = context;
   context.once("close", () => observed.closes++);
   await context.exposeFunction("recordPassword", () => observed.passwords++);
-  await context.exposeFunction("recordCode", code => observed.codes.push(code));
+  await context.exposeFunction("recordCode", async code => {
+   observed.codes.push(code);
+   if (code === "123456" && validDelayMs) await new Promise(resolve=>setTimeout(resolve,validDelayMs));
+  });
   // Every provider request is intercepted. No X request can leave this test.
   await context.route("**/*", async route => {
    const request = route.request(); observed.requests.push(request.url());
@@ -39,7 +42,7 @@ async function fixture(t) {
    await route.fulfill({ contentType: "text/html", body });
   });
   const page = context.pages()[0]; observed.page = page;
-  const wait = page.waitForTimeout.bind(page);
+  const wait = page.waitForTimeout.bind(page); observed.nativeWait=wait;
   page.waitForTimeout = async ms => {
    await wait(Math.min(ms,10));
    // Decorative delays stay short, but submitted fixture work must actually settle.
@@ -75,6 +78,8 @@ function serviceFor(t, seen, overrides={}) {
   Object.assign(process.env,overrides);
   service = new SocialLoginService({runtime:{...runtime,async runBrowserLogin(platform,input,...args) {
    seen.runtimeFailure=null;
+   // Every code continuation uses the production wait and polling behavior.
+   if (input.challengeHold) seen.page.waitForTimeout=seen.nativeWait;
    try { return await runtime.runBrowserLogin(platform,input,...args); }
    catch (error) {
     const names=["TimeoutError","Error","TypeError","ServiceError","AdmissionError","AbortError"];
@@ -100,7 +105,7 @@ test.beforeEach(() => runtime.reset());
 test.after(() => fs.rmSync(base,{recursive:true,force:true}));
 
 test("real Chromium parks X and submits invalid then valid code on the same page with one password", async t => {
- const seen=await fixture(t); const service=serviceFor(t,seen);
+ const seen=await fixture(t,{validDelayMs:3000}); const service=serviceFor(t,seen);
  const input=req("continue");const first=await service.login(input);
  assert.equal(first.result.failureType,"verification_required");assert.equal(Boolean(first.result.challenge?.id),true); assert.equal(service.capabilities().interactive_x,1);
  const page=seen.page;const navigations=seen.navigations;
@@ -117,7 +122,10 @@ test("real Chromium parks X and submits invalid then valid code on the same page
  assert.equal(invalid.result.deadline_at,first.result.deadline_at);
  assert.deepEqual(invalid.result.attempts,{browser:1,credential:1,solver:0,complete:true});
  await assert.rejects(service.login(continuation(input,first.result.challenge,"123456")),e=>e.code==="challenge_not_found");
- const success=await service.login(continuation(input,invalid.result.challenge,"123456"));
+ // Keep the old rejection visible during a delayed valid response.
+ assert.equal(await page.getByText("Incorrect verification code",{exact:true}).isVisible(),true);
+ const before=Date.now();const success=await service.login(continuation(input,invalid.result.challenge,"123456"));
+ assert.ok(Date.now()-before >= 3000);
  assert.equal(success.result.ok,true);assert.equal(success.result.session.auth_token,"synthetic-auth_token");assert.ok(success.result.session.user_agent);
  assert.deepEqual(success.result.attempts,{browser:1,credential:1,solver:0,complete:true});
  await waitForReleased(seen);assert.equal(seen.passwords,1);assert.equal(seen.launches,1);assert.deepEqual(seen.codes,["000000","123456"]);assert.equal(seen.closes,1);

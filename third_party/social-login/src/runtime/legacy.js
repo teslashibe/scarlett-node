@@ -1133,6 +1133,11 @@ async function xVisibleCodeField(page) {
   return null;
 }
 
+function xCodeRejection(body) {
+  const phrases = body.match(/\b(?:(?:incorrect|wrong|invalid|expired)(?:\s+(?:verification|security|confirmation))?\s+code|(?:verification\s+|security\s+|confirmation\s+)?code(?:\s+you\s+entered)?(?:\s+is|\s+was)?\s+(?:incorrect|wrong|invalid|expired|not\s+(?:valid|correct)))\b/gi) || [];
+  return phrases.map(value => value.toLowerCase().replace(/\s+/g, " ")).join("\n");
+}
+
 // A code continuation only touches the retained page. No login navigation,
 // browser launch, password fill or password submission is permitted here.
 async function finishXLogin(session, verificationCode, proxyUrl) {
@@ -1142,7 +1147,10 @@ async function finishXLogin(session, verificationCode, proxyUrl) {
     const modal = page.locator("#layers");
     const bodyText = () => page.locator("body").innerText();
     let codeField = await xVisibleCodeField(page);
+    let previousRejection = "";
+    let rejectionCleared = false;
     if (verificationCode) {
+      previousRejection = xCodeRejection(await bodyText());
       if (!codeField) throw new Error("challenge page is no longer available");
       await xType(codeField, String(verificationCode).trim());
       await xClick(page, modal, [/^next$/i, /^verify$/i, /^log in$/i, /^continue$/i]);
@@ -1155,11 +1163,17 @@ async function finishXLogin(session, verificationCode, proxyUrl) {
       const rateLimited = X_RATE_LIMIT_RE.test(body);
       codeField = await xVisibleCodeField(page);
       const codeRequired = Boolean(codeField) || X_CODE_CHALLENGE_RE.test(body);
+      const rejection = xCodeRejection(body);
+      if (!rejection) rejectionCleared = true;
+      // The old error can stay visible while a later code is accepted. Only a
+      // changed rejection or one observed after clearing settles this submission.
+      const freshRejection = Boolean(rejection) && (rejectionCleared || rejection !== previousRejection);
+      const challengeSettled = codeRequired && (!verificationCode || freshRejection);
       const cookies = await context.cookies(["https://x.com"]);
       const map = Object.fromEntries(cookies.map((c) => [c.name, c.value]));
       // Stale auth cookies on a challenge/login page never establish success.
       const ok = !rateLimited && !codeRequired && !/\/i\/(?:flow|jf)\/|\/login/.test(page.url()) && Boolean(map.auth_token && map.ct0);
-      if (ok || rateLimited || codeRequired || Date.now() >= deadline) {
+      if (ok || rateLimited || challengeSettled || Date.now() >= deadline) {
         parked = !ok && !rateLimited && codeRequired;
         return {
           ok, rateLimited, finalUrl: page.url(), cookies: ok ? map : {},
