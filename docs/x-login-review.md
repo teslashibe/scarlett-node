@@ -52,6 +52,14 @@ The review found and corrected these defects:
   field now has a distinct accessible name; cookie import retains its existing
   label and focus contract.
 
+- Installed desktop CLI binaries needed the desktop resource layout, while the
+  standalone CLI uses a sibling helper. Discovery now selects only those fixed
+  layouts, fails closed for an incomplete desktop bundle and tests actual native
+  subprocess launches on Windows and macOS, including Unix install symlinks.
+- Live expiry exposed a stale desktop code form and a delayed native lock release.
+  Both now use the earlier browser deadline. Cancellation fences also prevent an
+  older invocation's completion from re-enabling a replacement login.
+
 Both independent reviews report no unresolved confirmed P1/P2 implementation
 findings. This does not replace the platform and provider acceptance below.
 
@@ -63,7 +71,7 @@ private-storage checks are unchanged. Native Windows CI verifies these fixes.
 
 ## Validation limits
 
-Go race tests, vet/build, desktop's 20 tests and TypeScript/Vite build pass.
+Go race tests, vet/build, desktop's 22 tests and TypeScript/Vite build pass.
 The prover suite passes with 87 tests and two existing ignored tests. Desktop Rust
 unit checks use the test-only external-binary override; they do not establish a
 complete installed release. Runtime source/patch and resource tampering checks
@@ -76,8 +84,7 @@ rollback, missing-resource and tampering fixtures, including rejection of an
 altered installed Node executable before execution. Launching through the actual
 installed CLI symlink finds the helper without a resource override, reports
 readiness, requires its private bearer and shuts down on EOF. A synthetic browser
-exits before provider work in that startup smoke. The 107 existing desktop
-packaging/signing Python tests also pass.
+exits before provider work in that startup smoke. The 109 desktop packaging/signing Python tests also pass.
 
 GitHub Actions did not start the companion x-go job because an Actions budget
 is preventing further use. Node's remote checks started normally, and its Go,
@@ -89,9 +96,42 @@ Signed installed macOS and Windows browser continuation, private-file ACLs and
 process containment remain explicit release gates. No installer has been
 published, no production service deployed and no PR merged by this work.
 
-No test in this implementation used a live X account. The earlier diagnostic
-failed with provider code 366 before sending credentials and did not reproduce
-399. Follow the single-attempt opt-in procedure in [x-browser-runtime.md](x-browser-runtime.md)
-to validate live login, authenticated identity, a small Go read and restart reuse.
-Stop on rejection, rate limits or ambiguity; fixture success does not establish
-live Castle acceptance.
+## Installed macOS acceptance
+
+A complete arm64 app built from `fb3875a` was copied from a read-only DMG into
+an isolated Applications directory. The installed app's 266-entry inventory
+matches the built app exactly. Its bundled Node and Playwright with installed
+Chrome pass all seven intercepted browser fixtures. The actual installed Go
+manager passes readiness, private bearer rejection and EOF shutdown. Both the
+local app and the exact CI-built arm64 app pass self-signed signing and DMG
+verification locally; this does not establish notarization or distribution trust.
+
+Computer Use exercised the installed native app in a private temporary home:
+zero initial accounts, local form validation, cleared password after submission,
+visible code-entry form, cancellation, native window-close shutdown and restart
+with a saved test preference. The installed CLI's real hidden TTY prompts passed
+start, invalid-code continuation on the same browser and cancellation using a
+fully intercepted provider fixture: one browser, one password, one code, zero
+provider requests and no saved account. Computer Use denied Terminal access;
+the CLI prompts were tested through a PTY command session instead.
+
+One authorized live burner attempt reached X's email verification challenge.
+No code arrived within the original deadline. Chrome closed at expiry, no
+account was saved, and the test did not send another password. This establishes
+live challenge delivery, not authenticated session persistence or a successful
+Go read. The observed stale code form led to a fix: the native owner and UI now
+expire at the earlier browser deadline, with cancellation and generation fences
+covered by regression tests.
+
+Windows native Go race/vet/build and prover checks pass on NTFS. Installed
+Windows acceptance now checks the actual helper bytes, private bearer, readiness,
+EOF shutdown, headed Chrome launch and all seven intercepted challenge cases;
+zero or skipped cases cannot pass. The earlier Windows signed installer rehearsal passed real installation, UI
+import, upgrade and downgrade. The strengthened installed browser checks and
+final native/signing checks remain under CI validation. The earlier x-go diagnostic returned provider code 366 before
+sending credentials. The installed macOS attempt did not reproduce 399.
+
+Follow the bounded procedure in [x-browser-runtime.md](x-browser-runtime.md)
+to finish live code continuation, authenticated identity, a small Go read and
+restart reuse. Stop on rejection, rate limits or ambiguity. No installer has been
+published and no production release has been performed.
