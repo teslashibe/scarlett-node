@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "scheme": "self-signed-stable",
+  "macos": {
+    "subject": "O=Scarlett, CN=Scarlett Node Self-Signed macOS",
+    "certificate": "desktop/signing/macos-codesign.cert.pem",
+    "sha1": "32c7bb094412d12a95de7dfb5e6ed87c10348944",
+    "sha256": "c7cbee31549b04dcac129277b1e77ff5f0c14f630c142caa5e2042d1ac581dcc",
+    "notAfter": "2046-09-28T21:16:51Z",
+    "identifiers": {
+      "app": "ai.scarlett.node",
+      "scarlett-node": "ai.scarlett.node.scarlett-node",
+      "scarlett-prover": "ai.scarlett.node.scarlett-prover",
+      "open-agent-api": "ai.scarlett.node.open-agent-api",
+      "dmg": "ai.scarlett.node.dmg"
+    },
+    "designatedRequirement": "designated => identifier \"ai.scarlett.node\" and certificate leaf = H\"32c7bb094412d12a95de7dfb5e6ed87c10348944\""
+  },
+  "windows": {
+    "subject": "O=Scarlett, CN=Scarlett Node Self-Signed Windows",
+    "certificate": "desktop/signing/windows-authenticode.cert.pem",
+    "sha1": "2a7528535206c0fcf64d43ecb7313948c3a335f4",
+    "sha256": "040353aabcc26f03d2f584af857d78afaf7d278ab1927f80f05b4c85eee831fa",
+    "notAfter": "2046-09-28T21:16:51Z",
+    "timestampUrl": "http://timestamp.digicert.com"
+  }
+}

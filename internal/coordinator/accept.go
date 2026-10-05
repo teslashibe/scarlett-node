@@ -25,6 +25,15 @@ func digest(value string) bool {
 	return err == nil && len(raw) == 32 && hex.EncodeToString(raw) == value
 }
 
+// ValidOffer applies Accept's local checks to the unchanged offered terms. A
+// failure here means acceptance HTTP is never sent for the offer.
+func ValidOffer(offer Lease, now time.Time) error {
+	if !offer.AcceptanceRequired || offer.Version != Version || offer.VerifierToken != "" || !digest(offer.RequestSHA256) || !digest(offer.SignedJobID) || (offer.ServiceType != "codex" && offer.ServiceType != "x_read") || !offer.LeaseDeadline.After(now) || offer.LeaseDeadline.After(now.Add(MaxOfferLifetime)) || !offer.SettlementDeadline.Equal(offer.LeaseDeadline) {
+		return errors.New("invalid community offer")
+	}
+	return nil
+}
+
 // Accept asks only the locally configured authenticated HTTPS coordinator to
 // confirm production receipt authority for the exact immutable offered terms.
 // It does not read a node-selected RPC or treat prototype funds as authority.
@@ -34,9 +43,8 @@ func (c *Client) Accept(ctx context.Context, offer Lease) (Lease, error) {
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || c.Credential == "" {
 		return Lease{}, errors.New("funded acceptance requires the configured HTTPS coordinator")
 	}
-	now := time.Now()
-	if !offer.AcceptanceRequired || offer.Version != Version || offer.VerifierToken != "" || !digest(offer.RequestSHA256) || !digest(offer.SignedJobID) || (offer.ServiceType != "codex" && offer.ServiceType != "x_read") || !offer.LeaseDeadline.After(now) || offer.LeaseDeadline.After(now.Add(MaxOfferLifetime)) || !offer.SettlementDeadline.Equal(offer.LeaseDeadline) {
-		return Lease{}, errors.New("invalid community offer")
+	if err := ValidOffer(offer, time.Now()); err != nil {
+		return Lease{}, err
 	}
 	path, err := JobPath(offer.JobID, "accept")
 	if err != nil {

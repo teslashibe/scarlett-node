@@ -193,9 +193,10 @@ func TestLegacyCodexAdmissionGateAppliesOnlyToFundedTLSNMode(t *testing.T) {
 	}
 }
 
-// codex-cli writes auth.json in place, and open-agent-api v0.1.31 persists a
-// renewal through os.CreateTemp in the same directory and a rename. Neither
-// applies a Windows security descriptor.
+// codex-cli writes auth.json in place, and open-agent-api persists a renewal
+// through os.CreateTemp in the same directory and a rename. The result keeps
+// the DACL inherited from CODEX_HOME: v0.1.32 copies the replaced profile's
+// owner, and its DACL only when protected, which a codex-cli profile is not.
 func writeCodexAuthLikeCLI(t *testing.T, path string, raw []byte) {
 	t.Helper()
 	if err := os.WriteFile(path, raw, 0600); err != nil {

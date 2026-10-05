@@ -66,6 +66,9 @@ type Record struct {
 	SubmissionSHA256  string        `json:"submission_sha256,omitempty"`
 	UpdatedAt         time.Time     `json:"updated_at"`
 	ProofTraffic      *ProofTraffic `json:"proof_traffic,omitempty"`
+	// NoProvider marks an attempt that never runs provider work, such as a
+	// rejection. Older readers ignore it and treat the record as unbound.
+	NoProvider bool `json:"no_provider,omitempty"`
 }
 
 type Journal struct {
@@ -129,6 +132,14 @@ func (j *Journal) Close() error {
 }
 func Hash(raw []byte) string { h := sha256.Sum256(raw); return hex.EncodeToString(h[:]) }
 func key(r Record) string    { return Hash([]byte(r.JobID + "\x00" + r.Attempt + "\x00" + r.Fence)) }
+
+// Key identifies an attempt by job, attempt and fence, as its file name does.
+func (r Record) Key() string { return key(r) }
+
+// sameBinding compares the provider binding fixed when the attempt began.
+func sameBinding(a, b Record) bool {
+	return a.ProviderAccountID == b.ProviderAccountID && a.ProviderService == b.ProviderService && a.NoProvider == b.NoProvider
+}
 func validField(s string) bool {
 	if len(s) == 0 || len(s) > 128 {
 		return false
@@ -148,7 +159,7 @@ func valid(r Record) bool {
 	if r.ProofTraffic != nil && !r.ProofTraffic.valid(r.Fingerprint) {
 		return false
 	}
-	if r.ProviderAccountID != "" && (!validField(r.ProviderAccountID) || (r.ProviderService != "codex" && r.ProviderService != "x_read")) || r.ProviderAccountID == "" && r.ProviderService != "" {
+	if r.ProviderAccountID != "" && (!validField(r.ProviderAccountID) || (r.ProviderService != "codex" && r.ProviderService != "x_read")) || r.ProviderAccountID == "" && r.ProviderService != "" || r.NoProvider && r.ProviderAccountID != "" {
 		return false
 	}
 	if !validField(r.JobID) || !validField(r.Attempt) || !validField(r.Fence) || !validHash(r.Fingerprint) || r.Deadline.IsZero() || r.UpdatedAt.IsZero() {
@@ -300,7 +311,7 @@ func (j *Journal) Begin(r Record) error {
 	}
 	old, err := j.read(filepath.Join(j.dir, key(r)+".json"))
 	if err == nil {
-		if old.Fingerprint != r.Fingerprint || !old.Deadline.Equal(r.Deadline) || old.ProviderAccountID != r.ProviderAccountID || old.ProviderService != r.ProviderService {
+		if old.Fingerprint != r.Fingerprint || !old.Deadline.Equal(r.Deadline) || !sameBinding(old, r) {
 			return ErrConflict
 		}
 		return ErrExists
@@ -328,7 +339,7 @@ func (j *Journal) Ready(r Record, kind string, body []byte) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
-	if old.Fingerprint != r.Fingerprint || old.ProviderAccountID != r.ProviderAccountID || old.ProviderService != r.ProviderService {
+	if old.Fingerprint != r.Fingerprint || !sameBinding(old, r) {
 		return Record{}, ErrConflict
 	}
 	if old.State != "started" {
@@ -356,7 +367,7 @@ func (j *Journal) Terminal(r Record) error {
 	if err != nil {
 		return err
 	}
-	if old.Fingerprint != r.Fingerprint || old.ProviderAccountID != r.ProviderAccountID || old.ProviderService != r.ProviderService {
+	if old.Fingerprint != r.Fingerprint || !sameBinding(old, r) {
 		return ErrConflict
 	}
 	old.State = "terminal"

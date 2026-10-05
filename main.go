@@ -228,6 +228,17 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			fmt.Fprintln(os.Stderr, "reconcile:", err)
 		}
 	}
+	// Whatever is still pending was left by an earlier process, whose helper
+	// may outlive it. This process's own attempts are tracked as active work.
+	inherited, err := journal.Pending()
+	if err != nil {
+		return err
+	}
+	inheritedKeys := map[string]bool{}
+	for _, record := range inherited {
+		inheritedKeys[record.Key()] = true
+	}
+	active := &activeAttempts{}
 	var local worker.Completer
 	if c.Executor == config.ExecutorCodex {
 		cx, err := worker.NewCodex(c)
@@ -240,7 +251,10 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	var services *servicePool
 	if c.Executor == config.ExecutorServices {
 		services = newServicePool(c)
+		// The static slot ceiling is read before renewal can adjust health.
 		capacity = services.capacity()
+		stopRenewal := services.startCodexRenewal(ctx, managedAuthenticationFactory, inheritedPending(journal.Pending, inheritedKeys))
+		defer stopRenewal()
 	}
 	slots := make(chan struct{}, capacity)
 	var running sync.WaitGroup
@@ -300,15 +314,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			if err := journal.Purge(time.Now()); err != nil {
 				return err
 			}
-			if records, err := journal.Pending(); err == nil {
-				for _, record := range records {
-					if record.State == "ready" {
-						if err := recoverAttempt(ctx, client, journal, record); err != nil {
-							fmt.Fprintln(os.Stderr, "reconcile:", err)
-						}
-					}
-				}
-			} else {
+			if err := reconcileIdle(ctx, client, journal, active.snapshot()); err != nil {
 				return err
 			}
 			lastRecovery = time.Now()
@@ -470,9 +476,14 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 					selected = account.config
 				}
 			}
+			// Only this loop adds keys, so its reconciliation snapshot covers
+			// every attempt a worker may still be executing.
+			key := attempts.Record{JobID: l.JobID, Attempt: l.Attempt, Fence: l.Fence}.Key()
+			active.add(key)
 			running.Add(1)
 			go func() {
 				defer running.Done()
+				defer active.done(key)
 				defer func() { <-slots }()
 				defer func() {
 					mu.Lock()
@@ -550,14 +561,22 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 		return "", err
 	}
 	if l.AcceptanceRequired {
-		if l.ServiceType == "codex" && !codexAdmissionValid(c.CodexHome, l.LeaseDeadline) {
-			// No acceptance HTTP or provider execution has happened. Keep terminal
-			// replay metadata for this pinned attempt; let its offer expire remotely.
-			// rejectLease cannot be used here because it performs funded acceptance.
-			if err := journal.Terminal(record); err != nil {
-				return "auth_required", err
+		// No acceptance HTTP or provider execution happens on either local
+		// refusal below. Keep terminal replay metadata for this pinned attempt;
+		// let its offer expire remotely. rejectLease would fund acceptance.
+		if err := coordinator.ValidOffer(l, time.Now()); err != nil {
+			if terminalErr := journal.Terminal(record); terminalErr != nil {
+				return "invalid_lease", terminalErr
 			}
-			return "auth_required", errors.New("Codex credential validity is insufficient for the offered deadline")
+			return "invalid_lease", err
+		}
+		if l.ServiceType == "codex" && !codexAdmissionValid(c.CodexHome, l.LeaseDeadline) {
+			// The offer itself is valid, so the selected local credential is what
+			// fell short. This is local expiry evidence, never a provider denial.
+			if err := journal.Terminal(record); err != nil {
+				return codexLocalAuthExpired, err
+			}
+			return codexLocalAuthExpired, errors.New("Codex credential validity is insufficient for the offered deadline")
 		}
 		// Persist uncertainty before acceptance HTTP. A lost acknowledgement
 		// keeps this journal pending; recovery never re-executes the provider.

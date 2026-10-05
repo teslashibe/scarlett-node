@@ -2,7 +2,7 @@
 
 Tauri 2 with bundled vanilla TypeScript. The native bridge delegates execution and account scheduling to the independently built Go node and its Rust proof helper. It does not embed the private Scarlett application.
 
-The desktop provides pairing, status, start/drain/resume/stop, a menu-bar/tray supervisor and account controls. Account management requires the native pool release; older node binaries show it as unavailable. Automatic Codex token refresh for the proof-only runtime, signed public installers, automatic updates and full installed Windows GUI acceptance remain separate release gates. The Mac development app is unsigned and is not a community release.
+The desktop provides pairing, status, start/drain/resume/stop, a menu-bar/tray supervisor and account controls. Account management requires the native pool release; older node binaries show it as unavailable. Real-account acceptance of automatic Codex token renewal, automatic updates and full installed Windows GUI acceptance remain separate release gates. Release installers are signed with Scarlett's own stable self-signed certificates by the release workflow (see [Release signing](#release-signing)); they are not notarized by Apple and Windows shows an unknown publisher. The Mac development app is unsigned and is not a community release.
 
 ## Build
 
@@ -24,9 +24,9 @@ Then run `npm run tauri build -- --bundles app` from `desktop` on Mac. The sidec
 ## Native dependency contract
 
 - Coordinator: `https://network.scarlett.ai`; verifier: `verifier.scarlett.ai:7047`, with normal public TLS verification. These public defaults were supplied by the release owner. There is no plaintext test transport or browser networking bridge.
-- Node commands: `pair`, `status`, `run`, `drain`, `resume`.
-- Pool commands: `accounts list`; `accounts connect SERVICE ID CONCURRENCY` with credential JSON on stdin; `accounts add codex ID ABSOLUTE_PROFILE CONCURRENCY`; `accounts remove SERVICE ID`.
-- Pool list: an array of `{id,service,concurrency}`. Local status can contain `accounts[{id,service,state,capacity,in_flight,last_error_code,rest_until}]`. Only bounded selected metadata reaches JS.
+- Node commands: `pair`, `status`, `run`, `drain`, `resume`, `relay-resume`.
+- Pool commands: `accounts list`; `accounts connect SERVICE ID CONCURRENCY` with credential JSON on stdin; `accounts reconnect x_read ID` with cookie JSON on stdin; `accounts import-x PROFILE_ID ID CONCURRENCY`; `accounts reimport-x PROFILE_ID ID`; `accounts add codex ID ABSOLUTE_PROFILE CONCURRENCY`; `accounts remove SERVICE ID`.
+- Pool list: an array of `{id,service,concurrency}`. Local status can contain `relay_halted`, `services[{kind,state,capacity,in_flight,last_error_code,proof_modes}]` and `accounts[{id,service,state,capacity,in_flight,last_error_code,rest_until}]`. Proof modes are reduced to `mpc` and `relay`. Only bounded selected metadata reaches JS.
 - Services: `codex` and `x_read`. IDs use lowercase letters/digits/underscore/hyphen, 1–32 characters; `legacy` is reserved. The binary owns maximum eight accounts/provider, concurrency, cooldown and pinned-attempt recovery.
 - Press **Connect Codex** and sign in with your ChatGPT account in the browser. Scarlett assigns a local name such as `codex-1`, reserves a new private profile and registers it after successful login, with one concurrent job per account. Repeat to connect another account, up to eight Codex accounts; at eight, Connect Codex is disabled until you remove one. Existing profiles, including cancelled login directories, are never reused. On Windows the profile is created by the fixed `desktop private-dir-new` helper with its current-user/SYSTEM protected ACL applied at creation; an existing name, including an older unprotected directory, is skipped and never adopted or repaired. No OpenAI account ID or local nickname is required. The native CLI is fixed to the bundled `codex-cli 0.159.2`, with file credential storage explicitly selected; it does not reuse `~/.codex` or discover a CLI on PATH. Missing or incompatible bundled CLI disables Connect Codex. Login and model entitlement remain distinct.
 - X connects only the two approved cookie fields through protected stdin, preserving node validation and storage. Remove updates the private registry; the running node stops new admission on its next scheduling observation and retains credentials until safe explicit disposal after drain; it does not revoke the upstream session.
@@ -34,7 +34,7 @@ Then run `npm run tauri build -- --bundles app` from `desktop` on Mac. The sidec
 
 The native pool contract landed in [node PR 27](https://github.com/teslashibe/scarlett-node/pull/27), merged at `5ea00650`. This desktop branch includes that main revision. Rebuild both sidecars from the reviewed combined checkout before real account testing. An explicit missing app-owned registry lists no accounts and fails closed for new work; unrelated host profiles are not inherited.
 
-Codex admission requires a known access-token expiry beyond the job deadline plus 30 seconds. Expired, malformed or unknown expiry blocks new work before funded acceptance; it does not prevent existing accepted attempts from reconciling. This guard does not establish provider entitlement or renew credentials. Network work and the local API remain mutually exclusive. To renew through the existing gateway writer, drain and stop network work, start the local API and allow its account monitor to refresh the private profile, then stop the API and resume network work. Refresh occurs only within the gateway's 60-second refresh window; starting the API earlier does not force renewal, and API readiness alone does not prove it. Automatic renewal during network service remains a launch requirement.
+Codex admission requires a known access-token expiry beyond the job deadline plus 30 seconds. Expired, malformed or unknown expiry blocks new work before funded acceptance; it does not prevent existing accepted attempts from reconciling. This guard does not establish provider entitlement. While network work runs, the node renews the app's own login profiles itself: the desktop sets `SCARLETT_CODEX_MANAGED_ROOT` to the `codex-logins` directory, and a profile is renewed only between its jobs, once its token expires within 30 minutes. Network work and the local API remain mutually exclusive, so only one process writes a profile at a time. A state path the node would reject as a managed root leaves renewal off rather than stopping the node. A profile the provider has rejected still requires a new login.
 
 ## Local release validation
 
@@ -54,11 +54,17 @@ Windows runtime operations require private NTFS storage and the bundled native h
 
 Windows release signing uses an existing current-user code-signing identity and
 the trusted Microsoft SDK SignTool. No certificate or key is imported by the
-release helper. Set `SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT` to the reviewed public
-certificate thumbprint, `SCARLETT_WINDOWS_SIGNTOOL` to the absolute SDK executable
-and `SCARLETT_WINDOWS_TIMESTAMP_URL` to the approved HTTPS RFC3161 endpoint on a
-disposable native Windows release runner. Keep hardware-provider credentials and
-key access on that runner.
+release helper, and it never adds a trust root. On a disposable native Windows
+release runner, set `SCARLETT_SIGNING_SCHEME` (`self-signed-stable` or
+`authenticode`; there is no default), `SCARLETT_WINDOWS_PUBLISHER_THUMBPRINT` to
+the reviewed public certificate thumbprint and `SCARLETT_WINDOWS_SIGNTOOL` to the
+absolute SDK executable. In `self-signed-stable` mode the thumbprint must equal
+`windows.sha1` in `desktop/signing/identities.json`. The helper then exports the
+pinned certificate SHA-256 (`SCARLETT_WINDOWS_CERT_SHA256`) and the reviewed
+RFC3161 endpoint (`SCARLETT_WINDOWS_TIMESTAMP_URL`, exactly
+`http://timestamp.digicert.com`) to the Tauri callback and the checker. The
+timestamp token is itself signed and verified, so the endpoint is an exact-match
+allowlist rather than an HTTPS rule. Keep key access on that runner.
 
 After preparing the complete native runtime, build the release executable with
 `npm run tauri -- build --no-bundle --config src-tauri/tauri.complete.generated.json`.
@@ -66,13 +72,27 @@ Then run `python scripts/sign-windows-bundle.py <absolute-desktop-checkout> <new
 The helper validates the original inventory, signs Scarlett executables and
 the pinned NSIS packaging components,
 retains unsigned sidecar hashes and preserves provider bytes. It packages NSIS
-with Tauri's binary patching disabled, verifies trusted publisher/timestamp
-signatures and tests that exact installer with isolated local state. Evidence is
+with Tauri's binary patching disabled, verifies pinned publisher and trusted
+timestamp signatures and tests that exact installer with isolated local state.
+Tauri invokes the callback again for files it already signed; the callback
+leaves our pinned signature byte for byte and refuses any other signature. Evidence is
 written only after installed payload, lifecycle, preferences and browser tests
 pass. Real account login, signed upgrade/downgrade and publication remain
 separate gates; contract tests and unsigned rejection do not prove real signing.
 
-The Tauri callback permits exactly its five copied x86 NSIS plugin DLL paths.
+A failed run prints the fixed summary and one `Reason:` line built only from our
+own literal strings: the operation (for example `Signing scarlett-node`), its exit
+code and, when one raised it, the literal `throw` reason from
+`sign-windows-file.ps1`, `check-windows-signatures.ps1` or
+`import-windows-identity.ps1`, optionally followed by SignTool's eight-digit
+HRESULT. Python checker failures add the script line and exception class, and
+installed acceptance adds its script line numbers. Native messages, paths,
+certificate details and secrets are never printed.
+
+Tauri 2.12.1 passes sidecars to the callback relative to `src-tauri`
+(`binaries/<name>-<triple>.exe`); the callback resolves a plain relative path
+against its working directory and then applies every prepared-root and allowlist
+check. The Tauri callback permits exactly its five copied x86 NSIS plugin DLL paths.
 Generated x86 uninstallers must match NSIS 3.11's `nst<hex>.tmp` filename inside
 a fresh `target/release/nsis-signing-temp` directory. Only the packaging child
 receives that directory as TMP/TEMP and explicit callback context; it is removed
@@ -88,7 +108,7 @@ Tests use synthetic credentials and disposable temporary directories/fake execut
 
 ## Complete runtime package
 
-The complete bundle contains the desktop shell, native Go node, Rust proof helper, `open-agent-api` v0.1.31, Codex CLI 0.159.2 and Claude CLI 2.1.286. Users do not need a development toolchain to run these packaged binaries. The desktop starts and stops the local model API through its native supervisor. The node's verified network services remain Codex and X; packaging Claude does not add a verified Claude network service.
+The complete bundle contains the desktop shell, native Go node, Rust proof helper, `open-agent-api` v0.1.32, Codex CLI 0.159.2 and Claude CLI 2.1.286. Users do not need a development toolchain to run these packaged binaries. The desktop starts and stops the local model API through its native supervisor. The node's verified network services remain Codex and X; packaging Claude does not add a verified Claude network service.
 
 Build on the target OS and architecture. Prepare the three reviewed native binaries and the official unpacked native provider packages, then run:
 
@@ -122,7 +142,7 @@ Local API models expose their reviewed effort levels and normal/Fast modes. Code
 
 The complete bundle can start and stop its bundled model API from the desktop. It binds only `127.0.0.1` on an operator-selected port (default 8088), requires a generated 256-bit bearer, and reports Ready only after health succeeds, unauthenticated model access returns 401 and authenticated access returns 200. Show local API key explicitly reveals the private bearer; it clears on window blur or page exit. The file is private to the current user (mode 0600 on Unix; current-user/SYSTEM ACL on Windows), and symlink or shared-file reads fail closed. The bearer is never included in status, logs or process arguments.
 
-Codex clients use only completed app-owned login profiles for registered account IDs, plus bundled profile/scaffold files. Unrelated environment credentials and host profiles are cleared. Connect Claude subscription runs the fixed bundled CLI’s `auth login --claudeai`. Login, status, logout and inference share the app’s private `local-api/claude` directory through `CLAUDE_CONFIG_DIR`; the CLI manages its own per-directory credential storage. No global provider profile, credential or Keychain entry is copied or inspected by Scarlett. A successful known `claude.ai` status enables Claude when starting in subscription mode. Status exposes only connection/pending/error flags, never provider identity JSON. Cancellation and disconnect persist a private admission block, so an unfinished login or failed logout cannot reactivate after restart. Disconnect stops the local API before the official logout command.
+Codex clients use only completed app-owned login profiles for registered account IDs, plus bundled profile/scaffold files. Unrelated environment credentials and host profiles are cleared. Connect Claude subscription runs the fixed bundled CLI’s `auth login --claudeai`. Login, status, logout and inference share the app’s private `local-api/claude` directory through `CLAUDE_CONFIG_DIR`; the CLI manages its own per-directory credential storage. No global provider profile, credential or Keychain entry is copied or inspected by Scarlett. A successful known `claude.ai` status enables Claude when starting in subscription mode. Status exposes only connection/pending/error flags, never provider identity JSON. It is polled separately from node and local API status, so verifying the bundled runtime and launching its CLI never delays pairing or node state. Cancellation and disconnect persist a private admission block, so an unfinished login or failed logout cannot reactivate after restart. Disconnect stops the local API before the official logout command.
 
 API key billing is a separate explicit choice. A personal Anthropic API key stays only in the running service’s environment, is not saved to disk, and must be re-entered after stopping. API-key mode uses a separate private `claude-api-key` directory so it cannot fall back to stored subscription credentials. Billing mode controls are disabled while the API runs. Neither discovery nor readiness establishes provider entitlement.
 
@@ -152,7 +172,15 @@ Profile discovery reads directory/file metadata only. It returns opaque profile 
 
 The helper uses a bundled, cgo-free SQLite reader, opens stores read-only and immutable, and refuses populated WAL/journal files. It neither copies nor changes a browser database. Cookie-store changes during import fail with a retry message. Unsupported or inaccessible stores do not add an account. Linux CLI builds support standard Firefox profiles only; the desktop release targets remain Mac and Windows.
 
-Tests use disposable synthetic databases, encrypted cookie fixtures and malformed Safari records. Windows native tests generate their own current-user DPAPI fixture. These checks do not establish compatibility with every installed browser version or prove real X access. Imported accounts remain **Configured · access not verified** until their existing provider execution path verifies access.
+Tests use disposable synthetic databases, encrypted cookie fixtures and malformed Safari records. Windows native tests generate their own current-user DPAPI fixture. These checks do not establish compatibility with every installed browser version or prove real X access. Imported accounts remain **Configured · access not verified** until the node reports on them. While the running node checks an X account's login it shows **Warming up · checking login**.
+
+### Re-import an expired X session
+
+When X expires or revokes a session, the account shows **X session expired or revoked. Re-import the account** with an **Import X account again** button. The button opens the same import form for that account: its ID and job limit are fixed, and either a browser profile import (with the same consent tick) or cookie paste replaces only its saved session through `accounts reimport-x` or `accounts reconnect`. Import and Connect X still never overwrite an account. The node validates the new session before replacing the old one, and the running node picks it up on its next scheduling check without a restart. Until the node writes a newer status, the row says it is waiting for the node to check the new login.
+
+## Keyed relay halt
+
+When the node catches its verifier misusing an X session it stops serving keyed relay and keeps serving MPC-TLS. The app shows a red **Keyed relay is paused on this node** banner. **Resume relay** asks for confirmation, then runs only the bundled node's `relay-resume`, which removes the saved `relay-halt` marker. It never drains, stops or restarts the supervised node, so warm X clients and accepted work continue. A running node keeps relay paused until it picks the change up; until its status stops reporting `relay_halted`, the banner says the resume is saved. The node section shows what the running node advertises for X: **MPC + relay** or **MPC only**.
 
 ## Device preferences
 
@@ -183,23 +211,32 @@ Installed Windows import acceptance uses new synthetic Chrome/Firefox stores bel
 ## Windows release signature acceptance
 
 Verify the final signed setup and its installed complete payload on a clean native
-Windows machine before selecting a stable download. Supply the reviewed publisher
-certificate's public thumbprint; private keys and certificate passwords are not
-inputs to this read-only checker. Do not install a test certificate or add trust
-roots to make a release pass.
+Windows machine before selecting a stable download. Supply the scheme and the
+reviewed certificate's public thumbprint and SHA-256; private keys and certificate
+passwords are not inputs to this read-only checker. Never install a test
+certificate or add trust roots to make a release pass.
 
 ```powershell
 & desktop/scripts/check-windows-signatures.ps1 `
-  -Installer 'C:\release\Scarlett-Node-setup.exe' `
+  -Installer 'C:\release\Scarlett-Node-0.1.1-windows-amd64.exe' `
   -InstalledDirectory 'C:\acceptance\Scarlett Node' `
   -ExpectedPublisherThumbprint $ReviewedCertificateThumbprint `
+  -Scheme self-signed-stable -CertificateSha256 $ReviewedCertificateSha256 `
   -EvidenceFile 'C:\evidence\windows-signatures.json'
 ```
 
-The setup, desktop, node, proof helper and local model API must each have a
-Windows-trusted embedded Authenticode signature matching that certificate and a
-trusted timestamp. Unsigned, altered, untrusted, catalog-only, self-signed,
-untimestamped or unexpected-publisher files fail. Read hashes before and after
+The setup, desktop, node, proof helper and local model API must each have an
+embedded Authenticode signature matching that certificate and a timestamp whose
+certificate chains to a root Windows trusts. In `self-signed-stable` mode every
+file must report `UnknownError`, and a direct WinVerifyTrust call (no UI, no
+revocation, cache-only retrieval) must return exactly `0x800B0109`
+(CERT_E_UNTRUSTEDROOT): the digest verified and only the root is untrusted. The
+signer must be self-issued, and its SHA-1 thumbprint and SHA-256 over the raw
+certificate must equal the pins. `Valid` is rejected in this mode, because it
+would mean someone made the certificate a trusted root. In `authenticode` mode
+the signature must be `Valid` and the publisher may not be self-issued. Unsigned,
+altered, catalog-only, untimestamped or unexpected-publisher files fail in both
+modes. Read hashes before and after
 signature validation to reject changes during the check. Local file paths cannot
 use alternate streams or traverse reparse points. A new outcome/digest file is
 written only after all signature checks; existing evidence is never overwritten.
@@ -209,9 +246,14 @@ Run the complete installed payload/hash/protected-API checker and installed UI
 acceptance separately. These signature checks do not establish that an arbitrary
 installed directory came from the supplied setup, validate every provider byte,
 or prove login, upgrades, paid jobs or SmartScreen reputation. The native CI gate
-tests signature-record rejection and rejects the actual unsigned Go executable
-without creating signing certificates or modifying trust stores. Genuine signed
-installer acceptance and the Windows signing integration remain release work.
+tests signature-record rejection, rejects the actual unsigned Go executable and
+runs an ephemeral self-signed fixture with no secrets: two RSA-3072
+`New-SelfSignedCertificate` code-signing certificates in `CurrentUser\My` (never
+a root store), the real signer, SDK SignTool and DigiCert sign a copy of the Go
+executable, which must pass with its own pins, fail with HashMismatch after one
+flipped byte and fail against the second certificate. Both certificates and keys
+are deleted afterwards. The installed release acceptance runs in the release
+workflow.
 The checker uses [Windows Authenticode validation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/get-authenticodesignature).
 
 ## Mac release signing
@@ -222,37 +264,120 @@ src-tauri/tauri.complete.generated.json`. Omit `--debug`. Keep the original unsi
 build as provenance and sign a separate copy. The provider archives must already
 have passed their pinned archive checks during complete-bundle preparation.
 
-Configure an existing `APPLE_SIGNING_IDENTITY` that starts with `Developer ID
-Application: `, its ten-character `SCARLETT_APPLE_TEAM_ID`, and an existing
+`SCARLETT_SIGNING_SCHEME` is required and has no default.
+
+`self-signed-stable` (current releases) signs with Scarlett's own certificate,
+pinned in `desktop/signing/identities.json`. Set `SCARLETT_MAC_KEYCHAIN` to the
+absolute path of a temporary keychain that holds that identity, created by
+`desktop/scripts/import-macos-identity.sh` (it imports with `-T /usr/bin/codesign`,
+deletes the PKCS#12 file and sets the key partition list). Never use the login
+keychain. codesign finds an untrusted self-signed identity only through the user
+keychain search list, so the signer puts the temporary keychain first while it
+signs and restores the original list afterwards, also when signing fails. Every
+signature selects the identity by its pinned SHA-1 and uses `--timestamp=none`, a
+fixed `--identifier` (`ai.scarlett.node`, `ai.scarlett.node.<sidecar>` and
+`ai.scarlett.node.dmg`) and the explicit designated requirement
+`identifier "<identifier>" and certificate leaf = H"<sha1>"`. That requirement keeps
+Full Disk Access and other TCC grants valid across updates signed by the same
+certificate. There is no notarization, stapling or Gatekeeper assessment: users
+approve the unverified developer in Privacy & Security after each download.
+
+`developer-id` (kept for when an Apple Developer ID arrives) needs an existing
+`APPLE_SIGNING_IDENTITY` that starts with `Developer ID Application: `, its
+ten-character `SCARLETT_APPLE_TEAM_ID`, and an existing
 `SCARLETT_NOTARY_KEYCHAIN_PROFILE`. Store notarization credentials through Apple's
 Keychain tooling, outside the repository and chat. The signing script does not
-create certificates, import credentials or alter Keychain settings.
+create certificates, import credentials or alter Keychain trust settings.
 
 ```sh
+SCARLETT_SIGNING_SCHEME=self-signed-stable SCARLETT_MAC_KEYCHAIN=/absolute/release.keychain-db \
 python3 desktop/scripts/sign-macos-bundle.py \
   "/absolute/release-copy/Scarlett Node.app" \
-  "/absolute/new-output/Scarlett-Node.dmg"
+  "/absolute/new-output/Scarlett-Node-0.1.1-darwin-arm64.dmg"
 ```
 
 The script refuses a changed component inventory, altered input bytes, links,
 another product identity or an already finalized signing manifest. It verifies
 every bundled native provider object's existing Developer ID signature and
-hardened runtime, preserving those exact bytes and notices. It signs Scarlett's
-three sidecars and desktop executable, verifies their team and hardened runtime,
-records both input and signed sidecar digests, then seals the outer app. A generic
+hardened runtime, preserving those exact bytes and notices in both schemes. It
+signs Scarlett's three sidecars and desktop executable, verifies them, records both
+input and signed sidecar digests, then seals the outer app. In
+`self-signed-stable` mode each verification requires the pinned requirement
+(`codesign --verify --strict -R`), the exact designated requirement from
+`codesign -d -r-`, exactly one embedded certificate whose SHA-256 equals the pin,
+`TeamIdentifier=not set` and hardened runtime. In `developer-id` mode it requires
+the configured team. A generic
 hash refresh cannot turn an altered vendor binary into an accepted release.
 
-The packaged integrity and protected local API check must pass before notarization.
-Both the app and resulting drag-to-Applications DMG require an Accepted notarization
-response and a valid stapled ticket. The app must pass Gatekeeper assessment;
-the DMG signature must match the configured team. Only then is a neighboring
-`.evidence.json` written with artifact digests and notarization IDs. A failed or
+The packaged integrity and protected local API check must pass under the new
+signatures. In `developer-id` mode both the app and resulting drag-to-Applications
+DMG then require an Accepted notarization response and a valid stapled ticket, the
+app must pass Gatekeeper assessment and the DMG signature must match the
+configured team. In `self-signed-stable` mode the signed DMG must pass the pinned
+verification. Only then is a neighboring `.evidence.json` written with the
+artifact digest: notarization IDs for `developer-id`, or the certificate pins,
+designated requirement, `"notarization": "not-performed"` and
+`"gatekeeper": "user-approval-required"` for `self-signed-stable`. A failed or
 partly signed app must be rebuilt from its reviewed inputs, rather than signed
 again in place. Tool failures expose no raw signing or Keychain output.
 
-This is a Mac release preparation step, not automatic publication. It requires
-real signing credentials and does not replace downloaded-installer UI, remote
-account, upgrade/downgrade or paid-loop acceptance. Stable download publication
-still uses the infrastructure release process after those checks. Windows
-Authenticode signing remains a separate native release requirement. Platform
-setup follows [Tauri's signing guide](https://v2.tauri.app/distribute/sign/macos/).
+This is a Mac release preparation step, not automatic publication. It does not
+replace downloaded-installer UI, remote account, upgrade/downgrade or paid-loop
+acceptance. Stable download publication still uses the infrastructure release
+process after those checks. Platform setup follows
+[Tauri's signing guide](https://v2.tauri.app/distribute/sign/macos/).
+
+## Release signing
+
+`desktop/signing/` holds the only signing material in this repository: the two
+public certificates (`macos-codesign.cert.pem`, `windows-authenticode.cert.pem`)
+and `identities.json`, which records each subject, expiry and lowercase SHA-1 and
+SHA-256 over the DER certificate, the Mac identifiers and designated requirement,
+and the Windows timestamp endpoint. `desktop/scripts/signing_identities.py`
+recomputes every pin from the certificates on each load, so a pin changes only
+together with its certificate in a reviewed pull request. The download publisher
+and the download page carry reviewed copies of the four hashes. Private keys never
+enter the repository; they exist only as `release-signing` environment secrets.
+
+`.github/workflows/desktop-release.yml` is the release path. It runs only by
+manual dispatch on `main`, with a `version` input that must equal
+`tauri.conf.json`, a read-only token and no caches. Its `sign` job uses the
+`release-signing` environment on macos-15, macos-15-intel and windows-2025: it
+builds the runtime with the same `build-complete-runtime.sh` as PR CI, builds the
+unsigned app, imports the key (the secrets are visible to that step alone), signs,
+removes the key in an `always()` cleanup and, on Mac, runs
+`smoke-macos-dmg.sh`: it checks the DMG digest against the signer's evidence,
+verifies the DMG and the packaged app and sidecars against their pinned designated
+requirements, then launches the app from the DMG. The `assemble` job has no
+secrets. It runs `release-manifest.py`, which checks every evidence file and component manifest against
+`identities.json` and the installer SHA-256, then writes `release/`
+(`manifest.json`, `provenance.json` and `Scarlett-Node-<version>-{darwin-arm64.dmg,
+darwin-amd64.dmg,windows-amd64.exe}`, the set the publisher accepts) beside
+`SHA256SUMS` and `evidence/`.
+
+On Windows the key is imported by `desktop/scripts/import-windows-identity.ps1`
+with `Import-PfxCertificate` and no `-Exportable`. It then requires exactly the
+pinned certificate with a non-exportable, current-user RSA-3072 key in the CNG
+Microsoft Software Key Storage Provider (where Windows Server 2025 puts an
+OpenSSL 3 PKCS#12 key), refuses a trusted-root copy and deletes the PKCS#12 file.
+
+PR CI rehearses both platforms with no secrets.
+`desktop/scripts/rehearse-macos-signing.sh` makes a throwaway certificate with the
+release extensions, imports it with the release import script and runs the
+`self-signed-stable` signer over a copy of the complete debug app, then the launch
+smoke runs on the rehearsal DMG. The `windows_release_rehearsal` job repeats the
+release Windows job's build steps, then `desktop/scripts/rehearse-windows-signing.ps1`
+makes a throwaway RSA-3072 certificate with the release extensions, exports it as
+PKCS#12 with OpenSSL 3 defaults (AES-256-CBC, PBKDF2, SHA-256 MAC) like the release
+key, imports it with `import-windows-identity.ps1` and runs
+`sign-windows-bundle.py`: signing, NSIS packaging, installed acceptance and the
+pinned signature checks on the complete release build. The ephemeral fixture
+described above also still runs.
+A rehearsal may substitute its own identities file through
+`SCARLETT_SIGNING_IDENTITIES`, which is honoured only with
+`SCARLETT_SIGNING_REHEARSAL=1`. Everything signed that way records
+`"rehearsal": true`, which the release assembler rejects.
+
+When an Apple Developer ID and a commercial Windows certificate arrive, run the
+`developer-id` and `authenticode` schemes, which are kept and tested. The Mac
+designated requirement then changes, so users grant Full Disk Access once more.

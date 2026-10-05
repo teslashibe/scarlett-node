@@ -161,6 +161,11 @@ impl ClaudeAuth {
         *checked = valid.then_some((meta.len(), stamp, manifest_stamp));
         valid
     }
+    /// Whether this process has verified the bundled runtime's integrity.
+    #[cfg(test)]
+    pub(crate) fn integrity_checked(&self) -> bool {
+        self.verified.lock().is_ok_and(|checked| checked.is_some())
+    }
     fn command(&self, args: &[&str]) -> Result<Command> {
         if !self.available() {
             return Err(Error::ClaudeUnavailable);

@@ -6,6 +6,7 @@
   ],
   "permissions": [
     "allow-desktop-status",
+    "allow-claude-status",
     "allow-quit-desktop",
     "allow-pair-node",
     "allow-control-node",
@@ -13,6 +14,9 @@
     "allow-connect-x",
     "allow-browser-profiles",
     "allow-import-x-profile",
+    "allow-reconnect-x",
+    "allow-reimport-x-profile",
+    "allow-resume-relay",
     "allow-connect-codex",
     "allow-remove-account",
     "allow-cancel-login",
