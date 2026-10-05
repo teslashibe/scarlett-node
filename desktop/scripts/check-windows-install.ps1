@@ -1050,6 +1050,64 @@ function Identity-Diagnostics([string]$Name) {
     $diagnostic | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-identity-failure.json')
     Write-Output ($diagnostic | ConvertTo-Json -Depth 4 -Compress)
 }
+function Get-XLoginFailureDetails([string]$Output, [string]$ErrorOutput, [string]$Phase) {
+    $result = @{ category = 'unclassified'; failedCase = $null; interceptedBrowserCasesPassed = $null
+        errorCode = $null; failureType = $null; sourceBasename = $null; sourceLine = $null; sourceColumn = $null
+        expected = $null; actual = $null }
+    if ($Output -match '(?m)^# pass ([0-7])\r?$') { $result.interceptedBrowserCasesPassed = [int]$Matches[1] }
+    if ($Phase -eq 'manager') {
+        foreach ($known in @('helper readiness cancelled or timed out', 'helper exited before readiness',
+            'resource checksum mismatch', 'resource inventory invalid', 'private node state inaccessible',
+            'private state inaccessible', 'private profiles inaccessible', 'private bearer unavailable',
+            'helper process containment unavailable', 'Google Chrome must be installed')) {
+            if (($Output + $ErrorOutput).Contains($known)) { $result.category = $known; break }
+        }
+    }
+    if ($Phase -ne 'browser-fixtures') { return $result }
+    $block = ''
+    foreach ($knownCase in @('real Chromium parks X and submits invalid then valid code on the same page with one password',
+        'real Chromium cancel closes a parked browser and releases capacity',
+        'real Chromium expiry closes a parked browser and releases capacity',
+        'real Chromium shutdown closes a parked browser and releases capacity',
+        'real Chromium crash closes a parked browser and releases capacity',
+        'real Chromium budget closes a parked browser and releases capacity',
+        'real Chromium warm authenticated profile returns a candidate without another password')) {
+        $match = [regex]::Match($Output, '(?ms)^not ok [1-7] - ' + [regex]::Escape($knownCase) + '\r?\n(?<details>.*?)(?=^# Subtest:|^# tests |^1\.\.|\z)')
+        if ($match.Success) { $result.failedCase = $knownCase; $block = $match.Groups['details'].Value; break }
+    }
+    # A failed block can itself contain expected queue_timeout. Classify only
+    # its anchored runner error code, never telemetry or expected values.
+    $statuses = @('verification_required', 'login_failed', 'proxy_error', 'challenge_not_found',
+        'challenge_expired', 'queue_timeout', 'profile_busy', 'attempts_exhausted', 'deadline_exceeded')
+    foreach ($match in [regex]::Matches($block, '(?m)^  (code|failureType):[ \t]*[''"]?([A-Za-z_]+)[''"]?\r?$')) {
+        $value = $match.Groups[2].Value
+        if ($match.Groups[1].Value -eq 'code' -and ($value -in $statuses -or $value -in @('ERR_ASSERTION', 'ERR_TEST_FAILURE'))) {
+            $result.errorCode = $value
+            $result.category = if ($value -eq 'ERR_ASSERTION') { 'assertion' } else { $value }
+        } elseif ($match.Groups[1].Value -eq 'failureType' -and $value -in @('testCodeFailure', 'hookFailed', 'cancelledByParent', 'testAborted')) {
+            $result.failureType = $value
+        }
+    }
+    $stack = [regex]::Match($block, '(?m)^  stack: [|>][+-]?\r?\n(?<frames>(?:^    [^\r\n]*(?:\r?\n|\z))*)')
+    $location = [regex]::Match($stack.Groups['frames'].Value, '(?m)^    (?:at )?[^\r\n]*[\\/]interactive-x\.test\.js:([1-9][0-9]{0,3}):([1-9][0-9]{0,2})\)?[ \t]*\r?$')
+    if ($location.Success) {
+        $result.sourceBasename = 'interactive-x.test.js'
+        $result.sourceLine = [int]$location.Groups[1].Value
+        $result.sourceColumn = [int]$location.Groups[2].Value
+    }
+    foreach ($match in [regex]::Matches($block, '(?m)^  (expected|actual):[ \t]*(.*?)\r?$')) {
+        $value = $match.Groups[2].Value.Trim()
+        $status = $value.Trim("'").Trim('"')
+        $number = [double]0
+        if ($status -in $statuses) { $result[$match.Groups[1].Value] = $status }
+        elseif ($value -in @('true', 'false')) { $result[$match.Groups[1].Value] = $value -eq 'true' }
+        elseif ($value -match '^[+-]?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$' -and
+            [double]::TryParse($value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$number) -and
+            -not [double]::IsNaN($number) -and -not [double]::IsInfinity($number) -and [math]::Abs($number) -le 1000000) { $result[$match.Groups[1].Value] = $number }
+    }
+    return $result
+}
+
 function Invoke-XLoginAcceptanceProcess([string]$File, [string[]]$Arguments, [int]$TimeoutMs,
     [ValidateSet('manager', 'headed-chrome', 'browser-fixtures')][string]$Phase) {
     # Only fixed, reviewed fixture arguments enter this subprocess. Capture all
@@ -1080,33 +1138,11 @@ function Invoke-XLoginAcceptanceProcess([string]$File, [string[]]$Arguments, [in
         $output = $stdout.GetAwaiter().GetResult()
         $errorOutput = $stderr.GetAwaiter().GetResult()
         if ($process.ExitCode -ne 0) {
-            # Project only reviewed literal categories and numeric counters.
-            # Raw native output may contain paths or profile material.
-            $category = 'unclassified'
-            foreach ($known in @('helper readiness cancelled or timed out', 'helper exited before readiness',
-                'resource checksum mismatch', 'resource inventory invalid', 'private node state inaccessible',
-                'private state inaccessible', 'private profiles inaccessible', 'private bearer unavailable',
-                'helper process containment unavailable', 'Google Chrome must be installed',
-                'challenge_not_found', 'challenge_expired', 'queue_timeout')) {
-                if (($output + $errorOutput).Contains($known)) { $category = $known; break }
-            }
-            $passed = $null
-            if ($output -match '(?m)^# pass ([0-7])\r?$') { $passed = [int]$Matches[1] }
-            $failedCase = $null
-            foreach ($knownCase in @('real Chromium parks X and submits invalid then valid code on the same page with one password',
-                'real Chromium cancel closes a parked browser and releases capacity',
-                'real Chromium expiry closes a parked browser and releases capacity',
-                'real Chromium shutdown closes a parked browser and releases capacity',
-                'real Chromium crash closes a parked browser and releases capacity',
-                'real Chromium budget closes a parked browser and releases capacity',
-                'real Chromium warm authenticated profile returns a candidate without another password')) {
-                if ($output -match ('(?m)^not ok [1-7] - ' + [regex]::Escape($knownCase) + '\r?$')) {
-                    $failedCase = $knownCase; break
-                }
-            }
-            @{ phase = $Phase; exitCode = $process.ExitCode; elapsedMs = $elapsed.ElapsedMilliseconds
-                category = $category; interceptedBrowserCasesPassed = $passed; failedCase = $failedCase
-            } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-x-login-process-failure.json')
+            $details = Get-XLoginFailureDetails $output $errorOutput $Phase
+            $details.phase = $Phase
+            $details.exitCode = $process.ExitCode
+            $details.elapsedMs = $elapsed.ElapsedMilliseconds
+            $details | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-x-login-process-failure.json')
             Write-Host ('Installed browser acceptance failed phase: ' + $Phase + '; exit status: ' + $process.ExitCode)
             throw 'Installed browser acceptance process failed'
         }
