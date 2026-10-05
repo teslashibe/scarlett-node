@@ -2326,8 +2326,11 @@ printf '%s\n' '{"status":"updated","id":"one"}'
             browser_override(Some(&browser)).unwrap(),
             Some(browser.clone())
         );
-        let binary = temp.path().join("node");
-        std::fs::write(&binary, "fixture").unwrap();
+        let binary = test_node_helper().unwrap_or_else(|| {
+            let binary = temp.path().join("node");
+            std::fs::write(&binary, "fixture").unwrap();
+            binary
+        });
         let mut node = Node::new(
             temp.path().join("state"),
             binary,
