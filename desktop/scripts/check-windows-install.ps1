@@ -1053,7 +1053,7 @@ function Identity-Diagnostics([string]$Name) {
 function Get-XLoginFailureDetails([string]$Output, [string]$ErrorOutput, [string]$Phase) {
     $result = @{ category = 'unclassified'; failedCase = $null; interceptedBrowserCasesPassed = $null
         errorCode = $null; failureType = $null; sourceBasename = $null; sourceLine = $null; sourceColumn = $null
-        expected = $null; actual = $null }
+        expected = $null; actual = $null; fixtureError = $null }
     if ($Output -match '(?m)^# pass ([0-7])\r?$') { $result.interceptedBrowserCasesPassed = [int]$Matches[1] }
     if ($Phase -eq 'manager') {
         foreach ($known in @('helper readiness cancelled or timed out', 'helper exited before readiness',
@@ -1104,6 +1104,31 @@ function Get-XLoginFailureDetails([string]$Output, [string]$ErrorOutput, [string
         elseif ($value -match '^[+-]?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$' -and
             [double]::TryParse($value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$number) -and
             -not [double]::IsNaN($number) -and -not [double]::IsInfinity($number) -and [math]::Abs($number) -le 1000000) { $result[$match.Groups[1].Value] = $number }
+    }
+    # The fixture projects browser exceptions before production converts them
+    # to login_failed. Read only the reviewed diagnostic within this failed case.
+    $fixture = [regex]::Match($block, '(?m)^# SCARLETT_X_FIXTURE_ERROR (?<json>[^\r\n]{1,1000})\r?$')
+    if ($fixture.Success -and $fixture.Groups['json'].Value -match '^\{.*\}$') {
+        try {
+            $value = $fixture.Groups['json'].Value | ConvertFrom-Json -ErrorAction Stop
+            if ($value -is [pscustomobject] -and $value.stage -is [string] -and $value.stage -cin @('start', 'continue') -and
+                $value.errorName -is [string] -and $value.errorName -cin @('TimeoutError', 'Error', 'TypeError', 'ServiceError', 'AdmissionError', 'AbortError', 'unclassified')) {
+                $safe = @{ stage = $value.stage; errorName = $value.errorName
+                    sourceBasename = $null; sourceLine = $null; sourceColumn = $null }
+                $line = $value.sourceLine
+                $column = $value.sourceColumn
+                $numericLine = $line -is [int] -or $line -is [long] -or $line -is [double] -or $line -is [decimal]
+                $numericColumn = $column -is [int] -or $column -is [long] -or $column -is [double] -or $column -is [decimal]
+                if ($value.sourceBasename -is [string] -and $value.sourceBasename -cin @('interactive-x.test.js', 'legacy.js', 'login-budget.js', 'service.js') -and
+                    $numericLine -and $numericColumn -and $line -ge 1 -and $line -le 9999 -and $column -ge 1 -and $column -le 999 -and
+                    [math]::Floor($line) -eq $line -and [math]::Floor($column) -eq $column) {
+                    $safe.sourceBasename = $value.sourceBasename
+                    $safe.sourceLine = [int]$line
+                    $safe.sourceColumn = [int]$column
+                }
+                $result.fixtureError = $safe
+            }
+        } catch { } # Malformed or unreviewed diagnostics have no public projection.
     }
     return $result
 }

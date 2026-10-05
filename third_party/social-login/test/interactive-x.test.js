@@ -16,7 +16,7 @@ const req = (key = "fixture") => ({ platform: "x", profile_key: key, username: "
 const continuation = (input, challenge, code) => ({ ...input, username: "", password: "", challenge_id: challenge.id, verification_code: code, budget: { max_browser_attempts: 0, max_credential_attempts: 0, max_solver_attempts: 0 } });
 
 async function fixture(t) {
- const observed = { navigations: 0, passwords: 0, codes: [], launches: 0, closes: 0, requests: [], context: null, page: null };
+ const observed = { navigations: 0, passwords: 0, codes: [], launches: 0, closes: 0, requests: [], context: null, page: null, runtimeFailure: null };
  t.mock.method(chromium, "launchPersistentContext", async (dir, options) => {
   observed.launches++;
   const context = await launch(dir, options); observed.context = context;
@@ -73,13 +73,26 @@ function serviceFor(t, seen, overrides={}) {
  let service;
  try {
   Object.assign(process.env,overrides);
-  service = new SocialLoginService();
+  service = new SocialLoginService({runtime:{...runtime,async runBrowserLogin(platform,input,...args) {
+   seen.runtimeFailure=null;
+   try { return await runtime.runBrowserLogin(platform,input,...args); }
+   catch (error) {
+    const names=["TimeoutError","Error","TypeError","ServiceError","AdmissionError","AbortError"];
+    const location=String(error?.stack || "").match(/^[ \t]+at [^\r\n]*[\\/](interactive-x\.test\.js|legacy\.js|login-budget\.js|service\.js):([1-9][0-9]{0,3}):([1-9][0-9]{0,2})\)?[ \t]*$/m);
+    seen.runtimeFailure={stage:input.challengeHold?"continue":"start",errorName:names.includes(error?.name)?error.name:"unclassified",
+     sourceBasename:location?.[1] || null,sourceLine:location?Number(location[2]):null,sourceColumn:location?Number(location[3]):null};
+    throw error; // Preserve the exact production result, cancellation and retry behavior.
+   }
+  }}});
  } finally {
   for (const [name,value] of previous) {
    if (value === undefined) delete process.env[name]; else process.env[name]=value;
   }
  }
- t.after(async()=>{await service.shutdown(10000);if(seen.context) await waitForReleased(seen);});
+ t.after(async()=>{
+  try {await service.shutdown(10000);if(seen.context) await waitForReleased(seen);}
+  finally {if(seen.runtimeFailure) t.diagnostic("SCARLETT_X_FIXTURE_ERROR "+JSON.stringify(seen.runtimeFailure));}
+ });
  return service;
 }
 
@@ -89,7 +102,7 @@ test.after(() => fs.rmSync(base,{recursive:true,force:true}));
 test("real Chromium parks X and submits invalid then valid code on the same page with one password", async t => {
  const seen=await fixture(t); const service=serviceFor(t,seen);
  const input=req("continue");const first=await service.login(input);
- assert.equal(first.result.failureType,"verification_required"); assert.equal(service.capabilities().interactive_x,1);
+ assert.equal(first.result.failureType,"verification_required");assert.equal(Boolean(first.result.challenge?.id),true); assert.equal(service.capabilities().interactive_x,1);
  const page=seen.page;const navigations=seen.navigations;
  assert.equal(runtime.state().holds,1);assert.equal(runtime.state().activeAdmissions,0);
  for(const change of [{operation_owner:"other".repeat(10)},{profile_key:"wrong"},{proxy_url:"http://127.0.0.1:3456",proxy_lease:"wrong"},{generation:"2"}]) {
@@ -100,7 +113,7 @@ test("real Chromium parks X and submits invalid then valid code on the same page
  const other=await service.login({...req("other"),operation_owner:"other".repeat(10)}).catch(e=>e);
  assert.equal(other.code,"queue_timeout");assert.equal(seen.launches,1);
  const invalid=await service.login(continuation(input,first.result.challenge,"000000"));
- assert.equal(invalid.result.failureType,"verification_required"); assert.equal(seen.page,page);assert.equal(seen.navigations,navigations);assert.equal(seen.passwords,1);
+ assert.equal(invalid.result.failureType,"verification_required");assert.equal(Boolean(invalid.result.challenge?.id),true); assert.equal(seen.page,page);assert.equal(seen.navigations,navigations);assert.equal(seen.passwords,1);
  assert.equal(invalid.result.deadline_at,first.result.deadline_at);
  assert.deepEqual(invalid.result.attempts,{browser:1,credential:1,solver:0,complete:true});
  await assert.rejects(service.login(continuation(input,first.result.challenge,"123456")),e=>e.code==="challenge_not_found");
@@ -117,12 +130,16 @@ for (const reason of ["cancel", "expiry", "shutdown", "crash", "budget"]) {
   // Constructor-only TTL begins at parking, so a slow browser launch is not the expiry under test.
   const overrides=reason==="expiry"?{SOCIAL_LOGIN_CHALLENGE_TTL_MS:"2000"}:reason==="budget"?{SOCIAL_LOGIN_MAX_OTP_ATTEMPTS:"1"}:{};
   const service=serviceFor(t,seen,overrides);
-  const input=req(reason);const first=await service.login(input);assert.equal(runtime.state().holds,1);
+  const input=req(reason);const first=await service.login(input);
+  assert.equal(first.result.failureType,"verification_required");assert.equal(Boolean(first.result.challenge?.id),true);
+  assert.equal(runtime.state().holds,1);
   if(reason==="cancel") {await service.cancelChallenge(input);await service.cancelChallenge(input);}
   if(reason==="expiry") {await new Promise(resolve=>setTimeout(resolve,Math.max(1,Date.parse(first.result.challenge.expires_at)-Date.now())));await waitForReleased(seen);await assert.rejects(service.login(continuation(input,first.result.challenge,"123456")),e=>e.code==="challenge_not_found");}
   if(reason==="shutdown") await service.shutdown(10000);
   if(reason==="crash") {await seen.context.close();await waitForReleased(seen);assert.throws(()=>service.challengeStatus(input),e=>e.code==="challenge_not_found");await assert.rejects(service.login(continuation(input,first.result.challenge,"123456")),e=>e.code==="challenge_not_found");}
-  if(reason==="budget") {const invalid=await service.login(continuation(input,first.result.challenge,"000000"));await assert.rejects(service.login(continuation(input,invalid.result.challenge,"123456")),e=>e.code==="attempts_exhausted");}
+  if(reason==="budget") {const invalid=await service.login(continuation(input,first.result.challenge,"000000"));
+   assert.equal(invalid.result.failureType,"verification_required");assert.equal(Boolean(invalid.result.challenge?.id),true);
+   await assert.rejects(service.login(continuation(input,invalid.result.challenge,"123456")),e=>e.code==="attempts_exhausted");}
   await waitForReleased(seen);assert.equal(seen.closes,1);assert.equal(runtime.state().holds,0);assert.equal(runtime.state().activeAdmissions,0);assert.equal(seen.passwords,1);assert.deepEqual(seen.codes,reason==="budget"?["000000"]:[]);
  });
 }
