@@ -1,0 +1,33 @@
+{
+  "repository": "https://github.com/teslashibe/social-login",
+  "tag": "v0.2.20",
+  "revision": "11e2ffafe3e7f32f531af7b08b677430af0bf7d4",
+  "license": "No explicit upstream LICENSE file is present at this revision. Source notices retained.",
+  "original_sha256": {
+    "Dockerfile": "e20fd75377d2420632777b9bca324e32f58c1c1e7dc19631efcb773d5b694ceb",
+    "docker-entrypoint.sh": "673b330030cc30aa93d0486a6905791266e2eabdbd7355edab990ff4d65de9c7",
+    "inject-capsolver-key.mjs": "f0ddb442d28b7d9e94f79292585963661c4afd34ddead7f7a83c02e607fba04e",
+    "package-lock.json": "ce62e924e70c3070878493507bb8bd11e7f6bd1a56a550a3ebabfa09bd4a2236",
+    "package.json": "8e8d62d7dc19b96ca9f82e33fb7bad22c11f89a752862d4924f9bee79b3f35a1",
+    "src/http/envelopes.js": "df0d6a1ee05c0a74b5ef3912ccb67694b291fad67095ed09c1036aa0a1f74748",
+    "src/http/errors.js": "79740a6a8d48d9d9522c2434b9825e6956097d7f6d85ecca8465c5e8809015d6",
+    "src/platforms/index.js": "b97425bbe05dc2febb119ce55681fe9cd4884d8f0921b80926f3638359401379",
+    "src/platforms/registry.js": "8e98d77109681e7f01cea383ef93eff62cf728a920f2e2f43debc15d9ab23f3e",
+    "src/proxy/parse.js": "0f47c8f6fd905ace6d77d99de4d421de3bb8d2ca1248f4c34055ffec83d25c15",
+    "src/runtime/admission.js": "79993d81721434ab2897884d64550cdc9bf3308873fd7e054c1970dc3eea7ad9",
+    "src/runtime/browser-holds.js": "2f680e23cf04e67e2ef95f125aba4bd3357a82e1cb9b36c52975568f70613c1d",
+    "src/runtime/challenges.js": "56fb2573b7cb6ad59d1ad2b67ad95dcbe6076cd9ec8a900ff4845af64215d5c8",
+    "src/runtime/clock.js": "966010fda23ebda0bcbeaa7d5bbd5f89b9eb8ee662309f7fd1745f5ef704f101",
+    "src/runtime/legacy.js": "30e875c075cd1be742d1ce2ff327ef3afa103f8abcf82a90a90060c665bcc02e",
+    "src/runtime/login-budget.js": "0523fe00cd435d75b191c7b281c4c813a832cd40146a145d1aaa65f0e4ec3993",
+    "src/runtime/profiles.js": "2c810ff9ee0647090b0734398d00d6468261273e20415c725229048ba1948a37",
+    "src/server.js": "7b8ec7688081d21c11c8d55339f88acaa90a47abe39e847bd8cba8a38808402b",
+    "src/service.js": "e04468628adb0ad02a6eef08b58c7cc3daf59cb2fb10646c05d3bb4ea33c5e01",
+    "test/browser-holds.test.js": "e5bea9a8cebc10128f4a0efade8ac2335d134801c91e2cebf963f696c1c045a1",
+    "test/challenge-lifecycle.test.js": "8a152c408e70b67cbe297aae0426d5a2a56fef85eaeb5bf0c91dfdeea9c53293",
+    "test/fake-clock.js": "a6a7882c47daed69a5578a56cba494592f9999c4e5c123a4d6ed2925f6f19988",
+    "test/prewarm.test.js": "8366a67e135d57ef7dcbbc7dcaf0e8ba379c659c8f7ed5992a0063fdaea136bc",
+    "test/profile-delete.test.js": "7aa2ca2b41aa177c86746f93cf75d828818e723ce1b870ca483e362085d4454f",
+    "test/recovery-contract.test.js": "441b631b38f5fb156db919ca45ee57aca1a55c685686b1b5eddb685eed593b75"
+  }
+}

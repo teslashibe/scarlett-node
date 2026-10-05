@@ -381,3 +381,13 @@ A rehearsal may substitute its own identities file through
 When an Apple Developer ID and a commercial Windows certificate arrive, run the
 `developer-id` and `authenticode` schemes, which are kept and tested. The Mac
 designated requirement then changes, so users grant Full Disk Access once more.
+
+## X browser login helper
+
+Complete native preparation includes the pinned helper runtime and verifies its
+full resource inventory before bundling. Install Google Chrome at the documented
+fixed platform path; login never downloads a browser or discovers executables
+through PATH. Missing prerequisites return an unavailable result. The local helper
+uses loopback authentication and private persistent browser profiles. Read
+[the runtime preparation and release gates](../docs/x-browser-runtime.md) before
+building or testing this component.

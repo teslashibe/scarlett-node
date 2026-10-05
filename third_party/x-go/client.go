@@ -122,7 +122,19 @@ func (c *Client) doGraphQLGET(ctx context.Context, qid, operationName string, va
 		return nil, fmt.Errorf("%w: reading body: %v", ErrRequestFailed, err)
 	}
 
-	return c.parseGQLResponse(body)
+	data, parseErr := c.parseGQLResponse(body)
+	if errors.Is(parseErr, ErrRateLimited) {
+		wait := parseRetryAfter(resp.Header.Get("Retry-After"), 0)
+		if wait == 0 {
+			wait = parseRetryAfter(rlHeader(resp.Header, "Reset"), 0)
+		}
+		if wait <= 0 {
+			wait = 60 * time.Second
+		}
+		c.recordRateLimit(wait)
+		return nil, &RateLimitError{Wait: wait}
+	}
+	return data, parseErr
 }
 
 func (c *Client) operationError(operation string, req *http.Request, resp *http.Response, err error) error {
@@ -355,6 +367,10 @@ func (c *Client) waitForGap(ctx context.Context) {
 		case <-time.After(wait):
 		}
 	}
+	// Cancellation must not erase a provider cooldown that remains active.
+	if ctx.Err() != nil {
+		return
+	}
 	// Clear RetryAfter once we've waited past it.
 	c.rlMu.Lock()
 	c.rlState.RetryAfter = 0
@@ -439,8 +455,10 @@ func (c *Client) checkStatus(resp *http.Response) error {
 	// a bare status code (DM new2 often returns useful JSON on 400).
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
 	snippet := truncate(strings.TrimSpace(string(body)), 400)
-	if err := classifyRESTErrorBody(body); err != nil {
-		return err
+	if resp.StatusCode != http.StatusTooManyRequests {
+		if err := classifyRESTErrorBody(body); err != nil {
+			return err
+		}
 	}
 
 	switch {
@@ -455,18 +473,7 @@ func (c *Client) checkStatus(resp *http.Response) error {
 		if wait == 0 {
 			wait = parseRetryAfter(resp.Header.Get("Retry-After"), 60*time.Second)
 		}
-		c.rlMu.Lock()
-		c.rlState.Remaining = 0
-		c.rlState.RetryAfter = wait
-		if c.rlState.Reset.IsZero() || time.Until(c.rlState.Reset) < wait {
-			c.rlState.Reset = time.Now().Add(wait)
-		}
-		c.rlMu.Unlock()
-		c.gapMu.Lock()
-		if earliest := time.Now().Add(wait); c.lastReqAt.Before(earliest) {
-			c.lastReqAt = earliest
-		}
-		c.gapMu.Unlock()
+		c.recordRateLimit(wait)
 		return &RateLimitError{Wait: wait}
 	case resp.StatusCode >= 500:
 		if snippet != "" {
@@ -479,6 +486,22 @@ func (c *Client) checkStatus(resp *http.Response) error {
 		}
 		return fmt.Errorf("%w: unexpected HTTP %d", ErrRequestFailed, resp.StatusCode)
 	}
+}
+
+// recordRateLimit keeps later calls behind the same provider cooldown.
+func (c *Client) recordRateLimit(wait time.Duration) {
+	c.rlMu.Lock()
+	c.rlState.Remaining = 0
+	c.rlState.RetryAfter = wait
+	if c.rlState.Reset.IsZero() || time.Until(c.rlState.Reset) < wait {
+		c.rlState.Reset = time.Now().Add(wait)
+	}
+	c.rlMu.Unlock()
+	c.gapMu.Lock()
+	if earliest := time.Now().Add(wait); c.lastReqAt.Before(earliest) {
+		c.lastReqAt = earliest
+	}
+	c.gapMu.Unlock()
 }
 
 // classifyRESTErrorBody maps known X REST error payloads to sentinels so
@@ -610,7 +633,8 @@ func isNonRetriable(err error) bool {
 		errors.Is(err, ErrNotFound) ||
 		errors.Is(err, ErrSuspended) ||
 		errors.Is(err, ErrInvalidParams) ||
-		errors.Is(err, ErrQueryIDStale)
+		errors.Is(err, ErrQueryIDStale) ||
+		errors.Is(err, ErrChallenge)
 }
 
 func truncate(s string, n int) string {

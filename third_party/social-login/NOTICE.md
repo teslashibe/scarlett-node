@@ -1,0 +1,3 @@
+Pinned social-login source from teslashibe/social-login v0.2.20, revision 11e2ffafe3e7f32f531af7b08b677430af0bf7d4. Original source comments are retained. The upstream snapshot contains no explicit LICENSE file; this notice does not assign it a license. Node and Playwright distributed dependencies retain their own license files during runtime preparation.
+
+Local changes are recorded in PATCHES.md and patches/interactive-x.patch. UPSTREAM.json records the original bytes; PATCHED.json records shipped source bytes. Rebase the small patch on an upstream release with interactive X holds, run all fixtures, regenerate both manifests, and remove the patch when upstream supplies the same contract. Do not edit the external source repository from this checkout.

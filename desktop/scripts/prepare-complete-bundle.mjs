@@ -1,5 +1,6 @@
 // Developer build tooling. Uses explicitly reviewed binaries and vendor packages;
-// never reads account profiles, downloads software or calls a model provider.
+// Explicit build preparation downloads pinned helper software; it never reads
+// account profiles or calls a model provider.
 import {execFileSync} from 'node:child_process';
 import {copyFileSync, cpSync, lstatSync, readdirSync, readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync} from 'node:fs';
 import {createHash} from 'node:crypto';
@@ -79,6 +80,9 @@ for (const [name, source] of [['scarlett-node',node], ['scarlett-prover',prover]
   if (!suffix) chmodSync(destination,0o755);
 }
 const sidecars = [['scarlett-node',node], ['scarlett-prover',prover], ['open-agent-api',api]].map(([name,source]) => ({name,bytes:lstatSync(source).size,sha256:createHash('sha256').update(readFileSync(source)).digest('hex')}));
+// The login helper is a complete runtime resource, verified before COMPONENTS
+// inventories it and before signing modifies native payload bytes.
+execFileSync(process.execPath, [join(desktop, '..', 'scripts', 'prepare-x-login-runtime.mjs'), platform, join(runtime, 'x-login-runtime')], {stdio:'inherit'});
 const files = [];
 function record(directory) {
   for (const name of readdirSync(directory).sort()) {

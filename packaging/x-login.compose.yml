@@ -1,0 +1,33 @@
+# Apply with your node service configuration. The browser helper has no host ports.
+services:
+  scarlett-node:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      SCARLETT_X_LOGIN_URL: http://x-login:8090
+    secrets: [x_login_bearer]
+    networks: [x-auth, default]
+    depends_on:
+      x-login:
+        condition: service_healthy
+  x-login:
+    platform: linux/amd64
+    build:
+      context: ..
+      dockerfile: packaging/x-login.Dockerfile
+    secrets: [x_login_bearer]
+    volumes: [x-browser-profiles:/profiles]
+    networks: [x-auth]
+    stop_grace_period: 40s
+    init: true
+    restart: unless-stopped
+networks:
+  # Private connectivity without host publication. Egress is required by Chrome;
+  # internal:true would prevent X login. Only the node joins this bridge.
+  x-auth: {}
+volumes:
+  x-browser-profiles: {}
+secrets:
+  x_login_bearer:
+    file: ${SCARLETT_X_LOGIN_BEARER_FILE:?Set the absolute path of a private random bearer file}

@@ -1,0 +1,677 @@
+--- a/src/runtime/browser-holds.js
++++ b/src/runtime/browser-holds.js
+@@ -41,7 +41,7 @@
+     if (!hold) return null;
+     this.#holds.delete(ownerToken);
+     this.#clock.clearTimeout(hold.timer);
+-    if (hold.expiresAt <= this.#clock.now()) {
++    if (hold.expiresAt <= this.#clock.now() || hold.session.closed) {
+       void this.#close(hold, "expired");
+       return null;
+     }
+@@ -77,6 +77,10 @@
+     }
+   }
+ 
++  hasOwner(ownerToken) {
++    return this.#holds.has(ownerToken);
++  }
++
+   hasProfile(platform, profileKey) {
+     return this.hasProfileID(platform, profileID(platform, profileKey));
+   }
+@@ -100,7 +104,7 @@
+     let timeout;
+     try {
+       await Promise.race([
+-        Promise.resolve(hold.session.close(reason)).catch(() => {}),
++        Promise.resolve(hold.session.close(reason)),
+         new Promise((_, reject) => {
+           timeout = this.#clock.setTimeout(
+             () => reject(new ServiceError("browser_close_timeout", "browser session close timed out", 504)),
+--- a/src/runtime/challenges.js
++++ b/src/runtime/challenges.js
+@@ -31,7 +31,7 @@
+     this.#clock = clock;
+   }
+ 
+-  create(identity, credentials, result, deadline = Infinity) {
++  create(identity, credentials, result, deadline = Infinity, budgetState) {
+     if (this.#closed) throw new ServiceError("shutting_down", "service is shutting down", 503);
+     this.#purge();
+     if (this.#profileGuards.has(profileID(identity.platform, identity.profileKey))) {
+@@ -66,6 +66,7 @@
+       ...identity,
+       profileID: profileID(identity.platform, identity.profileKey),
+       credentials,
++      budgetState,
+       expiresAt,
+       timer,
+       attempts: prior?.attempts || 0,
+--- a/src/runtime/legacy.js
++++ b/src/runtime/legacy.js
+@@ -37,6 +37,7 @@
+ const PORT = parseInt(process.env.PORT || "8090", 10);
+ const HEADLESS = String(process.env.CAP_HEADLESS || "true") !== "false";
+ const BROWSER_CHANNEL = (process.env.CAP_BROWSER_CHANNEL || "").trim();
++const BROWSER_EXECUTABLE = (process.env.CAP_BROWSER_EXECUTABLE_PATH || "").trim();
+ const envInt = (name, fallback, min = 1) =>
+   Math.max(min, parseInt(process.env[name] || String(fallback), 10) || fallback);
+ const MAX_SESSIONS = envInt("SOCIAL_LOGIN_MAX_CONCURRENCY", 4);
+@@ -54,6 +55,8 @@
+ let drainPromise = null;
+ let activeAdmissions = 0;
+ const admissionQueue = [];
++// Versioned service holds retain the same capacity charge while awaiting a code.
++const serviceHolds = new Set();
+ const trackedSessions = new Set();
+ 
+ function telemetry(event, data = {}) {
+@@ -77,7 +80,7 @@
+ }
+ 
+ function dispatchAdmissions() {
+-  while (accepting && activeAdmissions + challengeHolds.size < MAX_SESSIONS && admissionQueue.length) {
++  while (accepting && activeAdmissions + challengeHolds.size + serviceHolds.size < MAX_SESSIONS && admissionQueue.length) {
+     const item = admissionQueue.shift();
+     clearTimeout(item.timer);
+     if (item.cancelled()) {
+@@ -96,7 +99,7 @@
+ 
+ function acquireAdmission(cancelled = () => false, signal) {
+   if (!accepting) return Promise.reject(new AdmissionError("shutting_down", "service is shutting down"));
+-  if (activeAdmissions + challengeHolds.size < MAX_SESSIONS) {
++  if (activeAdmissions + challengeHolds.size + serviceHolds.size < MAX_SESSIONS) {
+     activeAdmissions++;
+     return Promise.resolve(releaseAdmission);
+   }
+@@ -127,7 +130,12 @@
+ // A verification resume reuses a browser already counted in challengeHolds.
+ // Claim that exact hold before considering general capacity; callers without
+ // the matching platform/profile key still use the normal FIFO admission path.
+-function acquireChallengeAdmission(platform, profileKey, verificationCode, cancelled = () => false, signal) {
++function acquireChallengeAdmission(platform, profileKey, verificationCode, cancelled = () => false, signal, explicitHold) {
++  if (explicitHold) {
++    if (!serviceHolds.delete(explicitHold)) throw new AdmissionError("challenge_not_found", "browser hold is missing or expired");
++    activeAdmissions++;
++    return Promise.resolve({ held: explicitHold, release: releaseAdmission });
++  }
+   const held = verificationCode ? takeChallengeHold(platform, profileKey) : null;
+   if (held) {
+     // Transfer the capacity charge from the parked-hold bucket to the active
+@@ -296,7 +304,7 @@
+ // and the version tracks Chrome automatically. See #444 follow-up (X detection).
+ const UA =
+   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
+-const CONTEXT_OPTS = BROWSER_CHANNEL
++const CONTEXT_OPTS = (BROWSER_CHANNEL || BROWSER_EXECUTABLE)
+   ? { viewport: { width: 1280, height: 900 }, locale: "en-US" }
+   : { userAgent: UA, viewport: { width: 1280, height: 900 }, locale: "en-US" };
+ 
+@@ -484,6 +492,7 @@
+   const budget = currentLoginBudget();
+   const options = () => ({
+     ...launchOptions(proxyUrl, { stealth, loadCapsolverExt }),
++    ...(BROWSER_EXECUTABLE ? { executablePath: BROWSER_EXECUTABLE } : {}),
+     timeout: budget ? budget.timeout(30_000) : 30_000,
+   });
+   const launch = async (fn) => {
+@@ -996,13 +1005,15 @@
+   }
+ }
+ 
+-async function loginX({ username, password, totpSecret, verificationCode }, proxyUrl, profileKey) {
+-  const { context, page, close, persistent } = await openLoginSession({ proxyUrl, profileKey, stealth: true });
+-  const capturedUserAgent = await page.evaluate(() => navigator.userAgent).catch(() => "");
++async function loginX({ username, password, verificationCode, challengeHold }, proxyUrl, profileKey) {
++  if (challengeHold) return finishXLogin(challengeHold, verificationCode, proxyUrl);
++  if (verificationCode) throw new Error("challenge browser is required for code continuation");
++  const session = await openLoginSession({ proxyUrl, profileKey, stealth: true });
++  const { context, page, close } = session;
+   // Set when X presents its new-device confirmation-code challenge but no code
+   // is available yet — surfaced as verification_code_required so the agent
+   // collects one via the in-chat social_two_factor card.
+-  let needsVerification = false;
++  let handedOff = false;
+   try {
+     // Warm a persistent profile first: visiting x.com logged-out lets cf_clearance
+     // and the Castle device identity accrue so the subsequent login looks like a
+@@ -1015,7 +1026,13 @@
+     // "Sign in" affordance like a human, falling back to a direct nav only if the
+     // link can't be found.
+     let reachedLogin = false;
+-    await page.goto("https://x.com/", { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
++    await page.goto("https://x.com/", { waitUntil: "domcontentloaded", timeout: currentLoginBudget()?.timeout(60000) ?? 60000 });
++    const existing = await context.cookies(["https://x.com"]);
++    if (existing.some(c => c.name === "auth_token") && existing.some(c => c.name === "ct0") &&
++        !/\/i\/(?:flow|jf)\/|\/login/.test(page.url()) && !(await xVisibleCodeField(page))) {
++      handedOff = true;
++      return await finishXLogin(session, "", proxyUrl);
++    }
+     await humanWarm(page);
+ 
+     // Try to enter the flow organically via the "Sign in" link/button.
+@@ -1058,8 +1075,7 @@
+       try {
+         await userField.waitFor({ state: "visible", timeout: 15000 });
+       } catch {
+-        const snippet = (await bodyText()).replace(/\s+/g, " ").slice(0, 400);
+-        throw new Error(`username field not found (url=${page.url()} body="${snippet}")`);
++        throw new Error("username field not found");
+       }
+     }
+     // Small human beat before the first keystroke so the username step isn't
+@@ -1099,98 +1115,65 @@
+       limited = limited || X_RATE_LIMIT_RE.test(await bodyText());
+     }
+ 
+-    // Step 3 — challenge: X interposes a confirmation-code step after the
+-    // password for logins from a new device/IP (the warmed residential egress
+-    // looks unfamiliar to a brand-new account). It renders an
+-    // ocfEnterTextTextInput and emails/SMSes a code, or — for accounts with an
+-    // authenticator app — asks for a TOTP. Handle both:
+-    //   - an emailed/SMS code pasted via the social_two_factor card
+-    //     (verificationCode) takes precedence;
+-    //   - else a freshly computed TOTP when the account has 2FA configured;
+-    //   - else surface verification_code_required so the agent asks the user.
+-    // The persistent profile keeps the device identity across the code retry,
+-    // so re-login won't re-trip Castle and the emailed code stays valid.
+-    if (!limited) {
+-      const codeSel = 'input[name="code"], input[data-testid="ocfEnterTextTextInput"], input[name="text"], input[name="verfication_code"], input[autocomplete="one-time-code"], input[inputmode="numeric"]';
+-      let challenge = await xField(page, modal, codeSel, 12000);
+-      // The code screen can lag the password submit; also recognize it by its
+-      // on-screen copy so we don't fall through to a generic failure when the
+-      // input selector hasn't matched yet.
+-      const challengeByText = X_CODE_CHALLENGE_RE.test(await bodyText());
+-      if (challenge || challengeByText) {
+-        const code = (verificationCode && String(verificationCode).trim()) ||
+-          (totpSecret ? totpNow(totpSecret) : "");
+-        if (!code) {
+-          needsVerification = true;
+-        } else {
+-          // Re-resolve the field if text matched first (give it a beat to render).
+-          if (!challenge) {
+-            await page.waitForTimeout(1500);
+-            challenge = await xField(page, modal, codeSel, 8000);
+-          }
+-          if (challenge) {
+-            await xType(challenge, code);
+-            await xClick(page, modal, [/^next$/i, /^verify$/i, /^log in$/i, /^continue$/i]);
+-            await page.waitForTimeout(3000);
+-            limited = limited || X_RATE_LIMIT_RE.test(await bodyText());
+-          } else {
+-            needsVerification = true;
+-          }
+-        }
+-      }
+-    }
+-
+-    // Wait for the session to materialize (auth_token + ct0), bailing early if
+-    // X shows the rate-limit interstitial.
++    handedOff = true;
++    return await finishXLogin(session, "", proxyUrl);
++  } finally {
++    if (!handedOff) await close();
++  }
++}
++
++const X_CODE_SELECTOR = 'input[name="code"], input[name="text"], input[data-testid="ocfEnterTextTextInput"], input[name="verfication_code"], input[autocomplete="one-time-code"], input[inputmode="numeric"]';
++
++async function xVisibleCodeField(page) {
++  const fields = page.locator(X_CODE_SELECTOR);
++  for (let i = 0; i < await fields.count(); i++) {
++    const field = fields.nth(i);
++    if (await field.isVisible()) return field;
++  }
++  return null;
++}
++
++// A code continuation only touches the retained page. No login navigation,
++// browser launch, password fill or password submission is permitted here.
++async function finishXLogin(session, verificationCode, proxyUrl) {
++  const { context, page, close } = session;
++  let parked = false;
++  try {
++    const modal = page.locator("#layers");
++    const bodyText = () => page.locator("body").innerText();
++    let codeField = await xVisibleCodeField(page);
++    if (verificationCode) {
++      if (!codeField) throw new Error("challenge page is no longer available");
++      await xType(codeField, String(verificationCode).trim());
++      await xClick(page, modal, [/^next$/i, /^verify$/i, /^log in$/i, /^continue$/i]);
++      await page.waitForTimeout(1500);
++    }
+     const deadline = Math.min(Date.now() + 30000, currentLoginBudget()?.deadline ?? Infinity);
+-    let ok = false;
+-    while (Date.now() < deadline) {
+-      const cks = await context.cookies();
+-      if (cks.find((c) => c.name === "auth_token") && cks.find((c) => c.name === "ct0")) { ok = true; break; }
+-      if (X_RATE_LIMIT_RE.test(await bodyText())) { limited = true; break; }
+-      await page.waitForTimeout(1500);
+-    }
+-
+-    const cookies = await context.cookies();
+-    const map = Object.fromEntries(cookies.map((c) => [c.name, c.value]));
+-    let hints = [];
+-    let rateLimited = false;
+-    let finalBody = "";
+-    if (!ok) {
++    for (;;) {
++      currentLoginBudget()?.check();
+       const body = await bodyText();
+-      finalBody = body;
+-      if (X_RATE_LIMIT_RE.test(body)) {
+-        rateLimited = true;
+-        hints.push("rate_limited: X temporarily limited login; try again later");
+-      }
+-      // Signal the code challenge so the Go layer returns verification_required
+-      // and the agent collects a code via the social_two_factor card.
+-      if (needsVerification && !rateLimited) {
+-        hints.push("verification_code_required");
+-      }
+-      const more = body
+-        .split("\n")
+-        .map((l) => l.trim())
+-        .filter((l) => l && /wrong|incorrect|verify|suspicious|unusual|couldn|limit|code|sent/i.test(l))
+-        .slice(0, 6);
+-      hints = [...new Set([...hints, ...more])];
+-    }
+-    return {
+-      ok,
+-      rateLimited,
+-      finalUrl: page.url(),
+-      cookies: map,
+-      session: {
+-        auth_token: map.auth_token || null,
+-        ct0: map.ct0 || null,
+-        user_agent: capturedUserAgent || await page.evaluate(() => navigator.userAgent).catch(() => ""),
+-      },
+-      hints,
+-      challengeMethod: hints.includes("verification_code_required") ? "email_sms_in_app" : "",
+-      maskedDestination: extractMaskedDestination(finalBody),
+-    };
++      const rateLimited = X_RATE_LIMIT_RE.test(body);
++      codeField = await xVisibleCodeField(page);
++      const codeRequired = Boolean(codeField) || X_CODE_CHALLENGE_RE.test(body);
++      const cookies = await context.cookies(["https://x.com"]);
++      const map = Object.fromEntries(cookies.map((c) => [c.name, c.value]));
++      // Stale auth cookies on a challenge/login page never establish success.
++      const ok = !rateLimited && !codeRequired && !/\/i\/(?:flow|jf)\/|\/login/.test(page.url()) && Boolean(map.auth_token && map.ct0);
++      if (ok || rateLimited || codeRequired || Date.now() >= deadline) {
++        parked = !ok && !rateLimited && codeRequired;
++        return {
++          ok, rateLimited, finalUrl: page.url(), cookies: ok ? map : {},
++          session: ok ? { auth_token: map.auth_token, ct0: map.ct0, user_agent: await page.evaluate(() => navigator.userAgent) } : {},
++          hints: parked ? ["verification_code_required"] : rateLimited ? ["rate_limited"] : ["login_failed"],
++          challengeMethod: parked ? "verification_code" : "",
++          maskedDestination: parked ? extractMaskedDestination(body) : "",
++          ...(parked ? { browserHold: Object.assign(session, { proxyUrl }) } : {}),
++        };
++      }
++      await loginSleep(250);
++    }
+   } finally {
+-    await close();
++    if (!parked) await close();
+   }
+ }
+ 
+@@ -2664,8 +2647,8 @@
+       loginLinkedIn({ username, password, verificationCode, challengeHold }, proxyUrl, profileKey),
+   },
+   x: {
+-    run: ({ username, password, totpSecret, verificationCode }, proxyUrl, profileKey) =>
+-      loginX({ username, password, totpSecret, verificationCode }, proxyUrl, profileKey),
++    run: ({ username, password, verificationCode, challengeHold }, proxyUrl, profileKey) =>
++      loginX({ username, password, verificationCode, challengeHold }, proxyUrl, profileKey),
+   },
+   tiktok: {
+     run: ({ username, password, verificationCode }, proxyUrl, profileKey) =>
+@@ -2710,7 +2693,7 @@
+     };
+   }
+   const cancelled = () => Boolean(signal?.aborted);
+-  const admission = await acquireChallengeAdmission(platform, profileKey, code, cancelled, signal);
++  const admission = await acquireChallengeAdmission(platform, profileKey, code, cancelled, signal, input.challengeHold);
+   if (cancelled()) {
+     admission.release();
+     throw new AdmissionError("request_cancelled", "request cancelled before browser login");
+@@ -2719,7 +2702,22 @@
+   const recipeFlight = withProfileLock(profileKey, () => {
+     currentLoginBudget()?.check();
+     if (input.challengeHold) currentLoginBudget()?.bind(() => input.challengeHold.close("cancelled"));
+-    return recipe.run(input, proxyUrl, profileKey);
++    return recipe.run(input, proxyUrl, profileKey).then((result) => {
++      if (result.browserHold) {
++        const hold = result.browserHold;
++        if (!hold.capacityClose) {
++          const close = hold.close;
++          hold.capacityClose = true;
++          hold.close = async (reason) => {
++            try { await close(reason); }
++            finally { serviceHolds.delete(hold); dispatchAdmissions(); }
++          };
++          hold.context?.once("close", () => { hold.closed = true; trackedSessions.delete(hold); serviceHolds.delete(hold); dispatchAdmissions(); });
++        }
++        serviceHolds.add(hold);
++      }
++      return result;
++    });
+   })
+     .finally(admission.release);
+   const flight = recipeFlight;
+@@ -2736,15 +2734,15 @@
+   const reasons = [];
+   let processCount = -1;
+   if (!accepting) reasons.push("admission_closed");
+-  if (!process.env.DISPLAY && !HEADLESS) reasons.push("display_unset");
+-  if (!HEADLESS) {
++  if (process.platform === "linux" && !process.env.DISPLAY && !HEADLESS) reasons.push("display_unset");
++  if (process.platform === "linux" && !HEADLESS) {
+     try {
+       await execFileAsync("xdpyinfo", [], { timeout: 1500, env: process.env });
+     } catch {
+       reasons.push("xvfb_unreachable");
+     }
+   }
+-  try {
++  if (process.platform !== "win32") try {
+     const { stdout } = await execFileAsync("ps", ["-e", "-o", "pid="], { timeout: 1500 });
+     processCount = stdout.trim() ? stdout.trim().split(/\n/).length : 0;
+     if (processCount >= MAX_PROCESSES) reasons.push("process_threshold");
+@@ -2818,10 +2816,12 @@
+     return () => { BROWSER_LOGIN_RECIPES[platform] = previous; };
+   },
+   reset() {
++    accepting = true;
++    shuttingDown = false;
+     draining = false;
+     activeRequests = 0;
+     drainPromise = null;
+     freshLoginFlights.clear();
+   },
+-  state: () => ({ draining, activeRequests, holds: challengeHolds.size }),
++  state: () => ({ draining, activeRequests, holds: challengeHolds.size + serviceHolds.size, activeAdmissions }),
+ };
+--- a/src/runtime/login-budget.js
++++ b/src/runtime/login-budget.js
+@@ -40,6 +40,19 @@
+     this.#timer.unref?.();
+   }
+ 
++  snapshot() {
++    return { limits: { ...this.#limits }, attempts: { ...this.attempts }, deadline: this.deadline };
++  }
++  restore(state) {
++    if (!state) return;
++    // The original operation owns aggregate limits. A continuation can request
++    // zero new launches/submissions; it cannot erase previous attempts.
++    for (const kind of Object.keys(state.limits)) {
++      this.#limits[kind] = Math.min(state.limits[kind], state.attempts[kind] + this.#limits[kind]);
++    }
++    this.attempts = { ...state.attempts };
++    this.capDeadline(state.deadline);
++  }
+   get signal() { return this.#controller.signal; }
+   markIncomplete() { this.attempts.complete = false; }
+   follow(signal) {
+--- a/src/server.js
++++ b/src/server.js
+@@ -96,7 +96,7 @@
+       }
+       if (req.method === "POST" && req.url === "/v1/challenges/cancel") {
+         authorize(req, token);
+-        return json(res, 200, success(activeService.cancelChallenge(await readJSON(req))));
++        return json(res, 200, success(await activeService.cancelChallenge(await readJSON(req))));
+       }
+       const profile = req.method === "DELETE" ? profileDeleteParameters(req.url) : undefined;
+       if (profile) {
+@@ -115,7 +115,6 @@
+         console.error(JSON.stringify({
+           event: "unhandled_login_error",
+           name: error?.name,
+-          message: error instanceof Error ? error.message : String(error),
+           code: error?.code,
+         }));
+       }
+@@ -148,7 +147,11 @@
+ }
+ 
+ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
++  if (process.env.SOCIAL_LOGIN_MANAGED === "1") {
++    process.stdin.resume();
++    process.stdin.once("end", () => void shutdown());
++  }
+   process.once("SIGTERM", () => void shutdown());
+   process.once("SIGINT", () => void shutdown());
+-  server.listen(PORT, () => console.log(JSON.stringify({ event: "listening", port: PORT })));
++  server.listen(PORT, process.env.HOST || "0.0.0.0", () => console.log(JSON.stringify({ event: "listening", port: PORT })));
+ }
+--- a/src/service.js
++++ b/src/service.js
+@@ -35,7 +35,7 @@
+   }
+ 
+   capabilities() {
+-    return { recovery_budget: 1, profile_harvest: ["x", "reddit"] };
++    return { recovery_budget: 1, profile_harvest: ["x", "reddit"], interactive_x: 1 };
+   }
+ 
+   health() {
+@@ -123,19 +123,34 @@
+     if (challengeID && !verificationCode) {
+       throw new ServiceError("invalid_request", "verification_code is required for continuation", 400);
+     }
+-    const held = challengeID
+-      ? this.#challenges.claimContinuation(challengeID, { platform, profileKey, proxyLease, proxyURL, ...owner })
+-      : undefined;
++    let held;
++    if (challengeID) {
++      try {
++        held = this.#challenges.claimContinuation(challengeID, { platform, profileKey, proxyLease, proxyURL, ...owner });
++      } catch (error) {
++        if (error.code === "attempts_exhausted") await this.#browserHolds.release(owner.ownerToken, "attempts_exhausted");
++        throw error;
++      }
++    }
++    if (!held && (this.#challenges.hasProfile(platform, profileKey) || this.#browserHolds.hasProfile(platform, profileKey))) {
++      throw new ServiceError("profile_busy", "profile is awaiting challenge continuation", 409);
++    }
+     let releaseProfile;
++    let browserHold;
+     const session = Symbol("login");
+     try {
+       releaseProfile = this.#locks.acquire(platform, profileKey);
+       await this.#profiles.admit(platform, profileKey);
+       if (held) {
++        budget.restore(held.budgetState);
+         budget.follow(this.#challenges.signal(held.ownerToken));
+         budget.capDeadline(held.expiresAt);
+       }
+       budget.check();
++      if (held) {
++        browserHold = this.#browserHolds.take(held.ownerToken);
++        if (platform === "x" && !browserHold) throw new ServiceError("challenge_not_found", "challenge browser is missing or closed", 404);
++      }
+       const operation = harvest
+         ? this.#runtime.runProfileHarvest(platform, proxyURL, profileID(platform, profileKey), signal)
+         : recipe.login({
+@@ -143,7 +158,7 @@
+           password: held?.credentials.password || password,
+           totpSecret: held?.credentials.totpSecret || request.totp_secret,
+           verificationCode,
+-          challengeHold: held ? this.#browserHolds.take(held.ownerToken) : undefined,
++          challengeHold: browserHold,
+         }, proxyURL, profileID(platform, profileKey), signal);
+       this.#sessions.set(session, operation);
+       const result = await operation;
+@@ -156,11 +171,21 @@
+             held?.credentials || { username, password },
+             result,
+             budget.deadline,
++            budget.snapshot(),
+           );
+           if (result.browserHold) {
++            const browser = result.browserHold;
+             await this.#browserHolds.park(owner.ownerToken,
+-              { platform, profileKey }, result.browserHold,
++              { platform, profileKey }, browser,
+               Math.max(1, Date.parse(result.challenge.expires_at) - Date.now()));
++            if (!browser.serviceCloseBound && browser.context?.once) {
++              browser.serviceCloseBound = true;
++              browser.context.once("close", () => {
++                if (!this.#browserHolds.hasOwner(owner.ownerToken)) return;
++                this.#challenges.cancel(owner.ownerToken, { platform, profileKey, proxyLease, proxyURL, ...owner });
++                void this.#browserHolds.release(owner.ownerToken, "browser_closed").catch(() => {});
++              });
++            }
+             delete result.browserHold;
+           }
+         } catch (error) {
+@@ -176,7 +201,12 @@
+       if (result.ok || challengeID || result.reused) this.#profiles.touch(platform, profileKey);
+       return { status: statusForLogin(result), result };
+     } catch (error) {
+-      if (challengeID) this.#challenges.settle(owner.ownerToken, signal?.aborted ? "cancelled" : "failed");
++      if (challengeID) {
++        this.#challenges.consume(challengeID);
++        this.#challenges.settle(owner.ownerToken, signal?.aborted ? "cancelled" : "failed");
++        await Promise.resolve(browserHold?.close("continuation_failed")).catch(() => {});
++        await this.#browserHolds.release(owner.ownerToken, "continuation_failed").catch(() => {});
++      }
+       budget.check();
+       if (error instanceof ServiceError) throw error;
+       if (error?.name === "AdmissionError") {
+@@ -213,6 +243,9 @@
+       if (Date.parse(value.expires_at) > Date.now()) return { ...value, reused: true };
+       if (this.#prewarms.get(key) === existing) this.#prewarms.delete(key);
+       else return { ...(await this.#prewarms.get(key)), reused: true };
++    }
++    if (this.#challenges.hasProfile(platform, profileKey) || this.#browserHolds.hasProfile(platform, profileKey)) {
++      throw new ServiceError("profile_busy", "profile is awaiting challenge continuation", 409);
+     }
+     const operation = (async () => {
+       await this.#profiles.admit(platform, profileKey);
+@@ -246,10 +279,10 @@
+     return this.#challenges.status(String(request.operation_owner || ""), this.#challengeIdentity(request));
+   }
+ 
+-  cancelChallenge(request) {
++  async cancelChallenge(request) {
+     const ownerToken = String(request.operation_owner || "");
+     const result = this.#challenges.cancel(ownerToken, this.#challengeIdentity(request));
+-    void this.#browserHolds.release(ownerToken, "cancelled").catch(() => {});
++    await this.#browserHolds.release(ownerToken, "cancelled");
+     return result;
+   }
+ 
+--- /dev/null
++++ b/test/interactive-x.test.js
+@@ -0,0 +1,95 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++const base = fs.mkdtempSync(path.join(os.tmpdir(), "scarlett-interactive-x-"));
++process.env.CAP_PROFILE_BASE = base;
++process.env.CAP_HEADLESS = "true";
++process.env.SOCIAL_LOGIN_MAX_CONCURRENCY = "1";
++process.env.SOCIAL_LOGIN_QUEUE_TIMEOUT_MS = "100";
++const { chromium } = await import("playwright");
++const { SocialLoginService } = await import("../src/service.js");
++const { __test: runtime } = await import("../src/runtime/legacy.js");
++const launch = chromium.launchPersistentContext.bind(chromium);
++const req = (key = "fixture") => ({ platform: "x", profile_key: key, username: "synthetic-user", password: "synthetic-password", operation_owner: "owner".repeat(10), connection_id: "connection", generation: "1", revision: "1", recovery_claim: "claim", budget: { max_browser_attempts: 1, max_credential_attempts: 1, max_solver_attempts: 0, deadline_at: new Date(Date.now()+40000).toISOString() } });
++const continuation = (input, challenge, code) => ({ ...input, username: "", password: "", challenge_id: challenge.id, verification_code: code, budget: { max_browser_attempts: 0, max_credential_attempts: 0, max_solver_attempts: 0 } });
++
++async function fixture(t) {
++ const observed = { navigations: 0, passwords: 0, codes: [], launches: 0, closes: 0, requests: [], context: null, page: null };
++ t.mock.method(chromium, "launchPersistentContext", async (dir, options) => {
++  observed.launches++;
++  const context = await launch(dir, options); observed.context = context;
++  context.once("close", () => observed.closes++);
++  await context.exposeFunction("recordPassword", () => observed.passwords++);
++  await context.exposeFunction("recordCode", code => observed.codes.push(code));
++  // Every provider request is intercepted. No X request can leave this test.
++  await context.route("**/*", async route => {
++   const request = route.request(); observed.requests.push(request.url());
++   if (request.isNavigationRequest()) observed.navigations++;
++   if (new URL(request.url()).pathname === "/home") {
++    await context.addCookies(["auth_token", "ct0", "twid"].map(name => ({ name, value: "synthetic-"+name, domain: ".x.com", path: "/", secure: true })));
++    await route.fulfill({contentType:"text/html",body:"<html><body>Authenticated fixture</body></html>"}); return;
++   }
++   const login = `<html><body><div id="layers"><input name="username_or_email"><button onclick="document.querySelector('#layers').innerHTML='<input name=password type=password><button onclick=submitPassword()>Log in</button>'">Next</button></div><script>
++   async function submitPassword(){await window.recordPassword();document.querySelector('#layers').innerHTML='<p>Enter your verification code</p><input name=code autocomplete=one-time-code><button onclick=submitCode()>Verify</button>';}
++   async function submitCode(){const code=document.querySelector('input[name=code]').value;await window.recordCode(code);if(code==='123456')location.href='/home';else document.querySelector('p').textContent='Incorrect verification code';}
++   </script></body></html>`;
++   const body = new URL(request.url()).pathname === "/" ? '<html><body><a href="/i/flow/login">Sign in</a></body></html>' : login;
++   await route.fulfill({ contentType: "text/html", body });
++  });
++  const page = context.pages()[0]; observed.page = page;
++  const wait = page.waitForTimeout.bind(page); page.waitForTimeout = ms => wait(Math.min(ms,10));
++  return context;
++ });
++ return observed;
++}
++
++test.beforeEach(() => runtime.reset());
++test.after(() => fs.rmSync(base,{recursive:true,force:true}));
++
++test("real Chromium parks X and submits invalid then valid code on the same page with one password", async t => {
++ const seen=await fixture(t); const service=new SocialLoginService();t.after(()=>service.shutdown(1000));
++ const input=req("continue");const first=await service.login(input);
++ assert.equal(first.result.failureType,"verification_required"); assert.equal(service.capabilities().interactive_x,1);
++ const page=seen.page;const navigations=seen.navigations;
++ assert.equal(runtime.state().holds,1);assert.equal(runtime.state().activeAdmissions,0);
++ for(const change of [{operation_owner:"other".repeat(10)},{profile_key:"wrong"},{proxy_url:"http://127.0.0.1:3456",proxy_lease:"wrong"},{generation:"2"}]) {
++  await assert.rejects(service.login({...continuation(input,first.result.challenge,"123456"),...change}),e=>/mismatch/.test(e.code));
++ }
++ await assert.rejects(service.login({...input,username:"",password:"",operation_owner:"harvest".repeat(10)}),e=>e.code==="profile_busy");
++ // A held browser consumes the only capacity slot; unrelated work cannot launch.
++ const other=await service.login({...req("other"),operation_owner:"other".repeat(10)}).catch(e=>e);
++ assert.equal(other.code,"queue_timeout");assert.equal(seen.launches,1);
++ const invalid=await service.login(continuation(input,first.result.challenge,"000000"));
++ assert.equal(invalid.result.failureType,"verification_required"); assert.equal(seen.page,page);assert.equal(seen.navigations,navigations);assert.equal(seen.passwords,1);
++ assert.equal(invalid.result.deadline_at,first.result.deadline_at);
++ assert.deepEqual(invalid.result.attempts,{browser:1,credential:1,solver:0,complete:true});
++ await assert.rejects(service.login(continuation(input,first.result.challenge,"123456")),e=>e.code==="challenge_not_found");
++ const success=await service.login(continuation(input,invalid.result.challenge,"123456"));
++ assert.equal(success.result.ok,true);assert.equal(success.result.session.auth_token,"synthetic-auth_token");assert.ok(success.result.session.user_agent);
++ assert.deepEqual(success.result.attempts,{browser:1,credential:1,solver:0,complete:true});
++ assert.equal(seen.passwords,1);assert.equal(seen.launches,1);assert.deepEqual(seen.codes,["000000","123456"]);assert.equal(seen.closes,1);
++ assert.equal(runtime.state().holds,0);assert.equal(runtime.state().activeAdmissions,0);
++});
++
++for (const reason of ["cancel", "expiry", "shutdown", "crash", "budget"]) {
++ test(`real Chromium ${reason} closes a parked browser and releases capacity`,async t=>{
++  const seen=await fixture(t);if(reason==="budget") process.env.SOCIAL_LOGIN_MAX_OTP_ATTEMPTS="1";const service=new SocialLoginService();delete process.env.SOCIAL_LOGIN_MAX_OTP_ATTEMPTS;t.after(()=>service.shutdown(1000));
++  const input=req(reason);if(reason==="expiry") input.budget.deadline_at=new Date(Date.now()+15000).toISOString();const first=await service.login(input);assert.equal(runtime.state().holds,1);
++  if(reason==="cancel") {await service.cancelChallenge(input);await service.cancelChallenge(input);}
++  if(reason==="expiry") {await new Promise(resolve=>setTimeout(resolve,Math.max(1,Date.parse(first.result.challenge.expires_at)-Date.now()+100)));await assert.rejects(service.login(continuation(input,first.result.challenge,"123456")),e=>e.code==="challenge_not_found");}
++  if(reason==="shutdown") await service.shutdown(1000);
++  if(reason==="crash") {await seen.context.close();await new Promise(resolve=>setTimeout(resolve,10));assert.throws(()=>service.challengeStatus(input),e=>e.code==="challenge_not_found");await assert.rejects(service.login(continuation(input,first.result.challenge,"123456")),e=>e.code==="challenge_not_found");}
++  if(reason==="budget") {const invalid=await service.login(continuation(input,first.result.challenge,"000000"));await assert.rejects(service.login(continuation(input,invalid.result.challenge,"123456")),e=>e.code==="attempts_exhausted");}
++  assert.equal(seen.closes,1);assert.equal(runtime.state().holds,0);assert.equal(runtime.state().activeAdmissions,0);assert.equal(seen.passwords,1);assert.deepEqual(seen.codes,reason==="budget"?["000000"]:[]);
++ });
++}
++
++
++test("real Chromium warm authenticated profile returns a candidate without another password",async t=>{
++ const seen=await fixture(t);const original=chromium.launchPersistentContext;
++ t.mock.method(chromium,"launchPersistentContext",async(...args)=>{const context=await original(...args);await context.addCookies(["auth_token","ct0"].map(name=>({name,value:"synthetic-existing",domain:".x.com",path:"/",secure:true})));return context;});
++ const service=new SocialLoginService();t.after(()=>service.shutdown(1000));const result=await service.login(req("warm"));
++ assert.equal(result.result.ok,true);assert.equal(seen.passwords,0);assert.equal(seen.launches,1);assert.equal(seen.navigations,1);assert.equal(seen.closes,1);assert.equal(result.result.attempts.credential,0);
++});
+--- /dev/null
++++ b/test/aggregate-budget.test.js
+@@ -0,0 +1,9 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import {LoginBudget} from '../src/runtime/login-budget.js';
++test('continuation restores aggregate counters and forbids fresh browser/password work',async()=>{
++ const first=new LoginBudget({max_browser_attempts:2,max_credential_attempts:1,max_solver_attempts:0});
++ first.use('browser');first.use('credential');const state=first.snapshot();await first.dispose();
++ const next=new LoginBudget({max_browser_attempts:0,max_credential_attempts:0,max_solver_attempts:0});
++ try {next.restore(state);assert.equal(next.deadline,state.deadline);assert.deepEqual(next.attempts,state.attempts);assert.throws(()=>next.use('browser'),e=>e.code==='attempts_exhausted');assert.throws(()=>next.use('credential'),e=>e.code==='attempts_exhausted');}finally{await next.dispose();}
++});

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"net/http/cookiejar"
@@ -15,24 +16,9 @@ import (
 	"time"
 )
 
-// Credential login for X (#268).
-//
-// X gates the web login behind the new jfapi onboarding flow, but the classic
-// api.x.com/1.1/onboarding/task.json subtask state machine still authenticates
-// API clients and is what we drive here. The flow:
-//
-//  1. Mint a guest token (guest/activate.json) using the public web bearer.
-//  2. POST onboarding/task.json?flow_name=login to start the flow.
-//  3. Walk the returned subtasks, responding to each:
-//     - LoginJsInstrumentationSubtask -> solve the ui_metrics POW (uimetrics.go)
-//     - LoginEnterUserIdentifierSSO   -> submit username
-//     - LoginEnterPassword            -> submit password
-//     - LoginTwoFactorAuthChallenge   -> submit a TOTP/one-time code
-//     - AccountDuplicationCheck       -> acknowledge
-//     - LoginSuccessSubtask           -> terminal; auth_token + ct0 are set
-//  4. Read auth_token, ct0, twid from the cookie jar.
-//
-// The minted cookies feed straight into New(Cookies{...}).
+// Login retains the classic onboarding and legacy sidecar APIs for existing
+// callers. Neither is the interactive browser API: use BrowserLogin for a
+// bounded, owner-bound verification challenge and session-first recovery.
 
 const (
 	apiBase      = "https://api.x.com"
@@ -41,28 +27,23 @@ const (
 	loginFlowURL = onboardURL + "?flow_name=login"
 )
 
-// LoginParams holds X credentials. TOTPSecret (preferred) or OTP is only needed
-// when the account has two-factor auth enabled.
+// LoginParams holds credentials for the legacy Login API. OTP is a
+// user-supplied verification code. Interactive callers should use BrowserLogin.
 type LoginParams struct {
 	Username string
 	Password string
 	// TOTPSecret is the base32 authenticator seed; when set, Login generates a
-	// fresh 2FA code on demand (enables unattended re-login). Preferred over OTP.
+	// fresh 2FA code on demand. Retained for compatibility; not required.
 	TOTPSecret string
-	// OTP is a single 2FA/backup code, used when no TOTPSecret is available.
+	// OTP is a user-supplied 2FA, email, phone or backup verification code.
 	OTP string
 	// UserAgent overrides the browser UA used for the login + minted client.
 	UserAgent string
 	// ProxyURL routes the login through an HTTP/S proxy (residential egress).
 	ProxyURL string
-	// SidecarURL, when set, delegates the login to the headless-browser
-	// social-login sidecar (Playwright drives x.com/i/flow/login). X's
-	// onboarding edge fingerprints browser-only behavioral signals (HTTP/2
-	// frame order, ui_metrics execution, Arkose) that a pure-Go client can't
-	// reproduce — it 399s the credential step ("Could not log you in now")
-	// even with correct payloads + Chrome JA3. A real browser emits those
-	// signals natively, so the sidecar is the reliable path; the pure-Go flow
-	// below stays as a fallback. Mirrors instagram-go / tiktok-go.
+	// SidecarURL explicitly selects the legacy social-login /login protocol.
+	// This cannot return/resume owner-bound interactive challenges. Use
+	// BrowserLogin for the standalone v1 service; no fallback is automatic.
 	SidecarURL string
 }
 
@@ -83,25 +64,14 @@ func Login(ctx context.Context, p LoginParams) (*LoginResult, error) {
 		ua = defaultUserAgent
 	}
 
-	// Preferred path: drive the real web login through the headless-browser
-	// social-login sidecar (beats X's behavioral anti-bot, which 399s the
-	// pure-Go onboarding flow at the credential step).
 	if strings.TrimSpace(p.SidecarURL) != "" {
 		return loginViaSidecar(ctx, p)
 	}
 
 	jar, _ := cookiejar.New(nil)
-	// X's onboarding edge fingerprints the TLS ClientHello (JA3) + HTTP stack
-	// and 399s ("Could not log you in now") plain-Go clients at the credential
-	// step, even when the subtask payloads are correct. Present Chrome's
-	// ClientHello via the shared impersonate transport — the same posture
-	// reddit-go's login uses to clear its JA3 block.
-	// Pure-Go fallback transport. The sidecar path above is the reliable one
-	// for X; this onboarding flow is kept for completeness and is 399'd by X's
-	// behavioral anti-bot at the credential step (no browser signals). No JA3
-	// impersonation here on purpose: it doesn't clear the block and would add a
-	// private dependency that the module's CI can't resolve.
-	hc := &http.Client{Jar: jar, Timeout: 30 * time.Second}
+	// Classic onboarding is a compatibility path, not automatic recovery.
+
+	hc := &http.Client{Jar: jar, Timeout: 30 * time.Second, CheckRedirect: rejectLoginRedirect}
 	if p.ProxyURL != "" {
 		if parsed, err := url.Parse(p.ProxyURL); err == nil {
 			tr := http.DefaultTransport.(*http.Transport).Clone()
@@ -166,19 +136,22 @@ func Login(ctx context.Context, p LoginParams) (*LoginResult, error) {
 // --- social-login sidecar path -------------------------------------------
 
 type sidecarLoginRequest struct {
-	Platform   string `json:"platform"`
-	Username   string `json:"username"`
-	Password   string `json:"password"`
-	TOTPSecret string `json:"totpSecret,omitempty"`
-	ProxyURL   string `json:"proxyUrl,omitempty"`
+	Platform         string `json:"platform"`
+	Username         string `json:"username"`
+	Password         string `json:"password"`
+	TOTPSecret       string `json:"totpSecret,omitempty"`
+	VerificationCode string `json:"verificationCode,omitempty"`
+	ProxyURL         string `json:"proxyUrl,omitempty"`
 }
 
 type sidecarLoginResponse struct {
-	OK       bool              `json:"ok"`
-	FinalURL string            `json:"finalUrl"`
-	Cookies  map[string]string `json:"cookies"`
-	Hints    []string          `json:"hints"`
-	Error    string            `json:"error"`
+	OK          bool              `json:"ok"`
+	FinalURL    string            `json:"finalUrl"`
+	Cookies     map[string]string `json:"cookies"`
+	Hints       []string          `json:"hints"`
+	Error       string            `json:"error"`
+	FailureType string            `json:"failureType"`
+	Session     Session           `json:"session"`
 }
 
 // loginViaSidecar delegates the login to the headless-browser social-login
@@ -186,11 +159,12 @@ type sidecarLoginResponse struct {
 func loginViaSidecar(ctx context.Context, p LoginParams) (*LoginResult, error) {
 	endpoint := strings.TrimRight(p.SidecarURL, "/") + "/login"
 	payload, err := json.Marshal(sidecarLoginRequest{
-		Platform:   "x",
-		Username:   p.Username,
-		Password:   p.Password,
-		TOTPSecret: firstNonEmptyLogin(p.TOTPSecret, p.OTP),
-		ProxyURL:   p.ProxyURL,
+		Platform:         "x",
+		Username:         p.Username,
+		Password:         p.Password,
+		TOTPSecret:       p.TOTPSecret,
+		VerificationCode: p.OTP,
+		ProxyURL:         p.ProxyURL,
 	})
 	if err != nil {
 		return nil, err
@@ -201,26 +175,25 @@ func loginViaSidecar(ctx context.Context, p LoginParams) (*LoginResult, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	hc := &http.Client{Timeout: 180 * time.Second}
+	hc := &http.Client{Timeout: 180 * time.Second, CheckRedirect: rejectLoginRedirect}
 	resp, err := hc.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("x: social-login sidecar: %w", err)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, browserError("transport", 0, 0)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	var out sidecarLoginResponse
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, fmt.Errorf("x: social-login sidecar: bad response (status %d): %s", resp.StatusCode, truncateLogin(string(raw), 200))
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+	if readErr != nil || len(raw) > 1<<20 {
+		return nil, browserError("protocol", resp.StatusCode, 0)
 	}
-	if !out.OK {
-		detail := out.Error
-		if detail == "" && len(out.Hints) > 0 {
-			detail = strings.Join(out.Hints, "; ")
-		}
-		if detail == "" {
-			detail = "login failed"
-		}
-		return nil, fmt.Errorf("%w: %s", ErrUnauthorized, detail)
+	var out sidecarLoginResponse
+	if json.Unmarshal(raw, &out) != nil {
+		return nil, browserError("protocol", resp.StatusCode, 0)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || !out.OK {
+		return nil, browserError(classifyBrowserFailure(out.FailureType, resp.StatusCode), resp.StatusCode, parseRetryAfter(resp.Header.Get("Retry-After"), 0))
 	}
 	cookies := Cookies{
 		AuthToken: out.Cookies["auth_token"],
@@ -229,9 +202,9 @@ func loginViaSidecar(ctx context.Context, p LoginParams) (*LoginResult, error) {
 		KDT:       out.Cookies["kdt"],
 	}
 	if cookies.AuthToken == "" || cookies.CT0 == "" {
-		return nil, fmt.Errorf("%w: sidecar returned no session (auth_token/ct0 missing)", ErrUnauthorized)
+		return nil, browserError("protocol", resp.StatusCode, 0)
 	}
-	return &LoginResult{Cookies: cookies, UserAgent: p.UserAgent}, nil
+	return &LoginResult{Cookies: cookies, UserAgent: firstNonEmptyLogin(out.Session.UserAgent, p.UserAgent, defaultUserAgent)}, nil
 }
 
 func firstNonEmptyLogin(vals ...string) string {
@@ -284,7 +257,7 @@ func (f *loginFlow) guestToken(ctx context.Context) (string, error) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("guest activate status %d: %s", resp.StatusCode, truncateLogin(string(body), 200))
+		return "", fmt.Errorf("guest activate status %d", resp.StatusCode)
 	}
 	var out struct {
 		GuestToken string `json:"guest_token"`
@@ -373,26 +346,26 @@ func (f *loginFlow) task(ctx context.Context, target string, body []byte) (strin
 	}
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode != http.StatusOK {
-		return "", nil, fmt.Errorf("task status %d: %s", resp.StatusCode, truncateLogin(string(raw), 300))
+		return "", nil, fmt.Errorf("task status %d", resp.StatusCode)
 	}
 	var out struct {
 		FlowToken string    `json:"flow_token"`
 		Subtasks  []subtask `json:"subtasks"`
 		Errors    []struct {
-			Message string `json:"message"`
+			Code int `json:"code"`
 		} `json:"errors"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return "", nil, fmt.Errorf("decode task: %w", err)
 	}
 	if len(out.Errors) > 0 {
-		return "", nil, fmt.Errorf("x: %s", out.Errors[0].Message)
+		return "", nil, fmt.Errorf("x: login provider error (code %d)", out.Errors[0].Code)
 	}
 	ids := make([]string, 0, len(out.Subtasks))
 	for _, s := range out.Subtasks {
 		ids = append(ids, s.SubtaskID)
 	}
-	f.logf("flow_token=%s subtasks=%v", truncateLogin(out.FlowToken, 12), ids)
+	f.logf("flow_token_present=%v subtasks=%v", out.FlowToken != "", ids)
 	return out.FlowToken, out.Subtasks, nil
 }
 
@@ -454,8 +427,10 @@ func (f *loginFlow) respond(ctx context.Context, subtasks []subtask) (json.RawMe
 				"enter_text": map[string]any{"text": code, "link": "next_link"},
 			}), false, nil
 		case "LoginAcid":
-			// Email/phone verification challenge — needs a code we don't have.
-			return nil, false, fmt.Errorf("%w: account verification (LoginAcid) required; supply OTP", ErrUnauthorized)
+			if strings.TrimSpace(f.params.OTP) == "" {
+				return nil, false, ErrChallenge
+			}
+			return mustJSON(map[string]any{"subtask_id": s.SubtaskID, "enter_text": map[string]any{"text": f.params.OTP, "link": "next_link"}}), false, nil
 		case "AccountDuplicationCheck":
 			return mustJSON(map[string]any{
 				"subtask_id":              s.SubtaskID,
@@ -467,8 +442,8 @@ func (f *loginFlow) respond(ctx context.Context, subtasks []subtask) (json.RawMe
 			return nil, false, fmt.Errorf("%w: login denied by X", ErrUnauthorized)
 		}
 	}
-	// No actionable subtask recognized; treat as terminal so we can check cookies.
-	return nil, true, nil
+	// Unknown subtasks may require user interaction; never infer success.
+	return nil, false, ErrChallenge
 }
 
 func (f *loginFlow) twoFactorCode() (string, error) {
@@ -478,7 +453,7 @@ func (f *loginFlow) twoFactorCode() (string, error) {
 	if secret := strings.TrimSpace(f.params.TOTPSecret); secret != "" {
 		return totpNow(secret)
 	}
-	return "", fmt.Errorf("%w: two-factor required; set LoginParams.TOTPSecret or OTP", ErrUnauthorized)
+	return "", ErrChallenge
 }
 
 // solveInstrumentation fetches the js_instrumentation script and solves the
@@ -601,3 +576,11 @@ func truncateLogin(s string, n int) string {
 	}
 	return s
 }
+
+func rejectLoginRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+func (LoginParams) String() string                             { return "x.LoginParams{redacted}" }
+func (v LoginParams) GoString() string                         { return v.String() }
+func (v LoginParams) LogValue() slog.Value                     { return slog.StringValue(v.String()) }
+func (LoginResult) String() string                             { return "x.LoginResult{redacted}" }
+func (v LoginResult) GoString() string                         { return v.String() }
+func (v LoginResult) LogValue() slog.Value                     { return slog.StringValue(v.String()) }

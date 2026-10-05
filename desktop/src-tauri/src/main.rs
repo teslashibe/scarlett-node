@@ -273,6 +273,36 @@ async fn connect_x(
     node.connect_x(id, concurrency, auth_token, ct0).await
 }
 #[tauri::command]
+async fn start_x_login(
+    window: WebviewWindow,
+    node: State<'_, Arc<Node>>,
+    id: String,
+    concurrency: u8,
+    reconnect: bool,
+    username: String,
+    password: String,
+) -> node::Result<node::XLoginStatus> {
+    local_window(&window)?;
+    node.start_x_login(id, concurrency, reconnect, username, password)
+        .await
+}
+#[tauri::command]
+async fn continue_x_login(
+    window: WebviewWindow,
+    node: State<'_, Arc<Node>>,
+    id: String,
+    challenge_id: String,
+    code: String,
+) -> node::Result<node::XLoginStatus> {
+    local_window(&window)?;
+    node.continue_x_login(id, challenge_id, code).await
+}
+#[tauri::command]
+async fn cancel_x_login(window: WebviewWindow, node: State<'_, Arc<Node>>) -> node::Result<()> {
+    local_window(&window)?;
+    node.cancel_x_login().await
+}
+#[tauri::command]
 async fn connect_codex(window: WebviewWindow, node: State<'_, Arc<Node>>) -> node::Result<()> {
     local_window(&window)?;
     node.connect_codex(1).await
@@ -458,6 +488,9 @@ fn main() {
             control_node,
             open_network,
             connect_x,
+            start_x_login,
+            continue_x_login,
+            cancel_x_login,
             connect_codex,
             remove_account,
             cancel_login,

@@ -4,12 +4,13 @@ use serde_json::{Value, json};
 use std::{
     path::{Component, Path, PathBuf},
     process::Stdio,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
-    sync::Mutex,
+    sync::{Mutex, Notify},
 };
 
 const COORDINATOR: &str = "https://network.scarlett.ai";
@@ -214,6 +215,68 @@ pub struct Snapshot {
     /// caught up) from a halt nobody has resumed.
     pub relay_halt_marker: bool,
 }
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct XLoginStatus {
+    pub status: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub challenge_id: String,
+    #[serde(default)]
+    pub method: String,
+    #[serde(default)]
+    pub destination: String,
+    #[serde(default)]
+    pub expires_at: String,
+    #[serde(default)]
+    pub retry_after: i64,
+}
+struct XLogin {
+    child: Child,
+    id: String,
+}
+fn x_login_projection(raw: &[u8]) -> Result<XLoginStatus> {
+    let result: XLoginStatus = serde_json::from_slice(raw).map_err(|_| Error::CommandFailed)?;
+    if !matches!(
+        result.status.as_str(),
+        "pending" | "updated" | "cancelled" | "error"
+    ) || (!result.id.is_empty() && !valid_id(&result.id))
+        || result.challenge_id.len() > 256
+        || result.method.len() > 120
+        || result.destination.len() > 120
+        || result.expires_at.len() > 40
+        || result.retry_after < 0
+        || result.retry_after > 86400
+        || [
+            &result.challenge_id,
+            &result.method,
+            &result.destination,
+            &result.expires_at,
+        ]
+        .iter()
+        .any(|s| s.chars().any(char::is_control))
+        || (!result.code.is_empty()
+            && !matches!(
+                result.code.as_str(),
+                "restart_login"
+                    | "invalid_input"
+                    | "login_busy"
+                    | "private_storage_unavailable"
+                    | "accounts_unavailable"
+                    | "login_failed"
+                    | "cooldown"
+                    | "verification_failed"
+                    | "account_changed"
+                    | "runtime_unavailable"
+            ))
+    {
+        return Err(Error::CommandFailed);
+    }
+    Ok(result)
+}
 struct Login {
     child: Child,
     id: String,
@@ -231,6 +294,11 @@ pub struct Node {
     login: Mutex<Option<Login>>,
     login_error: Mutex<Option<Error>>,
     mutation: Mutex<()>,
+    x_login: Mutex<Option<XLogin>>,
+    x_login_cancel: Notify,
+    x_login_cancelled: AtomicBool,
+    x_login_resources: PathBuf,
+    x_login_browser: Option<PathBuf>,
 }
 
 pub fn valid_id(id: &str) -> bool {
@@ -548,6 +616,14 @@ fn proof_modes(value: &Value) -> Option<Value> {
         .collect::<Vec<_>>();
     Some(Value::Array(modes))
 }
+// This override comes only from trusted local process configuration.
+fn browser_override(path: Option<&Path>) -> Result<Option<PathBuf>> {
+    match path {
+        None => Ok(None),
+        Some(path) if path.is_absolute() && regular(path) => Ok(Some(path.to_path_buf())),
+        _ => Err(Error::InvalidInput),
+    }
+}
 impl Node {
     pub fn new(state: PathBuf, binary: PathBuf, helper: PathBuf) -> Self {
         let codex_binary = binary
@@ -564,9 +640,15 @@ impl Node {
             login: Mutex::new(None),
             login_error: Mutex::new(None),
             mutation: Mutex::new(()),
+            x_login: Mutex::new(None),
+            x_login_cancel: Notify::new(),
+            x_login_cancelled: AtomicBool::new(false),
+            x_login_resources: PathBuf::new(),
+            x_login_browser: None,
         }
     }
     pub fn with_provider_runtime(mut self, resource_root: &Path) -> Self {
+        self.x_login_resources = resource_root.join("runtime");
         self.codex_binary = resource_root
             .join("runtime")
             .join("codex")
@@ -576,6 +658,8 @@ impl Node {
     }
     pub fn from_environment(state: PathBuf, binary: PathBuf, helper: PathBuf) -> Result<Self> {
         let mut node = Self::new(state, binary, helper);
+        let browser = std::env::var_os("SCARLETT_X_LOGIN_BROWSER").map(PathBuf::from);
+        node.x_login_browser = browser_override(browser.as_deref())?;
         let coordinator = std::env::var("SCARLETT_DESKTOP_LOCAL_COORDINATOR").ok();
         let verifier = std::env::var("SCARLETT_DESKTOP_LOCAL_VERIFIER").ok();
         let ca = std::env::var_os("SCARLETT_DESKTOP_LOCAL_VERIFIER_CA").map(PathBuf::from);
@@ -626,7 +710,11 @@ impl Node {
                 cmd.env(name, v);
             }
         }
-        cmd.env("SCARLETT_STATE_DIR", &self.state)
+        if let Some(browser) = &self.x_login_browser {
+            cmd.env("SCARLETT_X_LOGIN_BROWSER", browser);
+        }
+        cmd.env("SCARLETT_X_LOGIN_RESOURCE_DIR", &self.x_login_resources)
+            .env("SCARLETT_STATE_DIR", &self.state)
             .env("SCARLETT_ACCOUNTS_FILE", self.state.join("accounts.json"))
             .env("SCARLETT_COORDINATOR", &self.endpoints.coordinator)
             .env("SCARLETT_VERIFIER", &self.endpoints.verifier)
@@ -765,6 +853,131 @@ impl Node {
         .await?;
         Ok(())
     }
+    /// One app-owned private pipe keeps the browser operation alive across UI submissions.
+    pub async fn start_x_login(
+        &self,
+        id: String,
+        concurrency: u8,
+        reconnect: bool,
+        username: String,
+        password: String,
+    ) -> Result<XLoginStatus> {
+        valid_selection("x_read", &id, concurrency)?;
+        if username.is_empty()
+            || username.len() > 64
+            || password.is_empty()
+            || password.len() > 1024
+        {
+            return Err(Error::InvalidInput);
+        }
+        let mut login = self.x_login.lock().await;
+        if login.is_some() {
+            return Err(Error::LoginBusy);
+        }
+        self.x_login_cancelled.store(false, Ordering::SeqCst);
+        let mut command = self.command(&["desktop", "x-login"])?;
+        let child = command.spawn().map_err(|_| Error::RuntimeUnavailable)?;
+        *login = Some(XLogin {
+            child,
+            id: id.clone(),
+        });
+        self.x_login_exchange(&mut login, json!({"action":"start","id":id,"concurrency":concurrency,"reconnect":reconnect,"username":username,"password":password})).await
+    }
+    pub async fn continue_x_login(
+        &self,
+        id: String,
+        challenge_id: String,
+        code: String,
+    ) -> Result<XLoginStatus> {
+        if !valid_id(&id)
+            || challenge_id.is_empty()
+            || challenge_id.len() > 256
+            || code.trim().is_empty()
+            || code.len() > 128
+        {
+            return Err(Error::InvalidInput);
+        }
+        let mut login = self.x_login.lock().await;
+        if login.as_ref().is_none_or(|p| p.id != id) {
+            return Err(Error::InvalidInput);
+        }
+        self.x_login_exchange(
+            &mut login,
+            json!({"action":"continue","id":id,"challenge_id":challenge_id,"code":code}),
+        )
+        .await
+    }
+    async fn x_login_exchange(
+        &self,
+        login: &mut Option<XLogin>,
+        message: Value,
+    ) -> Result<XLoginStatus> {
+        let cancelled = self.x_login_cancel.notified();
+        tokio::pin!(cancelled);
+        cancelled.as_mut().enable();
+        let result = {
+            let request = async {
+                let pending = login.as_mut().ok_or(Error::LoginFailed)?;
+                let mut raw = serde_json::to_vec(&message).map_err(|_| Error::InvalidInput)?;
+                raw.push(b'\n');
+                pending
+                    .child
+                    .stdin
+                    .as_mut()
+                    .ok_or(Error::LoginFailed)?
+                    .write_all(&raw)
+                    .await
+                    .map_err(|_| Error::LoginFailed)?;
+                raw.fill(0);
+                let stdout = pending.child.stdout.as_mut().ok_or(Error::LoginFailed)?;
+                let mut output = Vec::new();
+                loop {
+                    let byte = stdout.read_u8().await.map_err(|_| Error::LoginFailed)?;
+                    if byte == b'\n' {
+                        break;
+                    }
+                    if output.len() >= 2048 {
+                        return Err(Error::CommandFailed);
+                    }
+                    output.push(byte);
+                }
+                x_login_projection(&output)
+            };
+            let result = if self.x_login_cancelled.load(Ordering::SeqCst) {
+                Err(Error::LoginFailed)
+            } else {
+                tokio::select! {
+                    _ = cancelled => Err(Error::LoginFailed),
+                    result = tokio::time::timeout(Duration::from_secs(250),request) => result.map_err(|_|Error::CommandTimeout).and_then(|r|r),
+                }
+            };
+            result
+        };
+        if result.as_ref().map_or(true, |r| r.status != "pending") {
+            Self::close_x_login(login).await;
+        }
+        result
+    }
+    async fn close_x_login(login: &mut Option<XLogin>) {
+        if let Some(mut pending) = login.take() {
+            // EOF tells the helper to cancel and dispose the browser hold first.
+            drop(pending.child.stdin.take());
+            if tokio::time::timeout(Duration::from_secs(15), pending.child.wait())
+                .await
+                .is_err()
+            {
+                let _ = pending.child.kill().await;
+                let _ = pending.child.wait().await;
+            }
+        }
+    }
+    pub async fn cancel_x_login(&self) -> Result<()> {
+        self.x_login_cancelled.store(true, Ordering::SeqCst);
+        self.x_login_cancel.notify_waiters();
+        let mut login = self.x_login.lock().await;
+        Self::close_x_login(&mut login).await;
+        Ok(())
+    }
     pub async fn browser_profiles(&self) -> Result<Vec<BrowserProfile>> {
         let raw = self
             .call(&["accounts", "browser-profiles"], None, 5)
@@ -901,6 +1114,7 @@ impl Node {
     pub async fn stop(&self) -> Result<()> {
         let _guard = self.mutation.lock().await;
         self.cancel_login().await?;
+        self.cancel_x_login().await?;
         let mut running = self.running.lock().await;
         if let Some(child) = running.as_mut() {
             if child
@@ -1860,7 +2074,7 @@ esac
         use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
         let binary = tmp.path().join("node");
-        let script = "#!/bin/sh\ncase \"$1 $2\" in\n'accounts list') printf '[]';;\n'accounts connect') cat > \"$SCARLETT_STATE_DIR/captured.json\"; printf '%s\\n' \"$@\" > \"$SCARLETT_STATE_DIR/args\"; printf '{\"status\":\"updated\"}';;\n*) exit 1;;\nesac\n";
+        let script = "#!/bin/sh\ncase \"$1 $2\" in\n'accounts list') printf '[]';;\n'accounts connect') cat > \"$SCARLETT_STATE_DIR/captured.json\"; printf '%s\n' \"$@\" > \"$SCARLETT_STATE_DIR/args\"; printf '{\"status\":\"updated\"}';;\n*) exit 1;;\nesac\n";
         std::fs::write(&binary, script).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         let node = Node::new(tmp.path().join("state"), binary, tmp.path().join("helper"));
@@ -2011,6 +2225,123 @@ esac
         assert_eq!(
             node.call(&["large"], None, 2).await,
             Err(Error::CommandFailed)
+        );
+    }
+    #[test]
+    fn x_login_projection_rejects_unknown_secrets_and_provider_errors() {
+        assert!(
+            x_login_projection(br#"{"status":"pending","id":"one","password":"secret"}"#).is_err()
+        );
+        assert!(x_login_projection(br#"{"status":"error","code":"raw-provider-detail"}"#).is_err());
+        assert!(x_login_projection(br#"{"status":"pending","id":"one","challenge_id":"challenge","method":"email","destination":"f***@example.test","expires_at":"2026-10-05T23:00:00Z"}"#).is_ok());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interactive_x_login_owns_one_pipe_and_rejects_wrong_account() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("node");
+        std::fs::write(&binary,r##"#!/bin/sh
+[ "$1" = desktop ] && [ "$2" = x-login ] && [ "$#" = 2 ] || exit 9
+read -r start
+printf '%s\n' '{"status":"pending","id":"one","challenge_id":"challenge","method":"email","destination":"f***@example.test","expires_at":"2026-10-05T23:00:00Z"}'
+read -r continuation
+printf '%s\n' '{"status":"updated","id":"one"}'
+"##).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let node = Node::new(
+            temp.path().join("state"),
+            binary,
+            temp.path().join("helper"),
+        );
+        let result = node
+            .start_x_login(
+                "one".into(),
+                1,
+                false,
+                "fixture".into(),
+                "synthetic-password".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.status, "pending");
+        assert!(matches!(
+            node.continue_x_login("other".into(), "challenge".into(), "123456".into())
+                .await,
+            Err(Error::InvalidInput)
+        ));
+        assert!(matches!(
+            node.start_x_login("two".into(), 1, false, "fixture".into(), "password".into())
+                .await,
+            Err(Error::LoginBusy)
+        ));
+        assert_eq!(
+            node.continue_x_login("one".into(), "challenge".into(), "123456".into())
+                .await
+                .unwrap()
+                .status,
+            "updated"
+        );
+        assert!(node.x_login.lock().await.is_none());
+        assert!(
+            node.continue_x_login("one".into(), "challenge".into(), "123456".into())
+                .await
+                .is_err()
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interactive_x_cancel_interrupts_in_flight_login() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("node");
+        std::fs::write(&binary, "#!/bin/sh\nread -r start\nread -r owner\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let node = std::sync::Arc::new(Node::new(
+            temp.path().join("state"),
+            binary,
+            temp.path().join("helper"),
+        ));
+        let worker = node.clone();
+        let started = tokio::spawn(async move {
+            worker
+                .start_x_login("one".into(), 1, false, "fixture".into(), "password".into())
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        tokio::time::timeout(Duration::from_secs(2), node.cancel_x_login())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(started.await.unwrap().is_err());
+        assert!(node.x_login.lock().await.is_none());
+    }
+    #[test]
+    fn x_browser_override_is_local_absolute_and_forwarded_only_by_native() {
+        let temp = tempfile::tempdir().unwrap();
+        let browser = temp.path().join("chrome");
+        std::fs::write(&browser, "fixture").unwrap();
+        assert!(browser_override(Some(Path::new("relative-chrome"))).is_err());
+        assert!(browser_override(Some(temp.path())).is_err());
+        assert_eq!(
+            browser_override(Some(&browser)).unwrap(),
+            Some(browser.clone())
+        );
+        let binary = temp.path().join("node");
+        std::fs::write(&binary, "fixture").unwrap();
+        let mut node = Node::new(
+            temp.path().join("state"),
+            binary,
+            temp.path().join("helper"),
+        );
+        node.x_login_browser = Some(browser.clone());
+        let command = node.command(&["desktop", "x-login"]).unwrap();
+        assert!(
+            command
+                .as_std()
+                .get_envs()
+                .any(|(key, value)| key == "SCARLETT_X_LOGIN_BROWSER"
+                    && value == Some(browser.as_os_str()))
         );
     }
 }

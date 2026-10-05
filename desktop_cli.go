@@ -25,6 +25,9 @@ import (
 // Desktop helpers have no coordinator calls except explicit run. The renderer
 // cannot supply their binary paths; its native bridge selects bundled sidecars.
 func desktopCommand(args []string, owner io.Reader, out io.Writer) error {
+	if len(args) == 1 && args[0] == "x-login" {
+		return xLoginCommand(owner, out)
+	}
 	if len(args) == 2 && (args[0] == "preferences-get" || args[0] == "preferences-set") {
 		return desktopPreferencesCommand(args[0], args[1], owner, out)
 	}

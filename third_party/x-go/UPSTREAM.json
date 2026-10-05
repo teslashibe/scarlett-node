@@ -1,10 +1,14 @@
 {
   "module": "github.com/teslashibe/x-go",
   "version": "v1.13.0",
-  "scope": "Unmodified runtime package only; command and MCP adapters are omitted",
+  "source_repository": "https://github.com/teslashibe/x-go",
+  "source_revision": "fb031a0f6f69b68a7038efdf52d1c4ef22d54f85",
+  "scope": "Unmodified runtime package at source_revision; v1.13.0 is the local replacement label, not a claim that this commit is a tagged release. Commands, MCP and upstream tests are omitted.",
+  "refresh": "python3 scripts/refresh-x-go-runtime.py /path/to/x-go <reviewed-commit>",
   "sha256": {
     "actions.go": "ebbb62a66a191fc21bfca4bfc6d103a00043d6b373632d88f70d52f881019ff0",
-    "client.go": "66842fbca3e7beb84304f6d75870be534afc03c36db4bed7bc2def5686d5f152",
+    "browser_login.go": "b995b0cbc85720c4f9a02eca171e836bc20699c15cca94c857bf7790580eefb0",
+    "client.go": "b43e2bb003db4ee9c559bf156141103345d8d033b8770451bb62e3d4a8eaa5d6",
     "compose.go": "d0e1fa2f343db22d1156bb57ba9d3a70574b0e18802534d874b471d5a7bf0293",
     "dm.go": "da6d63bf29a1d5102b6b061f4f3221a1eddbbf85926ef6fa6b61800eb833acc0",
     "doc.go": "fee06772aa164abb05d85508dbca865c13cdd2701c12a1bbecb644dcde4be24f",
@@ -13,13 +17,13 @@
     "internal.go": "345448340649d484c6c51a7a7bef128052fd974c646114938be00a21e2267c0b",
     "iterator.go": "7b115ba6204a61512a83ea2309e156bd6316d035a9eb7990a05f9edf442cb7f5",
     "lists.go": "1fe32b55c9c12acb389c6983c1247aed253c69d4d7642da694fca21343e59d3f",
-    "login.go": "962d392e15b73f3822462853a9a69a326ae3ba6ecf7da1e29022f23bbb155061",
+    "login.go": "84f8845f8ab25c1428ddded3123b7418be1493d83be59caa8034ad7b92542651",
     "media.go": "455b004ff12685ec8fd152a47bc9d255dbf9659ccc0f78fc1ff6e5e585e8b5ea",
     "media_video.go": "b482d3349f712dc1eb3dab604b3e92e42ac0fbdf52ec6e5cad1df3ca924a26dc",
     "profile.go": "850522be17c5429d3b46fa9a8416183f9c1cf52ea11bf551b2c6c8ba58b0f933",
     "reply.go": "e55b4f01d361a3dd593d7ae1b78dd34fa5d1776dc43dd456e958d05968864470",
     "search.go": "f7b77c26f4842ac3393ad92e3264054401c676bda4502e6a1ff203196edb7fac",
-    "session.go": "5b2715949d4fa5ea23e59dad37afd5814b746bd18dae5f36f1c3195dd591e519",
+    "session.go": "26a8b2966e97f53adb51f480b1f4159542c468096992bac301a09927ce42ffa5",
     "social.go": "140b5332dc824d1f24110e0f9f963edc710b9dbc85cac364319d8ed4fc3e08bb",
     "timeline.go": "ae68165a8d39c49f12e2cb2434392c7d20023de205b665caf24c8e888e3e1032",
     "totp.go": "19ac139c4ac5eab9209706a78cd364844ec94ebcc1aa32d0fb2a042a3db2cb7e",
@@ -28,7 +32,6 @@
     "tweets.go": "4ff99deda7cb477e4cc9c79e842cad9611eee81d47964120e01fb2977ccaee24",
     "types.go": "7b140c6732422e9f130eb83b0bcf4130f7ca7e38871ac2a293360399f122365e",
     "uimetrics.go": "6bb666ea5e8cc5df7d65e6e7f89ffdd6f2b1a6834c33a34e240844b623c89303",
-    "x.go": "b9922b4318fdaf7d984c9d408a958734ced7fa5443c9364f543a92052245ed0b"
-  },
-  "module_sum": "h1:W/8A3TrHDaJHHIuTP6MmmvgH6Ph9CzG0/+5pb+u2i2s="
+    "x.go": "49fdd0ebef3e05c8aa82eba6b7f02f4aa5d899ae94ffd6fad340fc93879c37a6"
+  }
 }
