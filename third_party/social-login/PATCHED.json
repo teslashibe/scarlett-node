@@ -9,7 +9,7 @@
     "inject-capsolver-key.mjs": "f0ddb442d28b7d9e94f79292585963661c4afd34ddead7f7a83c02e607fba04e",
     "package-lock.json": "ce62e924e70c3070878493507bb8bd11e7f6bd1a56a550a3ebabfa09bd4a2236",
     "package.json": "8e8d62d7dc19b96ca9f82e33fb7bad22c11f89a752862d4924f9bee79b3f35a1",
-    "patches/interactive-x.patch": "26ec786f63474100ca2d23ca08792e6a7735c48f41d2290eaa1b455fded33a37",
+    "patches/interactive-x.patch": "ffffea4b9981189f999274262b4c3d83df36431b158e80153ef11d8738390e8f",
     "src/http/envelopes.js": "df0d6a1ee05c0a74b5ef3912ccb67694b291fad67095ed09c1036aa0a1f74748",
     "src/http/errors.js": "79740a6a8d48d9d9522c2434b9825e6956097d7f6d85ecca8465c5e8809015d6",
     "src/platforms/index.js": "b97425bbe05dc2febb119ce55681fe9cd4884d8f0921b80926f3638359401379",
@@ -28,7 +28,7 @@
     "test/browser-holds.test.js": "e5bea9a8cebc10128f4a0efade8ac2335d134801c91e2cebf963f696c1c045a1",
     "test/challenge-lifecycle.test.js": "8a152c408e70b67cbe297aae0426d5a2a56fef85eaeb5bf0c91dfdeea9c53293",
     "test/fake-clock.js": "a6a7882c47daed69a5578a56cba494592f9999c4e5c123a4d6ed2925f6f19988",
-    "test/interactive-x.test.js": "2323ff2e0a4fe4f0226b7ff1f5c6065ef5466ed9cef27d24dfe454eff27e01ed",
+    "test/interactive-x.test.js": "d4dc25e4626dd3abfe3fb90198ff9c2b5e98638ec126ed750db015adc550c67d",
     "test/prewarm.test.js": "8366a67e135d57ef7dcbbc7dcaf0e8ba379c659c8f7ed5992a0063fdaea136bc",
     "test/profile-delete.test.js": "7aa2ca2b41aa177c86746f93cf75d828818e723ce1b870ca483e362085d4454f",
     "test/recovery-contract.test.js": "441b631b38f5fb156db919ca45ee57aca1a55c685686b1b5eddb685eed593b75"

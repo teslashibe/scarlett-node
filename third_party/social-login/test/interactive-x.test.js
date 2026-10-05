@@ -32,24 +32,62 @@ async function fixture(t) {
     await route.fulfill({contentType:"text/html",body:"<html><body>Authenticated fixture</body></html>"}); return;
    }
    const login = `<html><body><div id="layers"><input name="username_or_email"><button onclick="document.querySelector('#layers').innerHTML='<input name=password type=password><button onclick=submitPassword()>Log in</button>'">Next</button></div><script>
-   async function submitPassword(){await window.recordPassword();document.querySelector('#layers').innerHTML='<p>Enter your verification code</p><input name=code autocomplete=one-time-code><button onclick=submitCode()>Verify</button>';}
-   async function submitCode(){const code=document.querySelector('input[name=code]').value;await window.recordCode(code);if(code==='123456')location.href='/home';else document.querySelector('p').textContent='Incorrect verification code';}
+   async function submitPassword(){window.fixtureState="submitting-password";await window.recordPassword();document.querySelector('#layers').innerHTML='<p>Enter your verification code</p><input name=code autocomplete=one-time-code><button onclick=submitCode()>Verify</button>';window.fixtureState="challenge";}
+   async function submitCode(){window.fixtureState="submitting-code";const code=document.querySelector('input[name=code]').value;await window.recordCode(code);if(code==='123456')location.href='/home';else {document.querySelector('p').textContent='Incorrect verification code';window.fixtureState="invalid-code";}}
    </script></body></html>`;
    const body = new URL(request.url()).pathname === "/" ? '<html><body><a href="/i/flow/login">Sign in</a></body></html>' : login;
    await route.fulfill({ contentType: "text/html", body });
   });
   const page = context.pages()[0]; observed.page = page;
-  const wait = page.waitForTimeout.bind(page); page.waitForTimeout = ms => wait(Math.min(ms,10));
+  const wait = page.waitForTimeout.bind(page);
+  page.waitForTimeout = async ms => {
+   await wait(Math.min(ms,10));
+   // Decorative delays stay short, but submitted fixture work must actually settle.
+   await page.waitForFunction(() => !["submitting-password", "submitting-code"].includes(window.fixtureState), null, {timeout:10000});
+   if (observed.codes.at(-1) === "123456") {
+    await page.waitForURL("**/home", {waitUntil:"domcontentloaded",timeout:10000});
+    await page.getByText("Authenticated fixture", {exact:true}).waitFor({state:"visible",timeout:10000});
+   } else if (observed.codes.length) {
+    await page.getByText("Incorrect verification code", {exact:true}).waitFor({state:"visible",timeout:10000});
+   } else if (observed.passwords) {
+    await page.locator('input[name="code"]').waitFor({state:"visible",timeout:10000});
+   }
+  };
   return context;
  });
  return observed;
+}
+
+async function waitForReleased(seen) {
+ const deadline = Date.now()+10000;
+ while ((seen.closes !== 1 || runtime.state().holds !== 0 || runtime.state().activeAdmissions !== 0) && Date.now() < deadline) {
+  await new Promise(resolve=>setTimeout(resolve,25));
+ }
+ assert.equal(seen.closes,1,"browser close event did not settle");
+ assert.equal(runtime.state().holds,0,"browser capacity was not released");
+ assert.equal(runtime.state().activeAdmissions,0,"browser admission was not released");
+}
+
+function serviceFor(t, seen, overrides={}) {
+ const previous = new Map(Object.keys(overrides).map(name=>[name,process.env[name]]));
+ let service;
+ try {
+  Object.assign(process.env,overrides);
+  service = new SocialLoginService();
+ } finally {
+  for (const [name,value] of previous) {
+   if (value === undefined) delete process.env[name]; else process.env[name]=value;
+  }
+ }
+ t.after(async()=>{await service.shutdown(10000);if(seen.context) await waitForReleased(seen);});
+ return service;
 }
 
 test.beforeEach(() => runtime.reset());
 test.after(() => fs.rmSync(base,{recursive:true,force:true}));
 
 test("real Chromium parks X and submits invalid then valid code on the same page with one password", async t => {
- const seen=await fixture(t); const service=new SocialLoginService();t.after(()=>service.shutdown(1000));
+ const seen=await fixture(t); const service=serviceFor(t,seen);
  const input=req("continue");const first=await service.login(input);
  assert.equal(first.result.failureType,"verification_required"); assert.equal(service.capabilities().interactive_x,1);
  const page=seen.page;const navigations=seen.navigations;
@@ -69,20 +107,23 @@ test("real Chromium parks X and submits invalid then valid code on the same page
  const success=await service.login(continuation(input,invalid.result.challenge,"123456"));
  assert.equal(success.result.ok,true);assert.equal(success.result.session.auth_token,"synthetic-auth_token");assert.ok(success.result.session.user_agent);
  assert.deepEqual(success.result.attempts,{browser:1,credential:1,solver:0,complete:true});
- assert.equal(seen.passwords,1);assert.equal(seen.launches,1);assert.deepEqual(seen.codes,["000000","123456"]);assert.equal(seen.closes,1);
+ await waitForReleased(seen);assert.equal(seen.passwords,1);assert.equal(seen.launches,1);assert.deepEqual(seen.codes,["000000","123456"]);assert.equal(seen.closes,1);
  assert.equal(runtime.state().holds,0);assert.equal(runtime.state().activeAdmissions,0);
 });
 
 for (const reason of ["cancel", "expiry", "shutdown", "crash", "budget"]) {
  test(`real Chromium ${reason} closes a parked browser and releases capacity`,async t=>{
-  const seen=await fixture(t);if(reason==="budget") process.env.SOCIAL_LOGIN_MAX_OTP_ATTEMPTS="1";const service=new SocialLoginService();delete process.env.SOCIAL_LOGIN_MAX_OTP_ATTEMPTS;t.after(()=>service.shutdown(1000));
-  const input=req(reason);if(reason==="expiry") input.budget.deadline_at=new Date(Date.now()+15000).toISOString();const first=await service.login(input);assert.equal(runtime.state().holds,1);
+  const seen=await fixture(t);
+  // Constructor-only TTL begins at parking, so a slow browser launch is not the expiry under test.
+  const overrides=reason==="expiry"?{SOCIAL_LOGIN_CHALLENGE_TTL_MS:"2000"}:reason==="budget"?{SOCIAL_LOGIN_MAX_OTP_ATTEMPTS:"1"}:{};
+  const service=serviceFor(t,seen,overrides);
+  const input=req(reason);const first=await service.login(input);assert.equal(runtime.state().holds,1);
   if(reason==="cancel") {await service.cancelChallenge(input);await service.cancelChallenge(input);}
-  if(reason==="expiry") {await new Promise(resolve=>setTimeout(resolve,Math.max(1,Date.parse(first.result.challenge.expires_at)-Date.now()+100)));await assert.rejects(service.login(continuation(input,first.result.challenge,"123456")),e=>e.code==="challenge_not_found");}
-  if(reason==="shutdown") await service.shutdown(1000);
-  if(reason==="crash") {await seen.context.close();await new Promise(resolve=>setTimeout(resolve,10));assert.throws(()=>service.challengeStatus(input),e=>e.code==="challenge_not_found");await assert.rejects(service.login(continuation(input,first.result.challenge,"123456")),e=>e.code==="challenge_not_found");}
+  if(reason==="expiry") {await new Promise(resolve=>setTimeout(resolve,Math.max(1,Date.parse(first.result.challenge.expires_at)-Date.now())));await waitForReleased(seen);await assert.rejects(service.login(continuation(input,first.result.challenge,"123456")),e=>e.code==="challenge_not_found");}
+  if(reason==="shutdown") await service.shutdown(10000);
+  if(reason==="crash") {await seen.context.close();await waitForReleased(seen);assert.throws(()=>service.challengeStatus(input),e=>e.code==="challenge_not_found");await assert.rejects(service.login(continuation(input,first.result.challenge,"123456")),e=>e.code==="challenge_not_found");}
   if(reason==="budget") {const invalid=await service.login(continuation(input,first.result.challenge,"000000"));await assert.rejects(service.login(continuation(input,invalid.result.challenge,"123456")),e=>e.code==="attempts_exhausted");}
-  assert.equal(seen.closes,1);assert.equal(runtime.state().holds,0);assert.equal(runtime.state().activeAdmissions,0);assert.equal(seen.passwords,1);assert.deepEqual(seen.codes,reason==="budget"?["000000"]:[]);
+  await waitForReleased(seen);assert.equal(seen.closes,1);assert.equal(runtime.state().holds,0);assert.equal(runtime.state().activeAdmissions,0);assert.equal(seen.passwords,1);assert.deepEqual(seen.codes,reason==="budget"?["000000"]:[]);
  });
 }
 
@@ -90,6 +131,6 @@ for (const reason of ["cancel", "expiry", "shutdown", "crash", "budget"]) {
 test("real Chromium warm authenticated profile returns a candidate without another password",async t=>{
  const seen=await fixture(t);const original=chromium.launchPersistentContext;
  t.mock.method(chromium,"launchPersistentContext",async(...args)=>{const context=await original(...args);await context.addCookies(["auth_token","ct0"].map(name=>({name,value:"synthetic-existing",domain:".x.com",path:"/",secure:true})));return context;});
- const service=new SocialLoginService();t.after(()=>service.shutdown(1000));const result=await service.login(req("warm"));
- assert.equal(result.result.ok,true);assert.equal(seen.passwords,0);assert.equal(seen.launches,1);assert.equal(seen.navigations,1);assert.equal(seen.closes,1);assert.equal(result.result.attempts.credential,0);
+ const service=serviceFor(t,seen);const result=await service.login(req("warm"));
+ await waitForReleased(seen);assert.equal(result.result.ok,true);assert.equal(seen.passwords,0);assert.equal(seen.launches,1);assert.equal(seen.navigations,1);assert.equal(seen.closes,1);assert.equal(result.result.attempts.credential,0);
 });
