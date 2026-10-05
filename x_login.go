@@ -487,7 +487,44 @@ func installedXLoginResourceDir(executable string) (string, error) {
 	if err != nil || !info.Mode().IsRegular() {
 		return "", errors.New("installed executable unavailable")
 	}
-	return filepath.Dir(canonical), nil
+	directory := filepath.Dir(canonical)
+	// A recognized desktop layout never falls back to an alternate sibling.
+	if filepath.Base(directory) == "MacOS" && filepath.Base(filepath.Dir(directory)) == "Contents" {
+		resources := filepath.Join(filepath.Dir(directory), "Resources")
+		if err := regularResourceDir(resources); err != nil {
+			return "", err
+		}
+		return checkedXLoginResourceDir(filepath.Join(resources, "runtime"))
+	}
+	desktop := filepath.Join(directory, "runtime")
+	if _, err := os.Lstat(desktop); err == nil {
+		return checkedXLoginResourceDir(desktop)
+	} else if !os.IsNotExist(err) {
+		return "", errors.New("installed runtime unavailable")
+	}
+	return checkedXLoginResourceDir(directory)
+}
+func regularResourceDir(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("installed runtime directory unavailable")
+	}
+	return nil
+}
+func checkedXLoginResourceDir(directory string) (string, error) {
+	if err := regularResourceDir(directory); err != nil {
+		return "", err
+	}
+	runtime := filepath.Join(directory, "x-login-runtime")
+	if err := regularResourceDir(runtime); err != nil {
+		return "", err
+	}
+	info, err := os.Lstat(filepath.Join(runtime, "manifest.json"))
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 1048576 {
+		return "", errors.New("installed runtime manifest unavailable")
+	}
+	// Manager.Verify still checks the complete pinned inventory before execution.
+	return directory, nil
 }
 
 // xLoginCommand is a private JSON-lines conversation. EOF (including app quit)
@@ -507,7 +544,7 @@ func xLoginCommand(input io.Reader, output io.Writer) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	resourceDir := os.Getenv("SCARLETT_X_LOGIN_RESOURCE_DIR")
-	if resourceDir == "" {
+	if resourceDir == "" && os.Getenv("SCARLETT_X_LOGIN_URL") == "" {
 		exe, err := os.Executable()
 		if err != nil {
 			return errors.New("browser runtime unavailable")

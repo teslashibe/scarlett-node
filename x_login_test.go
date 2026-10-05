@@ -423,47 +423,101 @@ func TestInteractiveXInstalledResourceLookup(t *testing.T) {
 		_, _ = os.Stdout.WriteString(dir)
 		os.Exit(0)
 	}
-	if runtime.GOOS == "windows" {
-		t.Skip("native Windows symlink creation requires platform privileges; install gate covers executable path")
-	}
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatal("native test executable unavailable")
 	}
-	canonical, err := filepath.EvalSymlinks(exe)
-	if err != nil {
-		t.Fatal("native executable resolution failed")
-	}
-	root := t.TempDir()
-	current := filepath.Join(root, "current")
-	if err := os.Symlink(filepath.Dir(canonical), current); err != nil {
-		t.Fatal(err)
-	}
-	launchDir := filepath.Join(root, "bin")
-	if err := os.Mkdir(launchDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	launch := filepath.Join(launchDir, "scarlett-node")
-	if err := os.Symlink(filepath.Join(current, filepath.Base(canonical)), launch); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	command := exec.CommandContext(ctx, launch, "-test.run=^TestInteractiveXInstalledResourceLookup$")
-	command.Env = append(os.Environ(), "SCARLETT_X_RESOURCE_LOOKUP_FIXTURE=1")
-	output, err := command.Output()
-	if err != nil {
-		t.Fatal("native symlink lookup fixture failed")
-	}
-	if string(output) != filepath.Dir(canonical) {
-		t.Fatal("runtime resolved beside launch symlink instead of installed executable")
-	}
-	dangling := filepath.Join(root, "missing-node")
-	if err := os.Symlink(filepath.Join(root, "missing"), dangling); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := installedXLoginResourceDir(dangling); err == nil {
-		t.Fatal("dangling executable did not fail closed")
+	for _, layout := range []string{"standalone", "desktop-runtime", "mac-bundle"} {
+		t.Run(layout, func(t *testing.T) {
+			root := t.TempDir()
+			directory := filepath.Join(root, "version")
+			resources := directory
+			if layout == "desktop-runtime" {
+				resources = filepath.Join(directory, "runtime")
+			}
+			if layout == "mac-bundle" {
+				directory = filepath.Join(root, "Scarlett Node.app", "Contents", "MacOS")
+				resources = filepath.Join(root, "Scarlett Node.app", "Contents", "Resources", "runtime")
+			}
+			if err := os.MkdirAll(directory, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(resources, "x-login-runtime"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(resources, "x-login-runtime", "manifest.json"), []byte(`{}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			name := "scarlett-node"
+			if runtime.GOOS == "windows" {
+				name += ".exe"
+			}
+			target := filepath.Join(directory, name)
+			source, err := os.Open(exe)
+			if err != nil {
+				t.Fatal(err)
+			}
+			destination, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0700)
+			if err != nil {
+				source.Close()
+				t.Fatal(err)
+			}
+			_, err = io.Copy(destination, source)
+			source.Close()
+			destination.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			launch := target
+			if runtime.GOOS != "windows" {
+				current := filepath.Join(root, "current")
+				if err := os.Symlink(directory, current); err != nil {
+					t.Fatal(err)
+				}
+				launch = filepath.Join(root, "launch-node")
+				if err := os.Symlink(filepath.Join(current, name), launch); err != nil {
+					t.Fatal(err)
+				}
+			}
+			expected, err := filepath.EvalSymlinks(resources)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			command := exec.CommandContext(ctx, launch, "-test.run=^TestInteractiveXInstalledResourceLookup$")
+			command.Env = append(os.Environ(), "SCARLETT_X_RESOURCE_LOOKUP_FIXTURE=1")
+			output, err := command.Output()
+			if err != nil {
+				t.Fatal("native installed resource lookup fixture failed")
+			}
+			if string(output) != expected {
+				t.Fatal("runtime resolved outside fixed installed layout")
+			}
+			// Once a desktop layout is recognized, a missing manifest must not use an alternate sibling.
+			if layout != "standalone" {
+				if err := os.Remove(filepath.Join(resources, "x-login-runtime", "manifest.json")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(filepath.Join(directory, "x-login-runtime"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				os.WriteFile(filepath.Join(directory, "x-login-runtime", "manifest.json"), []byte(`{}`), 0600)
+				if _, err := installedXLoginResourceDir(target); err == nil {
+					t.Fatal("incomplete desktop runtime fell back to alternate")
+				}
+			}
+			if runtime.GOOS != "windows" && layout == "standalone" {
+				manifest := filepath.Join(resources, "x-login-runtime", "manifest.json")
+				os.Remove(manifest)
+				if err := os.Symlink(target, manifest); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := installedXLoginResourceDir(target); err == nil {
+					t.Fatal("symlink manifest accepted")
+				}
+			}
+		})
 	}
 }
 
