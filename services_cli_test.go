@@ -79,6 +79,10 @@ func actualServicesCLIHeartbeat(t *testing.T, binary string, empty bool) {
 	if os.Getenv("SCARLETT_TEST_BUNDLE") != "1" {
 		cmd.Env = append(cmd.Env, "SCARLETT_PROVER="+helper)
 	}
+	// The node warms its X client at start through the default transport.
+	// Route that at a closed loopback port so the synthetic session never
+	// leaves this machine and the warm-up fails at once.
+	cmd.Env = append(cmd.Env, "HTTPS_PROXY=http://127.0.0.1:9", "HTTP_PROXY=http://127.0.0.1:9", "NO_PROXY=")
 	var stderr bytes.Buffer
 	cmd.Stdout = io.Discard
 	cmd.Stderr = &stderr

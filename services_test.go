@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -199,5 +200,33 @@ func TestServiceLimitsUseLocalConfigWithoutSharedSlices(t *testing.T) {
 	disabled := healthKind(t, poolFixture(t, "x_read"), "codex")
 	if disabled.MaxInputBytes != 0 || disabled.MaxOutputTokens != 0 || len(disabled.Models) != 0 {
 		t.Fatal("disabled service advertised capabilities")
+	}
+}
+
+// The accounts offered for warming at start are the usable X sessions only:
+// the legacy session in single-account mode, each configured X account in
+// managed mode, and none whose session file is unusable.
+func TestWarmableXAccountsFollowConfigurationAndHealth(t *testing.T) {
+	p := poolFixture(t, "codex", "x_read")
+	if got := p.xAccounts(); len(got) != 1 || got[0].ID != "legacy" || got[0].Path != p.config.XSession {
+		t.Fatalf("legacy warm list %+v", got)
+	}
+	if e := os.Chmod(p.config.XSession, 0644); e != nil {
+		t.Fatal(e)
+	}
+	if runtime.GOOS != "windows" {
+		if got := p.xAccounts(); len(got) != 0 {
+			t.Fatalf("unusable legacy session offered for warming: %+v", got)
+		}
+	}
+	m := multiPool(t)
+	got := m.xAccounts()
+	if len(got) != 2 || got[0].ID != "one" || got[1].ID != "two" || filepath.Base(got[0].Path) != "x_read-one" {
+		t.Fatalf("managed warm list %+v", got)
+	}
+	for _, a := range got {
+		if a.Path == "" || !filepath.IsAbs(a.Path) {
+			t.Fatal("warm entry without an absolute session path")
+		}
 	}
 }

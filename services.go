@@ -2,6 +2,7 @@ package main
 
 import (
 	"os/exec"
+	"sort"
 	"sync"
 	"time"
 
@@ -83,6 +84,31 @@ func (p *servicePool) health() []coordinator.ServiceHealth {
 			}
 		}
 		out = append(out, h)
+	}
+	return out
+}
+
+// xAccounts lists the X accounts whose session files are usable right now,
+// for keeping their clients warm. An account that is resting or that X
+// refused is left out, so the background does not ask X about it either.
+func (p *servicePool) xAccounts() []worker.XAccount {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.refresh(time.Now())
+	out := []worker.XAccount{}
+	if p.accountsError || p.healthError {
+		return out
+	}
+	keys := []string{}
+	for key, a := range p.accounts {
+		if a.spec.Service == "x_read" && !a.removed && (a.entry.state == "configured" || a.entry.state == "ready") {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		a := p.accounts[key]
+		out = append(out, worker.XAccount{ID: a.spec.ID, Path: a.spec.Path})
 	}
 	return out
 }

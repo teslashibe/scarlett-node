@@ -190,6 +190,8 @@ The coordinator constructs the request; buyers cannot supply URLs, query IDs, fe
 
 Other executors exist for fixtures and earlier modes (`gateway`, `codex`, `codex-tlsn`); they are documented in the [reference](docs/REFERENCE.md).
 
+**Warm X clients.** The node keeps one x-go client per X account, built at start and kept across jobs, so a job on a warm account does only its proven reads: x-go's two session-validation reads and two transaction-ID bootstrap fetches, which used to run unproven before every job (about 12 s around a 2 s proof), happen once per account. Each job's pinned exchanges and verifier token travel in its own request context, never in the shared client, and an X API request without a job behind it is refused. `x_read` reports `ready` once a client has validated the session against X, `configured` while one is still being built (or, for up to 15 seconds, after a rest ended or the session file was rewritten), and `auth_required`, `exhausted` or `unreachable` when the build failed, so a job is not needed to find out. The client is replaced in the background when the session file changes or X refuses the session, and a background refresh (`SCARLETT_X_REFRESH_SECONDS`, default 30 minutes) renews its transaction-ID material and asks X once whether the session still holds, without touching the jobs in flight. A check every 15 seconds builds a client for any account that has none (a new account, a new session file, a build that failed earlier) and drops the clients of removed accounts; a job builds a client itself only as a last resort. Details in the [reference](docs/REFERENCE.md).
+
 ## Security and trust model
 
 **What a proof shows.** The response is exactly what the provider returned to exactly the request the job pinned. It does not show that the supplier's machine is honest, that a subscription is unused, or that X returned everything that exists. It is not on-chain settlement.
@@ -226,6 +228,7 @@ Settings come from the environment, typically via `~/.config/scarlett-node/node.
 | `SCARLETT_X_RELAY` | Serve X jobs proven by keyed relay; `0` serves MPC-TLS only |
 | `SCARLETT_CODEX_CONCURRENCY` | Total simultaneous Codex jobs across accounts |
 | `SCARLETT_X_CONCURRENCY` | Total simultaneous X jobs across accounts |
+| `SCARLETT_X_REFRESH_SECONDS` | How often each warm X client refreshes its transaction-ID material and re-checks its session with X in the background (default 1800) |
 | `SCARLETT_STATE_DIR` | Private directory for identity, journal and account health |
 | `SCARLETT_BID` | Standing assignment bid; lower wins |
 | `SCARLETT_INFERENCE_TIMEOUT_SECONDS` | Per-job provider deadline |

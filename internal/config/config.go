@@ -57,7 +57,10 @@ type Config struct {
 	// upload per read from tens of megabytes to tens of kilobytes, and the
 	// node already trusts the operator-run verifier with its session (see
 	// README). SCARLETT_X_RELAY=0 opts out; the node then serves MPC-TLS only.
-	XRelay           bool
+	XRelay bool
+	// XRefresh is how often a warm X client's transaction-ID material is
+	// rebuilt in the background (SCARLETT_X_REFRESH_SECONDS; default 30 min).
+	XRefresh         time.Duration
 	CodexConcurrency int
 	XConcurrency     int
 	LocalFixture     bool
@@ -136,6 +139,14 @@ func Load() (Config, error) {
 			c.XRelay = false
 		default:
 			c.XRelay = true
+		}
+		c.XRefresh = 30 * time.Minute
+		if s := os.Getenv("SCARLETT_X_REFRESH_SECONDS"); s != "" {
+			v, e := strconv.Atoi(s)
+			if e != nil || v < 60 || v > 86400 {
+				return c, errors.New("invalid SCARLETT_X_REFRESH_SECONDS")
+			}
+			c.XRefresh = time.Duration(v) * time.Second
 		}
 		c.AccountsFile = os.Getenv("SCARLETT_ACCOUNTS_FILE")
 		c.AccountsRequired = c.AccountsFile != ""

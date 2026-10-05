@@ -232,7 +232,7 @@ components:
       required: [kind, state, capacity, in_flight]
       properties:
         kind: {type: string, enum: [codex, x_read]}
-        state: {type: string, enum: [not_added, configured, ready, exhausted, auth_required, unreachable], description: configured means a local credential file is usable; ready means local execution reported proof sent, not verifier acceptance}
+        state: {type: string, enum: [not_added, configured, ready, exhausted, auth_required, unreachable], description: "configured means a local credential file is usable (for x_read: the account's warm client is still being built, or a rest just ended and the next 15-second check has not yet confirmed the installed client); ready means local execution reported proof sent, not verifier acceptance, or for x_read that a client build validated the session against X; an x_read build that X refuses, rate-limits or cannot reach reports auth_required, exhausted or unreachable without waiting for a job"}
         capacity: {type: integer, minimum: 0, maximum: 32}
         in_flight: {type: integer, minimum: 0, maximum: 32}
         last_error_code: {type: string, description: Bounded failure code only, never raw provider errors or credentials}

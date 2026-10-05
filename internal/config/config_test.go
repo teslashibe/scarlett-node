@@ -178,6 +178,46 @@ func TestKeyedRelayDefaultsOnWithExplicitOptOut(t *testing.T) {
 	}
 }
 
+// The warm X client's background refresh interval defaults to 30 minutes and
+// takes 60 s to a day; anything else is a configuration error.
+func TestXRefreshIntervalDefaultsAndBounds(t *testing.T) {
+	t.Setenv("SCARLETT_COORDINATOR", "https://example.org")
+	t.Setenv("SCARLETT_PROFILE", "synthetic")
+	t.Setenv("SCARLETT_EXECUTOR", ExecutorServices)
+	t.Setenv("SCARLETT_SERVICES", "x_read")
+	t.Setenv("SCARLETT_VERIFIER", "127.0.0.1:7047")
+	t.Setenv("SCARLETT_PROVER", "scarlett-prover")
+	t.Setenv("SCARLETT_X_SESSION", filepath.Join(t.TempDir(), "synthetic-x.json"))
+	for _, tc := range []struct {
+		value string
+		want  time.Duration
+	}{{"", 30 * time.Minute}, {"60", time.Minute}, {"1800", 30 * time.Minute}, {"86400", 24 * time.Hour}, {"59", 0}, {"86401", 0}, {"soon", 0}} {
+		if tc.value == "" {
+			os.Unsetenv("SCARLETT_X_REFRESH_SECONDS")
+		} else {
+			t.Setenv("SCARLETT_X_REFRESH_SECONDS", tc.value)
+		}
+		c, err := Load()
+		if tc.want == 0 {
+			if err == nil {
+				t.Fatalf("SCARLETT_X_REFRESH_SECONDS=%q accepted", tc.value)
+			}
+			continue
+		}
+		if err != nil || c.XRefresh != tc.want {
+			t.Fatalf("SCARLETT_X_REFRESH_SECONDS=%q: %v, refresh %v, want %v", tc.value, err, c.XRefresh, tc.want)
+		}
+	}
+	// Outside services mode the field stays zero and the worker default applies.
+	os.Unsetenv("SCARLETT_X_REFRESH_SECONDS")
+	t.Setenv("SCARLETT_EXECUTOR", ExecutorGateway)
+	t.Setenv("SCARLETT_GATEWAY", "http://127.0.0.1:8080")
+	os.Unsetenv("SCARLETT_SERVICES")
+	if c, err := Load(); err != nil || c.XRefresh != 0 {
+		t.Fatal("refresh interval set outside services mode", err, c.XRefresh)
+	}
+}
+
 func TestJournalCapacityEnvironment(t *testing.T) {
 	t.Setenv("SCARLETT_COORDINATOR", "https://example.org")
 	t.Setenv("SCARLETT_PROFILE", "synthetic")

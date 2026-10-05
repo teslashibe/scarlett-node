@@ -175,6 +175,43 @@ func watchHeartbeat(ctx context.Context, cancel context.CancelCauseFunc, sent av
 	}
 }
 
+// xKeepInterval is how often the node checks that every X account still has a
+// warm client. A check reads session files only, unless a build is due.
+const xKeepInterval = 15 * time.Second
+
+// keepXClientsWarm builds each usable X account's client once, one at a time,
+// then on every tick evicts the clients of accounts the pool no longer holds,
+// starts a background build for an account that has none and confirms the
+// accounts that have one. The pool calls
+// return before the cache is called, so no build ever runs under the pool lock.
+func keepXClientsWarm(ctx context.Context, c config.Config, clients *worker.XClients, pool *servicePool, every time.Duration) {
+	clients.Warm(ctx, c, pool.xAccounts())
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			clients.Retain(pool.xSessionPaths())
+			clients.Ensure(c, pool.xAccounts())
+		}
+	}
+}
+
+// startXKeeper runs keepXClientsWarm and returns the function that ends it.
+// That function returns only once the keeper has, so a check already under way
+// cannot create a client after the cache is stopped.
+func startXKeeper(ctx context.Context, c config.Config, clients *worker.XClients, pool *servicePool, every time.Duration) (stop func()) {
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		keepXClientsWarm(ctx, c, clients, pool, every)
+	}()
+	return func() { cancel(); <-done }
+}
+
 func run(c config.Config) error {
 	return runWithOwner(c, nil)
 }
@@ -262,6 +299,18 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 		capacity = services.capacity()
 		stopRenewal := services.startCodexRenewal(ctx, managedAuthenticationFactory, inheritedPending(journal.Pending, inheritedKeys))
 		defer stopRenewal()
+		// Build each X account's client now and keep it warm from then on, so a
+		// job does only its proven read; each validated build's outcome becomes
+		// the account's advertised state.
+		stopKeeping := func() {}
+		if c.Enabled("x_read") {
+			worker.DefaultXClients().Observe(services.xValidated)
+			stopKeeping = startXKeeper(workCtx, c, worker.DefaultXClients(), services, xKeepInterval)
+		}
+		defer func() {
+			stopKeeping()
+			worker.DefaultXClients().Stop()
+		}()
 	}
 	slots := make(chan struct{}, capacity)
 	var running sync.WaitGroup
