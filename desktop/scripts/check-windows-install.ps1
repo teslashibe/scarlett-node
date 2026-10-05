@@ -1050,7 +1050,8 @@ function Identity-Diagnostics([string]$Name) {
     $diagnostic | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-identity-failure.json')
     Write-Output ($diagnostic | ConvertTo-Json -Depth 4 -Compress)
 }
-function Invoke-XLoginAcceptanceProcess([string]$File, [string[]]$Arguments, [int]$TimeoutMs) {
+function Invoke-XLoginAcceptanceProcess([string]$File, [string[]]$Arguments, [int]$TimeoutMs,
+    [ValidateSet('manager', 'headed-chrome', 'browser-fixtures')][string]$Phase) {
     # Only fixed, reviewed fixture arguments enter this subprocess. Capture all
     # output internally; evidence contains classifications, never native errors.
     $quoted = @($Arguments | ForEach-Object {
@@ -1065,6 +1066,8 @@ function Invoke-XLoginAcceptanceProcess([string]$File, [string[]]$Arguments, [in
     $process.StartInfo.CreateNoWindow = $true
     $process.StartInfo.RedirectStandardOutput = $true
     $process.StartInfo.RedirectStandardError = $true
+    $elapsed = [Diagnostics.Stopwatch]::StartNew()
+    Write-Host ('Installed browser acceptance phase: ' + $Phase)
     try {
         if (-not $process.Start()) { throw 'Installed browser acceptance process could not start' }
         $stdout = $process.StandardOutput.ReadToEndAsync()
@@ -1075,8 +1078,38 @@ function Invoke-XLoginAcceptanceProcess([string]$File, [string[]]$Arguments, [in
             throw 'Installed browser acceptance process timed out'
         }
         $output = $stdout.GetAwaiter().GetResult()
-        $null = $stderr.GetAwaiter().GetResult()
-        if ($process.ExitCode -ne 0) { throw 'Installed browser acceptance process failed' }
+        $errorOutput = $stderr.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) {
+            # Project only reviewed literal categories and numeric counters.
+            # Raw native output may contain paths or profile material.
+            $category = 'unclassified'
+            foreach ($known in @('helper readiness cancelled or timed out', 'helper exited before readiness',
+                'resource checksum mismatch', 'resource inventory invalid', 'private node state inaccessible',
+                'private state inaccessible', 'private profiles inaccessible', 'private bearer unavailable',
+                'helper process containment unavailable', 'Google Chrome must be installed',
+                'challenge_not_found', 'challenge_expired', 'queue_timeout')) {
+                if (($output + $errorOutput).Contains($known)) { $category = $known; break }
+            }
+            $passed = $null
+            if ($output -match '(?m)^# pass ([0-7])\r?$') { $passed = [int]$Matches[1] }
+            $failedCase = $null
+            foreach ($knownCase in @('real Chromium parks X and submits invalid then valid code on the same page with one password',
+                'real Chromium cancel closes a parked browser and releases capacity',
+                'real Chromium expiry closes a parked browser and releases capacity',
+                'real Chromium shutdown closes a parked browser and releases capacity',
+                'real Chromium crash closes a parked browser and releases capacity',
+                'real Chromium budget closes a parked browser and releases capacity',
+                'real Chromium warm authenticated profile returns a candidate without another password')) {
+                if ($output -match ('(?m)^not ok [1-7] - ' + [regex]::Escape($knownCase) + '\r?$')) {
+                    $failedCase = $knownCase; break
+                }
+            }
+            @{ phase = $Phase; exitCode = $process.ExitCode; elapsedMs = $elapsed.ElapsedMilliseconds
+                category = $category; interceptedBrowserCasesPassed = $passed; failedCase = $failedCase
+            } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-x-login-process-failure.json')
+            Write-Host ('Installed browser acceptance failed phase: ' + $Phase + '; exit status: ' + $process.ExitCode)
+            throw 'Installed browser acceptance process failed'
+        }
         return $output
     } finally {
         $process.Dispose()
@@ -1108,6 +1141,7 @@ function Check-XLoginRuntime([string]$Phase) {
         'CAP_BROWSER_EXECUTABLE_PATH', 'CAP_BROWSER_CHANNEL', 'PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH', 'NODE_OPTIONS')
     $before = @{}
     foreach ($name in $names) { $before[$name] = [Environment]::GetEnvironmentVariable($name, 'Process') }
+    New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
     try {
         $env:SCARLETT_TEST_X_LOGIN_RESOURCES = $resources
         $env:SCARLETT_TEST_X_LOGIN_BROWSER = $chrome
@@ -1115,14 +1149,14 @@ function Check-XLoginRuntime([string]$Phase) {
         foreach ($name in @('CAP_BROWSER_CHANNEL', 'PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH', 'NODE_OPTIONS')) {
             [Environment]::SetEnvironmentVariable($name, $null, 'Process')
         }
-        $manager = Invoke-XLoginAcceptanceProcess $fixturePath @('-test.run=^TestPackagedRuntimeLoopbackOptIn$', '-test.v', '-test.timeout=45s') 90000
+        $manager = Invoke-XLoginAcceptanceProcess $fixturePath @('-test.run=^TestPackagedRuntimeLoopbackOptIn$', '-test.v', '-test.timeout=45s') 90000 'manager'
         if ($manager -notmatch '--- PASS: TestPackagedRuntimeLoopbackOptIn') { throw 'Installed browser manager fixture did not run' }
         # Exercise the installed Playwright bytes and actual headed Chrome too.
         # about:blank performs no X navigation and requires no account state.
         $playwright = Join-Path $runtimeRoot 'social-login/node_modules/playwright/index.mjs'
         $headed = "const{pathToFileURL}=await import('node:url');const{chromium}=await import(pathToFileURL(process.argv[1]).href);const b=await chromium.launch({executablePath:process.env.CAP_BROWSER_EXECUTABLE_PATH,headless:false});try{const p=await b.newPage();await p.goto('about:blank')}finally{await b.close()}"
-        $null = Invoke-XLoginAcceptanceProcess $node @('--input-type=module', '-e', $headed, $playwright) 45000
-        $browserOutput = Invoke-XLoginAcceptanceProcess $node @('--test', '--test-reporter=tap', $browserTest) 180000
+        $null = Invoke-XLoginAcceptanceProcess $node @('--input-type=module', '-e', $headed, $playwright) 45000 'headed-chrome'
+        $browserOutput = Invoke-XLoginAcceptanceProcess $node @('--test', '--test-reporter=tap', $browserTest) 180000 'browser-fixtures'
         if ($browserOutput -notmatch '(?m)^# tests 7\r?$' -or
             $browserOutput -notmatch '(?m)^# pass 7\r?$' -or
             $browserOutput -notmatch '(?m)^# skipped 0\r?$') {
