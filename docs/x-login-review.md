@@ -55,6 +55,12 @@ The review found and corrected these defects:
 Both independent reviews report no unresolved confirmed P1/P2 implementation
 findings. This does not replace the platform and provider acceptance below.
 
+Windows CI also exposed fixture setup errors. Git attributes now preserve the
+vendored source bytes instead of converting them to CRLF during checkout. Login
+fixtures reuse the repository's protected private-directory helper and atomic
+private-file writer, since Unix mode bits do not establish NTFS ACLs. Production
+private-storage checks are unchanged. Native Windows CI verifies these fixes.
+
 ## Validation limits
 
 Go race tests, vet/build, desktop's 20 tests and TypeScript/Vite build pass.

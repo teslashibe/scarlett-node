@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	x "github.com/teslashibe/x-go"
 	"io"
 	"net"
 	"net/http"
@@ -18,6 +17,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/teslashibe/scarlett-node/internal/localfs"
+	x "github.com/teslashibe/x-go"
 )
 
 type fakeXLogin struct {
@@ -37,8 +39,7 @@ func (f *fakeXLogin) Continue(c context.Context, o x.BrowserLoginOperation, id, 
 func (f *fakeXLogin) Cancel(context.Context, x.BrowserLoginOperation) error { f.cancels++; return nil }
 func loginFixture(t *testing.T) (*xLoginOperation, *fakeXLogin, xLoginMessage) {
 	t.Helper()
-	dir := t.TempDir()
-	os.Chmod(dir, 0700)
+	dir := privateTestDir(t)
 	t.Setenv("SCARLETT_ACCOUNTS_FILE", filepath.Join(dir, "accounts.json"))
 	b := &fakeXLogin{}
 	o := newXLoginOperation(dir, b)
@@ -245,12 +246,13 @@ func TestInteractiveXLoginCancelBeforeCommit(t *testing.T) {
 func TestInteractiveXOwnerPipeCancelsBlockedStart(t *testing.T) {
 	for _, mode := range []string{"cancel", "queued_eof"} {
 		t.Run(mode, func(t *testing.T) {
-			dir := t.TempDir()
-			os.Chmod(dir, 0700)
+			dir := privateTestDir(t)
 			t.Setenv("SCARLETT_STATE_DIR", dir)
 			t.Setenv("SCARLETT_ACCOUNTS_FILE", filepath.Join(dir, "accounts.json"))
 			bearer := filepath.Join(dir, "bearer")
-			os.WriteFile(bearer, []byte(strings.Repeat("a", 64)), 0600)
+			if err := localfs.WriteAtomic(bearer, []byte(strings.Repeat("a", 64)), false); err != nil {
+				t.Fatal("private fixture bearer unavailable", err)
+			}
 			t.Setenv("SCARLETT_X_LOGIN_BEARER_FILE", bearer)
 			entered := make(chan struct{})
 			exited := make(chan struct{})
