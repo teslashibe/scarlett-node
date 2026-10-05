@@ -943,15 +943,14 @@ impl Node {
                 }
                 x_login_projection(&output)
             };
-            let result = if self.x_login_cancelled.load(Ordering::SeqCst) {
+            if self.x_login_cancelled.load(Ordering::SeqCst) {
                 Err(Error::LoginFailed)
             } else {
                 tokio::select! {
                     _ = cancelled => Err(Error::LoginFailed),
                     result = tokio::time::timeout(Duration::from_secs(250),request) => result.map_err(|_|Error::CommandTimeout).and_then(|r|r),
                 }
-            };
-            result
+            }
         };
         if result.as_ref().map_or(true, |r| r.status != "pending") {
             Self::close_x_login(login).await;
