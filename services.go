@@ -129,9 +129,13 @@ func (p *servicePool) finish(kind, code string) {
 	p.mu.Lock()
 	p.initAccounts()
 	a := p.accounts[kind+":legacy"]
+	lease := &accountLease{kind: kind, account: a, config: p.config}
+	if a != nil && kind == "x_read" {
+		lease.xStamp = worker.XSessionStamp(a.spec.Path)
+	}
 	p.mu.Unlock()
 	if a != nil {
-		p.finishAccount(&accountLease{kind: kind, account: a}, code)
+		p.finishAccount(lease, code)
 	}
 }
 

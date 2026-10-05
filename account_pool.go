@@ -25,6 +25,7 @@ type accountLease struct {
 	id, kind string
 	config   config.Config
 	account  *pooledAccount
+	xStamp   string
 }
 type accountStatus struct {
 	ID        string    `json:"id"`
@@ -370,12 +371,19 @@ func (p *servicePool) acquireAccount(kind string) (*accountLease, bool) {
 		if s.state != "configured" && s.state != "ready" {
 			return nil, false
 		}
-		s.inFlight++
 		a := p.accounts[kind+":legacy"]
+		stamp := ""
+		if kind == "x_read" {
+			stamp = worker.XSessionStamp(a.spec.Path)
+			if stamp == "" {
+				return nil, false
+			}
+		}
+		s.inFlight++
 		c := p.config
 		c.LocalAccountID = "legacy"
 		c.AccountCooldown = p.cooldown(a)
-		return &accountLease{"legacy", kind, c, a}, true
+		return &accountLease{id: "legacy", kind: kind, config: c, account: a, xStamp: stamp}, true
 	}
 	keys := []string{}
 	for key, a := range p.accounts {
@@ -394,6 +402,13 @@ func (p *servicePool) acquireAccount(kind string) (*accountLease, bool) {
 		if p.renewalHolds(a) || e.inFlight >= e.capacity || e.state != "configured" && e.state != "ready" {
 			continue
 		}
+		stamp := ""
+		if kind == "x_read" {
+			stamp = worker.XSessionStamp(a.spec.Path)
+			if stamp == "" {
+				continue
+			}
+		}
 		e.inFlight++
 		s.inFlight++
 		p.next[kind] = (idx + 1) % len(keys)
@@ -405,7 +420,7 @@ func (p *servicePool) acquireAccount(kind string) (*accountLease, bool) {
 		} else {
 			c.XSession = a.spec.Path
 		}
-		return &accountLease{a.spec.ID, kind, c, a}, true
+		return &accountLease{id: a.spec.ID, kind: kind, config: c, account: a, xStamp: stamp}, true
 	}
 	return nil, false
 }
@@ -419,6 +434,17 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 	if s.inFlight > 0 {
 		s.inFlight--
 	}
+	if l.kind == "x_read" && code == "auth_required" {
+		// Login can replace credentials while an admitted job finishes. Drain
+		// its slot, then refresh before deciding whether its refusal still
+		// describes this account's current path and exact valid contents.
+		p.refresh(time.Now())
+		if l.xStamp == "" || l.account.spec.Path != l.config.XSession || worker.XSessionStamp(l.account.spec.Path) != l.xStamp {
+			return
+		}
+	}
+	// Rate limits apply to the account across credential replacement; only
+	// authentication refusals are fenced by the admitted credential snapshot.
 	p.settle(l.account, code, false)
 }
 
