@@ -131,19 +131,26 @@ var errHeartbeatStale = errors.New("heartbeat availability changed while held")
 // availability is every local input to a heartbeat's advertised state that can
 // change while the coordinator holds it: an operator drain, a rest after the
 // gateway ran out of capacity, the local Codex admission guard, and each
-// service's state and proof modes. In-flight counts are left out: work that
-// finishes during a hold only frees capacity.
+// service's state, proof modes and offerable capacity. In-flight counts are
+// left out: work that finishes during a hold only frees capacity.
 type availability struct {
 	drained, drainUnreadable, resting, codexBlocked bool
 	services                                        string
 }
 
-// serviceStates is the part of service health that decides whether a service
-// takes work: its state and the proof modes it offers.
+// serviceStates is the part of service health that decides whether and how
+// much work a service takes: its state, the proof modes it offers and, while
+// it is offerable, its capacity. Capacity then counts usable accounts and does
+// not move as jobs start and finish; in any other state it is only the
+// in-flight count, which is left out like every in-flight count.
 func serviceStates(health []coordinator.ServiceHealth) string {
 	out := ""
 	for _, s := range health {
-		out += fmt.Sprintf("%s=%s%q;", s.Kind, s.State, s.ProofModes)
+		out += fmt.Sprintf("%s=%s%q", s.Kind, s.State, s.ProofModes)
+		if s.State == "configured" || s.State == "ready" {
+			out += fmt.Sprintf("x%d", s.Capacity)
+		}
+		out += ";"
 	}
 	return out
 }

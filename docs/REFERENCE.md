@@ -190,7 +190,7 @@ heartbeat capacity equals the service-capacity sum, including zero when all
 accounts are blocked. These observations
 provide no independently verified entitlement, billing or points evidence.
 
-**Local lifecycle**: `scarlett-node status` prints a private local JSON observation: runtime state, last acknowledged heartbeat, independent service reports, in-flight work and unresolved journal records. It contains no credentials, prompts, results or verifier tokens. A snapshot older than 30 seconds is offline; it does not prove current provider access or remote acceptance. These commands need only `SCARLETT_STATE_DIR`, which must match the running node.
+**Local lifecycle**: `scarlett-node status` prints a private local JSON observation: runtime state, last acknowledged heartbeat, independent service reports, in-flight work and unresolved journal records. It contains no credentials, prompts, results or verifier tokens. A snapshot older than 45 seconds is offline (a held heartbeat can keep one for 30); it does not prove current provider access or remote acceptance. These commands need only `SCARLETT_STATE_DIR`, which must match the running node.
 
 `scarlett-node drain` persists a drain request across process restarts. The next poll advertises exhausted capacity, and work delivered after the node observes the request is rejected without calling its provider. Already accepted jobs continue. `scarlett-node resume` removes the request; the next poll can accept work again if its service is available. The coordinator must honor exhausted nodes when dispatching. Drain is a local scheduling control, not remote unpairing or revocation.
 

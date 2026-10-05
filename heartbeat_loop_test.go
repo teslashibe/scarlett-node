@@ -338,3 +338,29 @@ func TestRunLoopKeepsUnchangedHeldHeartbeat(t *testing.T) {
 	}
 	stop()
 }
+
+// A held heartbeat ends when a service's offerable capacity changes, such as
+// one of two X accounts being removed while the other keeps the service ready.
+// In-flight counts never end it: outside configured and ready the reported
+// capacity is only that count.
+func TestServiceStatesTrackOfferableCapacityOnly(t *testing.T) {
+	health := func(state string, capacity, inFlight int) []coordinator.ServiceHealth {
+		return []coordinator.ServiceHealth{{Kind: "x_read", State: state, Capacity: capacity, InFlight: inFlight, ProofModes: []string{"mpc", "relay"}}}
+	}
+	for _, state := range []string{"configured", "ready"} {
+		if serviceStates(health(state, 2, 0)) == serviceStates(health(state, 1, 0)) {
+			t.Fatalf("%s: a capacity change must end the hold", state)
+		}
+		if serviceStates(health(state, 2, 0)) != serviceStates(health(state, 2, 1)) {
+			t.Fatalf("%s: an in-flight change must not end the hold", state)
+		}
+	}
+	for _, state := range []string{"exhausted", "unreachable", "auth_required", "not_added"} {
+		if serviceStates(health(state, 2, 2)) != serviceStates(health(state, 1, 1)) {
+			t.Fatalf("%s: capacity is the in-flight count there and must not end the hold", state)
+		}
+	}
+	if serviceStates(health("ready", 1, 0)) == serviceStates(health("exhausted", 1, 0)) {
+		t.Fatal("a state change must end the hold")
+	}
+}
