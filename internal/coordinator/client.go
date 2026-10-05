@@ -116,7 +116,22 @@ type Heartbeat struct {
 	Bid      int64           `json:"bid"`
 	Capacity int             `json:"capacity"`
 	Services []ServiceHealth `json:"services,omitempty"`
+	// WaitSeconds asks the coordinator to hold the heartbeat open for up to
+	// this long while it has nothing to offer, answering the moment a job for
+	// this node is funded. The coordinator clamps it to [0, 20]; the node sends
+	// HeartbeatWaitSeconds.
+	WaitSeconds int `json:"wait_seconds"`
 }
+
+// HeartbeatWaitSeconds is the hold the node asks for. The coordinator treats a
+// node as stale 30 seconds after its last heartbeat, so the hold plus a round
+// trip must stay well inside that.
+const HeartbeatWaitSeconds = 20
+
+// HeartbeatGrace is how much longer than the requested hold a heartbeat may
+// take before the node gives up on it: transport, queueing and the
+// coordinator's own work on the reply.
+const HeartbeatGrace = 10 * time.Second
 
 type Challenge struct {
 	Version   string    `json:"version"`
@@ -158,9 +173,14 @@ func WithoutProofModes(services []ServiceHealth) ([]ServiceHealth, bool) {
 
 // Poll echoes an app-issued challenge before returning any lease to inference.
 // The app owns single-use validation and RTT timing; the node supplies no duration.
+// The heartbeat is a long poll: it may legitimately stay open for the hold the
+// node asked for, so it runs under its own deadline of wait plus HeartbeatGrace
+// rather than the client's 10-second timeout, and ctx cancellation aborts it.
 func (c *Client) Poll(ctx context.Context, h Heartbeat) (HeartbeatReply, error) {
 	var reply HeartbeatReply
-	status, err := c.Post(ctx, "/api/node/v1/heartbeat", h, &reply)
+	pollCtx, cancel := context.WithTimeout(ctx, c.heartbeatTimeout(h.WaitSeconds))
+	defer cancel()
+	status, err := c.post(pollCtx, "/api/node/v1/heartbeat", h, &reply, true)
 	if status == http.StatusBadRequest {
 		return HeartbeatReply{}, ErrHeartbeatRejected
 	}
@@ -199,6 +219,18 @@ type Client struct {
 	Credential          string
 	EchoUnqualifiedHTTP bool
 	HTTP                *http.Client
+	// heartbeatGrace overrides HeartbeatGrace; tests shorten it.
+	heartbeatGrace time.Duration
+}
+
+// heartbeatTimeout is the deadline of one heartbeat: the hold the node asked
+// for plus the grace for transport and the coordinator's reply.
+func (c *Client) heartbeatTimeout(waitSeconds int) time.Duration {
+	grace := HeartbeatGrace
+	if c.heartbeatGrace > 0 {
+		grace = c.heartbeatGrace
+	}
+	return time.Duration(max(waitSeconds, 0))*time.Second + grace
 }
 
 func (c *Client) allowEcho(origin *url.URL) bool {
@@ -221,7 +253,15 @@ func (c *Client) allowEcho(origin *url.URL) bool {
 func New(origin, credential string) *Client {
 	return &Client{Origin: origin, Credential: credential, HTTP: &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 }
+
+// Post sends one report under the client's 10-second timeout.
 func (c *Client) Post(ctx context.Context, path string, body any, out any) (int, error) {
+	return c.post(ctx, path, body, out, false)
+}
+
+// post is Post, or with longPoll the same request bounded only by ctx: the
+// client's timeout would cut a heartbeat hold short.
+func (c *Client) post(ctx context.Context, path string, body any, out any, longPoll bool) (int, error) {
 	var raw []byte
 	var err error
 	if exact, ok := body.(json.RawMessage); ok {
@@ -247,7 +287,14 @@ func (c *Client) Post(ctx context.Context, path string, body any, out any) (int,
 	if c.Credential != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Credential)
 	}
-	resp, err := c.HTTP.Do(req)
+	client := c.HTTP
+	if longPoll {
+		// Same transport and TLS roots; only the overall timeout is lifted.
+		unbounded := *c.HTTP
+		unbounded.Timeout = 0
+		client = &unbounded
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, errors.New("coordinator unavailable")
 	}
