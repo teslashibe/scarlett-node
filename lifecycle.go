@@ -36,6 +36,12 @@ type runtimeStatus struct {
 	RelayHalted bool `json:"relay_halted,omitempty"`
 }
 
+// statusFresh is how old status.json may be before a running node reads as
+// offline. The loop writes it once per heartbeat, and a heartbeat the
+// coordinator never answers runs for the hold plus HeartbeatGrace before the
+// failure backoff, so the bound sits above their sum.
+const statusFresh = coordinator.HeartbeatWaitSeconds*time.Second + coordinator.HeartbeatGrace + 15*time.Second
+
 func localCommand(command string, output io.Writer) error {
 	dir := os.Getenv("SCARLETT_STATE_DIR")
 	if dir == "" {
@@ -90,7 +96,7 @@ func localCommand(command string, output io.Writer) error {
 		if c := status.JournalCapacity; c != nil && (c.Limits.Validate() != nil || c.Records < 0 || c.Records > c.Limits.MaxRecords || c.Bytes < 0 || c.Bytes > c.Limits.MaxTotalBytes || c.ReservedBytes < c.Bytes || c.AvailableRecords < 0 || c.AvailableRecords > c.Limits.MaxRecords-c.Records) {
 			return errors.New("invalid journal capacity status")
 		}
-		if time.Since(status.UpdatedAt) > 30*time.Second || status.UpdatedAt.After(time.Now().Add(time.Second)) {
+		if time.Since(status.UpdatedAt) > statusFresh || status.UpdatedAt.After(time.Now().Add(time.Second)) {
 			status.State = "offline"
 		}
 	} else if !os.IsNotExist(err) {
