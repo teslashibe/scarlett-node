@@ -827,7 +827,8 @@ function Invoke-SyntheticAccountCommand([string[]]$Arguments) {
 function Check-SyntheticAccounts([string[]]$IDs) {
     $registry = @(Imported-Accounts)
     $inventory = Invoke-SyntheticAccountCommand @('list')
-    $listed = @($inventory | ConvertFrom-Json)
+    # Grouping enumerates the parsed array on both Windows PowerShell 5.1 and 7.
+    $listed = @(($inventory | ConvertFrom-Json))
     foreach ($records in @($registry, $listed)) {
         if ($records.Count -ne $IDs.Count) { throw 'Synthetic account inventory count differs from its private registry' }
         foreach ($id in $IDs) {
