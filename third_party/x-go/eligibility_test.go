@@ -111,7 +111,7 @@ func TestPartialAfterCompleteRevokesChangedBurstAuthority(t *testing.T) {
 			// A later complete triplet can restore same-operation authority but
 			// cannot renew the stricter remaining budget within this window.
 			p.observe(RateLimitState{Limit: 50, Remaining: 30, Reset: e.Quota.Reset}, true, true, true, "SearchTimeline")
-			if got := p.Eligibility(time.Millisecond, now, "SearchTimeline"); got.Complete != (e.Quota.Remaining <= e.Quota.Limit) || got.Quota.Remaining != e.Quota.Remaining {
+			if got := p.Eligibility(time.Millisecond, now, "SearchTimeline"); got.Complete != (e.Quota.Limit == 50 && e.Quota.Remaining <= e.Quota.Limit) || got.Quota.Remaining != e.Quota.Remaining {
 				t.Fatal("complete evidence renewed budget", got)
 			}
 			if e.Quota.Remaining > e.Quota.Limit {
@@ -132,6 +132,13 @@ func TestPartialAfterCompleteRevokesChangedBurstAuthority(t *testing.T) {
 	p.observe(RateLimitState{Remaining: 0}, false, true, false, "SearchTimeline")
 	if e := p.Eligibility(time.Millisecond, now, "SearchTimeline"); e.Complete || e.At != initial.Reset.Add(50*time.Millisecond) || !e.Authoritative {
 		t.Fatal("partial exhaustion weakened explicit reset floor", e)
+	}
+	p = &RequestPacing{burst: true}
+	p.observe(RateLimitState{Limit: 100, Remaining: 90, Reset: initial.Reset}, true, true, true, "SearchTimeline")
+	p.observe(RateLimitState{Limit: 10}, true, false, false, "SearchTimeline")
+	p.observe(RateLimitState{Limit: 100, Remaining: 9, Reset: initial.Reset}, true, true, true, "SearchTimeline")
+	if e := p.Eligibility(time.Millisecond, now, "SearchTimeline"); e.Complete || e.Reason != "spread" || e.Quota.Remaining != 9 || e.Quota.Limit != 10 {
+		t.Fatal("retained smaller limit shrank complete provider reserve", e)
 	}
 }
 

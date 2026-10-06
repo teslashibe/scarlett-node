@@ -116,7 +116,7 @@ func (p *RequestPacing) observe(observed RateLimitState, hasLimit, hasRemaining,
 	if hasReset {
 		p.resetKnown = true
 	}
-	complete := hasLimit && hasRemaining && hasReset && observed.Limit > 0 && observed.Limit <= 1000000000 && observed.Remaining >= 0 && observed.Remaining <= observed.Limit && p.rlState.Limit > 0 && p.rlState.Remaining >= 0 && p.rlState.Remaining <= p.rlState.Limit
+	complete := hasLimit && hasRemaining && hasReset && observed.Limit > 0 && observed.Limit <= 1000000000 && observed.Remaining >= 0 && observed.Remaining <= observed.Limit && p.rlState.Limit == observed.Limit && p.rlState.Remaining >= 0 && p.rlState.Remaining <= p.rlState.Limit
 	if !complete && p.rlState != prior {
 		// A partial response can tighten a shared floor, but its mixed state is
 		// not a new complete provider triplet authorizing operation bursts.
