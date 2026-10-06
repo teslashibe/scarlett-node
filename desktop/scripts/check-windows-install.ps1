@@ -385,37 +385,50 @@ function Verify-KeyboardDelivery {
     # UIA Invoke/SetFocus can succeed without an interactive input desktop.
     # Prove native text delivery reaches a harmless empty field before blaming a shortcut.
     Write-Output "Installed keyboard probe: interactive=$([Environment]::UserInteractive), session=$([System.Diagnostics.Process]::GetCurrentProcess().SessionId)"
-    $target = $null
-    foreach ($name in @('Local X account ID', 'Local account ID')) {
-        $condition = [System.Windows.Automation.AndCondition]::new(
-            [System.Windows.Automation.PropertyCondition]::new(
-                [System.Windows.Automation.AutomationElement]::NameProperty, $name),
-            [System.Windows.Automation.PropertyCondition]::new(
-                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-                [System.Windows.Automation.ControlType]::Edit)
-        )
-        $target = $script:window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
-        if ($null -ne $target) { break }
-    }
+    # This fixed form pair is independent of browser profile discovery. Tab
+    # skips hidden per-account capacity and reaches the reconnect checkbox.
+    $name = 'Local account ID for X login'
+    $nextName = 'Replace the session for an existing local account'
+    $condition = [System.Windows.Automation.AndCondition]::new(
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::NameProperty, $name),
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Edit)
+    )
+    $targets = $script:window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    if ($targets.Count -ne 1) { throw 'Keyboard probe requires one disposable account field' }
+    $target = $targets[0]
     $value = $null
-    if ($null -eq $target -or -not $target.Current.IsEnabled -or
+    if ($null -eq $target -or -not $target.Current.IsEnabled -or -not $target.Current.IsKeyboardFocusable -or
+        $target.Current.IsPassword -or
         -not $target.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$value) -or
         $value.Current.Value -ne '') { throw 'Keyboard probe requires an empty disposable account field' }
+    Wait-Check {
+        $next = Find-Input $nextName
+        return $null -ne $next -and $next.Current.IsEnabled -and
+            $next.Current.ControlType -eq [System.Windows.Automation.ControlType]::CheckBox
+    } 15 'Keyboard probe successor did not become ready'
+    $next = Find-Input $nextName
+    $toggle = $null
+    if (-not $next.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$toggle)) {
+        throw 'Keyboard probe successor has no checkbox state'
+    }
+    $toggleBefore = $toggle.Current.ToggleState
     $handle = $application.MainWindowHandle
     [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
     [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
     $target.SetFocus()
     Wait-KeyboardTarget $target $handle 'Keyboard probe did not acquire foreground and field focus'
-    $nextName = X-AccountIDSuccessor
     [ScarlettAcceptanceWindow]::UnicodeTextAndTab('keyboard-probe')
     Wait-InputAdvanced $name $nextName $handle $false 'Keyboard probe text was not acknowledged by successor focus'
     Wait-Check { $value.Current.Value -ceq 'keyboard-probe' } 10 'CI keyboard injection did not reach the editable control'
     $target.SetFocus()
     Wait-KeyboardTarget $target $handle 'Keyboard probe did not reacquire field focus'
-    $nextName = X-AccountIDSuccessor
     [ScarlettAcceptanceWindow]::SelectAllClearAndTab()
     Wait-InputAdvanced $name $nextName $handle $true 'Keyboard probe clear was not acknowledged by successor focus'
     Wait-Check { $value.Current.Value -ceq '' } 10 'Native control-key input did not clear the disposable field'
+    if ($toggle.Current.ToggleState -ne $toggleBefore) { throw 'Keyboard probe changed the reconnect choice' }
     Write-Output 'Installed acceptance: text and native control-key delivery verified'
 }
 
@@ -428,19 +441,6 @@ function Find-Input([string]$Name) {
             [System.Windows.Automation.AutomationElement]::IsKeyboardFocusableProperty, $true)
     )
     return $script:window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
-}
-function X-AccountIDSuccessor {
-    # Per-account capacity is fixed and hidden. Tab reaches the profile picker
-    # when profiles are available, otherwise it skips the disabled import controls.
-    $profile = Find-Input 'Browser profile'
-    if ($null -ne $profile -and $profile.Current.IsEnabled) { return 'Browser profile' }
-    $consent = Find-Input 'Import only X session cookies from this profile'
-    $import = Find-Button 'Import X account'
-    if (($null -ne $consent -and $consent.Current.IsEnabled) -or
-        ($null -ne $import -and $import.Current.IsEnabled)) {
-        throw 'X account input successor has inconsistent import controls'
-    }
-    return 'auth_token'
 }
 function Set-Number([string]$Name, [int]$Value) {
     $inputControl = Find-Input $Name
