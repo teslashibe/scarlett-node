@@ -44,7 +44,7 @@ func TestWaitObserverCancellationPreservesQuotaAndReservation(t *testing.T) {
 	var cancelled bool
 	ctx = WithWaitObserver(ctx, func(reason string) func(bool) {
 		calls++
-		if reason != "quota" {
+		if reason != "reset" {
 			t.Fatalf("quota reason = %q", reason)
 		}
 		return func(value bool) { cancelled = value }

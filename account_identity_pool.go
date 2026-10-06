@@ -207,7 +207,7 @@ func (p *servicePool) applyXIdentity(a *pooledAccount, identity worker.VerifiedX
 }
 
 func (p *servicePool) xGroupAvailable(a *pooledAccount) int {
-	if p.xIdentityError || a.removed || a.duplicate || a.identity.ID == "" {
+	if p.xIdentityError || a.removed || a.duplicate || a.identity.ID == "" || p.xRecoveryHolds(a) {
 		return 0
 	}
 	limit, occupied := p.xGroupLimit(a), p.xInFlight[a.identity.ID]
@@ -237,6 +237,7 @@ func (p *servicePool) xGroupLimit(a *pooledAccount) int {
 func (p *servicePool) xIdentityValidated(path string, identity worker.VerifiedXIdentity) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	defer p.notifyAvailability()
 	if identity.ID == "" || identity.Stamp == "" || worker.XSessionStamp(path) != identity.Stamp {
 		return
 	}

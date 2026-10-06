@@ -1,16 +1,18 @@
 {
   "upstream_revision": "fb031a0f6f69b68a7038efdf52d1c4ef22d54f85",
-  "scope": "Local Scarlett changes share pacing after authenticated Viewer identity, preserve conservative quota state, add opt-in positive jitter to shared request reservations, and observe actual request-context waits and GraphQL decoding without changing provider results. Clients and credential validation remain session-specific. UPSTREAM.json retains the original source hashes.",
+  "scope": "Local Scarlett changes share per-identity pacing after authenticated Viewer validation, retain stricter quota observations, reserve positive bounded jitter, and enforce atomic authenticated dispatch debits. Conservative pacing remains the default; opt-in quota_budget requires complete same-operation headers above a 20 percent/minimum-two reserve. Bounded local wait/quota observers cannot alter provider results. Clients and credentials remain session-specific. UPSTREAM.json retains original source hashes.",
   "sha256": {
-    "client.go": "39aab102c50633598f223c664df3fffecbc3a2e6112178f5f0e0d86f083e3f2b",
+    "client.go": "e61de7c6a4491a0489a8b8e40cba94111d38bff0f687aec8486c3ce6498aabd4",
     "session.go": "f61634f928d36643543773fba76aa6f73ea7b8fe2d224a489c338713bace8fe2",
     "x.go": "85054113d9a1c8b2b2c39b8a0450ae17ebac634793c55c722105126584e58b27",
-    "pacing.go": "7a9abb836eaeac58df0c68036a37c295682441751f2aaebfb49c0fd4c010fdd6",
+    "pacing.go": "dd36f633ee89079422b46923763704e8e84aba715969ae2e3b3af20a3308a2e3",
     "pacing_test.go": "552f982525dea94f753618c5b15342df3c222a40974f6c5a14ad3bf3493b4def",
-    "wait_observer.go": "0299da32013526d1548046b39b685e06aa735212294e530a238d6ec437dc7a58",
-    "wait_observer_test.go": "305ab89bea7b7707c1833d2af497a4a7faa1eaf898c72461d4c907d293ec5e15",
+    "wait_observer.go": "84b8967611141e5dd7246af87da3cc55fc55ccb578c910d64e5e79178a0b6e1c",
+    "wait_observer_test.go": "b5ab62a3fcb304575a011ea96ca1d3ae6c8ebfc5c5d2e5caa9428b4edd14fd42",
     "response_observer.go": "b2e0ba9bb748a1fb4eb45cdd8d41807464c8d8bda923e77cebda0f36dfcca550",
     "response_observer_test.go": "3d7835fd00fe718fd02153f92ffe309e41d3d9ab6a5f34ab4049f485f0074808",
-    "request_jitter_test.go": "78165bf36fde1b21b10817cd653996a4f8545981598fae973d68f9233c347308"
+    "request_jitter_test.go": "78165bf36fde1b21b10817cd653996a4f8545981598fae973d68f9233c347308",
+    "eligibility.go": "1b63c004f3067ae8033d277578c03cf01635af9c0e8b12874ae6a6d6c86a727a",
+    "eligibility_test.go": "2fdc5ccd308525765596d567e83b9c59b68dc49042835831b52a1f9bdea35477"
   }
 }

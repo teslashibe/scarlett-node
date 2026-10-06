@@ -60,7 +60,7 @@ func New(dir string) *Store {
 			s.changedLocked()
 		}
 		s.attempts = append(s.attempts, &Attempt{store: s, record: record, finished: true, retained: true})
-		s.retainedBytes += 700 + len(record.Spans)*144
+		s.retainedBytes += estimatedBytes(record)
 	}
 	for s.retainedBytes > MaxHistoryBytes {
 		s.dropOldestLocked()
@@ -199,7 +199,7 @@ func (a *Attempt) Finish(code string) {
 func (a *Attempt) spanSlotLocked(phase, source string) int {
 	// Conservative wire accounting bounds memory while recording without JSON
 	// encoding in the provider hot path. Export applies the exact byte bound too.
-	if len(a.record.Spans) >= MaxSpans || 700+(len(a.record.Spans)+1)*144 > MaxAttemptBytes || a.store.retainedBytes+144 > MaxHistoryBytes {
+	if len(a.record.Spans) >= MaxSpans || estimatedBytes(a.record)+144 > MaxAttemptBytes || a.store.retainedBytes+144 > MaxHistoryBytes {
 		a.record.Truncated = true
 		a.store.changedLocked()
 		if len(a.record.Spans) == 0 {
@@ -260,7 +260,7 @@ func (s *Store) dropOldestLocked() {
 		}
 	}
 	s.attempts[index].retained = false
-	s.retainedBytes -= 700 + len(s.attempts[index].record.Spans)*144
+	s.retainedBytes -= estimatedBytes(s.attempts[index].record)
 	s.attempts = append(s.attempts[:index], s.attempts[index+1:]...)
 }
 
@@ -276,7 +276,7 @@ func (s *Store) pruneLocked() {
 		}
 		if old {
 			a.retained = false
-			s.retainedBytes -= 700 + len(a.record.Spans)*144
+			s.retainedBytes -= estimatedBytes(a.record)
 			pruned = true
 			continue
 		}

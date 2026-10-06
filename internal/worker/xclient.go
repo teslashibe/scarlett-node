@@ -238,7 +238,7 @@ func (c *XClients) account(cfg config.Config, id, path string, base http.RoundTr
 	if id == "" {
 		id = "x_read"
 	}
-	a := &xAccount{clients: c, id: id, path: path, board: &xSwitchboard{base: base}, timeout: cfg.InferenceTimeout, refresh: cfg.XRefresh, stop: make(chan struct{}), kick: make(chan struct{}, 1)}
+	a := &xAccount{clients: c, id: id, path: path, board: &xSwitchboard{base: base}, timeout: cfg.InferenceTimeout, refresh: cfg.XRefresh, quotaBudget: cfg.XPacingMode == "quota_budget", stop: make(chan struct{}), kick: make(chan struct{}, 1)}
 	if a.timeout <= 0 {
 		a.timeout = xBuildTimeout
 	}
@@ -252,11 +252,12 @@ func (c *XClients) account(cfg config.Config, id, path string, base http.RoundTr
 
 // xAccount is one account's warm client and the build that may be replacing it.
 type xAccount struct {
-	clients  *XClients
-	id, path string
-	board    *xSwitchboard
-	timeout  time.Duration
-	refresh  time.Duration
+	clients     *XClients
+	id, path    string
+	board       *xSwitchboard
+	timeout     time.Duration
+	refresh     time.Duration
+	quotaBudget bool
 
 	mu      sync.Mutex
 	current *xWarm
@@ -304,19 +305,12 @@ type xWarm struct {
 // it lets a read through once half the window has passed, and X would only
 // answer that read with a rate limit.
 func (w *xWarm) pacingWait(minGap time.Duration) (wait, reset time.Duration) {
-	rs := w.client.RateLimit()
-	reset = rs.ResetIn()
-	if reset <= 0 {
-		return 0, 0
-	}
-	if rs.Remaining <= 0 {
-		return reset, reset
-	}
-	gap := reset / time.Duration(max(int64(float64(rs.Remaining)*0.9), 1))
-	if gap <= minGap {
+	eligibility := w.client.NextEligibility(time.Now())
+	reset = eligibility.Quota.ResetIn()
+	if eligibility.Reason == "gap" {
 		return 0, reset
 	}
-	return max(time.Until(w.client.LastRequestAt().Add(gap)), 0), reset
+	return max(time.Until(eligibility.At), 0), reset
 }
 
 // exhausted is the time until X's quota window resets when X last reported no
@@ -682,7 +676,7 @@ func (a *xAccount) construct(ctx context.Context, prior *xWarm, ids map[string]s
 	// Each shared identity reserves up to a quarter of the minimum gap as extra
 	// delay (250 ms in production), including requests after an idle interval.
 	gap := a.clients.gap()
-	client, err := session.NewClient(withXConstruction(ctx, con), x.WithHTTPClient(hc), x.WithRetry(1, time.Millisecond), x.WithQueryIDs(ids), x.WithMinRequestGap(gap), x.WithRequestJitter(gap/4), x.WithIdentityPacing(a.pacingFor))
+	client, err := session.NewClient(withXConstruction(ctx, con), x.WithHTTPClient(hc), x.WithRetry(1, time.Millisecond), x.WithQueryIDs(ids), x.WithMinRequestGap(gap), x.WithRequestJitter(gap/4), x.WithQuotaBurst(a.quotaBudget), x.WithIdentityPacing(a.pacingFor))
 	if err != nil {
 		return nil, stamp, con.asked.Load(), err
 	}

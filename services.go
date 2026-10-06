@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/teslashibe/scarlett-node/internal/attempts"
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
 	"github.com/teslashibe/scarlett-node/internal/worker"
@@ -33,6 +34,11 @@ type servicePool struct {
 	xInFlight                               map[string]int
 	activeCoordinatorLeases                 map[*accountLease]coordinator.ActiveLease
 	xIdentityError, xIdentityHealthError    bool
+	xEligibility                            func(string, string, time.Time) time.Time
+	availabilityChanges                     chan<- struct{}
+	xRecovery                               func() ([]attempts.Record, error)
+	xRecoveryIdentities                     map[string]bool
+	xRecoveryUnknown                        bool
 }
 
 func newServicePool(c config.Config) *servicePool {
@@ -57,11 +63,34 @@ func (p *servicePool) refresh(now time.Time) {
 		}
 		refreshAccount(p.accounts[kind+":legacy"], now, helperError != nil)
 	}
+	p.refreshXRecovery()
+}
+
+func blockOperationAvailability(services []coordinator.ServiceHealth) {
+	for i := range services {
+		for j := range services[i].OperationAvailability {
+			services[i].OperationAvailability[j].RunnableCapacity = 0
+		}
+	}
+}
+
+// The compatibility retry must recompute the whole old contract after optional
+// physical and operation hints are removed, including during rollback.
+func legacyServiceHeartbeat(h coordinator.Heartbeat, blocked bool) coordinator.Heartbeat {
+	h.Capacity, h.State = 0, "exhausted"
+	for _, service := range h.Services {
+		h.Capacity += service.Capacity
+		if !blocked && (service.State == "configured" || service.State == "ready") && service.Capacity > service.InFlight {
+			h.State = "available"
+		}
+	}
+	return h
 }
 func (p *servicePool) health() []coordinator.ServiceHealth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.refresh(time.Now())
+	now := time.Now()
+	p.refresh(now)
 	out := []coordinator.ServiceHealth{}
 	for _, kind := range []string{"codex", "x_read"} {
 		s := p.entries[kind]
@@ -72,7 +101,37 @@ func (p *servicePool) health() []coordinator.ServiceHealth {
 				capacity = s.inFlight
 			}
 		}
+		if kind == "x_read" && s.enabled && !p.accountMode {
+			if a := p.accounts["x_read:legacy"]; a != nil && (p.xReadyAt(a, now).After(now) || p.xRecoveryHolds(a)) {
+				capacity = s.inFlight
+			}
+		}
 		h := coordinator.ServiceHealth{Kind: kind, State: s.state, Capacity: capacity, InFlight: s.inFlight, LastErrorCode: s.lastError}
+		if capacity == 0 && (h.State == "ready" || h.State == "configured") {
+			h.State = "exhausted"
+		}
+		if kind == "x_read" && s.enabled && p.accountMode {
+			a := p.xAvailability(now)
+			h.ConfiguredCapacity, h.ActiveAccounts, h.ReadyAccounts, h.CoolingAccounts = &a.configured, &a.active, &a.ready, &a.cooling
+			runnable := max(0, capacity-s.inFlight)
+			h.RunnableCapacity = &runnable
+			for _, operation := range []string{"search", "profile", "post", "thread"} {
+				a := p.xAvailability(now, operation)
+				hint := coordinator.OperationAvailability{Operation: operation, RunnableCapacity: min(a.available, max(0, a.configured-s.inFlight))}
+				if a.cooling > 0 && !a.next.IsZero() && !a.next.After(now.Add(30*24*time.Hour)) {
+					next := a.next.UTC()
+					hint.NextReadyAt = &next
+				}
+				h.OperationAvailability = append(h.OperationAvailability, hint)
+				if hint.RunnableCapacity > 0 && h.State == "exhausted" && h.LastErrorCode == "" {
+					h.State = "configured"
+				}
+			}
+			if !a.next.IsZero() && !a.next.After(now.Add(30*24*time.Hour)) {
+				next := a.next.UTC()
+				h.NextReadyAt = &next
+			}
+		}
 		for account, lease := range p.activeCoordinatorLeases {
 			if account.kind == kind {
 				h.ActiveLeases = append(h.ActiveLeases, lease)
@@ -119,7 +178,7 @@ func (p *servicePool) xAccounts() []worker.XAccount {
 	}
 	keys := []string{}
 	for key, a := range p.accounts {
-		if a.spec.Service == "x_read" && !a.removed && (a.entry.state == "configured" || a.entry.state == "ready") {
+		if a.spec.Service == "x_read" && !a.removed && !p.xRecoveryHolds(a) && (a.entry.state == "configured" || a.entry.state == "ready") {
 			keys = append(keys, key)
 		}
 	}
@@ -134,9 +193,13 @@ func (p *servicePool) xAccounts() []worker.XAccount {
 // xRefreshAllowed applies the keeper's same availability rules to the cache's
 // autonomous timer, which otherwise retains clients while accounts rest.
 func (p *servicePool) xRefreshAllowed(path string) bool {
-	for _, account := range p.xAccounts() {
-		if account.Path == path {
-			return true
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	p.refresh(now)
+	for _, a := range p.accounts {
+		if a.spec.Service == "x_read" && a.spec.Path == path && !a.removed && !p.healthError && !p.accountsError && (a.entry.state == "configured" || a.entry.state == "ready") {
+			return !p.xRecoveryHolds(a) && !p.xReadyAt(a, now).After(now)
 		}
 	}
 	return false

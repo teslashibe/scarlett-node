@@ -92,9 +92,8 @@ func retryWait(lastErr error, base time.Duration, attempt int) time.Duration {
 
 // doGraphQLGET performs a single GraphQL GET request.
 func (c *Client) doGraphQLGET(ctx context.Context, qid, operationName string, varsJSON, featsJSON []byte) (result json.RawMessage, err error) {
-	c.waitForGap(ctx)
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if err := c.waitForGap(ctx, operationName); err != nil {
+		return nil, err
 	}
 
 	endpoint := fmt.Sprintf("%s/%s/%s", graphqlBase, qid, operationName)
@@ -108,7 +107,7 @@ func (c *Client) doGraphQLGET(ctx context.Context, qid, operationName string, va
 	}
 	c.setHeaders(req)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.dispatch(req, operationName)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrRequestFailed, err)
 	}
@@ -116,7 +115,7 @@ func (c *Client) doGraphQLGET(ctx context.Context, qid, operationName string, va
 	decoded := beginObservedDecode(ctx)
 	defer func() { decoded(err != nil) }()
 
-	if err := c.checkStatus(resp); err != nil {
+	if err := c.checkStatus(resp, operationName); err != nil {
 		return nil, c.operationError(operationName, req, resp, err)
 	}
 
@@ -127,15 +126,9 @@ func (c *Client) doGraphQLGET(ctx context.Context, qid, operationName string, va
 
 	data, parseErr := c.parseGQLResponse(body)
 	if errors.Is(parseErr, ErrRateLimited) {
-		wait := parseRetryAfter(resp.Header.Get("Retry-After"), 0)
-		if wait == 0 {
-			wait = parseRetryAfter(rlHeader(resp.Header, "Reset"), 0)
-		}
-		if wait <= 0 {
-			wait = 60 * time.Second
-		}
-		c.recordRateLimit(wait)
-		return nil, &RateLimitError{Wait: wait}
+		wait, reset := providerReset(resp.Header)
+		c.recordRateLimit(wait, !reset.IsZero())
+		return nil, &RateLimitError{Wait: wait, Reset: reset}
 	}
 	return data, parseErr
 }
@@ -154,9 +147,8 @@ func (c *Client) operationError(operation string, req *http.Request, resp *http.
 
 // doGraphQLPOST performs a single GraphQL POST request.
 func (c *Client) doGraphQLPOST(ctx context.Context, qid, operationName string, variables map[string]interface{}) (json.RawMessage, error) {
-	c.waitForGap(ctx)
-	if ctx.Err() != nil {
-		return nil, errors.Join(errWriteNotAttempted, ctx.Err())
+	if err := c.waitForGap(ctx, operationName); err != nil {
+		return nil, errors.Join(errWriteNotAttempted, err)
 	}
 
 	endpoint := fmt.Sprintf("%s/%s/%s", graphqlBase, qid, operationName)
@@ -178,13 +170,13 @@ func (c *Client) doGraphQLPOST(ctx context.Context, qid, operationName string, v
 	req.Header.Set("Content-Type", "application/json")
 	c.setHeaders(req)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.dispatch(req, operationName)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrRequestFailed, err)
 	}
 	defer resp.Body.Close()
 
-	if err := c.checkStatus(resp); err != nil {
+	if err := c.checkStatus(resp, operationName); err != nil {
 		return nil, err
 	}
 
@@ -198,9 +190,8 @@ func (c *Client) doGraphQLPOST(ctx context.Context, qid, operationName string, v
 
 // restGET performs an authenticated REST API GET request.
 func (c *Client) restGET(ctx context.Context, path string, params url.Values) (json.RawMessage, error) {
-	c.waitForGap(ctx)
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if err := c.waitForGap(ctx); err != nil {
+		return nil, err
 	}
 
 	endpoint := baseURL + path
@@ -214,7 +205,7 @@ func (c *Client) restGET(ctx context.Context, path string, params url.Values) (j
 	}
 	c.setHeaders(req)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.dispatch(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrRequestFailed, err)
 	}
@@ -234,9 +225,8 @@ func (c *Client) restGET(ctx context.Context, path string, params url.Values) (j
 
 // restPOST performs an authenticated REST API POST request.
 func (c *Client) restPOST(ctx context.Context, path string, payload interface{}) (json.RawMessage, error) {
-	c.waitForGap(ctx)
-	if ctx.Err() != nil {
-		return nil, errors.Join(errWriteNotAttempted, ctx.Err())
+	if err := c.waitForGap(ctx); err != nil {
+		return nil, errors.Join(errWriteNotAttempted, err)
 	}
 
 	bodyBytes, err := json.Marshal(payload)
@@ -251,7 +241,7 @@ func (c *Client) restPOST(ctx context.Context, path string, payload interface{})
 	req.Header.Set("Content-Type", "application/json")
 	c.setHeaders(req)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.dispatch(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrRequestFailed, err)
 	}
@@ -271,9 +261,8 @@ func (c *Client) restPOST(ctx context.Context, path string, payload interface{})
 
 // restFormPOST performs an authenticated form-encoded POST to a REST endpoint.
 func (c *Client) restFormPOST(ctx context.Context, path string, form url.Values) (json.RawMessage, error) {
-	c.waitForGap(ctx)
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if err := c.waitForGap(ctx); err != nil {
+		return nil, err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+path, strings.NewReader(form.Encode()))
@@ -283,7 +272,7 @@ func (c *Client) restFormPOST(ctx context.Context, path string, form url.Values)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	c.setHeaders(req)
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.dispatch(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrRequestFailed, err)
 	}
@@ -354,42 +343,39 @@ func (c *Client) queryID(name string) string {
 // automatically to spread requests across the remaining window. Optional
 // positive jitter is part of the shared reservation, so neighboring requests
 // cannot consume the same slot while either request waits.
-func (c *Client) waitForGap(ctx context.Context) {
-	gap, reason := c.adaptiveGapReason()
+func (c *Client) waitForGap(ctx context.Context, operation ...string) error {
+	op := boundedPacingOperation(operation)
 	var jitter time.Duration
 	if c.requestJitter > 0 {
 		jitter = time.Duration(1 + rand.Int64N(int64(c.requestJitter)))
 	}
-
-	c.pacing.gapMu.Lock()
-	now := time.Now()
-	nextSlot := c.pacing.lastReqAt.Add(gap)
-	if now.After(nextSlot) {
-		nextSlot = now
+	reservation := c.pacing.reserve(c.minGap, jitter, time.Now(), op)
+	if err := waitUntil(ctx, reservation.baseAt, reservation.reason); err != nil {
+		return err
 	}
-	nextSlot = nextSlot.Add(jitter)
-	c.pacing.lastReqAt = nextSlot
-	c.pacing.gapMu.Unlock()
+	if err := waitUntil(ctx, reservation.at, "jitter"); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
+}
 
-	if wait := time.Until(nextSlot); wait > 0 {
+func waitUntil(ctx context.Context, at time.Time, reason string) error {
+	if wait := time.Until(at); wait > 0 {
 		done := beginObservedWait(ctx, reason)
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
 		select {
 		case <-ctx.Done():
 			done(true)
-		case <-time.After(wait):
+			return ctx.Err()
+		case <-timer.C:
 			done(false)
 		}
 	}
-	// Cancellation must not erase a provider cooldown that remains active.
-	if ctx.Err() != nil {
-		return
-	}
-	// Clear RetryAfter once we've waited past it.
-	c.pacing.rlMu.Lock()
-	if !time.Now().Before(c.pacing.rlState.Reset) {
-		c.pacing.rlState.RetryAfter = 0
-	}
-	c.pacing.rlMu.Unlock()
+	return ctx.Err()
 }
 
 // adaptiveGap returns the delay before the next request based on observed
@@ -402,38 +388,24 @@ func (c *Client) adaptiveGap() time.Duration {
 
 func (c *Client) adaptiveGapReason() (time.Duration, string) {
 	c.pacing.rlMu.Lock()
-	rs := c.pacing.rlState
-	c.pacing.rlMu.Unlock()
-
-	// Quota exhausted — wait for the window to reset.
-	if rs.Remaining == 0 && !rs.Reset.IsZero() {
-		if d := time.Until(rs.Reset); d > 0 {
-			return d + 50*time.Millisecond, "quota"
-		}
+	defer c.pacing.rlMu.Unlock()
+	gap, reason := quotaGap(c.pacing.rlState, false, false, c.minGap, time.Now())
+	if reason == "spread" || reason == "reset" {
+		reason = "quota"
 	}
-	// Spread remaining quota evenly across the reset window (90% safety margin).
-	if rs.Remaining > 0 && !rs.Reset.IsZero() {
-		if d := time.Until(rs.Reset); d > 0 {
-			slots := max(int64(float64(rs.Remaining)*0.9), 1)
-			spread := d / time.Duration(slots)
-			if spread > c.minGap {
-				return spread, "quota"
-			}
-		}
-	}
-	return c.minGap, "gap"
+	return gap, reason
 }
 
 // updateRateLimit reads rate-limit headers from a response and updates
 // the client's tracked state. Call on every HTTP response.
-func (c *Client) updateRateLimit(resp *http.Response) {
+func (c *Client) updateRateLimit(resp *http.Response, operation ...string) {
 	h := resp.Header
 	var observed RateLimitState
 	var hasLimit, hasRemaining, hasReset bool
-	if n, err := strconv.Atoi(rlHeader(h, "Limit")); err == nil && n >= 0 {
+	if n, err := strconv.Atoi(rlHeader(h, "Limit")); err == nil && n >= 0 && n <= 1000000000 {
 		observed.Limit, hasLimit = n, true
 	}
-	if n, err := strconv.Atoi(rlHeader(h, "Remaining")); err == nil && n >= 0 {
+	if n, err := strconv.Atoi(rlHeader(h, "Remaining")); err == nil && n >= 0 && n <= 1000000000 {
 		observed.Remaining, hasRemaining = n, true
 	}
 	if ts, err := strconv.ParseInt(rlHeader(h, "Reset"), 10, 64); err == nil && ts >= 0 {
@@ -444,7 +416,7 @@ func (c *Client) updateRateLimit(resp *http.Response) {
 		}
 		hasReset = true
 	}
-	c.pacing.observe(observed, hasLimit, hasRemaining, hasReset)
+	c.pacing.observe(observed, hasLimit, hasRemaining, hasReset, boundedPacingOperation(operation))
 }
 
 // rlHeader returns the trimmed value of a rate-limit header, checking the four
@@ -460,8 +432,8 @@ func rlHeader(h http.Header, suffix string) string {
 
 // checkStatus maps HTTP status codes to sentinel errors.
 // On non-OK responses, it drains the body so the TCP connection can be reused.
-func (c *Client) checkStatus(resp *http.Response) error {
-	c.updateRateLimit(resp)
+func (c *Client) checkStatus(resp *http.Response, operation ...string) error {
+	c.updateRateLimit(resp, operation...)
 
 	if resp.StatusCode == http.StatusOK {
 		return nil
@@ -485,12 +457,9 @@ func (c *Client) checkStatus(resp *http.Response) error {
 	case resp.StatusCode == http.StatusNotFound:
 		return ErrNotFound
 	case resp.StatusCode == http.StatusTooManyRequests:
-		wait := parseRetryAfter(resp.Header.Get("X-Rate-Limit-Reset"), 0)
-		if wait == 0 {
-			wait = parseRetryAfter(resp.Header.Get("Retry-After"), 60*time.Second)
-		}
-		c.recordRateLimit(wait)
-		return &RateLimitError{Wait: wait}
+		wait, reset := providerReset(resp.Header)
+		c.recordRateLimit(wait, !reset.IsZero())
+		return &RateLimitError{Wait: wait, Reset: reset}
 	case resp.StatusCode >= 500:
 		if snippet != "" {
 			return fmt.Errorf("%w: HTTP %d: %s", ErrRequestFailed, resp.StatusCode, snippet)
@@ -505,8 +474,9 @@ func (c *Client) checkStatus(resp *http.Response) error {
 }
 
 // recordRateLimit keeps later calls behind the same provider cooldown.
-func (c *Client) recordRateLimit(wait time.Duration) {
+func (c *Client) recordRateLimit(wait time.Duration, authoritative ...bool) {
 	c.pacing.rlMu.Lock()
+	c.pacing.resetKnown = len(authoritative) == 1 && authoritative[0]
 	c.pacing.rlState.Remaining = 0
 	c.pacing.rlState.RetryAfter = wait
 	if c.pacing.rlState.Reset.IsZero() || time.Until(c.pacing.rlState.Reset) < wait {
@@ -562,7 +532,8 @@ func classifyRESTErrorBody(body []byte) error {
 // RateLimitError carries the retry-after duration from a 429 response.
 // It wraps ErrRateLimited for errors.Is compatibility.
 type RateLimitError struct {
-	Wait time.Duration
+	Wait  time.Duration
+	Reset time.Time // nonzero only for an explicit authoritative provider reset/retry header
 }
 
 func (e *RateLimitError) Error() string {

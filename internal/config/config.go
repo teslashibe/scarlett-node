@@ -46,13 +46,15 @@ type Config struct {
 	Bid                      int64
 	// Concurrency is how many leases the node runs at once. The default matches
 	// the local Open Agent API baseline of 20 in-flight requests per account.
-	Concurrency      int
-	Services         []string
-	AccountsFile     string
-	AccountsRequired bool
-	AccountCooldown  func(time.Duration) // private provider quota observation
-	LocalAccountID   string              // private attempt identity; never sent to the coordinator
-	XSession         string
+	Concurrency       int
+	Services          []string
+	AccountsFile      string
+	AccountsRequired  bool
+	AccountCooldown   func(time.Duration) // private provider quota observation
+	AccountQuotaReset func(time.Time)     // absolute authoritative provider reset only
+	AccountReady      func(string) bool   // final selected-account check before funded acceptance
+	LocalAccountID    string              // private attempt identity; never sent to the coordinator
+	XSession          string
 	// Accepted X leases pin private credentials and verified provider identity.
 	// These values never enter coordinator reports or local public status.
 	ExpectedXStamp    string
@@ -66,6 +68,7 @@ type Config struct {
 	// XRefresh is how often a warm X client's transaction-ID material is
 	// rebuilt in the background (SCARLETT_X_REFRESH_SECONDS; default 30 min).
 	XRefresh         time.Duration
+	XPacingMode      string // conservative (default) or opt-in quota_budget
 	CodexConcurrency int
 	XConcurrency     int
 	// Optional per-authenticated-X-account ceiling; zero uses the account
@@ -149,6 +152,13 @@ func Load() (Config, error) {
 	}
 	if c.Executor == ExecutorServices {
 		c.XSession = os.Getenv("SCARLETT_X_SESSION")
+		c.XPacingMode = strings.TrimSpace(os.Getenv("SCARLETT_X_PACING_MODE"))
+		if c.XPacingMode == "" {
+			c.XPacingMode = "conservative"
+		}
+		if c.XPacingMode != "conservative" && c.XPacingMode != "quota_budget" {
+			return c, errors.New("invalid SCARLETT_X_PACING_MODE")
+		}
 		switch strings.ToLower(strings.TrimSpace(os.Getenv("SCARLETT_X_RELAY"))) {
 		case "0", "false", "off", "no":
 			c.XRelay = false
@@ -284,6 +294,9 @@ func (c Config) Validate() error {
 		return nil
 	}
 	if c.Executor == ExecutorServices {
+		if c.XPacingMode != "" && c.XPacingMode != "conservative" && c.XPacingMode != "quota_budget" {
+			return errors.New("invalid SCARLETT_X_PACING_MODE")
+		}
 		if c.LocalFixture || len(c.Services) < 1 || len(c.Services) > 2 || c.CodexConcurrency < 1 || c.CodexConcurrency > 32 || c.XConcurrency < 1 || c.XConcurrency > 32 || c.XAccountConcurrency < 0 || c.XAccountConcurrency > 32 {
 			return errors.New("invalid independent service configuration")
 		}

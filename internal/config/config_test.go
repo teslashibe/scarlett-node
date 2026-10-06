@@ -178,6 +178,29 @@ func TestKeyedRelayDefaultsOnWithExplicitOptOut(t *testing.T) {
 	}
 }
 
+func TestXPacingModeRequiresExplicitBoundedOptIn(t *testing.T) {
+	t.Setenv("SCARLETT_COORDINATOR", "https://example.org")
+	t.Setenv("SCARLETT_PROFILE", "synthetic")
+	t.Setenv("SCARLETT_EXECUTOR", ExecutorServices)
+	t.Setenv("SCARLETT_SERVICES", "x_read")
+	t.Setenv("SCARLETT_VERIFIER", "127.0.0.1:7047")
+	t.Setenv("SCARLETT_PROVER", "scarlett-prover")
+	t.Setenv("SCARLETT_X_SESSION", filepath.Join(t.TempDir(), "synthetic-x.json"))
+	for _, tc := range []struct{ value, want string }{{"", "conservative"}, {"conservative", "conservative"}, {" quota_budget ", "quota_budget"}, {"fast", ""}, {"QUOTA_BUDGET", ""}} {
+		t.Setenv("SCARLETT_X_PACING_MODE", tc.value)
+		c, err := Load()
+		if tc.want == "" {
+			if err == nil {
+				t.Fatal("unreviewed pacing mode accepted", tc.value)
+			}
+			continue
+		}
+		if err != nil || c.XPacingMode != tc.want {
+			t.Fatal("incorrect pacing policy", tc, c.XPacingMode, err)
+		}
+	}
+}
+
 // The warm X client's background refresh interval defaults to 30 minutes and
 // takes 60 s to a day; anything else is a configuration error.
 func TestXRefreshIntervalDefaultsAndBounds(t *testing.T) {

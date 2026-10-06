@@ -115,6 +115,17 @@ func requiredHistoryFields(raw []byte) bool {
 				return false
 			}
 		}
+		if rawQuota, exists := record["quota_snapshots"]; exists {
+			var quotas []map[string]json.RawMessage
+			if json.Unmarshal(rawQuota, &quotas) != nil {
+				return false
+			}
+			for _, quota := range quotas {
+				if !present(quota, "exchange", "operation", "mode", "limit", "remaining", "reset", "complete", "authoritative", "observed_at", "captured_at", "next_eligible_at") {
+					return false
+				}
+			}
+		}
 	}
 	return true
 }
@@ -215,6 +226,7 @@ func (s *Store) snapshotLocked() Snapshot {
 	for _, a := range s.attempts {
 		record := a.record
 		record.Spans = append([]Span{}, record.Spans...)
+		record.QuotaSnapshots = append([]QuotaSnapshot(nil), record.QuotaSnapshots...)
 		if record.DurationMS != nil {
 			duration := *record.DurationMS
 			record.DurationMS = &duration
