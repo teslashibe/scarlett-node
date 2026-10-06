@@ -23,6 +23,37 @@ public static class ScarlettAcceptanceWindow {
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
     [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
+    [DllImport("user32.dll")] private static extern IntPtr GetThreadDpiAwarenessContext();
+    [DllImport("user32.dll")] private static extern int GetAwarenessFromDpiAwarenessContext(IntPtr context);
+    [DllImport("user32.dll")] private static extern uint GetDpiForWindow(IntPtr window);
+    [DllImport("kernel32.dll")] private static extern void SetLastError(uint error);
+    [StructLayout(LayoutKind.Sequential)] private struct ScreenPoint { public int x, y; }
+    [DllImport("user32.dll")] private static extern IntPtr WindowFromPhysicalPoint(ScreenPoint point);
+    public enum NativeFailure { None, DesktopBounds, InputLayout, ModifierPressed, RejectedEvents }
+    public static NativeFailure LastNativeFailure { get; private set; }
+    public static uint LastInputExpected { get; private set; }
+    public static uint LastInputAccepted { get; private set; }
+    public static int LastInputError { get; private set; }
+    public static void ResetInputDiagnostics() {
+        LastNativeFailure = NativeFailure.None;
+        LastInputExpected = LastInputAccepted = 0;
+        LastInputError = 0;
+    }
+    public static int ThreadDpiAwareness() {
+        return GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext());
+    }
+    public static uint WindowDpi(IntPtr window) { return GetDpiForWindow(window); }
+    public static bool PointOwnedByWindow(IntPtr window, int x, int y) {
+        ScreenPoint point = new ScreenPoint(); point.x = x; point.y = y;
+        IntPtr owner = WindowFromPhysicalPoint(point);
+        return owner != IntPtr.Zero && (owner == window || IsChild(window, owner));
+    }
+    public static bool PointInDesktop(int x, int y) {
+        int left = GetSystemMetrics(76), top = GetSystemMetrics(77);
+        int width = GetSystemMetrics(78), height = GetSystemMetrics(79);
+        return width >= 2 && height >= 2 && x >= left && y >= top &&
+            (long)x < (long)left + width && (long)y < (long)top + height;
+    }
     [StructLayout(LayoutKind.Sequential)] private struct KeyboardInput {
         public ushort key, scan; public uint flags, time; public UIntPtr extra;
     }
@@ -49,11 +80,27 @@ public static class ScarlettAcceptanceWindow {
     }
     public static int InputSize() { return Marshal.SizeOf(typeof(Input)); }
     private static void Send(Input[] inputs) {
-        if (InputSize() != (IntPtr.Size == 8 ? 40 : 28))
+        ResetInputDiagnostics();
+        if (InputSize() != (IntPtr.Size == 8 ? 40 : 28)) {
+            LastNativeFailure = NativeFailure.InputLayout;
             throw new InvalidOperationException("Native input layout mismatch");
-        if (!ModifiersReleased()) throw new InvalidOperationException("CI keyboard modifier was already pressed");
-        if (SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Input))) != (uint)inputs.Length)
+        }
+        if (!ModifiersReleased()) {
+            LastNativeFailure = NativeFailure.ModifierPressed;
+            throw new InvalidOperationException("CI keyboard modifier was already pressed");
+        }
+        LastInputExpected = (uint)inputs.Length;
+        int size = Marshal.SizeOf(typeof(Input));
+        // .NET Framework preserves native last-error across P/Invokes. SendInput
+        // can reject events without setting it, so clear stale error information.
+        SetLastError(0);
+        LastInputAccepted = SendInput(LastInputExpected, inputs, size);
+        int error = Marshal.GetLastWin32Error();
+        if (LastInputAccepted != LastInputExpected) {
+            LastInputError = error;
+            LastNativeFailure = NativeFailure.RejectedEvents;
             throw new InvalidOperationException("Native input stream rejected events");
+        }
     }
     public static void UnicodeTextAndTab(string text) {
         // Disposable ASCII fixtures only. One stream preserves text/Tab order.
@@ -80,11 +127,14 @@ public static class ScarlettAcceptanceWindow {
         Send(new Input[] { Key(0x1B, false), Key(0x1B, true) });
     }
     public static void Click(int x, int y) {
+        ResetInputDiagnostics();
         int left = GetSystemMetrics(76), top = GetSystemMetrics(77);
         int width = GetSystemMetrics(78), height = GetSystemMetrics(79);
         if (width < 2 || height < 2 || x < left || y < top ||
-            (long)x >= (long)left + width || (long)y >= (long)top + height)
+            (long)x >= (long)left + width || (long)y >= (long)top + height) {
+            LastNativeFailure = NativeFailure.DesktopBounds;
             throw new InvalidOperationException("Synthetic click outside desktop bounds");
+        }
         Input move = new Input();
         move.value.mouse.x = (int)(((long)x - left) * 65535 / (width - 1));
         move.value.mouse.y = (int)(((long)y - top) * 65535 / (height - 1));
@@ -618,35 +668,85 @@ function Check-Preferences {
 
 function Click-Control([System.Windows.Automation.AutomationElement]$Control) {
     $handle = $application.MainWindowHandle
-    [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
-    [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
     $scroll = $null
-    if ($Control.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) {
-        $scroll.ScrollIntoView()
-    }
-    $Control.SetFocus()
-    Wait-Check {
-        return [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
-    } 10 'Installed control did not acquire foreground input'
-    $click = @{ point = [System.Windows.Point]::new(0.0, 0.0) }
+    $click = @{ point = [System.Windows.Point]::new(0.0, 0.0); pointAvailable = $false; nativeAttempted = $false }
+    $stage = 1
+    [ScarlettAcceptanceWindow]::ResetInputDiagnostics()
     try {
+        [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
+        [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
+        if ($Control.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) {
+            $scroll.ScrollIntoView()
+        }
+        $Control.SetFocus()
+        Wait-Check {
+            return [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+        } 10 'Installed control did not acquire foreground input'
+        $stage = 2
         Wait-Check {
             $point = [System.Windows.Point]::new(0.0, 0.0)
             if (-not $Control.TryGetClickablePoint([ref]$point)) { return $false }
             $click.point = $point
+            $click.pointAvailable = $true
             return $true
         } 10 'Installed control did not become visible for native click'
+        $stage = 3
+        $x, $y = [int]$click.point.X, [int]$click.point.Y
+        $click.nativeAttempted = $true
+        [ScarlettAcceptanceWindow]::Click($x, $y)
     } catch {
         $originalFailure = $_
-        $diagnostic = @{ controlEnabled = $Control.Current.IsEnabled; controlFocused = $Control.Current.HasKeyboardFocus
-            controlOffscreen = $Control.Current.IsOffscreen; scrollSupported = $null -ne $scroll
-            foregroundOwned = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle; realProviderJobs = 0 }
-        New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
-        $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-click-input-failure.json')
+        # Fixed enum, booleans and native counts only. Never coordinates, UI names,
+        # values, window titles, exception messages or password readback.
+        $diagnostic = @{ clickFailureStage = $stage; nativeFailure = [string][ScarlettAcceptanceWindow]::LastNativeFailure
+            nativeClickAttempted = $click.nativeAttempted; inputExpectedCount = [ScarlettAcceptanceWindow]::LastInputExpected
+            inputAcceptedCount = [ScarlettAcceptanceWindow]::LastInputAccepted; inputLastError = [ScarlettAcceptanceWindow]::LastInputError
+            controlStateAvailable = $false; controlEnabled = $false; controlFocused = $false
+            controlOffscreen = $false; controlPassword = $false; controlSameProcess = $false
+            scrollSupported = $null -ne $scroll; pointAvailable = $click.pointAvailable; pointFinite = $false
+            pointDiagnosticsAvailable = $false; pointInsideControl = $false; pointInDesktop = $false; pointWindowOwned = $false
+            foregroundOwned = $false; modifiersReleased = $false; webViewNativeInputFocus = $false
+            accessibilityWindowNativeFocus = $false; threadDpiContextKnown = $false; threadDpiUnaware = $false
+            threadDpiSystemAware = $false; threadDpiPerMonitorAware = $false; windowDpiKnown = $false
+            windowAbove96Dpi = $false; realProviderJobs = 0 }
+        try {
+            $diagnostic.controlEnabled = $Control.Current.IsEnabled
+            $diagnostic.controlFocused = $Control.Current.HasKeyboardFocus
+            $diagnostic.controlOffscreen = $Control.Current.IsOffscreen
+            $diagnostic.controlPassword = $Control.Current.IsPassword
+            $diagnostic.controlSameProcess = $Control.Current.ProcessId -eq $script:window.Current.ProcessId
+            $diagnostic.controlStateAvailable = $true
+            $diagnostic.pointFinite = $click.pointAvailable -and -not [double]::IsNaN($click.point.X) -and
+                -not [double]::IsNaN($click.point.Y) -and -not [double]::IsInfinity($click.point.X) -and
+                -not [double]::IsInfinity($click.point.Y)
+            if ($diagnostic.pointFinite) {
+                $diagnostic.pointInsideControl = $Control.Current.BoundingRectangle.Contains($click.point)
+                $diagnostic.pointInDesktop = [ScarlettAcceptanceWindow]::PointInDesktop([int]$click.point.X, [int]$click.point.Y)
+                $diagnostic.pointWindowOwned = [ScarlettAcceptanceWindow]::PointOwnedByWindow($handle, [int]$click.point.X, [int]$click.point.Y)
+                $diagnostic.pointDiagnosticsAvailable = $true
+            }
+        } catch { }
+        try {
+            $diagnostic.foregroundOwned = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+            $diagnostic.modifiersReleased = [ScarlettAcceptanceWindow]::ModifiersReleased()
+            $diagnostic.webViewNativeInputFocus = [ScarlettAcceptanceWindow]::WebViewHasInputFocus($handle)
+            $diagnostic.accessibilityWindowNativeFocus = [ScarlettAcceptanceWindow]::AccessibilityWindowFocused($handle)
+            $awareness = [ScarlettAcceptanceWindow]::ThreadDpiAwareness()
+            $diagnostic.threadDpiContextKnown = $awareness -in @(0, 1, 2)
+            $diagnostic.threadDpiUnaware = $awareness -eq 0
+            $diagnostic.threadDpiSystemAware = $awareness -eq 1
+            $diagnostic.threadDpiPerMonitorAware = $awareness -eq 2
+            $dpi = [ScarlettAcceptanceWindow]::WindowDpi($handle)
+            $diagnostic.windowDpiKnown = $dpi -gt 0
+            $diagnostic.windowAbove96Dpi = $dpi -gt 96
+        } catch { }
         Write-Output ($diagnostic | ConvertTo-Json -Compress)
+        try {
+            New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+            $diagnostic | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-click-input-failure.json')
+        } catch { }
         throw $originalFailure
     }
-    [ScarlettAcceptanceWindow]::Click([int]$click.point.X, [int]$click.point.Y)
 }
 
 function Input-Advanced([string]$Name, [string]$NextName, [IntPtr]$Handle, [hashtable]$Diagnostic = $null) {
