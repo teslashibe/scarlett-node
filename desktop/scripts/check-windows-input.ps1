@@ -45,42 +45,45 @@ foreach ($scenario in $scenarios) {
 }
 Write-Output 'Synthetic inventory normalization preserved 0/1/3 records and identities'
 
-# Exercise the exact reviewed successor resolver without UIA or native input.
-$successors = @($ast.FindAll({
+# Bind the exact probe names and control types to the installed form markup.
+# This checks the real source before any app launch or native input injection.
+$probes = @($ast.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ceq 'Verify-KeyboardDelivery'
+}, $true))
+if ($probes.Count -ne 1) { throw 'Expected exactly one installed keyboard probe' }
+$resolvers = @($ast.FindAll({
     param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
         $node.Name -ceq 'X-AccountIDSuccessor'
 }, $true))
-if ($successors.Count -ne 1) { throw 'Expected exactly one X account input successor resolver' }
-Invoke-Expression $successors[0].Extent.Text
-function Find-Input([string]$Name) {
-    switch ($Name) {
-        'Browser profile' { return $script:successorScenario.profile }
-        'Import only X session cookies from this profile' { return $script:successorScenario.consent }
-        default { throw 'Unexpected input lookup in successor resolver' }
+if ($resolvers.Count -ne 0) { throw 'Keyboard probe must not depend on browser discovery' }
+$probe = $probes[0].Extent.Text
+$name = [regex]::Match($probe, '\$name = ''([^'']+)''').Groups[1].Value
+$nextName = [regex]::Match($probe, '\$nextName = ''([^'']+)''').Groups[1].Value
+$main = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../src/main.ts') -Raw
+$form = [regex]::Match($main, '<form id="x-login-form">([\s\S]*?)</form>').Groups[1].Value
+if ($form -ceq '') { throw 'Installed keyboard probe form is missing' }
+$source = [regex]::Match($form, '<label>([^<]+)<input id="x-login-id"([^>]*)>')
+$successor = [regex]::Match($form, '<label class="check"><input id="x-login-reconnect"([^>]*)>([^<]+)</label>')
+if (-not $source.Success -or -not $successor.Success -or
+    $name -cne $source.Groups[1].Value -or $nextName -cne $successor.Groups[2].Value) {
+    throw 'Installed keyboard probe names differ from their labelled controls'
+}
+if ($source.Groups[2].Value -match '\btype="password"|\bdisabled\b' -or
+    $successor.Groups[1].Value -notmatch '\btype="checkbox"' -or
+    $successor.Groups[1].Value -match '\bdisabled\b') {
+    throw 'Installed keyboard probe requires an enabled text field and checkbox'
+}
+$controls = @([regex]::Matches($form, '<(?:input|select|button)\b([^>]*)>') | ForEach-Object {
+    $attributes = $_.Groups[1].Value
+    if ($attributes -notmatch '\btype="hidden"') {
+        [regex]::Match($attributes, '\bid="([^"]+)"').Groups[1].Value
     }
+})
+if ($controls.Count -lt 2 -or $controls[0] -cne 'x-login-id' -or $controls[1] -cne 'x-login-reconnect' -or
+    $form -notmatch '<input id="x-login-capacity" type="hidden" value="1">') {
+    throw 'Installed keyboard probe controls are not adjacent in the visible form'
 }
-function Find-Button([string]$Name) {
-    if ($Name -cne 'Import X account') { throw 'Unexpected button lookup in successor resolver' }
-    return $script:successorScenario.import
-}
-$enabled = [pscustomobject]@{ Current = [pscustomobject]@{ IsEnabled = $true } }
-$disabled = [pscustomobject]@{ Current = [pscustomobject]@{ IsEnabled = $false } }
-foreach ($scenario in @(
-    @{ profile = $enabled; consent = $enabled; import = $disabled; expected = 'Browser profile' },
-    @{ profile = $disabled; consent = $disabled; import = $disabled; expected = 'auth_token' },
-    @{ profile = $null; consent = $null; import = $disabled; expected = 'auth_token' }
-)) {
-    $script:successorScenario = $scenario
-    if ((X-AccountIDSuccessor) -cne $scenario.expected) { throw 'X account input successor differs from its enabled controls' }
-}
-foreach ($scenario in @(
-    @{ profile = $disabled; consent = $enabled; import = $disabled },
-    @{ profile = $disabled; consent = $disabled; import = $enabled }
-)) {
-    $script:successorScenario = $scenario
-    $rejected = $false
-    try { X-AccountIDSuccessor | Out-Null } catch { $rejected = $true }
-    if (-not $rejected) { throw 'X account input successor accepted inconsistent import controls' }
-}
-Write-Output 'X account input successor covered enabled, disabled, absent and inconsistent import controls; no input injected'
+Write-Output 'Installed keyboard probe names, text/checkbox types and visible tab order match the real form; no input injected'
