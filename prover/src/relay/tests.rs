@@ -752,6 +752,85 @@ fn split_tag_inputs_are_bound_to_the_request_layout() {
     assert!(tag::node_record(&material, &[9..10], b"x", &[[0; 16]; 8]).is_err());
 }
 
+/// An unpaid relay profile with fresh TLS/OT state against the loopback server.
+/// The delay is per complete control frame, not a model of a particular WAN.
+#[tokio::test]
+#[ignore = "bounded unpaid local relay profile; run explicitly"]
+async fn benchmark_synthetic_relay_latency() {
+    use crate::diagnostics::{Phase, Trace};
+
+    fn median(values: &mut [f64]) -> f64 {
+        values.sort_by(f64::total_cmp);
+        (values[values.len() / 2 - 1] + values[values.len() / 2]) / 2.0
+    }
+
+    async fn forward<R, W>(mut reader: R, mut writer: W, delay: Duration)
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        while let Ok((kind, bytes)) = wire::recv(&mut reader).await {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            if wire::send(&mut writer, kind, &bytes).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    let server = server(response(), |_| {}).await;
+    let config = verifier::tls_config(server.roots.clone()).unwrap();
+    for delay_ms in [0, 25] {
+        let mut durations = Vec::new();
+        let mut phases = std::collections::BTreeMap::<String, Vec<f64>>::new();
+        for _ in 0..6 {
+            let trace = Trace::new();
+            let started = std::time::Instant::now();
+            let tcp = trace.measure(Phase::XTcpConnect, async {
+                let tcp = TcpStream::connect(server.addr).await?;
+                tcp.set_nodelay(true)?;
+                anyhow::Ok(tcp)
+            }).await.unwrap();
+            let (node_end, node_far) = tokio::io::duplex(1 << 20);
+            let (verifier_end, verifier_far) = tokio::io::duplex(1 << 20);
+            let (from_node, to_node) = tokio::io::split(node_far);
+            let (from_verifier, to_verifier) = tokio::io::split(verifier_far);
+            let delay = Duration::from_millis(delay_ms);
+            let up = tokio::spawn(forward(from_node, to_verifier, delay));
+            let down = tokio::spawn(forward(from_verifier, to_node, delay));
+            let node_trace = trace.clone();
+            let node = tokio::spawn(async move {
+                let raw = request();
+                node_trace.measure(Phase::RelaySession, node::session_observed(node_end, tcp, &raw, xpolicy::HOST, &node_trace)).await
+            });
+            let result = within(verifier::run(verifier_end, config.clone(), xpolicy::HOST, verifier::authorize_x)).await.unwrap();
+            let received = within(node).await.unwrap().unwrap();
+            up.abort();
+            down.abort();
+            assert_eq!(received, response());
+            assert_eq!(result.received, received);
+            assert_eq!(server.seen.lock().unwrap().as_deref(), Some(request().as_slice()));
+            durations.push(started.elapsed().as_secs_f64() * 1000.0);
+            let snapshot = serde_json::to_value(trace.snapshot()).unwrap();
+            for span in snapshot["spans"].as_array().unwrap() {
+                if span["duration_ms"].as_u64().unwrap() > 0 {
+                    phases.entry(span["phase"].as_str().unwrap().to_owned()).or_default().push(span["duration_ms"].as_u64().unwrap() as f64);
+                }
+            }
+        }
+        let p50 = median(&mut durations);
+        println!("synthetic_relay_profile control_frame_delay_ms={delay_ms} samples=6 median_ms={p50:.3} max_ms={:.3}", durations[5]);
+        for (phase, mut values) in phases {
+            // Only compare phases measured in every fresh session. Nested
+            // timings overlap and are never added to produce the total.
+            if values.len() == 6 {
+                println!("synthetic_relay_phase control_frame_delay_ms={delay_ms} phase={phase} samples=6 median_ms={:.3}", median(&mut values));
+            }
+        }
+    }
+}
+
 /// Not run by default: one unauthenticated relay session against the real
 /// x.com, with placeholder values where a session's would go. It shows that
 /// X's own TLS stack accepts the jointly sealed record. X answers with an
