@@ -2,7 +2,10 @@
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -239,12 +242,12 @@ class WindowsReleaseIdentityContracts(unittest.TestCase):
 class FailureDiagnostics(unittest.TestCase):
     """Failures name the operation and reason, never a native message, path or secret."""
 
-    def child(self, code, stdout='', stderr='', seconds=60, name='child.py'):
+    def child(self, code, stdout='', stderr='', seconds=60, name='child.py', operation='Signing scarlett-node'):
         with tempfile.TemporaryDirectory() as folder:
             script = Path(folder) / name
             script.write_text('import sys\nsys.stdout.write(%r)\nsys.stderr.write(%r)\nraise SystemExit(%d)\n' % (stdout, stderr, code))
             with self.assertRaises(signing.ChildFailure) as caught:
-                signing.run('Signing scarlett-node', [sys.executable, str(script)], folder, None, seconds)
+                signing.run(operation, [sys.executable, str(script)], folder, None, seconds)
         return str(caught.exception)
 
     def test_literal_powershell_reason_is_reported_with_exit_code(self):
@@ -291,6 +294,142 @@ class FailureDiagnostics(unittest.TestCase):
         stdout = 'Installed acceptance: started\n{"realProviderJobs":0,"acceptanceFailureLines":[1092,1210]}\n'
         self.assertEqual(self.child(1, stdout=stdout, stderr='native text D:\\a\n'),
                          'Signing scarlett-node failed with exit code 1: check-windows-install.ps1 lines 1092,1210')
+
+    def xlogin_record(self, **fields):
+        value = {'phase': 'browser-fixtures', 'category': 'assertion', 'exitCode': 1, 'elapsedMs': 12000}
+        value.update(fields)
+        return ('SCARLETT_X_LOGIN_FAILURE ' + json.dumps(value) + '\n').encode()
+
+    def test_xlogin_projection_preserves_literal_reason_and_exit(self):
+        stdout = self.xlogin_record(errorCode='ERR_ASSERTION', actual='login_failed', expected='verification_required',
+                                   failedCase=signing.XLOGIN_CASES[0], interceptedBrowserCasesPassed=6,
+                                   sourceBasename='interactive-x.test.js', sourceLine=110, sourceColumn=9,
+                                   fixtureError={'stage': 'start', 'errorName': 'TimeoutError', 'sourceBasename': 'legacy.js',
+                                                 'sourceLine': 210, 'sourceColumn': 8}).decode()
+        result = self.child(1, stdout=stdout, stderr='Installed browser acceptance process failed\n',
+                            operation='Installed acceptance')
+        prefix = 'Installed acceptance failed with exit code 1: Installed browser acceptance process failed; X-runtime '
+        self.assertTrue(result.startswith(prefix))
+        projection = json.loads(result.removeprefix(prefix))
+        self.assertEqual(projection, json.loads(stdout.removeprefix('SCARLETT_X_LOGIN_FAILURE ')))
+        self.assertNotIn('X-runtime', self.child(1, stdout=stdout))
+
+    def test_xlogin_projection_scopes_categories_and_drops_private_fields(self):
+        projection = signing.xlogin_failure(self.xlogin_record(
+            phase='manager', category='helper exited before readiness', failedCase='private case',
+            bearer='synthetic private bearer', sourceBasename='D:\\private\\secret.js', sourceLine=10,
+            sourceColumn=2, expected='private credential', actual='private path',
+            fixtureError={'stage': 'start', 'errorName': 'private error'}, private={'path': 'D:\\private'}))
+        self.assertEqual(projection, {'phase': 'manager', 'category': 'helper exited before readiness',
+                                      'exitCode': 1, 'elapsedMs': 12000})
+        headed = signing.xlogin_failure(self.xlogin_record(phase='headed-chrome', category='unclassified'))
+        self.assertEqual(headed['phase'], 'headed-chrome')
+        for fields in ({'phase': 'private'}, {'category': 'private native message'},
+                       {'phase': 'headed-chrome', 'category': 'assertion'}, {'phase': []}, {'category': {}}):
+            with self.subTest(fields=fields):
+                self.assertIsNone(signing.xlogin_failure(self.xlogin_record(**fields)))
+
+    def test_xlogin_projection_requires_strict_anchor_and_bounded_json(self):
+        valid = self.xlogin_record()
+        invalid = (b'prefix ' + valid, b' ' + valid, valid.rstrip() + b' private suffix\n',
+                   b'SCARLETT_X_LOGIN_FAILURE {malformed}\n',
+                   b'SCARLETT_X_LOGIN_FAILURE ' + json.dumps({'phase': 'manager', 'category': 'unclassified',
+                                                              'private': 'x' * 4096}).encode() + b'\n',
+                   b'SCARLETT_X_LOGIN_FAILURE {"phase":"manager","phase":"headed-chrome","category":"unclassified"}\n')
+        for record in invalid:
+            with self.subTest(record=record[:60]):
+                self.assertIsNone(signing.xlogin_failure(record))
+        self.assertEqual(signing.xlogin_failure(b'private noise\n' + valid), signing.xlogin_failure(valid))
+        nested = (b'SCARLETT_X_LOGIN_FAILURE {"phase":"manager","category":"unclassified","private":' +
+                  b'[' * 1100 + b'0' + b']' * 1100 + b'}\n')
+        result = signing.xlogin_failure(nested)
+        self.assertIn(result, (None, {'phase': 'manager', 'category': 'unclassified'}))
+
+    def test_xlogin_projection_validates_numeric_types_and_bounds(self):
+        for fields in ({'exitCode': True, 'elapsedMs': False, 'interceptedBrowserCasesPassed': True},
+                       {'exitCode': 0, 'elapsedMs': -1, 'interceptedBrowserCasesPassed': 8},
+                       {'exitCode': 2147483648, 'elapsedMs': 900001, 'interceptedBrowserCasesPassed': 1.5}):
+            with self.subTest(fields=fields):
+                result = signing.xlogin_failure(self.xlogin_record(**fields))
+                self.assertEqual(set(result), {'phase', 'category'})
+        for value in (None, 'private', float('nan'), float('inf'), -1000001, 10 ** 1000, [], {}):
+            with self.subTest(valueType=type(value).__name__):
+                result = signing.xlogin_failure(self.xlogin_record(actual=value, expected=value))
+                self.assertNotIn('actual', result)
+                self.assertNotIn('expected', result)
+        for value in (True, False, 1000000, -1000000, 1.5, 'verification_required'):
+            self.assertEqual(signing.xlogin_failure(self.xlogin_record(actual=value))['actual'], value)
+
+    def test_xlogin_projection_validates_nested_fixture_and_source_locations(self):
+        invalid = ({'sourceBasename': 'private.js', 'sourceLine': 1, 'sourceColumn': 1},
+                   {'sourceBasename': 'interactive-x.test.js', 'sourceLine': True, 'sourceColumn': 1},
+                   {'sourceBasename': 'interactive-x.test.js', 'sourceLine': 10000, 'sourceColumn': 1},
+                   {'sourceBasename': 'interactive-x.test.js', 'sourceLine': 1, 'sourceColumn': 1000})
+        for fields in invalid:
+            with self.subTest(fields=fields):
+                result = signing.xlogin_failure(self.xlogin_record(**fields, fixtureError={
+                    'stage': 'continue', 'errorName': 'Error', **fields, 'message': 'private'}))
+                self.assertFalse(set(fields) & set(result))
+                self.assertEqual(result['fixtureError'], {'stage': 'continue', 'errorName': 'Error'})
+        for fixture in ({'stage': 'private', 'errorName': 'Error'}, {'stage': 'start', 'errorName': 'private'}, [], 'private'):
+            self.assertNotIn('fixtureError', signing.xlogin_failure(self.xlogin_record(fixtureError=fixture)))
+
+    def test_xlogin_producer_emits_closed_record_before_best_effort_artifact(self):
+        source = (Path(__file__).with_name('check-windows-install.ps1')).read_text()
+        block = source.split('if ($process.ExitCode -ne 0) {', 1)[1].split('return $output', 1)[0]
+        self.assertIn("Write-Host ('SCARLETT_X_LOGIN_FAILURE ' + ($details | ConvertTo-Json -Depth 4 -Compress))", block)
+        self.assertLess(block.index('SCARLETT_X_LOGIN_FAILURE'), block.index('Set-Content'))
+        self.assertIn('} catch { }', block)
+        self.assertIn("throw 'Installed browser acceptance process failed'", block)
+
+    @unittest.skipUnless(sys.platform == 'win32', 'Native Windows PowerShell required')
+    def test_xlogin_native_assignment_keeps_stdout_record_and_original_failure(self):
+        powershell = shutil.which('powershell.exe')
+        self.assertIsNotNone(powershell)
+        harness = r'''
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $env:SCARLETT_DIAGNOSTIC_SOURCE, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -ne 0) { throw 'Diagnostic source did not parse' }
+foreach ($name in @('Get-XLoginFailureDetails', 'Invoke-XLoginAcceptanceProcess')) {
+    $definitions = @($ast.FindAll({ param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+    }, $true))
+    if ($definitions.Count -ne 1) { throw 'Diagnostic function is not unique' }
+    . ([scriptblock]::Create($definitions[0].Extent.Text))
+}
+# Deliberately missing: artifact writing must not replace the child failure.
+$EvidenceDirectory = Join-Path $PSScriptRoot 'absent-directory'
+$nativeShell = Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
+foreach ($discard in @($false, $true)) {
+    try {
+        if ($discard) {
+            $null = Invoke-XLoginAcceptanceProcess $nativeShell @('-NoProfile', '-NonInteractive', '-Command', 'exit 7') 10000 'headed-chrome'
+        } else {
+            $manager = Invoke-XLoginAcceptanceProcess $nativeShell @('-NoProfile', '-NonInteractive', '-Command', 'exit 7') 10000 'headed-chrome'
+        }
+        throw 'Diagnostic fixture unexpectedly succeeded'
+    } catch {
+        if ($_.Exception.Message -cne 'Installed browser acceptance process failed') { throw }
+        Write-Host 'SCARLETT_X_DIAGNOSTIC_HARNESS originalFailurePreserved'
+    }
+}
+'''
+        with tempfile.TemporaryDirectory() as folder:
+            script = Path(folder) / 'diagnostic-harness.ps1'
+            script.write_text(harness)
+            env = dict(os.environ, SCARLETT_DIAGNOSTIC_SOURCE=str(Path(__file__).with_name('check-windows-install.ps1')))
+            result = subprocess.run([powershell, '-NoProfile', '-NonInteractive', '-File', str(script)],
+                                    env=env, capture_output=True, timeout=40)
+        self.assertEqual(result.returncode, 0, 'Native closed-diagnostic harness failed')
+        self.assertEqual(result.stdout.count(b'SCARLETT_X_LOGIN_FAILURE '), 2)
+        self.assertEqual(result.stdout.count(b'SCARLETT_X_DIAGNOSTIC_HARNESS originalFailurePreserved'), 2)
+        projection = signing.xlogin_failure(result.stdout)
+        self.assertEqual(projection['phase'], 'headed-chrome')
+        self.assertEqual(projection['category'], 'unclassified')
+        self.assertEqual(projection['exitCode'], 7)
 
     def test_unavailable_or_slow_children_name_the_operation(self):
         with self.assertRaises(signing.ChildFailure) as caught:
