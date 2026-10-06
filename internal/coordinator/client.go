@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const Version = "node-v1"
@@ -63,12 +65,32 @@ type XRequest struct {
 	Pages     int    `json:"pages,omitempty"`
 }
 
+// ActiveLease is an already acquired coordinator lease occupying local work.
+// The coordinator only deduplicates references that match its live owned lease.
+// Other or absent references remain conservatively additive to reported work.
+type ActiveLease struct {
+	JobID   string `json:"job_id"`
+	Attempt string `json:"attempt"`
+	Fence   string `json:"fence"`
+}
+
+func (l ActiveLease) Valid() bool {
+	for _, value := range []string{l.JobID, l.Attempt, l.Fence} {
+		id, err := uuid.Parse(value)
+		if err != nil || id == uuid.Nil || id.String() != value {
+			return false
+		}
+	}
+	return true
+}
+
 type ServiceHealth struct {
-	Kind          string `json:"kind"`
-	State         string `json:"state"`
-	Capacity      int    `json:"capacity"`
-	InFlight      int    `json:"in_flight"`
-	LastErrorCode string `json:"last_error_code,omitempty"`
+	Kind          string        `json:"kind"`
+	State         string        `json:"state"`
+	Capacity      int           `json:"capacity"`
+	InFlight      int           `json:"in_flight"`
+	LastErrorCode string        `json:"last_error_code,omitempty"`
+	ActiveLeases  []ActiveLease `json:"active_leases,omitempty"`
 	// Local execution limits, not provider authorization or proven readiness.
 	MaxInputBytes   int      `json:"max_input_bytes,omitempty"`
 	MaxOutputTokens int      `json:"max_output_tokens,omitempty"`
@@ -167,6 +189,19 @@ func WithoutProofModes(services []ServiceHealth) ([]ServiceHealth, bool) {
 			s.ProofModes = nil
 		}
 		out[i] = s
+	}
+	return out, removed
+}
+
+// WithoutExtensions returns the conservative heartbeat understood by older
+// coordinators. A rollback retains additive occupancy and MPC-TLS execution.
+func WithoutExtensions(services []ServiceHealth) ([]ServiceHealth, bool) {
+	out, removed := WithoutProofModes(services)
+	for i := range out {
+		if out[i].ActiveLeases != nil {
+			removed = true
+			out[i].ActiveLeases = nil
+		}
 	}
 	return out, removed
 }

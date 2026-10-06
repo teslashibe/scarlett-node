@@ -4,6 +4,7 @@ go 1.25.13
 
 require (
 	filippo.io/edwards25519 v1.1.0
+	github.com/google/uuid v1.6.0
 	github.com/ncruces/go-sqlite3 v0.34.4
 	github.com/teslashibe/open-agent-api v0.1.32
 	github.com/teslashibe/x-go v1.13.0
@@ -14,7 +15,6 @@ require (
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/joho/godotenv v1.5.1 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect

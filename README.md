@@ -228,6 +228,7 @@ Settings come from the environment, typically via `~/.config/scarlett-node/node.
 | `SCARLETT_X_RELAY` | Serve X jobs proven by keyed relay; `0` serves MPC-TLS only |
 | `SCARLETT_CODEX_CONCURRENCY` | Total simultaneous Codex jobs across accounts |
 | `SCARLETT_X_CONCURRENCY` | Total simultaneous X jobs across accounts |
+| `SCARLETT_X_ACCOUNT_CONCURRENCY` | Optional ceiling per authenticated X account, 1–32; CLI default 32 retains the registry limit, desktop sets 1 |
 | `SCARLETT_X_REFRESH_SECONDS` | How often each warm X client refreshes its transaction-ID material and re-checks its session with X in the background (default 1800) |
 | `SCARLETT_STATE_DIR` | Private directory for identity, journal and account health |
 | `SCARLETT_BID` | Standing assignment bid; lower wins |

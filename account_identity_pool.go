@@ -223,6 +223,9 @@ func (p *servicePool) xGroupAvailable(a *pooledAccount) int {
 
 func (p *servicePool) xGroupLimit(a *pooledAccount) int {
 	limit := a.entry.capacity
+	if p.config.XAccountConcurrency > 0 {
+		limit = min(limit, p.config.XAccountConcurrency)
+	}
 	for _, other := range p.accounts {
 		if other.spec.Service == "x_read" && !other.removed && other.identity.ID == a.identity.ID {
 			limit = min(limit, other.entry.capacity)

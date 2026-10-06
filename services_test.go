@@ -230,3 +230,76 @@ func TestWarmableXAccountsFollowConfigurationAndHealth(t *testing.T) {
 		}
 	}
 }
+
+func TestHeartbeatLeaseReferencesTrackExactOccupiedAccountsUntilRelease(t *testing.T) {
+	p := multiPool(t)
+	p.config.XAccountConcurrency = 1
+	one, ok := p.acquireAccount("x_read")
+	if !ok {
+		t.Fatal("first account unavailable")
+	}
+	lease := coordinator.Lease{ServiceType: "x_read", JobID: "11111111-1111-4111-8111-111111111111", Attempt: "22222222-2222-4222-8222-222222222222", Fence: "33333333-3333-4333-8333-333333333333"}
+	p.bindCoordinatorLease(one, lease)
+	h := healthKind(t, p, "x_read")
+	if h.Capacity != 2 || h.InFlight != 1 || len(h.ActiveLeases) != 1 || h.ActiveLeases[0].JobID != lease.JobID {
+		t.Fatalf("occupied lease not represented exactly: %+v", h)
+	}
+	two, ok := p.acquireAccount("x_read")
+	if !ok || two.xIdentity == one.xIdentity {
+		t.Fatal("remaining authenticated lane unavailable")
+	}
+	wrongService := lease
+	wrongService.ServiceType = "codex"
+	p.bindCoordinatorLease(two, wrongService)
+	p.bindCoordinatorLease(two, lease) // A duplicate job never provides a second match.
+	opaque := lease
+	opaque.JobID = "synthetic-legacy-job"
+	p.bindCoordinatorLease(two, opaque)
+	h = healthKind(t, p, "x_read")
+	if h.InFlight != 2 || len(h.ActiveLeases) != 1 {
+		t.Fatal("unknown or duplicate work incorrectly deduplicable")
+	}
+	raw, err := json.Marshal(p.health())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, private := range []string{one.config.XSession, one.id, one.xIdentity, one.xStamp} {
+		if len(private) > 3 && bytes.Contains(raw, []byte(private)) {
+			t.Fatal("private account identity leaked in wire")
+		}
+	}
+	p.finishAccount(one, "")
+	h = healthKind(t, p, "x_read")
+	if h.InFlight != 1 || len(h.ActiveLeases) != 0 {
+		t.Fatal("completed lease reference remained occupied")
+	}
+	p.finishAccount(two, "report_pending")
+	h = healthKind(t, p, "x_read")
+	if h.InFlight != 0 || len(h.ActiveLeases) != 0 {
+		t.Fatal("pending reporting was asserted as active local execution")
+	}
+}
+
+func TestLegacyXAccountRespectsExplicitIdentityCeiling(t *testing.T) {
+	prior := poolFixture(t, "x_read")
+	c := prior.config
+	c.XConcurrency = 2
+	c.XAccountConcurrency = 1
+	p := newServicePool(c)
+	if h := healthKind(t, p, "x_read"); h.Capacity != 1 {
+		t.Fatalf("legacy account advertised excess capacity: %+v", h)
+	}
+	one, ok := p.acquireAccount("x_read")
+	if !ok {
+		t.Fatal("legacy account unavailable")
+	}
+	if _, ok := p.acquireAccount("x_read"); ok {
+		t.Fatal("legacy account bypassed identity ceiling")
+	}
+	p.finishAccount(one, "")
+	if again, ok := p.acquireAccount("x_read"); !ok {
+		t.Fatal("released legacy lane unavailable")
+	} else {
+		p.finishAccount(again, "")
+	}
+}

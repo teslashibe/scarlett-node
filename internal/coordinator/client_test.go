@@ -102,6 +102,7 @@ func TestWireFixtures(t *testing.T) {
 		{"lease-acceptance.json", &LeaseAcceptance{}},
 		{"lease-x.json", &Lease{}},
 		{"heartbeat-services.json", &Heartbeat{}},
+		{"heartbeat-active-leases.json", &Heartbeat{}},
 		{"proven.json", &Proven{}},
 		{"attempt-status.json", &AttemptStatus{}},
 		{"result.json", &Result{}},
@@ -276,5 +277,53 @@ func TestPollLongPollDeadlineIsWaitPlusGrace(t *testing.T) {
 	}
 	if time.Since(started) > 250*time.Millisecond {
 		t.Fatal("cancellation did not abort the held heartbeat", time.Since(started))
+	}
+}
+
+func TestActiveLeaseReferencesAreCanonicalAndCompatibilityIsConservative(t *testing.T) {
+	valid := ActiveLease{JobID: "11111111-1111-4111-8111-111111111111", Attempt: "22222222-2222-4222-8222-222222222222", Fence: "33333333-3333-4333-8333-333333333333"}
+	if !valid.Valid() {
+		t.Fatal("canonical owned reference rejected")
+	}
+	for _, change := range []func(*ActiveLease){
+		func(l *ActiveLease) { l.JobID = "00000000-0000-0000-0000-000000000000" },
+		func(l *ActiveLease) { l.Attempt = "1" },
+		func(l *ActiveLease) { l.Fence = "{33333333-3333-4333-8333-333333333333}" },
+		func(l *ActiveLease) { l.JobID = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA" },
+	} {
+		invalid := valid
+		change(&invalid)
+		if invalid.Valid() {
+			t.Fatal("noncanonical or nil reference accepted")
+		}
+	}
+	original := []ServiceHealth{{Kind: "x_read", State: "ready", Capacity: 2, InFlight: 1, ActiveLeases: []ActiveLease{valid}}}
+	stripped, removed := WithoutExtensions(original)
+	if !removed || stripped[0].ActiveLeases != nil || stripped[0].Capacity != 2 || stripped[0].InFlight != 1 || len(original[0].ActiveLeases) != 1 {
+		t.Fatal("compatibility fallback changed occupancy or original")
+	}
+	if _, removed = WithoutExtensions(stripped); removed {
+		t.Fatal("compatibility fallback was not stable")
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var h Heartbeat
+		if err := json.NewDecoder(r.Body).Decode(&h); err != nil {
+			t.Fatal(err)
+		}
+		if len(h.Services[0].ActiveLeases) > 0 {
+			http.Error(w, "invalid heartbeat", 400)
+			return
+		}
+		json.NewEncoder(w).Encode(HeartbeatReply{})
+	}))
+	defer server.Close()
+	h := Heartbeat{Version: Version, NodeID: "synthetic-node", Services: original}
+	client := New(server.URL, "synthetic-credential")
+	if _, err := client.Poll(context.Background(), h); !errors.Is(err, ErrHeartbeatRejected) {
+		t.Fatal("old coordinator rejection not classified")
+	}
+	h.Services = stripped
+	if _, err := client.Poll(context.Background(), h); err != nil {
+		t.Fatal("old shape not accepted", err)
 	}
 }

@@ -68,10 +68,13 @@ type Config struct {
 	XRefresh         time.Duration
 	CodexConcurrency int
 	XConcurrency     int
-	LocalFixture     bool
-	InferenceTimeout time.Duration
-	MaxInputBytes    int
-	MaxOutputTokens  int
+	// Optional per-authenticated-X-account ceiling; zero uses the account
+	// registry limit. Desktop pins this to one while allowing distinct accounts.
+	XAccountConcurrency int
+	LocalFixture        bool
+	InferenceTimeout    time.Duration
+	MaxInputBytes       int
+	MaxOutputTokens     int
 }
 
 var (
@@ -166,8 +169,8 @@ func Load() (Config, error) {
 			c.AccountsFile = filepath.Join(c.StateDir, "accounts.json")
 		}
 		c.Services = strings.Split(os.Getenv("SCARLETT_SERVICES"), ",")
-		c.CodexConcurrency, c.XConcurrency = 1, 1
-		for name, destination := range map[string]*int{"SCARLETT_CODEX_CONCURRENCY": &c.CodexConcurrency, "SCARLETT_X_CONCURRENCY": &c.XConcurrency} {
+		c.CodexConcurrency, c.XConcurrency, c.XAccountConcurrency = 1, 1, 32
+		for name, destination := range map[string]*int{"SCARLETT_CODEX_CONCURRENCY": &c.CodexConcurrency, "SCARLETT_X_CONCURRENCY": &c.XConcurrency, "SCARLETT_X_ACCOUNT_CONCURRENCY": &c.XAccountConcurrency} {
 			if value := os.Getenv(name); value != "" {
 				n, e := strconv.Atoi(value)
 				if e != nil || n < 1 || n > 32 {
@@ -281,7 +284,7 @@ func (c Config) Validate() error {
 		return nil
 	}
 	if c.Executor == ExecutorServices {
-		if c.LocalFixture || len(c.Services) < 1 || len(c.Services) > 2 || c.CodexConcurrency < 1 || c.CodexConcurrency > 32 || c.XConcurrency < 1 || c.XConcurrency > 32 {
+		if c.LocalFixture || len(c.Services) < 1 || len(c.Services) > 2 || c.CodexConcurrency < 1 || c.CodexConcurrency > 32 || c.XConcurrency < 1 || c.XConcurrency > 32 || c.XAccountConcurrency < 0 || c.XAccountConcurrency > 32 {
 			return errors.New("invalid independent service configuration")
 		}
 		seen := map[string]bool{}

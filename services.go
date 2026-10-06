@@ -31,11 +31,15 @@ type servicePool struct {
 	accountMode, accountsError, healthError bool
 	xCooldowns                              map[string]xIdentityCooldown
 	xInFlight                               map[string]int
+	activeCoordinatorLeases                 map[*accountLease]coordinator.ActiveLease
 	xIdentityError, xIdentityHealthError    bool
 }
 
 func newServicePool(c config.Config) *servicePool {
 	p := &servicePool{next: map[string]int{}, config: c, entries: map[string]*serviceEntry{"codex": {capacity: c.CodexConcurrency}, "x_read": {capacity: c.XConcurrency}}}
+	if c.XAccountConcurrency > 0 {
+		p.entries["x_read"].capacity = min(c.XConcurrency, c.XAccountConcurrency)
+	}
 	for _, kind := range c.Services {
 		p.entries[kind].enabled = true
 	}
@@ -69,6 +73,16 @@ func (p *servicePool) health() []coordinator.ServiceHealth {
 			}
 		}
 		h := coordinator.ServiceHealth{Kind: kind, State: s.state, Capacity: capacity, InFlight: s.inFlight, LastErrorCode: s.lastError}
+		for account, lease := range p.activeCoordinatorLeases {
+			if account.kind == kind {
+				h.ActiveLeases = append(h.ActiveLeases, lease)
+			}
+		}
+		sort.Slice(h.ActiveLeases, func(i, j int) bool { return h.ActiveLeases[i].JobID < h.ActiveLeases[j].JobID })
+		// An unreadable local pool must never assert more identities than work.
+		if len(h.ActiveLeases) > min(32, h.InFlight) {
+			h.ActiveLeases = nil
+		}
 		if s.enabled {
 			h.MaxInputBytes = p.config.MaxInputBytes
 			if kind == "codex" {

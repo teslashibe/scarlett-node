@@ -189,6 +189,7 @@ async fn save_desktop_preferences(
     data.validate()?;
     let _guard = runtime.0.lock().await;
     node.save_preferences(&data).await?;
+    node.set_x_concurrency(data.x_concurrency)?;
     preferences.updated(data)
 }
 #[tauri::command]
@@ -547,6 +548,14 @@ fn main() {
                 .map_err(|_| "invalid desktop endpoint configuration")?
                 .with_provider_runtime(&resources),
             ));
+            let x_concurrency = app
+                .state::<Arc<Preferences>>()
+                .snapshot()
+                .map_err(|_| "private desktop preferences unavailable")?
+                .x_concurrency;
+            app.state::<Arc<Node>>()
+                .set_x_concurrency(x_concurrency)
+                .map_err(|_| "invalid desktop X concurrency")?;
             let login_node = app.state::<Arc<Node>>().inner().clone();
             tauri::async_runtime::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));

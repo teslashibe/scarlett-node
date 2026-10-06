@@ -308,6 +308,7 @@ pub struct Node {
     x_login: Mutex<Option<XLogin>>,
     x_login_cancel: Notify,
     x_login_cancelled: AtomicBool,
+    x_concurrency: std::sync::atomic::AtomicU8,
     x_login_resources: PathBuf,
     x_login_browser: Option<PathBuf>,
 }
@@ -670,6 +671,9 @@ impl Node {
             x_login: Mutex::new(None),
             x_login_cancel: Notify::new(),
             x_login_cancelled: AtomicBool::new(false),
+            x_concurrency: std::sync::atomic::AtomicU8::new(
+                crate::preferences::default_x_concurrency(),
+            ),
             x_login_resources: PathBuf::new(),
             x_login_browser: None,
         }
@@ -700,6 +704,15 @@ impl Node {
             coordinator_ca.as_deref(),
         )?;
         Ok(node)
+    }
+    /// Device setting for the next child process. A running node keeps its
+    /// accepted account leases and is never restarted by a preferences write.
+    pub fn set_x_concurrency(&self, concurrency: u8) -> Result<()> {
+        if !(1..=8).contains(&concurrency) {
+            return Err(Error::InvalidInput);
+        }
+        self.x_concurrency.store(concurrency, Ordering::SeqCst);
+        Ok(())
     }
     pub fn network_url(&self, destination: &str) -> Result<String> {
         let path = match destination {
@@ -747,6 +760,11 @@ impl Node {
             .env("SCARLETT_VERIFIER", &self.endpoints.verifier)
             .env("SCARLETT_EXECUTOR", "services")
             .env("SCARLETT_SERVICES", "codex,x_read")
+            .env(
+                "SCARLETT_X_CONCURRENCY",
+                self.x_concurrency.load(Ordering::SeqCst).to_string(),
+            )
+            .env("SCARLETT_X_ACCOUNT_CONCURRENCY", "1")
             .env("SCARLETT_PROFILE", "standard")
             .env("SCARLETT_PROVER", &self.helper)
             .env(
@@ -2569,6 +2587,42 @@ esac
             serde_json::to_string(&Error::CommandFailed).unwrap(),
             "\"command_failed\""
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn launcher_sets_bounded_x_capacity_without_inheriting_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("node");
+        std::fs::write(&binary, "synthetic node").unwrap();
+        let node = Node::new(
+            temp.path().join("state"),
+            binary,
+            temp.path().join("helper"),
+        );
+        let assert_env = |expected: &str| {
+            let command = node.command(&["desktop", "run"]).unwrap();
+            let env: std::collections::HashMap<_, _> = command.as_std().get_envs().collect();
+            assert_eq!(
+                env.get(std::ffi::OsStr::new("SCARLETT_X_CONCURRENCY"))
+                    .unwrap()
+                    .unwrap(),
+                std::ffi::OsStr::new(expected)
+            );
+            assert_eq!(
+                env.get(std::ffi::OsStr::new("SCARLETT_X_ACCOUNT_CONCURRENCY"))
+                    .unwrap()
+                    .unwrap(),
+                std::ffi::OsStr::new("1")
+            );
+            assert!(!env.contains_key(std::ffi::OsStr::new("SCARLETT_CREDENTIAL")));
+        };
+        assert_env("2");
+        node.set_x_concurrency(4).unwrap();
+        assert_env("4");
+        for invalid in [0, 9, u8::MAX] {
+            assert_eq!(node.set_x_concurrency(invalid), Err(Error::InvalidInput));
+        }
+        assert_env("4");
     }
     #[cfg(unix)]
     #[tokio::test]
