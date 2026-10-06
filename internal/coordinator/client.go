@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -186,49 +188,110 @@ type ChallengeEcho struct {
 type HeartbeatReply struct {
 	Lease     *Lease     `json:"lease"`
 	Challenge *Challenge `json:"challenge,omitempty"`
+	// RetryAfter is the reply's Retry-After header, clamped, or zero when it
+	// has none. A coordinator that is shutting down answers a held heartbeat
+	// at once with no lease and a short Retry-After. Never part of the body.
+	RetryAfter time.Duration `json:"-"`
 }
 
-// ErrHeartbeatRejected is a heartbeat the coordinator refused as invalid. A
-// coordinator older than a heartbeat field rejects the whole report, so the
-// caller may retry with the fields that coordinator knows.
+// ErrHeartbeatRejected is a heartbeat the coordinator refused as invalid (400)
+// or too large (413). Resending the same report cannot succeed, so the node
+// logs it and backs off; it never resends a reduced shape.
 var ErrHeartbeatRejected = errors.New("coordinator rejected the heartbeat")
 
-// WithoutProofModes returns a copy of the services with proof_modes removed,
-// and whether anything was removed: the heartbeat a coordinator that predates
-// the field accepts.
-func WithoutProofModes(services []ServiceHealth) ([]ServiceHealth, bool) {
-	out := make([]ServiceHealth, len(services))
-	removed := false
-	for i, s := range services {
-		if s.ProofModes != nil {
-			removed = true
-			s.ProofModes = nil
-		}
-		out[i] = s
-	}
-	return out, removed
+// A Retry-After from the coordinator is clamped to [MinRetryAfter,
+// MaxRetryAfter] before the node waits on it.
+const (
+	MinRetryAfter = time.Second
+	MaxRetryAfter = 60 * time.Second
+)
+
+// ErrorReply is the coordinator's JSON error body. The node reads only the
+// code, and only to decide whether a request is worth repeating.
+type ErrorReply struct {
+	Error ErrorDetail `json:"error"`
+}
+type ErrorDetail struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }
 
-// WithoutExtensions returns the conservative heartbeat understood by older
-// coordinators. A rollback retains additive occupancy and MPC-TLS execution.
-func WithoutExtensions(services []ServiceHealth) ([]ServiceHealth, bool) {
-	out, removed := WithoutProofModes(services)
-	for i := range out {
-		if out[i].ConfiguredCapacity != nil || out[i].RunnableCapacity != nil || out[i].ActiveAccounts != nil || out[i].ReadyAccounts != nil || out[i].CoolingAccounts != nil || out[i].NextReadyAt != nil || out[i].OperationAvailability != nil {
-			removed = true
-			out[i].ConfiguredCapacity, out[i].ActiveAccounts, out[i].ReadyAccounts, out[i].CoolingAccounts, out[i].NextReadyAt = nil, nil, nil, nil, nil
-			out[i].RunnableCapacity = nil
-			out[i].OperationAvailability = nil
-			if out[i].Capacity == 0 && (out[i].State == "configured" || out[i].State == "ready") {
-				out[i].State = "exhausted"
-			}
-		}
-		if out[i].ActiveLeases != nil {
-			removed = true
-			out[i].ActiveLeases = nil
+// StatusError is a coordinator answer outside 2xx. Code is the error code of
+// its JSON body, empty when the body has none; RetryAfter is its clamped
+// Retry-After header, zero when it has none.
+type StatusError struct {
+	Status     int
+	Code       string
+	RetryAfter time.Duration
+}
+
+func (e *StatusError) Error() string {
+	if e.Code != "" {
+		return fmt.Sprintf("coordinator HTTP %d %s", e.Status, e.Code)
+	}
+	return fmt.Sprintf("coordinator HTTP %d", e.Status)
+}
+
+// maxErrorBytes bounds the error body read for its code.
+const maxErrorBytes = 4 << 10
+
+// statusError reads a non-2xx answer. The code reaches logs, so only a short
+// lowercase machine code is kept.
+func statusError(resp *http.Response) error {
+	e := &StatusError{Status: resp.StatusCode, RetryAfter: retryAfter(resp.Header, time.Now())}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBytes+1))
+	var reply ErrorReply
+	if err == nil && len(data) <= maxErrorBytes && json.Unmarshal(data, &reply) == nil && errorCode(reply.Error.Code) {
+		e.Code = reply.Error.Code
+	}
+	return e
+}
+
+func errorCode(code string) bool {
+	if code == "" || len(code) > 64 {
+		return false
+	}
+	for _, r := range code {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' {
+			return false
 		}
 	}
-	return out, removed
+	return true
+}
+
+// retryAfter reads a Retry-After header, in seconds or as an HTTP date, and
+// clamps it to [MinRetryAfter, MaxRetryAfter]. It returns zero when the header
+// is absent or unreadable.
+func retryAfter(header http.Header, now time.Time) time.Duration {
+	value := strings.TrimSpace(header.Get("Retry-After"))
+	if value == "" {
+		return 0
+	}
+	var wait time.Duration
+	seconds, err := strconv.ParseUint(value, 10, 64)
+	switch {
+	case err == nil:
+		wait = time.Duration(min(seconds, uint64(MaxRetryAfter/time.Second))) * time.Second
+	case errors.Is(err, strconv.ErrRange):
+		wait = MaxRetryAfter
+	default:
+		at, err := http.ParseTime(value)
+		if err != nil {
+			return 0
+		}
+		wait = at.Sub(now)
+	}
+	return min(max(wait, MinRetryAfter), MaxRetryAfter)
+}
+
+// RetryAfterWait is how long to wait on a clamped Retry-After: the value plus
+// a random share of up to half of it again, so nodes the coordinator asked to
+// wait the same time do not all come back at once.
+func RetryAfterWait(retryAfter time.Duration) time.Duration {
+	if retryAfter <= 0 {
+		return 0
+	}
+	return retryAfter + rand.N(retryAfter/2+1)
 }
 
 // Poll echoes an app-issued challenge before returning any lease to inference.
@@ -240,9 +303,9 @@ func (c *Client) Poll(ctx context.Context, h Heartbeat) (HeartbeatReply, error) 
 	var reply HeartbeatReply
 	pollCtx, cancel := context.WithTimeout(ctx, c.heartbeatTimeout(h.WaitSeconds))
 	defer cancel()
-	status, err := c.post(pollCtx, "/api/node/v1/heartbeat", h, &reply, true)
-	if status == http.StatusBadRequest {
-		return HeartbeatReply{}, ErrHeartbeatRejected
+	status, header, err := c.post(pollCtx, "/api/node/v1/heartbeat", h, &reply, true)
+	if status == http.StatusBadRequest || status == http.StatusRequestEntityTooLarge {
+		return HeartbeatReply{}, fmt.Errorf("%w: %w", ErrHeartbeatRejected, err)
 	}
 	if err != nil {
 		return HeartbeatReply{}, err
@@ -250,6 +313,7 @@ func (c *Client) Poll(ctx context.Context, h Heartbeat) (HeartbeatReply, error) 
 	if status != http.StatusOK {
 		return HeartbeatReply{}, errors.New("unexpected heartbeat status")
 	}
+	reply.RetryAfter = retryAfter(header, time.Now())
 	if reply.Challenge == nil {
 		return reply, nil
 	}
@@ -281,6 +345,8 @@ type Client struct {
 	HTTP                *http.Client
 	// heartbeatGrace overrides HeartbeatGrace; tests shorten it.
 	heartbeatGrace time.Duration
+	// retryWait overrides RetryAfterWait for acceptance retries; tests shorten it.
+	retryWait func(retryAfter time.Duration) time.Duration
 }
 
 // heartbeatTimeout is the deadline of one heartbeat: the hold the node asked
@@ -314,33 +380,36 @@ func New(origin, credential string) *Client {
 	return &Client{Origin: origin, Credential: credential, HTTP: &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 }
 
-// Post sends one report under the client's 10-second timeout.
+// Post sends one report under the client's 10-second timeout. An answer
+// outside 2xx is a *StatusError.
 func (c *Client) Post(ctx context.Context, path string, body any, out any) (int, error) {
-	return c.post(ctx, path, body, out, false)
+	status, _, err := c.post(ctx, path, body, out, false)
+	return status, err
 }
 
 // post is Post, or with longPoll the same request bounded only by ctx: the
-// client's timeout would cut a heartbeat hold short.
-func (c *Client) post(ctx context.Context, path string, body any, out any, longPoll bool) (int, error) {
+// client's timeout would cut a heartbeat hold short. It also returns the
+// response headers, which carry Retry-After.
+func (c *Client) post(ctx context.Context, path string, body any, out any, longPoll bool) (int, http.Header, error) {
 	var raw []byte
 	var err error
 	if exact, ok := body.(json.RawMessage); ok {
 		if !json.Valid(exact) {
-			return 0, errors.New("invalid coordinator report")
+			return 0, nil, errors.New("invalid coordinator report")
 		}
 		raw = exact // preserve the journal's submission hash, including whitespace
 	} else {
 		raw, err = json.Marshal(body)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 	}
 	if len(raw) > 131072 {
-		return 0, errors.New("request too large")
+		return 0, nil, errors.New("request too large")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Origin+path, bytes.NewReader(raw))
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -356,25 +425,25 @@ func (c *Client) post(ctx context.Context, path string, body any, out any, longP
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, errors.New("coordinator unavailable")
+		return 0, nil, errors.New("coordinator unavailable")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNoContent {
-		return resp.StatusCode, nil
+		return resp.StatusCode, resp.Header, nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return resp.StatusCode, fmt.Errorf("coordinator HTTP %d", resp.StatusCode)
+		return resp.StatusCode, resp.Header, statusError(resp)
 	}
 	if out != nil {
 		data, err := io.ReadAll(io.LimitReader(resp.Body, maxReplyBytes+1))
 		if err != nil || len(data) > maxReplyBytes {
-			return resp.StatusCode, errors.New("coordinator response too large")
+			return resp.StatusCode, resp.Header, errors.New("coordinator response too large")
 		}
 		if err = json.Unmarshal(data, out); err != nil {
-			return resp.StatusCode, errors.New("invalid coordinator response")
+			return resp.StatusCode, resp.Header, errors.New("invalid coordinator response")
 		}
 	}
-	return resp.StatusCode, nil
+	return resp.StatusCode, resp.Header, nil
 }
 func JobPath(id, kind string) (string, error) {
 	if id == "" || len(id) > 128 || strings.ContainsAny(id, "/\\?&# \t\n\r") {

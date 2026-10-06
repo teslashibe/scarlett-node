@@ -74,18 +74,6 @@ func blockOperationAvailability(services []coordinator.ServiceHealth) {
 	}
 }
 
-// The compatibility retry must recompute the whole old contract after optional
-// physical and operation hints are removed, including during rollback.
-func legacyServiceHeartbeat(h coordinator.Heartbeat, blocked bool) coordinator.Heartbeat {
-	h.Capacity, h.State = 0, "exhausted"
-	for _, service := range h.Services {
-		h.Capacity += service.Capacity
-		if !blocked && (service.State == "configured" || service.State == "ready") && service.Capacity > service.InFlight {
-			h.State = "available"
-		}
-	}
-	return h
-}
 func (p *servicePool) health() []coordinator.ServiceHealth {
 	p.mu.Lock()
 	defer p.mu.Unlock()

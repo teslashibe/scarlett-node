@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -128,6 +130,51 @@ const heartbeatWatchInterval = time.Second
 // errHeartbeatStale ends a held heartbeat whose advertised availability the
 // node has since changed. It is not a coordinator failure and earns no backoff.
 var errHeartbeatStale = errors.New("heartbeat availability changed while held")
+
+// Failed heartbeats back off from heartbeatBackoffBase, doubling to
+// heartbeatBackoffCap: well inside the coordinator's 30-second staleness rule,
+// so no single pause outlasts a node's freshness at the coordinator.
+const (
+	heartbeatBackoffBase = time.Second
+	heartbeatBackoffCap  = 15 * time.Second
+)
+
+// heartbeatBackoff paces heartbeats after consecutive failures. Each pause has
+// equal jitter: half the current step plus a random share of the other half,
+// never under heartbeatBackoffBase. Nodes that failed together, as across a
+// coordinator deploy, come back spread over seconds instead of in one wave.
+// An answered heartbeat resets it.
+type heartbeatBackoff struct {
+	step time.Duration
+	// fixed replaces the schedule with one constant pause (the local fixture).
+	fixed time.Duration
+	// jitter returns a duration in [0, n]; nil draws it uniformly. Tests pin it.
+	jitter func(n time.Duration) time.Duration
+}
+
+// next is the pause after a failed heartbeat. A 429 or 503 that carries
+// Retry-After waits at least that long, clamped, plus jitter.
+func (b *heartbeatBackoff) next(err error) time.Duration {
+	wait := b.fixed
+	if wait == 0 {
+		b.step = min(max(2*b.step, heartbeatBackoffBase), heartbeatBackoffCap)
+		half := b.step / 2
+		spread := b.step - half
+		if b.jitter != nil {
+			wait = half + min(max(b.jitter(spread), 0), spread)
+		} else {
+			wait = half + rand.N(spread+1)
+		}
+		wait = max(wait, heartbeatBackoffBase)
+	}
+	var status *coordinator.StatusError
+	if errors.As(err, &status) && (status.Status == http.StatusTooManyRequests || status.Status == http.StatusServiceUnavailable) && status.RetryAfter > 0 {
+		wait = max(wait, coordinator.RetryAfterWait(status.RetryAfter))
+	}
+	return wait
+}
+
+func (b *heartbeatBackoff) reset() { b.step = 0 }
 
 // availability is every local input to a heartbeat's advertised state that can
 // change while the coordinator holds it: an operator drain, a rest after the
@@ -266,10 +313,13 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	}
 	// The heartbeat is a long poll: while idle the coordinator holds it for
 	// HeartbeatWaitSeconds and answers the moment a job is funded, so the loop
-	// adds no delay of its own. backoff is the pause after a failed heartbeat.
-	backoff := 5 * time.Second
+	// adds no delay of its own. failures paces heartbeats after a failure, and
+	// drainRejectDelay is the pause after rejecting a lease during a drain.
+	failures := heartbeatBackoff{}
+	drainRejectDelay := 5 * time.Second
 	if c.LocalFixture {
-		backoff = time.Second
+		failures.fixed = time.Second
+		drainRejectDelay = time.Second
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	if owner != nil {
@@ -369,9 +419,6 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	var restUntil time.Time
 	inFlight := map[string]struct{}{}
 	legacyCodexBlocked := false
-	// legacyHeartbeat is set once the coordinator has rejected optional service
-	// extensions; from then on the node sends the older shape.
-	legacyHeartbeat := false
 	// currentAvailability rereads, without the loop's side effects, what a
 	// heartbeat's advertised state is built from.
 	currentAvailability := func() availability {
@@ -428,9 +475,6 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 		if services != nil {
 			h.Services = services.health()
 			sent.services = serviceStates(h.Services)
-			if legacyHeartbeat {
-				h.Services, _ = coordinator.WithoutExtensions(h.Services)
-			}
 			h.Capacity = 0
 			for _, service := range h.Services {
 				h.Capacity += service.Capacity
@@ -497,11 +541,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			defer close(watched)
 			watchHeartbeat(pollCtx, cancelPoll, sent, currentAvailability, availabilityChanges)
 		}()
-		wasLegacy := legacyHeartbeat
-		reply, err := pollHeartbeatWithFallback(pollCtx, client, h, &legacyHeartbeat, drained || resting || journalCapacity.AvailableRecords <= len(slots))
-		if !wasLegacy && legacyHeartbeat {
-			fmt.Fprintln(os.Stderr, "heartbeat: coordinator rejected optional service extensions; advertising the legacy service shape until restart")
-		}
+		reply, err := client.Poll(pollCtx, h)
 		stale := err != nil && errors.Is(context.Cause(pollCtx), errHeartbeatStale)
 		cancelPoll(nil)
 		<-watched
@@ -511,8 +551,11 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			continue
 		}
 		if err != nil {
+			// A rejected heartbeat (400 or 413) is logged and backed off like
+			// any other failure; the node never resends it in a reduced shape.
 			fmt.Fprintln(os.Stderr, "heartbeat:", err)
 		} else if reply.Lease != nil {
+			failures.reset()
 			status.LastHeartbeatAt = time.Now().UTC()
 			// Read again after polling: drain may have arrived while the request
 			// was in flight. Never start newly delivered work while draining.
@@ -527,7 +570,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 				select {
 				case <-ctx.Done():
 					return nil
-				case <-time.After(backoff):
+				case <-time.After(drainRejectDelay):
 				}
 				continue
 			}
@@ -643,14 +686,23 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			continue
 		} else {
 			// An idle hold ended with nothing to do; the next long poll is the
-			// wait, so loop straight into it.
+			// wait, so loop straight into it. A coordinator that is shutting
+			// down answers at once and asks, with Retry-After, for a pause.
+			failures.reset()
 			status.LastHeartbeatAt = time.Now().UTC()
+			if reply.RetryAfter > 0 {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(coordinator.RetryAfterWait(reply.RetryAfter)):
+				}
+			}
 			continue
 		}
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-time.After(backoff):
+		case <-time.After(failures.next(err)):
 		}
 	}
 	return nil

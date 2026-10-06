@@ -5,12 +5,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -188,5 +192,160 @@ func TestFundedAcceptanceBindsMicroUSDQuoteCommitment(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// acceptRetryServer answers acceptance requests from replies in order, then
+// accepts the exact offer. Each reply is a status, a Retry-After and a code.
+type acceptReply struct {
+	status     int
+	retryAfter string
+	code       string
+}
+
+func acceptRetryServer(t *testing.T, offer Lease, replies []acceptReply) (*Client, *atomic.Int32, func() []time.Time) {
+	t.Helper()
+	var calls atomic.Int32
+	var mu sync.Mutex
+	arrivals := []time.Time{}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var in map[string]string
+		if r.URL.Path != "/api/node/v1/jobs/"+offer.JobID+"/accept" || json.NewDecoder(r.Body).Decode(&in) != nil || in["attempt"] != offer.Attempt || in["fence"] != offer.Fence || in["terms_sha256"] != offer.SignedJobID {
+			t.Error("retry changed the acceptance request")
+		}
+		n := int(calls.Add(1)) - 1
+		mu.Lock()
+		arrivals = append(arrivals, time.Now())
+		mu.Unlock()
+		if n < len(replies) {
+			if replies[n].retryAfter != "" {
+				w.Header().Set("Retry-After", replies[n].retryAfter)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(replies[n].status)
+			if replies[n].code != "" {
+				json.NewEncoder(w).Encode(ErrorReply{Error: ErrorDetail{Code: replies[n].code, Message: "synthetic"}})
+			}
+			return
+		}
+		accepted := offer
+		accepted.VerifierToken = strings.Repeat("c", 64)
+		json.NewEncoder(w).Encode(LeaseAcceptance{Version: Version, State: "leased", FundingAuthority: "production_receipt", Lease: accepted})
+	}))
+	t.Cleanup(server.Close)
+	client := New(server.URL, "synthetic-credential")
+	client.HTTP = server.Client()
+	return client, &calls, func() []time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]time.Time(nil), arrivals...)
+	}
+}
+
+func retryOffer(deadline time.Duration) Lease {
+	offer := Lease{Version: Version, ServiceType: "codex", JobID: "synthetic-retry", SignedJobID: strings.Repeat("a", 64), RequestSHA256: strings.Repeat("b", 64), Attempt: "attempt", Fence: "fence", Profile: "p", AcceptanceRequired: true, LeaseDeadline: time.Now().Add(deadline)}
+	offer.SettlementDeadline = offer.LeaseDeadline
+	return offer
+}
+
+// A busy or temporarily unavailable coordinator is asked again inside the same
+// acceptance, after each Retry-After (one second when absent, clamped to a
+// minute), with the identical request.
+func TestAcceptRetriesBusyAndUnavailableHonouringRetryAfter(t *testing.T) {
+	offer := retryOffer(time.Minute)
+	client, calls, _ := acceptRetryServer(t, offer, []acceptReply{{503, "2", "dispatch_busy"}, {503, "", "network_unavailable"}, {503, "600", "dispatch_busy"}})
+	var waits []time.Duration
+	client.retryWait = func(after time.Duration) time.Duration {
+		waits = append(waits, after)
+		return time.Millisecond
+	}
+	got, err := client.Accept(context.Background(), offer)
+	if err != nil || got.VerifierToken != strings.Repeat("c", 64) {
+		t.Fatal("retried acceptance failed", err)
+	}
+	if calls.Load() != 4 || !reflect.DeepEqual(waits, []time.Duration{2 * time.Second, time.Second, MaxRetryAfter}) {
+		t.Fatalf("calls %d, Retry-After waits %v", calls.Load(), waits)
+	}
+}
+
+// At most three retries; the last busy answer is returned as the error.
+func TestAcceptRetryLimit(t *testing.T) {
+	offer := retryOffer(time.Minute)
+	busy := acceptReply{503, "1", "dispatch_busy"}
+	client, calls, _ := acceptRetryServer(t, offer, []acceptReply{busy, busy, busy, busy, busy})
+	retries := 0
+	client.retryWait = func(time.Duration) time.Duration { retries++; return time.Millisecond }
+	_, err := client.Accept(context.Background(), offer)
+	var status *StatusError
+	if !errors.As(err, &status) || status.Status != 503 || status.Code != "dispatch_busy" {
+		t.Fatal("exhausted retries reported as", err)
+	}
+	if calls.Load() != 1+acceptRetries || retries != acceptRetries {
+		t.Fatalf("calls %d, retries %d", calls.Load(), retries)
+	}
+}
+
+// Refusals, rate limits and other unavailability are final: one request each.
+func TestAcceptNeverRetriesRefusals(t *testing.T) {
+	for _, reply := range []acceptReply{{401, "1", "node_unauthorized"}, {404, "1", "attempt_unavailable"}, {409, "1", "attempt_conflict"}, {429, "1", "rate_limited"}, {400, "", "invalid_request"}, {503, "1", "dispatch_unavailable"}, {503, "1", ""}, {500, "1", "network_unavailable"}} {
+		offer := retryOffer(time.Minute)
+		client, calls, _ := acceptRetryServer(t, offer, []acceptReply{reply, reply})
+		client.retryWait = func(time.Duration) time.Duration { t.Error("refusal retried", reply); return time.Millisecond }
+		if _, err := client.Accept(context.Background(), offer); err == nil {
+			t.Fatal("refused acceptance authorized work", reply)
+		}
+		if calls.Load() != 1 {
+			t.Fatalf("%+v: %d requests", reply, calls.Load())
+		}
+	}
+}
+
+// No retry starts later than 30 seconds before the lease deadline: the rest of
+// the lease belongs to provider work.
+func TestAcceptRetryStopsBeforeLeaseDeadline(t *testing.T) {
+	busy := acceptReply{503, "15", "dispatch_busy"}
+	offer := retryOffer(40 * time.Second)
+	client, calls, _ := acceptRetryServer(t, offer, []acceptReply{busy, busy})
+	started := time.Now()
+	if _, err := client.Accept(context.Background(), offer); err == nil {
+		t.Fatal("busy acceptance authorized work")
+	}
+	if calls.Load() != 1 || time.Since(started) > time.Second {
+		t.Fatalf("retried into the last 30 seconds: %d requests in %v", calls.Load(), time.Since(started))
+	}
+	// One-second waits fit twice before the margin, not three times.
+	unavailable := acceptReply{503, "", "network_unavailable"}
+	offer = retryOffer(acceptRetryMargin + 2500*time.Millisecond)
+	client, calls, _ = acceptRetryServer(t, offer, []acceptReply{unavailable, unavailable, unavailable, unavailable})
+	client.retryWait = func(after time.Duration) time.Duration { return after }
+	if _, err := client.Accept(context.Background(), offer); err == nil {
+		t.Fatal("unavailable acceptance authorized work")
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("%d requests before the deadline margin, want 3", calls.Load())
+	}
+}
+
+// The real wait honours Retry-After plus jitter, and cancellation ends it.
+func TestAcceptRetryWaitsRetryAfterAndStopsOnCancel(t *testing.T) {
+	offer := retryOffer(time.Minute)
+	client, calls, arrivals := acceptRetryServer(t, offer, []acceptReply{{503, "1", "dispatch_busy"}})
+	if _, err := client.Accept(context.Background(), offer); err != nil {
+		t.Fatal(err)
+	}
+	at := arrivals()
+	if gap := at[1].Sub(at[0]); calls.Load() != 2 || gap < time.Second || gap > 2500*time.Millisecond {
+		t.Fatalf("retry after %v, %d requests", gap, calls.Load())
+	}
+	client, calls, _ = acceptRetryServer(t, offer, []acceptReply{{503, "1", "dispatch_busy"}})
+	client.retryWait = func(time.Duration) time.Duration { return 10 * time.Second }
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	started := time.Now()
+	if _, err := client.Accept(ctx, offer); err == nil {
+		t.Fatal("cancelled acceptance authorized work")
+	}
+	if calls.Load() != 1 || time.Since(started) > time.Second {
+		t.Fatalf("cancel did not end the retry wait: %d requests in %v", calls.Load(), time.Since(started))
 	}
 }
