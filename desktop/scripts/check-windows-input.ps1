@@ -18,6 +18,34 @@ if ([IntPtr]::Size -eq 8) { $expectedSize = 40 }
 if ([ScarlettAcceptanceWindow]::InputSize() -ne $expectedSize) { throw 'Native input layout differs from the platform ABI' }
 Write-Output 'Native Windows acceptance input compiled with the correct ABI; no input injected'
 
+# Exercise the exact bounds guard with a point that cannot belong to the desktop.
+# Fail before calling Click if the guard disagrees, so this never injects input.
+if ([ScarlettAcceptanceWindow]::PointInDesktop([int]::MinValue, [int]::MinValue)) {
+    throw 'Native click bounds guard accepted the invalid test point'
+}
+[ScarlettAcceptanceWindow]::ResetInputDiagnostics()
+$rejected = $false
+try { [ScarlettAcceptanceWindow]::Click([int]::MinValue, [int]::MinValue) } catch { $rejected = $true }
+if (-not $rejected -or [string][ScarlettAcceptanceWindow]::LastNativeFailure -cne 'DesktopBounds' -or
+    [ScarlettAcceptanceWindow]::LastInputExpected -ne 0 -or [ScarlettAcceptanceWindow]::LastInputAccepted -ne 0 -or
+    [ScarlettAcceptanceWindow]::LastInputError -ne 0) {
+    throw 'Native click bounds failure did not preserve its classification without input'
+}
+[ScarlettAcceptanceWindow]::ResetInputDiagnostics()
+if ([string][ScarlettAcceptanceWindow]::LastNativeFailure -cne 'None' -or
+    [ScarlettAcceptanceWindow]::LastInputExpected -ne 0 -or [ScarlettAcceptanceWindow]::LastInputAccepted -ne 0 -or
+    [ScarlettAcceptanceWindow]::LastInputError -ne 0) {
+    throw 'Native input diagnostics retained a previous failure'
+}
+Write-Output 'Native click bounds rejection and diagnostic reset passed; no input injected'
+$awarenessBefore = [ScarlettAcceptanceWindow]::ThreadDpiAwareness()
+$physical = [ScarlettAcceptanceWindow]::PhysicalPointContext([IntPtr]::Zero, [int]::MinValue, [int]::MinValue)
+if ($awarenessBefore -notin @(0, 1, 2) -or -not $physical[0] -or $physical[1] -or $physical[2] -or
+    -not $physical[3] -or [ScarlettAcceptanceWindow]::ThreadDpiAwareness() -ne $awarenessBefore) {
+    throw 'Physical click diagnostics did not reject an absent point and restore caller DPI awareness'
+}
+Write-Output 'Physical click diagnostics rejected the absent point and restored caller DPI awareness; no input injected'
+
 # Evaluate the exact inventory normalization used by installed acceptance.
 # Windows PowerShell 5.1 emits JSON arrays as one pipeline object; PowerShell 7
 # enumerates them. Neither shell may turn 0/1/3 records into a nested one-item list.
