@@ -16,6 +16,7 @@ import (
 	"github.com/teslashibe/scarlett-node/internal/attempts"
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
+	"github.com/teslashibe/scarlett-node/internal/diagnostics"
 	"github.com/teslashibe/scarlett-node/internal/localfs"
 	"github.com/teslashibe/scarlett-node/internal/worker"
 )
@@ -40,13 +41,13 @@ func start(args []string) error {
 		return accountsCommand(args[1:], os.Stdin, os.Stdout)
 	}
 	if len(args) != 1 {
-		return errors.New("usage: scarlett-node pair|run|status|drain|resume|relay-resume|accounts")
+		return errors.New("usage: scarlett-node pair|run|status|diagnostics|drain|resume|relay-resume|accounts")
 	}
-	if args[0] == "status" || args[0] == "drain" || args[0] == "resume" || args[0] == "relay-resume" {
+	if args[0] == "status" || args[0] == "diagnostics" || args[0] == "drain" || args[0] == "resume" || args[0] == "relay-resume" {
 		return localCommand(args[0], os.Stdout)
 	}
 	if args[0] != "pair" && args[0] != "run" {
-		return errors.New("usage: scarlett-node pair|run|status|drain|resume|relay-resume|accounts")
+		return errors.New("usage: scarlett-node pair|run|status|diagnostics|drain|resume|relay-resume|accounts")
 	}
 	c, err := config.Load()
 	if err != nil {
@@ -261,6 +262,13 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	defer stop()
 	workCtx, cancelWork := context.WithCancel(context.Background())
 	defer cancelWork()
+	var diagnosticStore *diagnostics.Store
+	if !c.DiagnosticsDisabled {
+		diagnosticStore = diagnostics.New(c.StateDir)
+		diagnosticCtx, cancelDiagnostics := context.WithCancel(context.Background())
+		go diagnosticStore.Run(diagnosticCtx)
+		defer func() { cancelDiagnostics(); diagnosticStore.Close() }()
+	}
 	if err := journal.Purge(time.Now()); err != nil {
 		return err
 	}
@@ -515,11 +523,17 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			if duplicate {
 				continue
 			}
+			observation := beginLeaseDiagnostics(diagnosticStore, l)
+			attemptCtx := observation.Context(workCtx)
+			endWorkerAcquire := diagnostics.Start(attemptCtx, "worker_acquire", 0)
 			// The coordinator counts this node's open leases against its capacity,
 			// so a slot frees up as soon as an earlier result is recorded.
 			select {
 			case slots <- struct{}{}:
+				endWorkerAcquire("success")
 			case <-ctx.Done():
+				endWorkerAcquire("cancelled")
+				observation.Finish("cancelled")
 				mu.Lock()
 				delete(inFlight, l.JobID)
 				mu.Unlock()
@@ -529,7 +543,13 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			var account *accountLease
 			serviceAvailable := true
 			if services != nil {
+				endAccountAcquire := diagnostics.Start(attemptCtx, "account_acquire", 0)
 				account, serviceAvailable = services.acquireAccount(l.ServiceType)
+				if serviceAvailable {
+					endAccountAcquire("success")
+				} else {
+					endAccountAcquire("service_unavailable")
+				}
 				if serviceAvailable {
 					selected = account.config
 				}
@@ -557,10 +577,10 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 						// expire rather than funding it through rejectLease.
 						err = errors.New("Codex offer has no locally valid account")
 					} else {
-						err = rejectLease(workCtx, client, journal, l, code)
+						err = rejectLease(attemptCtx, client, journal, l, code)
 					}
 				} else {
-					code, err = submitLease(workCtx, client, selected, l, local, journal)
+					code, err = submitLease(attemptCtx, client, selected, l, local, journal)
 					if services != nil {
 						if err != nil && code == "" {
 							services.finishAccount(account, "report_pending")
@@ -569,6 +589,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 						}
 					}
 				}
+				observation.Finish(diagnosticOutcome(attemptCtx, code, err))
 				if code == "capacity_unavailable" {
 					mu.Lock()
 					restUntil = time.Now().Add(capacityRest)
@@ -615,7 +636,7 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	if c.LocalAccountID != "" {
 		record.ProviderAccountID, record.ProviderService = c.LocalAccountID, l.ServiceType
 	}
-	if err := journal.Begin(record); err != nil {
+	if err := journal.BeginContext(ctx, record); err != nil {
 		return "", err
 	}
 	if l.AcceptanceRequired {
@@ -623,7 +644,7 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 		// refusal below. Keep terminal replay metadata for this pinned attempt;
 		// let its offer expire remotely. rejectLease would fund acceptance.
 		if err := coordinator.ValidOffer(l, time.Now()); err != nil {
-			if terminalErr := journal.Terminal(record); terminalErr != nil {
+			if terminalErr := journal.TerminalContext(ctx, record); terminalErr != nil {
 				return "invalid_lease", terminalErr
 			}
 			return "invalid_lease", err
@@ -631,14 +652,16 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 		if l.ServiceType == "codex" && !codexAdmissionValid(c.CodexHome, l.LeaseDeadline) {
 			// The offer itself is valid, so the selected local credential is what
 			// fell short. This is local expiry evidence, never a provider denial.
-			if err := journal.Terminal(record); err != nil {
+			if err := journal.TerminalContext(ctx, record); err != nil {
 				return codexLocalAuthExpired, err
 			}
 			return codexLocalAuthExpired, errors.New("Codex credential validity is insufficient for the offered deadline")
 		}
 		// Persist uncertainty before acceptance HTTP. A lost acknowledgement
 		// keeps this journal pending; recovery never re-executes the provider.
+		endAccept := diagnostics.Start(ctx, "accept_http", 0)
 		l, err = client.Accept(ctx, l)
+		endAccept(diagnosticOutcome(ctx, "", err))
 		if err != nil {
 			return "", err
 		}
@@ -647,19 +670,20 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	if l.AcceptanceRequired && provenExecutor {
 		if limit := worker.ProofSampleLimit(c, l); limit > 0 {
 			ctx = worker.WithProofObserver(ctx, func() (func(attempts.ProofSample) error, error) {
-				ordinal, err := journal.BeginProof(record, limit)
+				ordinal, err := journal.BeginProofContext(ctx, record, limit)
 				if err != nil {
 					return nil, err
 				}
 				return func(sample attempts.ProofSample) error {
 					sample.Ordinal = ordinal
-					return journal.CompleteProof(record, sample)
+					return journal.CompleteProofContext(ctx, record, sample)
 				}, nil
 			})
 		}
 	}
 	var body any
 	code := ""
+	endWorker := diagnostics.Start(ctx, "worker", 0)
 	if c.Executor == config.ExecutorCodexTLSN || c.Executor == config.ExecutorServices {
 		var detail string
 		if c.Executor == config.ExecutorServices && !c.Enabled(l.ServiceType) {
@@ -689,14 +713,17 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 			body = coordinator.Failure{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence, Code: code}
 		}
 	}
+	endWorker(diagnosticOutcome(ctx, code, nil))
 	// Persist the exact report before touching the coordinator. Recovery may
 	// retry only after the authenticated replay-safe contract is confirmed.
 	if l.AcceptanceRequired && provenExecutor {
-		if err := journal.FinishProofTraffic(record); err != nil {
+		if err := journal.FinishProofTrafficContext(ctx, record); err != nil {
 			return code, err
 		}
 	}
+	endPrepare := diagnostics.Start(ctx, "report_prepare", 0)
 	raw, err := json.Marshal(body)
+	endPrepare(diagnosticOutcome(ctx, "", err))
 	if err != nil {
 		return code, err
 	}
@@ -706,7 +733,7 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	} else if c.Executor == config.ExecutorCodexTLSN || c.Executor == config.ExecutorServices {
 		kind = "proven"
 	}
-	record, err = journal.Ready(record, kind, raw)
+	record, err = journal.ReadyContext(ctx, record, kind, raw)
 	if err != nil {
 		return code, err
 	}

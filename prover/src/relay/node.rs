@@ -23,6 +23,7 @@ use super::{
     wire::{self, CHUNK},
 };
 use crate::{
+    diagnostics::{Outcome, Phase, Run, Snapshot, Trace},
     policy::find,
     xpolicy::{self, HOST},
     xprove::{MAX_RECV, Request},
@@ -127,9 +128,18 @@ pub struct Summary {
     pub sent_bytes: usize,
     pub received_bytes: usize,
     pub duration_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Snapshot>,
 }
 
 pub async fn run(request: Request) -> Result<Summary> {
+    let diagnostics = Run::new();
+    let mut summary = run_observed(request, &diagnostics.trace()).await?;
+    summary.diagnostics = Some(diagnostics.success());
+    Ok(summary)
+}
+
+async fn run_observed(request: Request, trace: &Trace) -> Result<Summary> {
     let raw = STANDARD.decode(request.request.as_bytes()).context("request is not base64")?;
     if raw.len() > MAX_REQUEST || !raw.starts_with(b"GET /i/api/graphql/") {
         bail!("request must be an X GraphQL GET of at most {MAX_REQUEST} bytes");
@@ -139,11 +149,13 @@ pub async fn run(request: Request) -> Result<Summary> {
     }
     let started = Instant::now();
     // Reach X first: presenting the token spends one of the job's attempts.
-    let server = TcpStream::connect((HOST, 443)).await.context("x.com unreachable")?;
+    let server = trace.measure(Phase::XTcpConnect, async { TcpStream::connect((HOST, 443)).await.context("x.com unreachable") }).await?;
     server.set_nodelay(true)?;
-    let (mut socket, traffic) = crate::control::connect(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture).await?;
+    let (mut socket, traffic) = crate::control::connect_observed(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture, Some(trace)).await?;
     socket.write_all(format!("{}\n", request.token).as_bytes()).await?;
-    let response = tokio::time::timeout(std::time::Duration::from_secs(120), session(socket, server, &raw, HOST)).await.context("relay session timed out")??;
+    let response = trace.measure(Phase::RelaySession, async {
+        tokio::time::timeout(std::time::Duration::from_secs(120), session_observed(socket, server, &raw, HOST, trace)).await.context("relay session timed out")?
+    }).await?;
     Ok(Summary {
         verifier_transport: traffic.snapshot(),
         status: "proof_sent",
@@ -151,6 +163,7 @@ pub async fn run(request: Request) -> Result<Summary> {
         response: STANDARD.encode(&response),
         sent_bytes: raw.len(),
         duration_ms: started.elapsed().as_millis(),
+        diagnostics: None,
     })
 }
 
@@ -171,11 +184,25 @@ enum Event {
 
 /// Runs the session over an established verifier socket and a connection to
 /// `host`, and returns the response the verifier decrypted.
+#[cfg(test)]
 pub async fn session<V, X>(verifier: V, server: X, raw: &[u8], host: &str) -> Result<Vec<u8>>
 where
     V: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     X: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    session_observed(verifier, server, raw, host, &Trace::new()).await
+}
+
+pub(crate) async fn session_observed<V, X>(verifier: V, server: X, raw: &[u8], host: &str, trace: &Trace) -> Result<Vec<u8>>
+where
+    V: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    X: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // These begin together. Authorization is the locally observed wait until
+    // MATERIAL confirms readiness; it also includes any remaining TLS/OT work.
+    let mut authorization = Some(trace.span(Phase::RelayAuthorization));
+    let mut tls_ready = Some(trace.span(Phase::XTlsReady));
+    let mut ot_ready = Some(trace.span(Phase::OtReady));
     let (hidden, secret) = secrets(raw)?;
     let bits = tag::hidden_bits(raw.len(), &hidden)?;
     let mut public = raw.to_vec();
@@ -221,6 +248,7 @@ where
         ot = Some(state);
     } else {
         send_request(&mut to_verifier, &public, &hidden, &[]).await?;
+        ot_ready.take().expect("OT readiness is pending").finish(Outcome::Success);
         received = Some(Vec::new());
     }
 
@@ -229,6 +257,7 @@ where
     let mut sealed: Option<Vec<u8>> = None;
     let mut checked = false;
     let mut response = Vec::new();
+    let mut response_last_byte = None;
     while let Some(event) = inbox.recv().await {
         match event {
             Event::Failed(e) => {
@@ -261,6 +290,9 @@ where
                 let (kind, check) = ot.on_chi(&payload)?;
                 wire::send(&mut to_verifier, kind, &check).await?;
                 let (choices, blocks) = ot.take(bits)?;
+                if let Some(span) = ot_ready.take() {
+                    span.finish(Outcome::Success);
+                }
                 send_request(&mut to_verifier, &public, &hidden, &tag::corrections(&secret, &choices)?).await?;
                 received = Some(blocks);
             }
@@ -271,6 +303,9 @@ where
                     bail!("verifier tried to send more than its handshake");
                 }
                 to_server.write_all(&handshake.admit(&payload, host)?).await?;
+                if handshake.finished && let Some(span) = tls_ready.take() {
+                    span.finish(Outcome::Success);
+                }
             }
             Event::Frame(wire::MATERIAL, payload) => {
                 if !handshake.finished {
@@ -278,21 +313,36 @@ where
                 }
                 let blocks = received.take().context("verifier sent request material twice or before the request")?;
                 let material = parse_material(&payload, public.len(), bits)?;
+                if let Some(span) = authorization.take() {
+                    span.finish(Outcome::Success);
+                }
                 let record = tag::node_record(&material, &hidden, &secret, &blocks)?;
                 to_server.write_all(&record).await?;
                 to_server.flush().await?;
                 record_sent = true;
+                trace.milestone(Phase::RequestSent);
                 sealed = Some(record);
             }
             Event::Frame(wire::PLAIN, payload) => {
                 if !record_sent || response.len() + payload.len() > MAX_RECV {
                     bail!("verifier returned an unexpected or oversized response");
                 }
+                if response.is_empty() && !payload.is_empty() {
+                    trace.milestone(Phase::ResponseFirstByte);
+                }
                 response.extend_from_slice(&payload);
+                if !payload.is_empty() {
+                    response_last_byte = Some(Instant::now());
+                }
             }
             Event::Frame(wire::OPENING, payload) => {
+                // Check framing once, after the verifier stopped returning data,
+                // to avoid a new repeated full-body scan for small PLAIN frames.
+                if xpolicy::response_complete(&response) && let Some(at) = response_last_byte.take() {
+                    trace.milestone_at(Phase::ResponseComplete, at);
+                }
                 let record = sealed.take().context("verifier opened a record that was not sent")?;
-                opened_as(&payload, &record, raw)?;
+                trace.measure_sync(Phase::OpeningCheck, || opened_as(&payload, &record, raw))?;
                 checked = true;
             }
             Event::Frame(wire::DONE, _) => {

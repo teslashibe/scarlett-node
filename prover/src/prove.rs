@@ -24,6 +24,7 @@ use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest, http::H
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
 use crate::policy::{HOST, PATH, find, validate_job};
+use crate::diagnostics::{Outcome, Phase, Run, Snapshot, Trace};
 
 #[derive(Deserialize)]
 pub struct Request {
@@ -44,6 +45,8 @@ pub struct Summary {
     pub codex_ms: u128,
     pub sent_bytes: usize,
     pub received_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Snapshot>,
 }
 
 // Provider errors can contain prompts, authentication headers, and account IDs.
@@ -106,6 +109,13 @@ fn codex_websocket_request() -> Result<tokio_tungstenite::tungstenite::http::Req
 }
 
 pub async fn run(request: Request) -> Result<Summary> {
+    let diagnostics = Run::new();
+    let mut summary = run_observed(request, &diagnostics.trace()).await?;
+    summary.diagnostics = Some(diagnostics.success());
+    Ok(summary)
+}
+
+async fn run_observed(request: Request, trace: &Trace) -> Result<Summary> {
     validate_job(&request.payload)?;
     if request.token.len() != 64 || !request.token.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("verifier token must be 64 hex characters");
@@ -128,7 +138,7 @@ pub async fn run(request: Request) -> Result<Summary> {
     };
     let creds = load_creds()?;
 
-    let (mut socket, traffic) = crate::control::connect(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture).await?;
+    let (mut socket, traffic) = crate::control::connect_observed(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture, Some(trace)).await?;
     socket.write_all(format!("{}\n", request.token).as_bytes()).await?;
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();
@@ -152,15 +162,24 @@ pub async fn run(request: Request) -> Result<Summary> {
             .await
             .context("Codex WebSocket handshake failed")?;
         ws.send(Message::text(payload.to_string())).await?;
+        trace.milestone(Phase::RequestSent);
+        let mut response_started = false;
         loop {
             let message = tokio::time::timeout(Duration::from_secs(240), ws.next())
                 .await
                 .context("timed out waiting for Codex")?
                 .ok_or_else(|| anyhow!("Codex closed the stream before completing"))??;
             let Message::Text(text) = message else { continue };
+            if !response_started {
+                trace.milestone(Phase::ResponseFirstByte);
+                response_started = true;
+            }
             let event: Value = serde_json::from_str(&text)?;
             match event["type"].as_str() {
-                Some("response.completed") => break,
+                Some("response.completed") => {
+                    trace.milestone(Phase::ResponseComplete);
+                    break;
+                }
                 Some("response.failed" | "error") => bail!("Codex provider error: {}", provider_error_kind(&event)),
                 _ => {}
             }
@@ -170,6 +189,7 @@ pub async fn run(request: Request) -> Result<Summary> {
         while let Ok(Some(Ok(_))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await {}
         drop(ws);
 
+        let finalize = trace.span(Phase::ProofFinalize);
         let mut prover =
             tokio::time::timeout(Duration::from_secs(30), prover_task).await.context("TLS connection did not close")???;
         let sent = prover.transcript().sent().to_vec();
@@ -199,12 +219,13 @@ pub async fn run(request: Request) -> Result<Summary> {
         }
         let config = builder.build()?;
         prover.prove(&config).await?;
+        finalize.finish(Outcome::Success);
         anyhow::Ok((prover, codex_ms, sent.len(), received.len()))
     };
     let (prover, codex_ms, sent_bytes, received_bytes) = session.step(work).await?;
     session.finish(async { Ok(prover.close().await?) }, || handle.close()).await?;
 
-    Ok(Summary { status: "proof_sent", codex_ms, sent_bytes, received_bytes, verifier_transport: traffic.snapshot() })
+    Ok(Summary { status: "proof_sent", codex_ms, sent_bytes, received_bytes, verifier_transport: traffic.snapshot(), diagnostics: None })
 }
 
 /// The task driving a prover's TLSNotary session. tlsn's handle waits

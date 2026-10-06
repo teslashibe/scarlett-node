@@ -12,6 +12,7 @@ import (
 
 	"github.com/teslashibe/scarlett-node/internal/attempts"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
+	"github.com/teslashibe/scarlett-node/internal/diagnostics"
 )
 
 func attemptRecord(l coordinator.Lease) (attempts.Record, error) {
@@ -62,17 +63,22 @@ func submitRecord(ctx context.Context, client *coordinator.Client, journal *atte
 	if err != nil {
 		return err
 	}
+	endReport := diagnostics.Start(ctx, "report_http", 0)
 	status, err := client.Post(ctx, path, json.RawMessage(r.Body), nil)
 	if err != nil {
+		endReport(diagnosticOutcome(ctx, "", err))
 		return err
 	} // durable ready record remains for reconciliation
 	if status == http.StatusAccepted && r.Kind == "proven" {
+		endReport("success")
 		return nil
 	}
 	if status != http.StatusOK && status != http.StatusCreated && status != http.StatusNoContent {
+		endReport("report_error")
 		return errors.New("unexpected attempt report status")
 	}
-	return journal.Terminal(r)
+	endReport("success")
+	return journal.TerminalContext(ctx, r)
 }
 
 func rejectLease(ctx context.Context, client *coordinator.Client, journal *attempts.Journal, l coordinator.Lease, code string) error {
@@ -86,18 +92,21 @@ func rejectLease(ctx context.Context, client *coordinator.Client, journal *attem
 	// A rejection never runs a provider. Say so explicitly, so its pending
 	// record is not mistaken for unbound provider work on some profile.
 	r.NoProvider = true
-	if err = journal.Begin(r); err != nil {
+	if err = journal.BeginContext(ctx, r); err != nil {
 		return err
 	}
 	if l.AcceptanceRequired {
 		if err = coordinator.ValidOffer(l, time.Now()); err != nil {
 			// No acceptance HTTP was sent; the offer expires remotely.
-			if terminalErr := journal.Terminal(r); terminalErr != nil {
+			if terminalErr := journal.TerminalContext(ctx, r); terminalErr != nil {
 				return terminalErr
 			}
 			return err
 		}
-		if _, err = client.Accept(ctx, l); err != nil {
+		endAccept := diagnostics.Start(ctx, "accept_http", 0)
+		_, err = client.Accept(ctx, l)
+		endAccept(diagnosticOutcome(ctx, "", err))
+		if err != nil {
 			return err
 		}
 	}
@@ -105,7 +114,7 @@ func rejectLease(ctx context.Context, client *coordinator.Client, journal *attem
 	if err != nil {
 		return err
 	}
-	r, err = journal.Ready(r, "fail", raw)
+	r, err = journal.ReadyContext(ctx, r, "fail", raw)
 	if err != nil {
 		return err
 	}

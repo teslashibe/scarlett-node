@@ -8,6 +8,7 @@
 //! `scarlett-prover fake-openai <addr> <ca-out>` is for impersonation tests.
 
 mod control;
+mod diagnostics;
 #[cfg(unix)]
 mod fake;
 mod policy;

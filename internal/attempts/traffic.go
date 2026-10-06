@@ -1,6 +1,7 @@
 package attempts
 
 import (
+	"context"
 	"path/filepath"
 	"reflect"
 	"time"
@@ -69,7 +70,12 @@ func boundRecord(old, r Record) bool {
 // BeginProof reserves evidence before spawning a helper. A crash leaves a started
 // sample with no byte values; recovery never calls this method or repeats work.
 func (j *Journal) BeginProof(r Record, maxSamples int) (int, error) {
-	j.mu.Lock()
+	return j.BeginProofContext(context.Background(), r, maxSamples)
+}
+
+// BeginProofContext records local timings for the existing durable reservation.
+func (j *Journal) BeginProofContext(ctx context.Context, r Record, maxSamples int) (int, error) {
+	j.lockContext(ctx)
 	defer j.mu.Unlock()
 	old, err := j.read(filepath.Join(j.dir, key(r)+".json"))
 	if err != nil {
@@ -88,7 +94,7 @@ func (j *Journal) BeginProof(r Record, maxSamples int) (int, error) {
 	ordinal := len(t.Samples) + 1
 	t.Samples = append(t.Samples, ProofSample{Ordinal: ordinal, State: "started"})
 	old.UpdatedAt = time.Now().UTC()
-	if err := j.write(old); err != nil {
+	if err := j.writeContext(ctx, old); err != nil {
 		return 0, err
 	}
 	return ordinal, nil
@@ -97,7 +103,12 @@ func (j *Journal) BeginProof(r Record, maxSamples int) (int, error) {
 // CompleteProof accepts a single allowlisted observation for the reserved call.
 // An identical delivery is idempotent while started; after Ready no edits occur.
 func (j *Journal) CompleteProof(r Record, sample ProofSample) error {
-	j.mu.Lock()
+	return j.CompleteProofContext(context.Background(), r, sample)
+}
+
+// CompleteProofContext records local timings for the existing proof observation.
+func (j *Journal) CompleteProofContext(ctx context.Context, r Record, sample ProofSample) error {
+	j.lockContext(ctx)
 	defer j.mu.Unlock()
 	old, err := j.read(filepath.Join(j.dir, key(r)+".json"))
 	if err != nil {
@@ -115,11 +126,16 @@ func (j *Journal) CompleteProof(r Record, sample ProofSample) error {
 	}
 	old.ProofTraffic.Samples[sample.Ordinal-1] = sample
 	old.UpdatedAt = time.Now().UTC()
-	return j.write(old)
+	return j.writeContext(ctx, old)
 }
 
 func (j *Journal) FinishProofTraffic(r Record) error {
-	j.mu.Lock()
+	return j.FinishProofTrafficContext(context.Background(), r)
+}
+
+// FinishProofTrafficContext records local timings for the existing worker marker.
+func (j *Journal) FinishProofTrafficContext(ctx context.Context, r Record) error {
+	j.lockContext(ctx)
 	defer j.mu.Unlock()
 	old, err := j.read(filepath.Join(j.dir, key(r)+".json"))
 	if err != nil {
@@ -133,5 +149,5 @@ func (j *Journal) FinishProofTraffic(r Record) error {
 	}
 	old.ProofTraffic.WorkerFinished = true
 	old.UpdatedAt = time.Now().UTC()
-	return j.write(old)
+	return j.writeContext(ctx, old)
 }

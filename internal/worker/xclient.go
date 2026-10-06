@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/teslashibe/scarlett-node/internal/config"
+	"github.com/teslashibe/scarlett-node/internal/diagnostics"
 	x "github.com/teslashibe/x-go"
 )
 
@@ -373,6 +374,10 @@ func xRefused(e error) bool {
 // background swap the job happened to wait on is not the job's: it starts a
 // build of its own instead, at most twice.
 func (a *xAccount) acquire(ctx context.Context, ids map[string]string, strict bool) (*xWarm, error) {
+	end := diagnostics.Start(ctx, "client_acquire", 0)
+	outcome := "error"
+	defer func() { end(outcome) }()
+	waited := false
 	for inherited := 0; ; {
 		_, stamp, err := readXSession(a.path)
 		if err != nil {
@@ -384,6 +389,7 @@ func (a *xAccount) acquire(ctx context.Context, ids map[string]string, strict bo
 			return nil, errXDropped
 		}
 		cur := a.current
+		rotated := cur != nil && cur.stamp != stamp
 		if cur != nil && cur.stamp != stamp {
 			// The file changed under the client: it would send stale cookies.
 			a.current, cur = nil, nil
@@ -391,6 +397,10 @@ func (a *xAccount) acquire(ctx context.Context, ids map[string]string, strict bo
 		}
 		if cur != nil && cur.serves(ids, strict) {
 			a.mu.Unlock()
+			outcome = "cache_hit"
+			if waited {
+				outcome = "cache_miss"
+			}
 			return cur, nil
 		}
 		b := a.build
@@ -398,9 +408,21 @@ func (a *xAccount) acquire(ctx context.Context, ids map[string]string, strict bo
 			b = a.startBuild(cur, ids, "")
 		}
 		a.mu.Unlock()
+		waited = true
+		var endRebuild func(string)
+		if strict || cur != nil || rotated || b.kind == "rebuild" || b.kind == "replay" {
+			endRebuild = diagnostics.Start(ctx, "client_rebuild", 0)
+		}
 		select {
 		case <-b.done:
+			if endRebuild != nil {
+				endRebuild(diagnosticOutcome(ctx, b.err))
+			}
 		case <-ctx.Done():
+			outcome = "cancelled"
+			if endRebuild != nil {
+				endRebuild(outcome)
+			}
 			return nil, ctx.Err()
 		}
 		// The file can rotate while validation or bootstrap is in progress.
@@ -427,6 +449,7 @@ func (a *xAccount) acquire(ctx context.Context, ids map[string]string, strict bo
 		// this lease needs, is not this job's client; the next round compares
 		// it with the file as it is now and builds again if it must.
 		if b.warm.stamp == stamp && b.warm.serves(ids, strict) {
+			outcome = "cache_miss"
 			return b.warm, nil
 		}
 	}
@@ -842,6 +865,14 @@ func xBindingFrom(ctx context.Context) *xBinding {
 func (b *xBinding) roundTrip(r *http.Request) (*http.Response, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	exchange := b.next + 1
+	endBinding := diagnostics.Start(r.Context(), "binding_check", exchange)
+	bound := false
+	defer func() {
+		if !bound {
+			endBinding("error")
+		}
+	}()
 	if r.URL.Host != "x.com" || b.next >= len(b.specs) {
 		return nil, errUnprovenXCall
 	}
@@ -885,10 +916,13 @@ func (b *xBinding) roundTrip(r *http.Request) (*http.Response, error) {
 	} else if _, present := q["fieldToggles"]; present {
 		return nil, errUnprovenXCall
 	}
+	bound = true
+	endBinding("success")
 	b.sent++
 	if b.warm != nil {
 		b.warm.lastReq.Store(time.Now().UnixNano())
 	}
+	r = r.WithContext(withXExchange(r.Context(), exchange))
 	response, e := b.proof.RoundTrip(r)
 	if e == nil {
 		b.next++

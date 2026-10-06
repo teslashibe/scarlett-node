@@ -6,6 +6,7 @@
   ],
   "permissions": [
     "allow-desktop-status",
+    "allow-desktop-diagnostics",
     "allow-claude-status",
     "allow-quit-desktop",
     "allow-pair-node",

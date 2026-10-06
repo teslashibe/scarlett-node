@@ -19,6 +19,7 @@ import (
 
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
+	"github.com/teslashibe/scarlett-node/internal/diagnostics"
 	"github.com/teslashibe/scarlett-node/internal/localfs"
 	x "github.com/teslashibe/x-go"
 )
@@ -468,10 +469,13 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 		if warm.exhausted() > 0 {
 			// The reset fits in the lease. x-go would let the read through before
 			// it, so the node waits here.
+			endWait := diagnostics.Start(ctx, "quota_wait", 0)
 			select {
 			case <-ctx.Done():
+				endWait("cancelled")
 				return w.limited(warm.exhausted())
 			case <-time.After(wait):
+				endWait("success")
 			}
 		}
 	}
@@ -532,16 +536,28 @@ func (w X) read(ctx context.Context, client *x.Client, request coordinator.XRequ
 	var e error
 	switch request.Operation {
 	case "profile":
+		ctx = withXExchange(ctx, 1)
+		end := diagnostics.Start(ctx, "page_wall", 1)
 		_, e = client.GetProfile(ctx, request.Username)
+		end(diagnosticOutcome(ctx, e))
 	case "post":
+		ctx = withXExchange(ctx, 1)
+		end := diagnostics.Start(ctx, "page_wall", 1)
 		_, e = client.GetTweet(ctx, request.PostID)
+		end(diagnosticOutcome(ctx, e))
 	case "thread":
+		ctx = withXExchange(ctx, 1)
+		end := diagnostics.Start(ctx, "page_wall", 1)
 		_, e = client.GetTweetDetail(ctx, request.PostID)
+		end(diagnosticOutcome(ctx, e))
 	case "search":
 		cursor := ""
 		for i := 0; i < request.Pages; i++ {
 			var page x.TweetPage
-			page, e = client.SearchTweetsPage(ctx, request.Query, request.Count, cursor, x.WithSearchType(x.SearchLatest))
+			pageCtx := withXExchange(ctx, i+1)
+			end := diagnostics.Start(pageCtx, "page_wall", i+1)
+			page, e = client.SearchTweetsPage(pageCtx, request.Query, request.Count, cursor, x.WithSearchType(x.SearchLatest))
+			end(diagnosticOutcome(pageCtx, e))
 			if e != nil {
 				break
 			}

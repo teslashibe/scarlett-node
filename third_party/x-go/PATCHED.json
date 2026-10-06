@@ -1,11 +1,15 @@
 {
   "upstream_revision": "fb031a0f6f69b68a7038efdf52d1c4ef22d54f85",
-  "scope": "Local Scarlett changes share request pacing only after authenticated Viewer identity and preserve conservative quota state; clients and credential validation remain session-specific. UPSTREAM.json retains the original source hashes.",
+  "scope": "Local Scarlett changes share pacing after authenticated Viewer identity, preserve conservative quota state, and observe actual request-context waits and GraphQL decoding without changing scheduling or provider results. Clients and credential validation remain session-specific. UPSTREAM.json retains the original source hashes.",
   "sha256": {
-    "client.go": "cf80899deb62cee137c96f4df01969b43aa7d5988cd9e564011129f7806c0a8b",
+    "client.go": "e7bfaef8b54771b69c85f96dcb689651f3035345eebc0454a052832d87024336",
     "session.go": "f61634f928d36643543773fba76aa6f73ea7b8fe2d224a489c338713bace8fe2",
     "x.go": "b9c6f096756a9ce107ee23b7f520b047d39edcd215ca25216c2c0d497b7ff144",
     "pacing.go": "7a9abb836eaeac58df0c68036a37c295682441751f2aaebfb49c0fd4c010fdd6",
-    "pacing_test.go": "552f982525dea94f753618c5b15342df3c222a40974f6c5a14ad3bf3493b4def"
+    "pacing_test.go": "552f982525dea94f753618c5b15342df3c222a40974f6c5a14ad3bf3493b4def",
+    "wait_observer.go": "0299da32013526d1548046b39b685e06aa735212294e530a238d6ec437dc7a58",
+    "wait_observer_test.go": "305ab89bea7b7707c1833d2af497a4a7faa1eaf898c72461d4c907d293ec5e15",
+    "response_observer.go": "b2e0ba9bb748a1fb4eb45cdd8d41807464c8d8bda923e77cebda0f36dfcca550",
+    "response_observer_test.go": "3d7835fd00fe718fd02153f92ffe309e41d3d9ab6a5f34ab4049f485f0074808"
   }
 }
