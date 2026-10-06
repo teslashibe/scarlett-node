@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { diagnosticsNote, duration, groupTitle, localCapacity, outcomeCounts, phase, recentAttempts, summaryCells, timelineAxes, type DiagnosticsRecord } from "../src/diagnostics.ts";
+import { readFileSync } from "node:fs";
+import { diagnosticsNote, duration, groupTitle, localCapacity, outcomeCounts, phase, recentAttempts, summaryCells, timelineAxes, type Diagnostics, type DiagnosticsRecord } from "../src/diagnostics.ts";
 import type { AccountHealth, Snapshot } from "../src/model.ts";
 
 const record: DiagnosticsRecord = {
@@ -12,6 +13,24 @@ const record: DiagnosticsRecord = {
     {phase:"helper_total",source:"helper",exchange:2,start_ms:0,duration_ms:800,outcome:"success"},
   ],
 };
+test("Go-emitted pacing history keeps readable timelines across legacy and new attempts", () => {
+  const snapshot = JSON.parse(readFileSync(new URL("./fixtures/pacing-diagnostics-v1.json", import.meta.url), "utf8")) as NonNullable<Diagnostics["snapshot"]>;
+  assert.equal(snapshot.attempts.length, 31);
+  assert.match(diagnosticsNote({available: true, snapshot}), /Saved locally/);
+  const labels = new Map([
+    ["fixed_gap_wait", "Minimum request gap"], ["jitter_wait", "Request jitter"],
+    ["quota_spread_wait", "Quota pacing spread"], ["quota_reset_wait", "Provider quota reset wait"],
+  ]);
+  const jitterAttempts = snapshot.attempts.filter((r) => r.spans.some((s) => s.phase === "jitter_wait"));
+  assert.equal(jitterAttempts.length, 9);
+  for (const [name, label] of labels) {
+    assert.equal(phase(name), label);
+    assert.ok(snapshot.attempts.some((r) => timelineAxes(r)[0].spans.some((s) => s.phase === name)));
+  }
+  assert.equal(phase("future_pacing_wait"), "Unknown phase");
+  assert.equal(recentAttempts(snapshot.attempts).length, 20);
+  assert.equal(recentAttempts(snapshot.attempts)[0].id, snapshot.attempts[30].id);
+});
 test("Unknown timings remain unknown and successful latency groups keep sample count and freshness", () => {
   assert.equal(duration(undefined), "Unknown"); assert.equal(duration(NaN), "Unknown");
   assert.equal(duration(-1), "Unknown"); assert.equal(duration(0), "0 ms"); assert.equal(duration(1500), "1.50 s");
