@@ -13,6 +13,7 @@ import copy
 from contextlib import contextmanager
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -164,6 +165,20 @@ NATIVE_CODE = re.compile(r'(.+) \((0x[0-9A-F]{8})\)')
 PYTHON_FRAME = re.compile(r'File "[^"\r\n]*[\\/](check-complete-bundle|prepare-browser-fixtures|windows_pe_imports)\.py", line ([0-9]{1,6})')
 PYTHON_EXCEPTION = re.compile(r'([A-Za-z_][A-Za-z0-9_.]{0,127}(?:Error|Exception))(?:: (.*))?')
 ACCEPTANCE_LINES = re.compile(r'"acceptanceFailureLines"\s*:\s*\[([0-9,\s]{0,200})\]')
+XLOGIN_FAILURE = re.compile(r'^SCARLETT_X_LOGIN_FAILURE (\{[^\r\n]{1,4094}\})\r?$', re.MULTILINE)
+XLOGIN_STATUSES = ('verification_required', 'login_failed', 'proxy_error', 'challenge_not_found',
+                   'challenge_expired', 'queue_timeout', 'profile_busy', 'attempts_exhausted', 'deadline_exceeded')
+XLOGIN_MANAGER_CATEGORIES = ('helper readiness cancelled or timed out', 'helper exited before readiness',
+                            'resource checksum mismatch', 'resource inventory invalid', 'private node state inaccessible',
+                            'private state inaccessible', 'private profiles inaccessible', 'private bearer unavailable',
+                            'helper process containment unavailable', 'Google Chrome must be installed')
+XLOGIN_CASES = ('real Chromium parks X and submits invalid then valid code on the same page with one password',
+               'real Chromium cancel closes a parked browser and releases capacity',
+               'real Chromium expiry closes a parked browser and releases capacity',
+               'real Chromium shutdown closes a parked browser and releases capacity',
+               'real Chromium crash closes a parked browser and releases capacity',
+               'real Chromium budget closes a parked browser and releases capacity',
+               'real Chromium warm authenticated profile returns a candidate without another password')
 
 
 class ChildFailure(ValueError):
@@ -219,6 +234,63 @@ def child_detail(stdout, stderr):
     return None
 
 
+def xlogin_failure(stdout):
+    """Project only the closed installed-browser diagnostic, never child output."""
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('Duplicate diagnostic field')
+            result[key] = value
+        return result
+
+    def integer(value, minimum, maximum):
+        return type(value) is int and minimum <= value <= maximum
+
+    def location(value, basenames):
+        if (value.get('sourceBasename') in basenames and
+                integer(value.get('sourceLine'), 1, 9999) and integer(value.get('sourceColumn'), 1, 999)):
+            return {key: value[key] for key in ('sourceBasename', 'sourceLine', 'sourceColumn')}
+        return {}
+
+    for record in reversed(XLOGIN_FAILURE.findall(stdout.decode('utf-8', 'replace'))):
+        try:
+            value = json.loads(record, object_pairs_hook=unique_object)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        phase, category = value.get('phase'), value.get('category')
+        categories = {'manager': ('unclassified',) + XLOGIN_MANAGER_CATEGORIES,
+                      'headed-chrome': ('unclassified',),
+                      'browser-fixtures': ('unclassified', 'assertion', 'ERR_TEST_FAILURE') + XLOGIN_STATUSES}
+        if type(phase) is not str or phase not in categories or category not in categories[phase]:
+            continue
+        result = {'phase': phase, 'category': category}
+        for key, minimum, maximum in (('exitCode', -2147483648, 2147483647), ('elapsedMs', 0, 900000),
+                                      ('interceptedBrowserCasesPassed', 0, 7)):
+            if integer(value.get(key), minimum, maximum) and (key != 'exitCode' or value[key] != 0):
+                result[key] = value[key]
+        if phase == 'browser-fixtures':
+            for key, allowed in (('failedCase', XLOGIN_CASES), ('errorCode', XLOGIN_STATUSES + ('ERR_ASSERTION', 'ERR_TEST_FAILURE')),
+                                 ('failureType', ('testCodeFailure', 'hookFailed', 'cancelledByParent', 'testAborted'))):
+                if value.get(key) in allowed:
+                    result[key] = value[key]
+            for key in ('expected', 'actual'):
+                actual = value.get(key)
+                if (type(actual) is bool or (type(actual) in (int, float) and abs(actual) <= 1000000 and math.isfinite(actual)) or
+                        (type(actual) is str and actual in XLOGIN_STATUSES)):
+                    result[key] = actual
+            result.update(location(value, ('interactive-x.test.js',)))
+            fixture = value.get('fixtureError')
+            if (isinstance(fixture, dict) and fixture.get('stage') in ('start', 'continue') and
+                    fixture.get('errorName') in ('TimeoutError', 'Error', 'TypeError', 'ServiceError', 'AdmissionError', 'AbortError', 'unclassified')):
+                result['fixtureError'] = {key: fixture[key] for key in ('stage', 'errorName')}
+                result['fixtureError'].update(location(fixture, ('interactive-x.test.js', 'legacy.js', 'login-budget.js', 'service.js')))
+        return result
+    return None
+
+
 def run(operation, arguments, cwd, env, seconds=180):
     try:
         result = subprocess.run(arguments, cwd=cwd, env=env, capture_output=True, timeout=seconds)
@@ -228,6 +300,9 @@ def run(operation, arguments, cwd, env, seconds=180):
         raise ChildFailure('%s could not start' % operation) from None
     if result.returncode:
         detail = child_detail(result.stdout, result.stderr)
+        diagnostic = xlogin_failure(result.stdout) if operation == 'Installed acceptance' else None
+        if diagnostic:
+            detail = (detail + '; ' if detail else '') + 'X-runtime ' + json.dumps(diagnostic, sort_keys=True, separators=(',', ':'))
         raise ChildFailure('%s failed with exit code %d%s' % (operation, result.returncode, ': ' + detail if detail else ''))
     return result.stdout
 

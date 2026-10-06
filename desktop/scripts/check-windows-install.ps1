@@ -1397,7 +1397,12 @@ function Invoke-XLoginAcceptanceProcess([string]$File, [string[]]$Arguments, [in
             $details.phase = $Phase
             $details.exitCode = $process.ExitCode
             $details.elapsedMs = $elapsed.ElapsedMilliseconds
-            $details | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-x-login-process-failure.json')
+            # The success stream is assigned by callers; the host stream reaches
+            # powershell.exe stdout without becoming a fixture return value.
+            Write-Host ('SCARLETT_X_LOGIN_FAILURE ' + ($details | ConvertTo-Json -Depth 4 -Compress))
+            try {
+                $details | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-x-login-process-failure.json')
+            } catch { } # Evidence writing must not replace the original process failure.
             Write-Host ('Installed browser acceptance failed phase: ' + $Phase + '; exit status: ' + $process.ExitCode)
             throw 'Installed browser acceptance process failed'
         }
