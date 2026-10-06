@@ -46,7 +46,7 @@ type Attempt struct {
 // file affects diagnostics status; it cannot prevent provider work.
 func New(dir string) *Store {
 	s := &Store{dir: dir, attempts: make([]*Attempt, 0), wallNow: time.Now, monoNow: time.Now, closeDone: make(chan struct{})}
-	snapshot := Read(dir)
+	snapshot, expired := read(dir)
 	s.loadError, s.updatedAt = snapshot.LoadError, snapshot.UpdatedAt
 	for _, record := range snapshot.Attempts {
 		if record.Outcome == "running" {
@@ -64,6 +64,9 @@ func New(dir string) *Store {
 	}
 	for s.retainedBytes > MaxHistoryBytes {
 		s.dropOldestLocked()
+		s.changedLocked()
+	}
+	if expired {
 		s.changedLocked()
 	}
 	return s
@@ -264,6 +267,7 @@ func (s *Store) dropOldestLocked() {
 func (s *Store) pruneLocked() {
 	now := s.wallNow()
 	retained := s.attempts[:0]
+	pruned := false
 	for _, a := range s.attempts {
 		// Active records use monotonic age; persisted records use wall-clock age.
 		old := now.Sub(a.record.StartedAt) > Retention
@@ -273,12 +277,16 @@ func (s *Store) pruneLocked() {
 		if old {
 			a.retained = false
 			s.retainedBytes -= 700 + len(a.record.Spans)*144
-			s.dirty = true
+			pruned = true
 			continue
 		}
 		retained = append(retained, a)
 	}
+	clear(s.attempts[len(retained):])
 	s.attempts = retained
+	if pruned {
+		s.changedLocked()
+	}
 }
 
 // Run flushes at most once per second. Cancellation does not affect jobs; Close
@@ -320,6 +328,7 @@ func (s *Store) flush(final bool) {
 	s.flushMu.Lock()
 	defer s.flushMu.Unlock()
 	s.mu.Lock()
+	s.pruneLocked()
 	if !s.dirty || s.dir == "" {
 		s.mu.Unlock()
 		return

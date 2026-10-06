@@ -24,7 +24,7 @@ use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest, http::H
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
 use crate::policy::{HOST, PATH, find, validate_job};
-use crate::diagnostics::{Outcome, Phase, Run, Snapshot, Trace};
+use crate::diagnostics::{Phase, Run, Snapshot, Trace};
 
 #[derive(Deserialize)]
 pub struct Request {
@@ -189,38 +189,38 @@ async fn run_observed(request: Request, trace: &Trace) -> Result<Summary> {
         while let Ok(Some(Ok(_))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await {}
         drop(ws);
 
-        let finalize = trace.span(Phase::ProofFinalize);
-        let mut prover =
-            tokio::time::timeout(Duration::from_secs(30), prover_task).await.context("TLS connection did not close")???;
-        let sent = prover.transcript().sent().to_vec();
-        let received = prover.transcript().received().to_vec();
-        let mut hide_sent = occurrences(&sent, creds.access_token.as_bytes());
-        if hide_sent.is_empty() {
-            bail!("login token not found in the request; refusing to guess what to hide");
-        }
-        let mut hide_recv = Vec::new();
-        match cheat.as_str() {
-            "hide-model" => hide_recv = occurrences(&received, request.payload["model"].as_str().unwrap_or_default().as_bytes()),
-            "hide-account" => hide_sent.extend(occurrences(&sent, creds.account_id.as_bytes())),
-            "hide-request" => {
-                let body = find(&sent, b"\r\n\r\n").context("no request header")? + 4;
-                hide_sent.push(body + 8..(body + 40).min(sent.len()));
+        trace.measure(Phase::ProofFinalize, async {
+            let mut prover =
+                tokio::time::timeout(Duration::from_secs(30), prover_task).await.context("TLS connection did not close")???;
+            let sent = prover.transcript().sent().to_vec();
+            let received = prover.transcript().received().to_vec();
+            let mut hide_sent = occurrences(&sent, creds.access_token.as_bytes());
+            if hide_sent.is_empty() {
+                bail!("login token not found in the request; refusing to guess what to hide");
             }
-            _ => {}
-        }
+            let mut hide_recv = Vec::new();
+            match cheat.as_str() {
+                "hide-model" => hide_recv = occurrences(&received, request.payload["model"].as_str().unwrap_or_default().as_bytes()),
+                "hide-account" => hide_sent.extend(occurrences(&sent, creds.account_id.as_bytes())),
+                "hide-request" => {
+                    let body = find(&sent, b"\r\n\r\n").context("no request header")? + 4;
+                    hide_sent.push(body + 8..(body + 40).min(sent.len()));
+                }
+                _ => {}
+            }
 
-        let mut builder = ProveConfig::builder(prover.transcript());
-        builder.server_identity();
-        for range in complement(sent.len(), hide_sent) {
-            builder.reveal_sent(&range)?;
-        }
-        for range in complement(received.len(), hide_recv) {
-            builder.reveal_recv(&range)?;
-        }
-        let config = builder.build()?;
-        prover.prove(&config).await?;
-        finalize.finish(Outcome::Success);
-        anyhow::Ok((prover, codex_ms, sent.len(), received.len()))
+            let mut builder = ProveConfig::builder(prover.transcript());
+            builder.server_identity();
+            for range in complement(sent.len(), hide_sent) {
+                builder.reveal_sent(&range)?;
+            }
+            for range in complement(received.len(), hide_recv) {
+                builder.reveal_recv(&range)?;
+            }
+            let config = builder.build()?;
+            prover.prove(&config).await?;
+            anyhow::Ok((prover, codex_ms, sent.len(), received.len()))
+        }).await
     };
     let (prover, codex_ms, sent_bytes, received_bytes) = session.step(work).await?;
     session.finish(async { Ok(prover.close().await?) }, || handle.close()).await?;
@@ -404,5 +404,54 @@ mod provider_error_tests {
         ] {
             assert_eq!(provider_error_kind(&event), "provider_error");
         }
+    }
+}
+
+#[cfg(test)]
+mod driver_tests {
+    use super::*;
+    use std::future::pending;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn proof_finalization_error_keeps_its_error_and_measured_outcome() {
+        let trace = Trace::new();
+        let mut driver = Driver::new(tokio::spawn(pending::<Result<()>>()));
+        let result = driver
+            .step(trace.measure(Phase::ProofFinalize, async {
+                Err::<(), _>(anyhow!("synthetic finalization failure"))
+            }))
+            .await;
+        driver.task.abort();
+
+        assert_eq!(result.unwrap_err().to_string(), "synthetic finalization failure");
+        let snapshot = serde_json::to_value(trace.snapshot()).unwrap();
+        assert_eq!(snapshot["spans"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["spans"][0]["phase"], "proof_finalize");
+        assert_eq!(snapshot["spans"][0]["outcome"], "error");
+    }
+
+    #[tokio::test]
+    async fn session_failure_cancels_pending_proof_finalization() {
+        let trace = Trace::new();
+        let (release, started) = oneshot::channel();
+        let mut driver = Driver::new(tokio::spawn(async {
+            started.await.unwrap();
+            Err::<(), _>(anyhow!("synthetic session failure"))
+        }));
+        let result = driver
+            .step(trace.measure(Phase::ProofFinalize, async {
+                release.send(()).unwrap();
+                pending::<Result<()>>().await
+            }))
+            .await;
+
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), "verifier session failed");
+        assert_eq!(err.root_cause().to_string(), "synthetic session failure");
+        let snapshot = serde_json::to_value(trace.snapshot()).unwrap();
+        assert_eq!(snapshot["spans"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["spans"][0]["phase"], "proof_finalize");
+        assert_eq!(snapshot["spans"][0]["outcome"], "cancelled");
     }
 }

@@ -33,7 +33,7 @@ use tokio::{
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::{
-    diagnostics::{Outcome, Phase, Run, Snapshot, Trace},
+    diagnostics::{Phase, Run, Snapshot, Trace},
     policy::find,
     prove::Driver,
     xpolicy::{self, HOST},
@@ -143,19 +143,19 @@ async fn run_observed(request: Request, trace: &Trace) -> Result<Summary> {
         end.finish();
         drop(tls);
 
-        let finalize = trace.span(Phase::ProofFinalize);
-        let mut prover = prover_task.await??;
-        let sent = prover.transcript().sent().to_vec();
-        let received_bytes = prover.transcript().received().len();
-        let mut builder = ProveConfig::builder(prover.transcript());
-        builder.server_identity();
-        for range in reveal(&sent)? {
-            builder.reveal_sent(&range)?;
-        }
-        builder.reveal_recv(&(0..received_bytes))?;
-        prover.prove(&builder.build()?).await?;
-        finalize.finish(Outcome::Success);
-        anyhow::Ok((prover, response, sent.len(), received_bytes))
+        trace.measure(Phase::ProofFinalize, async {
+            let mut prover = prover_task.await??;
+            let sent = prover.transcript().sent().to_vec();
+            let received_bytes = prover.transcript().received().len();
+            let mut builder = ProveConfig::builder(prover.transcript());
+            builder.server_identity();
+            for range in reveal(&sent)? {
+                builder.reveal_sent(&range)?;
+            }
+            builder.reveal_recv(&(0..received_bytes))?;
+            prover.prove(&builder.build()?).await?;
+            anyhow::Ok((prover, response, sent.len(), received_bytes))
+        }).await
     };
     let (prover, response, sent_bytes, received_bytes) = session.step(work).await?;
     session.finish(async { Ok(prover.close().await?) }, || handle.close()).await?;

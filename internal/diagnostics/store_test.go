@@ -11,15 +11,31 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/teslashibe/scarlett-node/internal/localfs"
 )
 
 func privateDir(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0700); err != nil {
+	dir := filepath.Join(t.TempDir(), "private")
+	if err := localfs.EnsureDir(dir); err != nil {
 		t.Fatal(err)
 	}
 	return dir
+}
+
+func privateHistoryInfo(t *testing.T, dir string) os.FileInfo {
+	t.Helper()
+	f, err := localfs.OpenPrivate(filepath.Join(dir, historyName))
+	if err != nil {
+		t.Fatal("history was not private", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info
 }
 
 func metadata(id string) Metadata {
@@ -116,8 +132,9 @@ func TestFailurePrefixAndInterruptedHistory(t *testing.T) {
 	Start(running.Context(context.Background()), "accept_http", 0)
 	*now = now.Add(15 * time.Millisecond)
 	s.Close()
-	if Read(s.dir).Attempts[1].Outcome != "running" {
-		t.Fatal("live CLI read falsely declared a crash")
+	live := Read(s.dir)
+	if live.LoadError != "" || len(live.Attempts) != 2 || live.Attempts[1].Outcome != "running" {
+		t.Fatal("live CLI read lost the running attempt", live.LoadError, len(live.Attempts))
 	}
 	restarted := New(s.dir)
 	reloaded := restarted.Snapshot()
@@ -129,7 +146,8 @@ func TestFailurePrefixAndInterruptedHistory(t *testing.T) {
 		t.Fatalf("fabricated finished timing after crash: %+v", r)
 	}
 	restarted.Close()
-	if persisted := Read(s.dir).Attempts[1]; persisted.Outcome != "interrupted" || persisted.DurationMS != nil {
+	persisted := Read(s.dir)
+	if persisted.LoadError != "" || len(persisted.Attempts) != 2 || persisted.Attempts[1].Outcome != "interrupted" || persisted.Attempts[1].DurationMS != nil {
 		t.Fatalf("restart without jobs did not persist unknown interruption: %+v", persisted)
 	}
 }
@@ -267,9 +285,9 @@ func TestBoundsPriorityRetentionAndLateCallbacks(t *testing.T) {
 		t.Fatalf("memory/attempt bounds: %d %d", len(snap.Attempts), s.retainedBytes)
 	}
 	s.Close()
-	info, err := os.Stat(filepath.Join(s.dir, historyName))
-	if err != nil || info.Size() > MaxHistoryBytes || info.Mode().Perm() != 0600 {
-		t.Fatalf("private bounded history: %v %v", info, err)
+	info := privateHistoryInfo(t, s.dir)
+	if info.Size() > MaxHistoryBytes {
+		t.Fatalf("private bounded history exceeded size limit: %v", info)
 	}
 }
 
@@ -301,7 +319,7 @@ func TestReadBoundsRecordAfterAddingDerivedFields(t *testing.T) {
 		t.Fatalf("fixture did not exercise derivation overflow: %d -> %d", len(stored), len(derivedRaw))
 	}
 	file, _ := json.Marshal(history{Version: Version, UpdatedAt: now, Attempts: []Record{record}})
-	if err := os.WriteFile(filepath.Join(dir, historyName), file, 0600); err != nil {
+	if err := localfs.WriteAtomic(filepath.Join(dir, historyName), file, false); err != nil {
 		t.Fatal(err)
 	}
 	snapshot := Read(dir)
@@ -316,13 +334,17 @@ func TestReadBoundsRecordAfterAddingDerivedFields(t *testing.T) {
 }
 
 func TestCorruptOversizedPublicAndDiskFailureAreDiagnosticsOnly(t *testing.T) {
-	for _, raw := range []string{`{"version":1,"version":1}`, `{"version":1,"secret":"cookie"}`, strings.Repeat("x", MaxHistoryBytes+1)} {
+	for _, test := range []struct{ raw, want string }{
+		{`{"version":1,"version":1}`, "corrupt"},
+		{`{"version":1,"secret":"cookie"}`, "corrupt"},
+		{strings.Repeat("x", MaxHistoryBytes+1), "too_large"},
+	} {
 		dir := privateDir(t)
-		if err := os.WriteFile(filepath.Join(dir, historyName), []byte(raw), 0600); err != nil {
+		if err := localfs.WriteAtomic(filepath.Join(dir, historyName), []byte(test.raw), false); err != nil {
 			t.Fatal(err)
 		}
-		if snap := Read(dir); snap.LoadError == "" || len(snap.Attempts) != 0 {
-			t.Fatalf("unsafe history exported: %+v", snap)
+		if snap := Read(dir); snap.LoadError != test.want || len(snap.Attempts) != 0 {
+			t.Fatalf("unsafe history was not rejected as %s: %+v", test.want, snap)
 		}
 	}
 	dir := privateDir(t)
@@ -368,6 +390,106 @@ func TestRetentionAndPercentileGrouping(t *testing.T) {
 	*now = now.Add(Retention + time.Millisecond)
 	if snap = s.Snapshot(); len(snap.Attempts) != 0 || len(snap.Summaries) != 0 {
 		t.Fatal("retention fabricated empty-cohort percentiles")
+	}
+}
+
+func TestIdleFlushRemovesExpiredHistory(t *testing.T) {
+	s, now := controlled(t)
+	wall := time.Now()
+	s.wallNow = func() time.Time { return wall }
+	a := s.Begin(metadata("idle-expiry"))
+	a.Finish("success")
+	s.flush(false)
+	if s.dirty {
+		t.Fatal("initial history was not flushed")
+	}
+	*now = now.Add(Retention + time.Hour)
+	wall = wall.Add(Retention + time.Hour)
+	s.lastFlush = time.Now().Add(-2 * time.Second)
+	s.flush(false) // The idle Run loop reaches the same flush without new work.
+	if a.retained || len(s.attempts) != 0 || s.retainedBytes != 0 || s.dirty {
+		t.Fatal("idle flush did not prune and publish expired history")
+	}
+	raw, err := os.ReadFile(filepath.Join(s.dir, historyName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted history
+	if strictJSON(raw, &persisted) != nil || len(persisted.Attempts) != 0 {
+		t.Fatal("expired attempt remained on disk")
+	}
+}
+
+func TestRestartPublishesExpiredHistoryCleanupWithoutNewWork(t *testing.T) {
+	for _, keepRecent := range []bool{false, true} {
+		t.Run(fmt.Sprintf("keep-recent=%t", keepRecent), func(t *testing.T) {
+			dir := privateDir(t)
+			now := time.Now().UTC()
+			expired := Record{ID: strings.Repeat("a", 64), Operation: "codex", ProofMode: "none", StartedAt: now.Add(-Retention - time.Hour), Outcome: "success", Spans: []Span{}, MissingPhases: []string{}}
+			records := []Record{expired}
+			if keepRecent {
+				recent := expired
+				recent.ID, recent.StartedAt = strings.Repeat("b", 64), now
+				records = append(records, recent)
+			}
+			raw, err := json.Marshal(history{Version: Version, UpdatedAt: now, Attempts: records})
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, historyName)
+			if err := localfs.WriteAtomic(path, raw, false); err != nil {
+				t.Fatal(err)
+			}
+			s := New(dir)
+			want := 0
+			if keepRecent {
+				want = 1
+			}
+			if !s.dirty || s.loadError != "" || len(s.attempts) != want {
+				t.Fatal("restart did not schedule validated retention cleanup")
+			}
+			beforeFlush, err := os.ReadFile(path)
+			if err != nil || string(beforeFlush) != string(raw) {
+				t.Fatal("startup performed synchronous history cleanup", err)
+			}
+			s.Close()
+			cleaned, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var persisted history
+			if strictJSON(cleaned, &persisted) != nil || len(persisted.Attempts) != want || s.dirty || s.loadError != "" {
+				t.Fatal("restart without new jobs did not publish retention cleanup")
+			}
+			if keepRecent && persisted.Attempts[0].ID != strings.Repeat("b", 64) {
+				t.Fatal("retention cleanup removed the recent attempt")
+			}
+		})
+	}
+}
+
+func TestExpiredHistoryCleanupWaitsForValidHistory(t *testing.T) {
+	dir := privateDir(t)
+	now := time.Now().UTC()
+	expired := Record{ID: strings.Repeat("a", 64), Operation: "codex", ProofMode: "none", StartedAt: now.Add(-Retention - time.Hour), Outcome: "success", Spans: []Span{}, MissingPhases: []string{}}
+	invalid := expired
+	invalid.ID = "invalid"
+	raw, err := json.Marshal(history{Version: Version, UpdatedAt: now, Attempts: []Record{expired, invalid}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, historyName)
+	if err := localfs.WriteAtomic(path, raw, false); err != nil {
+		t.Fatal(err)
+	}
+	s := New(dir)
+	s.Close()
+	if s.dirty || s.loadError != "corrupt" || len(s.attempts) != 0 {
+		t.Fatal("invalid history was scheduled for retention cleanup")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || string(after) != string(raw) {
+		t.Fatal("retention cleanup rewrote invalid history", err)
 	}
 }
 

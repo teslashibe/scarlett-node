@@ -18,59 +18,68 @@ var errInvalid = errors.New("invalid diagnostic history")
 // Read returns a safe local export. It never follows a nonregular history file
 // or returns file names, decode errors, or unvalidated data to callers.
 func Read(dir string) Snapshot {
+	snapshot, _ := read(dir)
+	return snapshot
+}
+
+// read reports when validated history needs retention cleanup on disk. Read
+// remains an export-only operation; the store publishes cleanup asynchronously.
+func read(dir string) (Snapshot, bool) {
 	empty := Snapshot{Version: Version, Attempts: []Record{}, Summaries: []Summary{}}
 	if dir == "" {
 		empty.LoadError = "unavailable"
-		return empty
+		return empty, false
 	}
 	path := filepath.Join(dir, historyName)
 	if err := localfs.CheckOwnedDir(dir); err != nil {
 		empty.LoadError = "io_error"
-		return empty
+		return empty, false
 	}
 	f, err := localfs.OpenPrivate(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return empty
+		return empty, false
 	}
 	if err != nil {
 		empty.LoadError = "io_error"
-		return empty
+		return empty, false
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
 		empty.LoadError = "io_error"
-		return empty
+		return empty, false
 	}
 	if info.Size() > MaxHistoryBytes {
 		empty.LoadError = "too_large"
-		return empty
+		return empty, false
 	}
 	raw, err := io.ReadAll(io.LimitReader(f, MaxHistoryBytes+1))
 	if err != nil {
 		empty.LoadError = "io_error"
-		return empty
+		return empty, false
 	}
 	if len(raw) > MaxHistoryBytes {
 		empty.LoadError = "too_large"
-		return empty
+		return empty, false
 	}
 	var stored history
 	if strictJSON(raw, &stored) != nil || !requiredHistoryFields(raw) || stored.Version != Version || stored.UpdatedAt.IsZero() || stored.Attempts == nil || len(stored.Attempts) > MaxAttempts {
 		empty.LoadError = "corrupt"
-		return empty
+		return empty, false
 	}
 	now := time.Now()
+	expired := false
 	seen := make(map[string]bool, len(stored.Attempts))
 	for _, record := range stored.Attempts {
 		if !validRecord(record) || seen[record.ID] {
 			empty.LoadError = "corrupt"
 			empty.Attempts = []Record{}
-			return empty
+			return empty, false
 		}
 		seen[record.ID] = true
 		record.StartedAt = record.StartedAt.UTC()
 		if now.Sub(record.StartedAt) > Retention {
+			expired = true
 			continue
 		}
 		record = boundedRecord(record)
@@ -79,7 +88,7 @@ func Read(dir string) Snapshot {
 	updatedAt := stored.UpdatedAt.UTC()
 	empty.UpdatedAt = &updatedAt
 	empty.Summaries = summarize(empty.Attempts)
-	return empty
+	return empty, expired
 }
 
 // Numeric zero is a legitimate observation only when the field was actually
