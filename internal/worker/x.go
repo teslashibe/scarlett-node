@@ -462,9 +462,10 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 	// back. When that wait cannot fit in the lease, the job would only burn its
 	// deadline and leave its reserved slot behind: rest the account instead,
 	// before any proof is spent.
-	if wait, reset := warm.pacingWait(clients.gap()); wait > 0 {
+	eligibility := warm.client.NextEligibility(time.Now(), XGraphQLOperation(l.XRequest.Operation))
+	if wait := time.Until(eligibility.At); wait > 0 && (eligibility.Reason == "spread" || eligibility.Reason == "reset") {
 		if wait >= time.Until(deadline) {
-			return w.limited(reset)
+			return w.limitedEligibility(eligibility)
 		}
 		if warm.exhausted() > 0 {
 			// The reset fits in the lease. x-go would let the read through before
@@ -473,7 +474,7 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 			select {
 			case <-ctx.Done():
 				endWait("cancelled")
-				return w.limited(warm.exhausted())
+				return w.limitedEligibility(eligibility)
 			case <-time.After(wait):
 				endWait("success")
 			}
@@ -508,7 +509,7 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 			// the account rests until the reset. Otherwise the slot the job
 			// reserved stays on the shared client, which is replaced.
 			if reset := warm.exhausted(); reset > 0 {
-				return w.limited(reset)
+				return w.limitedEligibility(warm.client.NextEligibility(time.Now(), XGraphQLOperation(l.XRequest.Operation)))
 			}
 			account.replace(warm)
 		}
@@ -529,6 +530,14 @@ func (w X) limited(reset time.Duration) string {
 		w.Config.AccountCooldown(reset)
 	}
 	return "x_rate_limited"
+}
+
+func (w X) limitedEligibility(eligibility x.Eligibility) string {
+	if eligibility.Authoritative && w.Config.AccountQuotaReset != nil {
+		w.Config.AccountQuotaReset(eligibility.Quota.Reset)
+		return "x_rate_limited"
+	}
+	return w.limited(eligibility.Quota.ResetIn())
 }
 
 // read performs the lease's reads on client; ctx carries the job binding.
@@ -606,8 +615,12 @@ func xAuthFailure(e error) bool {
 // and response headers never enter local status or coordinator reports.
 func (w X) failure(ctx context.Context, e error) string {
 	var limited *x.RateLimitError
-	if errors.As(e, &limited) && w.Config.AccountCooldown != nil {
-		w.Config.AccountCooldown(limited.Wait)
+	if errors.As(e, &limited) {
+		if !limited.Reset.IsZero() && w.Config.AccountQuotaReset != nil {
+			w.Config.AccountQuotaReset(limited.Reset)
+		} else if w.Config.AccountCooldown != nil {
+			w.Config.AccountCooldown(limited.Wait)
+		}
 	}
 	return xFailure(ctx, e)
 }

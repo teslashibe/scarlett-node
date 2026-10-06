@@ -103,6 +103,7 @@ func TestWireFixtures(t *testing.T) {
 		{"lease-x.json", &Lease{}},
 		{"heartbeat-services.json", &Heartbeat{}},
 		{"heartbeat-active-leases.json", &Heartbeat{}},
+		{"heartbeat-quota-readiness.json", &Heartbeat{}},
 		{"proven.json", &Proven{}},
 		{"attempt-status.json", &AttemptStatus{}},
 		{"result.json", &Result{}},

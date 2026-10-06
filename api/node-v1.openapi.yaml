@@ -220,7 +220,7 @@ components:
         state: {type: string, enum: [available, exhausted], description: exhausted means the node's gateway recently had no capacity; the coordinator offers it no lease until it reports available again.}
         wait_seconds: {type: integer, minimum: 0, maximum: 20, description: "How long the coordinator may hold this heartbeat open while it has nothing to offer. The node sends 20; the coordinator clamps the value to [0, 20] and answers early the moment an offer exists. Zero asks for an immediate answer."}
         bid: {type: integer, minimum: 0, maximum: 1000000000, description: Standing assignment bid. Lower wins, then least assigned work, then node_id. Missing is treated as 100. Not an on-chain quote.}
-        capacity: {type: integer, minimum: 0, maximum: 64, description: "Typed services report the exact sum of their capacities, including zero only when exhausted with all services blocked or not_added. Configured and ready services require positive capacity. Legacy untyped reports require positive capacity; omitted legacy capacity defaults to 1. The coordinator keeps open leases within this bound."}
+        capacity: {type: integer, minimum: 0, maximum: 64, description: "Legacy typed reports use the exact sum of service capacities. Enriched readiness reports use the shared physical ceiling: the sum of configured_capacity where present and ordinary capacity otherwise. Generic runnable capacity may be zero while an exact operation is runnable. Legacy untyped reports require positive capacity; omitted legacy capacity defaults to 1. Physical capacity alone never grants operation readiness."}
         services:
           type: array
           maxItems: 2
@@ -235,6 +235,30 @@ components:
         state: {type: string, enum: [not_added, configured, ready, exhausted, auth_required, unreachable], description: "configured means a local credential file is usable (for x_read: the account's warm client is still being built, or a rest just ended and the next 15-second check has not yet confirmed the installed client); ready means local execution reported proof sent, not verifier acceptance, or for x_read that a client build validated the session against X; an x_read build that X refuses, rate-limits or cannot reach reports auth_required, exhausted or unreachable without waiting for a job"}
         capacity: {type: integer, minimum: 0, maximum: 32}
         in_flight: {type: integer, minimum: 0, maximum: 32}
+        configured_capacity: {type: integer, minimum: 0, maximum: 32, description: "Optional physical service ceiling including retained in-flight work and distinct usable authenticated account lanes, at least capacity. Never provider quota or global independence across nodes."}
+        runnable_capacity: {type: integer, minimum: 0, maximum: 32, description: "Optional free slots eligible across every supported operation; capacity equals in_flight plus runnable_capacity. Per-operation slots overlap this inventory and are never added together."}
+        active_accounts: {type: integer, minimum: 0, maximum: 32, description: "Canonical verified usable nonremoved local identities, including busy and quota-resting identities. Account counts are present together; removed draining work remains only in occupancy."}
+        ready_accounts: {type: integer, minimum: 0, maximum: 32, description: "Active identities with a free lane eligible for at least one supported operation. Not a count of provider requests."}
+        cooling_accounts: {type: integer, minimum: 0, maximum: 32, description: "Active identities with a free lane and a known future wait for every supported operation. ready_accounts plus cooling_accounts is at most active_accounts."}
+        next_ready_at: {type: string, format: date-time, description: "Optional UTC deadline for the earliest known cooling account, no more than 30 days ahead. Transit may make this overdue. Advisory only: a fresh report and final local check grant readiness."}
+        operation_availability:
+          type: array
+          maxItems: 4
+          description: >-
+            Optional X readiness for unique fixed operations. Entries share physical identity
+            lanes and are never summed. Each free count is at most configured_capacity minus
+            in_flight. Configured/ready service capacity may be zero when an operation has free
+            capacity; node available requires actual generic or exact-operation free capacity.
+            Drain, rest and unavailable recovery journals zero every operation's free count.
+            Omitted entries fall back to generic readiness, never guessed provider budgets.
+          items:
+            type: object
+            additionalProperties: false
+            required: [operation, runnable_capacity]
+            properties:
+              operation: {type: string, enum: [search, profile, post, thread]}
+              runnable_capacity: {type: integer, minimum: 0, maximum: 32}
+              next_ready_at: {type: string, format: date-time, description: "Optional bounded UTC eligibility hint; elapsed time alone does not authorize an offer."}
         last_error_code: {type: string, description: Bounded failure code only, never raw provider errors or credentials}
         max_input_bytes: {type: integer, minimum: 1, maximum: 65536, description: Local Codex prompt UTF-8 bytes or serialized x_request UTF-8 bytes; omitted by legacy nodes}
         max_output_tokens: {type: integer, minimum: 1, maximum: 8192, description: Codex local output reservation limit; absent for X}

@@ -106,6 +106,7 @@ type Client struct {
 	maxRetries        int
 	retryBase         time.Duration
 	minGap            time.Duration
+	requestJitter     time.Duration
 	pacing            *RequestPacing
 	identityPacing    func(string) (*RequestPacing, error)
 	reqMu             sync.RWMutex // protects queryIDs
@@ -179,6 +180,13 @@ func WithProxy(proxyURL string) Option {
 // Default: 1s. Lower values risk triggering X's rate limiter.
 func WithMinRequestGap(d time.Duration) Option {
 	return func(c *Client) { c.minGap = d }
+}
+
+// WithRequestJitter adds a positive random delay up to maxDelay to every reserved request
+// slot, including the first request after idle. It never shortens the minimum
+// gap or adaptive quota wait. Nonpositive values disable jitter (the default).
+func WithRequestJitter(maxDelay time.Duration) Option {
+	return func(c *Client) { c.requestJitter = max(maxDelay, 0) }
 }
 
 // WithIdentityPacing joins a request pacing domain only after the Viewer

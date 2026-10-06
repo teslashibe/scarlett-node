@@ -26,11 +26,12 @@ type pooledAccount struct {
 	xLeases    map[*accountLease]struct{}
 }
 type accountLease struct {
-	id, kind  string
-	config    config.Config
-	account   *pooledAccount
-	xStamp    string
-	xIdentity string
+	id, kind   string
+	config     config.Config
+	account    *pooledAccount
+	xStamp     string
+	xIdentity  string
+	quotaUntil time.Time
 }
 type accountStatus struct {
 	ID        string    `json:"id"`
@@ -244,6 +245,7 @@ func (p *servicePool) refreshAccounts(now time.Time) bool {
 		}
 	}
 	p.refreshXIdentities(now)
+	p.refreshXRecovery()
 	for kind, s := range p.entries {
 		s.inFlight = 0
 		available := 0
@@ -255,11 +257,13 @@ func (p *servicePool) refreshAccounts(now time.Time) bool {
 				continue
 			}
 			s.inFlight += a.entry.inFlight
-			held := p.renewalHolds(a)
+			held := p.renewalHolds(a) || kind == "x_read" && p.xRecoveryHolds(a)
 			identityUnavailable := kind == "x_read" && (p.xIdentityError || a.identity.ID == "" || a.duplicate)
 			if !a.removed && !held && (a.entry.state == "ready" || a.entry.state == "configured") {
 				if kind == "x_read" {
-					available += p.xGroupAvailable(a)
+					if !p.xReadyAt(a, now).After(now) {
+						available += p.xGroupAvailable(a)
+					}
 				} else {
 					available += max(0, a.entry.capacity-a.entry.inFlight)
 				}
@@ -297,6 +301,12 @@ func (p *servicePool) refreshAccounts(now time.Time) bool {
 			s.state, s.lastError = "exhausted", "capacity_unavailable"
 		case unreachable:
 			s.state, s.lastError = "unreachable", "prover_error"
+		}
+		if kind == "x_read" && s.enabled && available == 0 && s.inFlight == 0 && p.xAvailability(now).cooling > 0 {
+			s.state, s.lastError = "exhausted", ""
+		}
+		if kind == "x_read" && s.enabled && p.xRecoveryUnknown {
+			s.capacity, s.state, s.lastError = s.inFlight, "exhausted", "capacity_unavailable"
 		}
 	}
 	return true
@@ -375,12 +385,20 @@ func refreshAccount(a *pooledAccount, now time.Time, helperMissing bool) {
 		}
 	}
 }
-func (p *servicePool) acquireAccount(kind string) (*accountLease, bool) {
+func (p *servicePool) acquireAccount(kind string, operation ...string) (*accountLease, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.refresh(time.Now())
+	now := time.Now()
+	p.refresh(now)
 	s := p.entries[kind]
-	if s == nil || !s.enabled || s.inFlight >= s.capacity || p.healthError || p.accountsError {
+	if s == nil || !s.enabled || p.healthError || p.accountsError {
+		return nil, false
+	}
+	capacity := s.capacity
+	if kind == "x_read" && len(operation) == 1 && worker.XGraphQLOperation(operation[0]) != "" && p.accountMode {
+		capacity = min(p.config.XConcurrency, s.inFlight+p.xAvailability(now, operation...).available)
+	}
+	if s.inFlight >= capacity {
 		return nil, false
 	}
 	if !p.accountMode {
@@ -392,6 +410,12 @@ func (p *servicePool) acquireAccount(kind string) (*accountLease, bool) {
 		if kind == "x_read" {
 			stamp = worker.XSessionStamp(a.spec.Path)
 			if stamp == "" {
+				return nil, false
+			}
+			if p.xRecoveryHolds(a) {
+				return nil, false
+			}
+			if p.xReadyAt(a, now, operation...).After(now) {
 				return nil, false
 			}
 			if a.identity.Stamp == stamp {
@@ -408,6 +432,8 @@ func (p *servicePool) acquireAccount(kind string) (*accountLease, bool) {
 		lease := &accountLease{id: "legacy", kind: kind, config: c, account: a, xStamp: stamp, xIdentity: identity}
 		p.trackXLease(lease)
 		lease.config.AccountCooldown = p.cooldown(lease)
+		lease.config.AccountQuotaReset = p.quotaReset(lease)
+		lease.config.AccountReady = p.accountReady(lease)
 		return lease, true
 	}
 	keys := []string{}
@@ -429,6 +455,9 @@ func (p *servicePool) acquireAccount(kind string) (*accountLease, bool) {
 		}
 		stamp := ""
 		if kind == "x_read" {
+			if p.xReadyAt(a, now, operation...).After(now) {
+				continue
+			}
 			stamp = worker.XSessionStamp(a.spec.Path)
 			if stamp == "" || stamp != a.identity.Stamp || p.xGroupAvailable(a) == 0 {
 				continue
@@ -448,6 +477,8 @@ func (p *servicePool) acquireAccount(kind string) (*accountLease, bool) {
 		lease := &accountLease{id: a.spec.ID, kind: kind, config: c, account: a, xStamp: stamp, xIdentity: a.identity.ID}
 		p.trackXLease(lease)
 		lease.config.AccountCooldown = p.cooldown(lease)
+		lease.config.AccountQuotaReset = p.quotaReset(lease)
+		lease.config.AccountReady = p.accountReady(lease)
 		return lease, true
 	}
 	return nil, false
@@ -504,7 +535,9 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 		}
 	}
 	if l.kind == "x_read" && l.xIdentity != "" && (code == "x_rate_limited" || code == "capacity_unavailable") {
-		p.recordXCooldown(l.xIdentity, time.Now().Add(15*time.Minute), false)
+		if l.quotaUntil.IsZero() {
+			p.recordXCooldown(l.xIdentity, time.Now().Add(15*time.Minute), false)
+		}
 		p.refresh(time.Now())
 		if l.account.identity.ID != l.xIdentity {
 			return
@@ -521,7 +554,7 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 	}
 	// Authenticated quota follows the admitted user across replacement.
 	// Without verified identity, quota applies only to the admitted credentials.
-	p.settle(l.account, code, false)
+	p.settle(l.account, code, false, l.quotaUntil)
 }
 
 // xValidated applies the outcome of an X client build that asked X to
@@ -532,6 +565,7 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 func (p *servicePool) xValidated(path, stamp, code string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	defer p.notifyAvailability()
 	p.refresh(time.Now())
 	// A login may replace this path while the observer waits for p.mu. Apply
 	// the old result only to the exact content that produced it.
@@ -567,7 +601,7 @@ func (p *servicePool) xSessionPaths() map[string]bool {
 
 // settle moves an account's state for one outcome: a finished job's result
 // code or, with validation set, an X client build's. Caller holds p.mu.
-func (p *servicePool) settle(a *pooledAccount, code string, validation bool) {
+func (p *servicePool) settle(a *pooledAccount, code string, validation bool, knownReset ...time.Time) {
 	s := a.entry
 	if validation && code == "" {
 		// A validated session is ready for work. It repairs nothing a job
@@ -618,7 +652,11 @@ func (p *servicePool) settle(a *pooledAccount, code string, validation bool) {
 		s.localAuthInvalid = false
 	case "x_rate_limited", "capacity_unavailable":
 		s.state = "exhausted"
-		if until := time.Now().Add(15 * time.Minute); until.After(s.restUntil) {
+		until := time.Now().Add(15 * time.Minute)
+		if len(knownReset) == 1 && !knownReset[0].IsZero() {
+			until = knownReset[0]
+		}
+		if until.After(s.restUntil) {
 			s.restUntil = until
 		}
 		if a.spec.Service == "x_read" {

@@ -5,8 +5,8 @@ import "context"
 type waitObserverKey struct{}
 
 // WithWaitObserver observes only the actual pacing sleep of this request.
-// Reason is "gap" for the configured gap, or "quota" for a quota-derived
-// gap. The returned callback runs after the sleep or context cancellation.
+// Reason is "gap", "jitter", "spread" or "reset". The returned callback
+// runs after that actual sleep or context cancellation.
 // Observers receive no request, response, account or credential values.
 func WithWaitObserver(ctx context.Context, observe func(reason string) func(cancelled bool)) context.Context {
 	if ctx == nil || observe == nil {

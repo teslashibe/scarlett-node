@@ -156,12 +156,34 @@ func serviceStates(health []coordinator.ServiceHealth) string {
 func watchHeartbeat(ctx context.Context, cancel context.CancelCauseFunc, sent availability, current func() availability, changes <-chan struct{}) {
 	tick := time.NewTicker(heartbeatWatchInterval)
 	defer tick.Stop()
+	var health []coordinator.ServiceHealth
+	_ = json.Unmarshal([]byte(sent.services), &health)
+	var deadline time.Time
+	for _, service := range health {
+		candidates := []*time.Time{service.NextReadyAt}
+		for _, operation := range service.OperationAvailability {
+			candidates = append(candidates, operation.NextReadyAt)
+		}
+		for _, at := range candidates {
+			if at != nil && at.After(time.Now()) && (deadline.IsZero() || at.Before(deadline)) {
+				deadline = *at
+			}
+		}
+	}
+	var ready <-chan time.Time
+	if !deadline.IsZero() {
+		timer := time.NewTimer(max(0, time.Until(deadline)))
+		defer timer.Stop()
+		ready = timer.C
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
 		case <-changes:
+		case <-ready:
+			ready = nil
 		}
 		if current() != sent {
 			cancel(errHeartbeatStale)
@@ -295,9 +317,13 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 		local = cx
 	}
 	capacity := max(c.Concurrency, 1)
+	availabilityChanges := make(chan struct{}, 1)
 	var services *servicePool
 	if c.Executor == config.ExecutorServices {
 		services = newServicePool(c)
+		services.availabilityChanges = availabilityChanges
+		services.xRecovery = inheritedPending(journal.Pending, inheritedKeys)
+		services.xEligibility = worker.DefaultXClients().NextEligibility
 		// The static slot ceiling is read before renewal can adjust health.
 		capacity = services.capacity()
 		stopRenewal := services.startCodexRenewal(ctx, managedAuthenticationFactory, inheritedPending(journal.Pending, inheritedKeys))
@@ -317,7 +343,6 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 		}()
 	}
 	slots := make(chan struct{}, capacity)
-	availabilityChanges := make(chan struct{}, 1)
 	var running sync.WaitGroup
 	status := runtimeStatus{Version: coordinator.Version, State: "running", NodeID: nodeID, Services: []coordinator.ServiceHealth{}}
 	defer func() {
@@ -409,11 +434,19 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			h.Capacity = 0
 			for _, service := range h.Services {
 				h.Capacity += service.Capacity
+				if service.ConfiguredCapacity != nil {
+					h.Capacity += *service.ConfiguredCapacity - service.Capacity
+				}
 			}
 			h.State = "exhausted"
 			for _, s := range h.Services {
 				if (s.State == "configured" || s.State == "ready") && s.InFlight < s.Capacity {
 					h.State = "available"
+				}
+				for _, operation := range s.OperationAvailability {
+					if (s.State == "configured" || s.State == "ready") && operation.RunnableCapacity > 0 {
+						h.State = "available"
+					}
 				}
 			}
 		}
@@ -421,6 +454,9 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 		if drained {
 			h.State = "exhausted"
 			status.State = "draining"
+		}
+		if drained || resting {
+			blockOperationAvailability(h.Services)
 		}
 		journalCapacity, err := journal.Capacity()
 		if err != nil {
@@ -434,6 +470,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			for i := range h.Services {
 				h.Services[i].State = "exhausted"
 			}
+			blockOperationAvailability(h.Services)
 		}
 		status.Services = h.Services
 		if services != nil {
@@ -460,17 +497,10 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			defer close(watched)
 			watchHeartbeat(pollCtx, cancelPoll, sent, currentAvailability, availabilityChanges)
 		}()
-		reply, err := client.Poll(pollCtx, h)
-		if errors.Is(err, coordinator.ErrHeartbeatRejected) && !legacyHeartbeat {
-			// A coordinator that rejects optional service extensions still gets
-			// the heartbeat shape it knows, including after a rollback.
-			if stripped, removed := coordinator.WithoutExtensions(h.Services); removed {
-				h.Services = stripped
-				if reply, err = client.Poll(pollCtx, h); err == nil {
-					legacyHeartbeat = true
-					fmt.Fprintln(os.Stderr, "heartbeat: coordinator rejected optional service extensions; advertising the legacy service shape until restart")
-				}
-			}
+		wasLegacy := legacyHeartbeat
+		reply, err := pollHeartbeatWithFallback(pollCtx, client, h, &legacyHeartbeat, drained || resting || journalCapacity.AvailableRecords <= len(slots))
+		if !wasLegacy && legacyHeartbeat {
+			fmt.Fprintln(os.Stderr, "heartbeat: coordinator rejected optional service extensions; advertising the legacy service shape until restart")
 		}
 		stale := err != nil && errors.Is(context.Cause(pollCtx), errHeartbeatStale)
 		cancelPoll(nil)
@@ -537,7 +567,11 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			serviceAvailable := true
 			if services != nil {
 				endAccountAcquire := diagnostics.Start(attemptCtx, "account_acquire", 0)
-				account, serviceAvailable = services.acquireAccount(l.ServiceType)
+				if l.ServiceType == "x_read" && l.XRequest != nil {
+					account, serviceAvailable = services.acquireAccount(l.ServiceType, l.XRequest.Operation)
+				} else {
+					account, serviceAvailable = services.acquireAccount(l.ServiceType)
+				}
 				if serviceAvailable {
 					endAccountAcquire("success")
 				} else {
@@ -576,10 +610,10 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 				var err error
 				if !serviceAvailable {
 					code = "service_unavailable"
-					if l.AcceptanceRequired && l.ServiceType == "codex" {
+					if l.AcceptanceRequired && (l.ServiceType == "codex" || l.ServiceType == "x_read") {
 						// No selected valid profile: leave the unaccepted offer to
 						// expire rather than funding it through rejectLease.
-						err = errors.New("Codex offer has no locally valid account")
+						err = errors.New("provider offer has no locally eligible account")
 					} else {
 						err = rejectLease(attemptCtx, client, journal, l, code)
 					}
@@ -660,6 +694,12 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 				return codexLocalAuthExpired, err
 			}
 			return codexLocalAuthExpired, errors.New("Codex credential validity is insufficient for the offered deadline")
+		}
+		if l.ServiceType == "x_read" && (l.XRequest == nil || c.AccountReady != nil && !c.AccountReady(l.XRequest.Operation)) {
+			if err := journal.TerminalContext(ctx, record); err != nil {
+				return "service_unavailable", err
+			}
+			return "service_unavailable", errors.New("X account eligibility changed before acceptance")
 		}
 		// Persist uncertainty before acceptance HTTP. A lost acknowledgement
 		// keeps this journal pending; recovery never re-executes the provider.

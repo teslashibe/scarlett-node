@@ -18,17 +18,43 @@ func withXExchange(ctx context.Context, exchange int) context.Context {
 	ctx = context.WithValue(ctx, xExchangeKey{}, exchange)
 	ctx = x.WithWaitObserver(ctx, func(reason string) func(bool) {
 		phase := "pacing_wait"
-		if reason == "quota" {
+		fine := "fixed_gap_wait"
+		switch reason {
+		case "jitter":
+			fine = "jitter_wait"
+		case "spread":
+			fine = "quota_spread_wait"
+		case "reset":
+			fine = "quota_reset_wait"
+		}
+		if reason == "quota" || reason == "spread" || reason == "reset" {
 			phase = "quota_wait"
 		}
 		end := diagnostics.Start(ctx, phase, exchange)
+		endFine := diagnostics.Start(ctx, fine, exchange)
 		return func(cancelled bool) {
 			if cancelled {
 				end("cancelled")
+				endFine("cancelled")
 			} else {
 				end("success")
+				endFine("success")
 			}
 		}
+	})
+	ctx = x.WithQuotaObserver(ctx, func(q x.QuotaObservation) {
+		operation := ""
+		switch q.Operation {
+		case "SearchTimeline":
+			operation = "search"
+		case "UserByScreenName":
+			operation = "profile"
+		case "TweetResultByRestId":
+			operation = "post"
+		case "TweetDetail":
+			operation = "thread"
+		}
+		diagnostics.ObserveQuota(ctx, diagnostics.QuotaSnapshot{ObservedAt: q.ObservedAt.UTC(), CapturedAt: q.CapturedAt.UTC(), NextEligibleAt: q.NextEligibleAt.UTC(), Exchange: exchange, Operation: operation, Mode: q.Mode, Limit: q.Limit, Remaining: q.Remaining, Reset: q.Reset.UTC(), Complete: q.Complete, Authoritative: q.Authoritative})
 	})
 	return x.WithDecodeObserver(ctx, func() func(bool) {
 		end := diagnostics.Start(ctx, "response_decode", exchange)

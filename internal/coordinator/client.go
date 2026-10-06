@@ -91,6 +91,14 @@ type ServiceHealth struct {
 	InFlight      int           `json:"in_flight"`
 	LastErrorCode string        `json:"last_error_code,omitempty"`
 	ActiveLeases  []ActiveLease `json:"active_leases,omitempty"`
+	// Optional aggregate readiness, never identities or provider quota budgets.
+	ConfiguredCapacity    *int                    `json:"configured_capacity,omitempty"`
+	RunnableCapacity      *int                    `json:"runnable_capacity,omitempty"`
+	ActiveAccounts        *int                    `json:"active_accounts,omitempty"`
+	ReadyAccounts         *int                    `json:"ready_accounts,omitempty"`
+	CoolingAccounts       *int                    `json:"cooling_accounts,omitempty"`
+	NextReadyAt           *time.Time              `json:"next_ready_at,omitempty"`
+	OperationAvailability []OperationAvailability `json:"operation_availability,omitempty"`
 	// Local execution limits, not provider authorization or proven readiness.
 	MaxInputBytes   int      `json:"max_input_bytes,omitempty"`
 	MaxOutputTokens int      `json:"max_output_tokens,omitempty"`
@@ -98,6 +106,14 @@ type ServiceHealth struct {
 	// Proof modes this node serves for the kind beyond the default. Absent
 	// means MPC-TLS only, which is what every node before this field serves.
 	ProofModes []string `json:"proof_modes,omitempty"`
+}
+
+// Per-operation lanes overlap and must never be added together. Admission
+// applies the exact immutable job operation and the configured physical ceiling.
+type OperationAvailability struct {
+	Operation        string     `json:"operation"`
+	RunnableCapacity int        `json:"runnable_capacity"`
+	NextReadyAt      *time.Time `json:"next_ready_at,omitempty"`
 }
 
 // Proven tells the coordinator a proof was sent; it reads the answer from the verifier.
@@ -198,6 +214,15 @@ func WithoutProofModes(services []ServiceHealth) ([]ServiceHealth, bool) {
 func WithoutExtensions(services []ServiceHealth) ([]ServiceHealth, bool) {
 	out, removed := WithoutProofModes(services)
 	for i := range out {
+		if out[i].ConfiguredCapacity != nil || out[i].RunnableCapacity != nil || out[i].ActiveAccounts != nil || out[i].ReadyAccounts != nil || out[i].CoolingAccounts != nil || out[i].NextReadyAt != nil || out[i].OperationAvailability != nil {
+			removed = true
+			out[i].ConfiguredCapacity, out[i].ActiveAccounts, out[i].ReadyAccounts, out[i].CoolingAccounts, out[i].NextReadyAt = nil, nil, nil, nil, nil
+			out[i].RunnableCapacity = nil
+			out[i].OperationAvailability = nil
+			if out[i].Capacity == 0 && (out[i].State == "configured" || out[i].State == "ready") {
+				out[i].State = "exhausted"
+			}
+		}
 		if out[i].ActiveLeases != nil {
 			removed = true
 			out[i].ActiveLeases = nil

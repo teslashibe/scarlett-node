@@ -46,7 +46,8 @@ func TestSharedPacingAcceptsNewWindowOnlyAfterExpiry(t *testing.T) {
 func TestIdentityPacingMergeKeepsEarlierReservationsAndQuota(t *testing.T) {
 	now := time.Now()
 	shared := &RequestPacing{lastReqAt: now.Add(30 * time.Second), rlState: RateLimitState{Remaining: 0, Reset: now.Add(time.Minute), RetryAfter: time.Minute}}
-	local := &RequestPacing{lastReqAt: now, rlState: RateLimitState{Limit: 100, Remaining: 99, Reset: now.Add(2 * time.Minute)}}
+	local := &RequestPacing{lastReqAt: now}
+	local.observe(RateLimitState{Limit: 100, Remaining: 99, Reset: now.Add(2 * time.Minute)}, true, true, true)
 	shared.merge(local)
 	if got := shared.RateLimit(); got.Remaining != 0 || got.Reset.Before(local.RateLimit().Reset) || got.RetryAfter != time.Minute {
 		t.Fatal("validation merge discarded existing quota", got)
