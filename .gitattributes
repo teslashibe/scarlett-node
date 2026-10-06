@@ -1,3 +1,6 @@
 # Preserve exact upstream bytes for the snapshot and patch integrity checks.
 third_party/x-go/** -text
 third_party/social-login/** -text
+
+# The collector emits LF bytes on every platform.
+desktop/tests/fixtures/pacing-diagnostics-v1.json text eol=lf
