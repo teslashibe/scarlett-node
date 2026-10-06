@@ -20,6 +20,7 @@ using System.Runtime.InteropServices;
 public static class ScarlettAcceptanceWindow {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr window, int command);
+    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr window);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
     [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
@@ -58,8 +59,8 @@ public static class ScarlettAcceptanceWindow {
             (long)x < (long)left + width && (long)y < (long)top + height;
     }
     public static bool[] PhysicalPointContext(IntPtr window, int x, int y) {
-        // Failure diagnostics only: compare physical UIA coordinates to real
-        // monitors, then restore the caller's context before returning.
+        // Compare physical UIA coordinates to real monitors without retaining
+        // a change to the caller's context or injecting any input.
         bool[] state = new bool[4];
         IntPtr previous = SetThreadDpiAwarenessContext(new IntPtr(-4));
         if (previous == IntPtr.Zero) return state;
@@ -690,8 +691,14 @@ function Click-Control([System.Windows.Automation.AutomationElement]$Control) {
     $stage = 1
     [ScarlettAcceptanceWindow]::ResetInputDiagnostics()
     try {
-        [ScarlettAcceptanceWindow]::ShowWindow($handle, 9) | Out-Null
+        # A restored client window plus native chrome can exceed the runner's
+        # work area. Normalize the owned window before scrolling its controls.
+        [ScarlettAcceptanceWindow]::ShowWindow($handle, 3) | Out-Null
         [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
+        Wait-Check {
+            return [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle -and
+                [ScarlettAcceptanceWindow]::IsZoomed($handle)
+        } 10 'Installed control did not acquire a maximized foreground window'
         if ($Control.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) {
             $scroll.ScrollIntoView()
         }
@@ -701,12 +708,24 @@ function Click-Control([System.Windows.Automation.AutomationElement]$Control) {
         } 10 'Installed control did not acquire foreground input'
         $stage = 2
         Wait-Check {
+            if ([ScarlettAcceptanceWindow]::GetForegroundWindow() -ne $handle -or
+                -not [ScarlettAcceptanceWindow]::IsZoomed($handle)) { return $false }
             $point = [System.Windows.Point]::new(0.0, 0.0)
             if (-not $Control.TryGetClickablePoint([ref]$point)) { return $false }
             $click.point = $point
             $click.pointAvailable = $true
+            if ([double]::IsNaN($point.X) -or [double]::IsNaN($point.Y) -or
+                [double]::IsInfinity($point.X) -or [double]::IsInfinity($point.Y)) { return $false }
+            if (-not $Control.Current.IsEnabled -or $Control.Current.IsOffscreen -or
+                -not $Control.Current.BoundingRectangle.Contains($point)) { return $false }
+            $pointX, $pointY = [int]$point.X, [int]$point.Y
+            if (-not [ScarlettAcceptanceWindow]::PointInDesktop($pointX, $pointY) -or
+                -not [ScarlettAcceptanceWindow]::PointOwnedByWindow($handle, $pointX, $pointY)) { return $false }
+            $physical = [ScarlettAcceptanceWindow]::PhysicalPointContext($handle, $pointX, $pointY)
+            if ($physical[0] -and -not $physical[3]) { throw 'Native click did not restore caller DPI awareness' }
+            if (-not $physical[0] -or -not $physical[1] -or -not $physical[2]) { return $false }
             return $true
-        } 10 'Installed control did not become visible for native click'
+        } 10 'Installed control did not expose an owned on-screen click point'
         $stage = 3
         $x, $y = [int]$click.point.X, [int]$click.point.Y
         $click.nativeAttempted = $true
@@ -724,7 +743,7 @@ function Click-Control([System.Windows.Automation.AutomationElement]$Control) {
             pointDiagnosticsAvailable = $false; pointInsideControl = $false; pointInDesktop = $false; pointWindowOwned = $false
             physicalContextAvailable = $false; physicalContextRestored = $false
             pointOnPhysicalMonitor = $false; windowOnPhysicalMonitor = $false
-            foregroundOwned = $false; modifiersReleased = $false; webViewNativeInputFocus = $false
+            foregroundOwned = $false; windowMaximized = $false; modifiersReleased = $false; webViewNativeInputFocus = $false
             accessibilityWindowNativeFocus = $false; threadDpiContextKnown = $false; threadDpiUnaware = $false
             threadDpiSystemAware = $false; threadDpiPerMonitorAware = $false; windowDpiKnown = $false
             windowAbove96Dpi = $false; realProviderJobs = 0 }
@@ -752,6 +771,7 @@ function Click-Control([System.Windows.Automation.AutomationElement]$Control) {
         } catch { }
         try {
             $diagnostic.foregroundOwned = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
+            $diagnostic.windowMaximized = [ScarlettAcceptanceWindow]::IsZoomed($handle)
             $diagnostic.modifiersReleased = [ScarlettAcceptanceWindow]::ModifiersReleased()
             $diagnostic.webViewNativeInputFocus = [ScarlettAcceptanceWindow]::WebViewHasInputFocus($handle)
             $diagnostic.accessibilityWindowNativeFocus = [ScarlettAcceptanceWindow]::AccessibilityWindowFocused($handle)
