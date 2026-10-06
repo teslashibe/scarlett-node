@@ -140,10 +140,11 @@ const (
 )
 
 // heartbeatBackoff paces heartbeats after consecutive failures. Each pause has
-// equal jitter: half the current step plus a random share of the other half,
-// never under heartbeatBackoffBase. Nodes that failed together, as across a
-// coordinator deploy, come back spread over seconds instead of in one wave.
-// An answered heartbeat resets it.
+// equal jitter: half the current step, never under heartbeatBackoffBase, plus
+// a random share of the other half, so even the first pause is spread over
+// one to one and a half seconds. Nodes that failed together, as when a
+// coordinator crashes or a proxy drops every held heartbeat at once, come back
+// spread out instead of in one wave. An answered heartbeat resets it.
 type heartbeatBackoff struct {
 	step time.Duration
 	// fixed replaces the schedule with one constant pause (the local fixture).
@@ -158,14 +159,13 @@ func (b *heartbeatBackoff) next(err error) time.Duration {
 	wait := b.fixed
 	if wait == 0 {
 		b.step = min(max(2*b.step, heartbeatBackoffBase), heartbeatBackoffCap)
-		half := b.step / 2
-		spread := b.step - half
+		half := max(b.step/2, heartbeatBackoffBase)
+		spread := b.step - b.step/2
 		if b.jitter != nil {
 			wait = half + min(max(b.jitter(spread), 0), spread)
 		} else {
 			wait = half + rand.N(spread+1)
 		}
-		wait = max(wait, heartbeatBackoffBase)
 	}
 	var status *coordinator.StatusError
 	if errors.As(err, &status) && (status.Status == http.StatusTooManyRequests || status.Status == http.StatusServiceUnavailable) && status.RetryAfter > 0 {
@@ -175,6 +175,43 @@ func (b *heartbeatBackoff) next(err error) time.Duration {
 }
 
 func (b *heartbeatBackoff) reset() { b.step = 0 }
+
+// newHeartbeatBackoff is the run loop's failure pacing: the full schedule, or
+// one fixed second for the local fixture. Tests replace it to observe the
+// schedule the loop drives.
+var newHeartbeatBackoff = func(localFixture bool) heartbeatBackoff {
+	if localFixture {
+		return heartbeatBackoff{fixed: time.Second}
+	}
+	return heartbeatBackoff{}
+}
+
+// heartbeatStatusRefresh is how often a pause between heartbeats rewrites
+// status.json, well inside statusFresh.
+const heartbeatStatusRefresh = 10 * time.Second
+
+// waitRefreshing waits d, calling refresh when it starts and every interval
+// meanwhile. It reports false if ctx ended first.
+func waitRefreshing(ctx context.Context, d, every time.Duration, refresh func()) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	refresh()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			return true
+		case <-ticker.C:
+			refresh()
+		}
+	}
+}
 
 // availability is every local input to a heartbeat's advertised state that can
 // change while the coordinator holds it: an operator drain, a rest after the
@@ -315,10 +352,9 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	// HeartbeatWaitSeconds and answers the moment a job is funded, so the loop
 	// adds no delay of its own. failures paces heartbeats after a failure, and
 	// drainRejectDelay is the pause after rejecting a lease during a drain.
-	failures := heartbeatBackoff{}
+	failures := newHeartbeatBackoff(c.LocalFixture)
 	drainRejectDelay := 5 * time.Second
 	if c.LocalFixture {
-		failures.fixed = time.Second
 		drainRejectDelay = time.Second
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
@@ -436,6 +472,15 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			a.services = serviceStates(services.health())
 		}
 		return a
+	}
+	// pause waits d before the next heartbeat and reports false if the node is
+	// stopping. The loop saves status.json once per heartbeat, but a pause can
+	// outlast statusFresh (a Retry-After asks for up to 90 seconds with
+	// jitter), so the snapshot is saved again when a pause starts and every
+	// heartbeatStatusRefresh while it lasts: a node that is only waiting never
+	// reads as offline.
+	pause := func(d time.Duration) bool {
+		return waitRefreshing(ctx, d, heartbeatStatusRefresh, func() { _ = saveRuntimeStatus(c.StateDir, status) })
 	}
 	lastRecovery := time.Now()
 	for ctx.Err() == nil {
@@ -564,13 +609,14 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 				return err
 			}
 			if drained || ctx.Err() != nil {
-				if err := rejectLease(workCtx, client, journal, *reply.Lease, "service_unavailable"); err != nil {
+				// The acceptance is sent once, never retried: it only precedes
+				// an immediate service_unavailable report, and a busy
+				// coordinator must not hold up the next heartbeat or a stop.
+				if err := rejectLease(coordinator.WithoutAcceptRetry(workCtx), client, journal, *reply.Lease, "service_unavailable"); err != nil {
 					fmt.Fprintln(os.Stderr, "drain rejection:", err)
 				}
-				select {
-				case <-ctx.Done():
+				if !pause(drainRejectDelay) {
 					return nil
-				case <-time.After(drainRejectDelay):
 				}
 				continue
 			}
@@ -690,19 +736,13 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			// down answers at once and asks, with Retry-After, for a pause.
 			failures.reset()
 			status.LastHeartbeatAt = time.Now().UTC()
-			if reply.RetryAfter > 0 {
-				select {
-				case <-ctx.Done():
-					return nil
-				case <-time.After(coordinator.RetryAfterWait(reply.RetryAfter)):
-				}
+			if reply.RetryAfter > 0 && !pause(coordinator.RetryAfterWait(reply.RetryAfter)) {
+				return nil
 			}
 			continue
 		}
-		select {
-		case <-ctx.Done():
+		if !pause(failures.next(err)) {
 			return nil
-		case <-time.After(failures.next(err)):
 		}
 	}
 	return nil

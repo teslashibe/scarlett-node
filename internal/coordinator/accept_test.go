@@ -285,6 +285,25 @@ func TestAcceptRetryLimit(t *testing.T) {
 	}
 }
 
+// A caller that accepts only to report a rejection at once sends the
+// acceptance once, busy or not, as before acceptance retried.
+func TestAcceptWithoutRetrySendsOnce(t *testing.T) {
+	offer := retryOffer(time.Minute)
+	busy := acceptReply{503, "1", "dispatch_busy"}
+	client, calls, _ := acceptRetryServer(t, offer, []acceptReply{busy, busy})
+	client.retryWait = func(time.Duration) time.Duration { t.Error("rejection acceptance retried"); return time.Millisecond }
+	_, err := client.Accept(WithoutAcceptRetry(context.Background()), offer)
+	var status *StatusError
+	if !errors.As(err, &status) || status.Code != "dispatch_busy" || calls.Load() != 1 {
+		t.Fatalf("calls %d, error %v", calls.Load(), err)
+	}
+	// An answered acceptance is unaffected.
+	client, calls, _ = acceptRetryServer(t, offer, nil)
+	if got, err := client.Accept(WithoutAcceptRetry(context.Background()), offer); err != nil || got.VerifierToken != strings.Repeat("c", 64) || calls.Load() != 1 {
+		t.Fatalf("calls %d, error %v", calls.Load(), err)
+	}
+}
+
 // Refusals, rate limits and other unavailability are final: one request each.
 func TestAcceptNeverRetriesRefusals(t *testing.T) {
 	for _, reply := range []acceptReply{{401, "1", "node_unauthorized"}, {404, "1", "attempt_unavailable"}, {409, "1", "attempt_conflict"}, {429, "1", "rate_limited"}, {400, "", "invalid_request"}, {503, "1", "dispatch_unavailable"}, {503, "1", ""}, {500, "1", "network_unavailable"}} {

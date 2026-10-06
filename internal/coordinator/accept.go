@@ -30,6 +30,16 @@ const acceptRetries = 3
 // retrying, leaving the rest of the lease to the provider work.
 const acceptRetryMargin = 30 * time.Second
 
+type noAcceptRetry struct{}
+
+// WithoutAcceptRetry marks ctx so that Accept sends its acceptance once and
+// never retries it. A caller that accepts only to report a rejection at once,
+// such as the heartbeat loop during a drain or a stop, uses it so that a busy
+// coordinator cannot hold up its next heartbeat or its shutdown.
+func WithoutAcceptRetry(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noAcceptRetry{}, true)
+}
+
 // acceptRetryAfter reports whether a failed acceptance may be repeated, and
 // the Retry-After to honour first: one second when the coordinator sent none.
 // A 401, 404, 409, 429, any other 503 and a transport failure are final.
@@ -60,7 +70,8 @@ func ValidOffer(offer Lease, now time.Time) error {
 // It does not read a node-selected RPC or treat prototype funds as authority.
 // A busy or temporarily unavailable coordinator is asked again within this
 // call, at most acceptRetries times and never later than acceptRetryMargin
-// before the lease deadline. No retry authorizes repeating provider work.
+// before the lease deadline, unless ctx came from WithoutAcceptRetry. No retry
+// authorizes repeating provider work.
 func (c *Client) Accept(ctx context.Context, offer Lease) (Lease, error) {
 	u, err := url.Parse(c.Origin)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || c.Credential == "" {
@@ -84,11 +95,15 @@ func (c *Client) Accept(ctx context.Context, offer Lease) (Lease, error) {
 	}{Version, offer.Attempt, offer.Fence, offer.RequestSHA256, offer.SignedJobID}
 	var reply LeaseAcceptance
 	var status int
+	retries := acceptRetries
+	if ctx.Value(noAcceptRetry{}) != nil {
+		retries = 0
+	}
 	for retry := 0; ; retry++ {
 		reply = LeaseAcceptance{}
 		status, err = c.Post(ctx, path, body, &reply)
 		after, retryable := acceptRetryAfter(err)
-		if !retryable || retry == acceptRetries {
+		if !retryable || retry == retries {
 			break
 		}
 		wait := RetryAfterWait(after)

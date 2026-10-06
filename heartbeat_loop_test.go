@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -574,8 +575,9 @@ func TestRunLoopCompletionRefreshesFullHeldHeartbeatWithoutBackoff(t *testing.T)
 }
 
 // Failed heartbeats back off from one second, doubling to a 15-second cap with
-// equal jitter and a one-second floor, and an answered heartbeat resets the
-// schedule. A Retry-After on a 429 or 503 is a lower bound on the pause.
+// equal jitter whose fixed half is never under a second, so even the first
+// pause is spread; an answered heartbeat resets the schedule. A Retry-After on
+// a 429 or 503 is a lower bound on the pause.
 func TestHeartbeatBackoffScheduleJitterAndRetryAfter(t *testing.T) {
 	failure := errors.New("coordinator unavailable")
 	sequence := func(b *heartbeatBackoff, n int) []time.Duration {
@@ -590,26 +592,27 @@ func TestHeartbeatBackoffScheduleJitterAndRetryAfter(t *testing.T) {
 		t.Fatalf("least jitter: %v, want %v", got, want)
 	}
 	high := &heartbeatBackoff{jitter: func(n time.Duration) time.Duration { return n }}
-	if got, want := sequence(high, 7), []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second, 15 * time.Second, 15 * time.Second}; !reflect.DeepEqual(got, want) {
+	if got, want := sequence(high, 7), []time.Duration{1500 * time.Millisecond, 2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second, 15 * time.Second, 15 * time.Second}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("most jitter: %v, want %v", got, want)
 	}
 	high.reset()
-	if got := high.next(failure); got != time.Second {
+	if got := high.next(failure); got != 1500*time.Millisecond {
 		t.Fatalf("after a success the backoff restarted at %v", got)
 	}
-	// Drawn jitter stays within each step and spreads a fleet out.
+	// Drawn jitter stays within each step and spreads a fleet out, from the
+	// first failure on.
 	steps := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second}
 	for i, step := range steps {
 		seen := map[time.Duration]bool{}
 		for range 500 {
 			b := &heartbeatBackoff{}
 			wait := sequence(b, i+1)[i]
-			if wait < max(step/2, time.Second) || wait > step {
+			if wait < max(step/2, time.Second) || wait > max(step, time.Second+step/2) {
 				t.Fatalf("step %v waited %v", step, wait)
 			}
 			seen[wait] = true
 		}
-		if i > 0 && len(seen) < 100 {
+		if len(seen) < 100 {
 			t.Fatalf("step %v: only %d distinct waits", step, len(seen))
 		}
 	}
@@ -625,9 +628,9 @@ func TestHeartbeatBackoffScheduleJitterAndRetryAfter(t *testing.T) {
 	}{
 		{&coordinator.StatusError{Status: http.StatusServiceUnavailable, RetryAfter: 5 * time.Second}, 5 * time.Second, 7500 * time.Millisecond},
 		{&coordinator.StatusError{Status: http.StatusTooManyRequests, RetryAfter: coordinator.MaxRetryAfter}, coordinator.MaxRetryAfter, 90 * time.Second},
-		{&coordinator.StatusError{Status: http.StatusServiceUnavailable}, time.Second, time.Second},
-		{&coordinator.StatusError{Status: http.StatusInternalServerError, RetryAfter: 5 * time.Second}, time.Second, time.Second},
-		{fmt.Errorf("%w: %w", coordinator.ErrHeartbeatRejected, &coordinator.StatusError{Status: http.StatusRequestEntityTooLarge, RetryAfter: 5 * time.Second}), time.Second, time.Second},
+		{&coordinator.StatusError{Status: http.StatusServiceUnavailable}, time.Second, 1500 * time.Millisecond},
+		{&coordinator.StatusError{Status: http.StatusInternalServerError, RetryAfter: 5 * time.Second}, time.Second, 1500 * time.Millisecond},
+		{fmt.Errorf("%w: %w", coordinator.ErrHeartbeatRejected, &coordinator.StatusError{Status: http.StatusRequestEntityTooLarge, RetryAfter: 5 * time.Second}), time.Second, 1500 * time.Millisecond},
 	} {
 		for _, b := range []*heartbeatBackoff{{}, {fixed: time.Second}} {
 			if got := b.next(tc.err); got < tc.min || got > tc.max {
@@ -712,12 +715,22 @@ func TestRunLoopHonoursRetryAfterAndBacksOffRejectedHeartbeat(t *testing.T) {
 		reader.Close()
 	})
 	var got []arrival
-	for range 4 {
+	for i := range 4 {
 		select {
 		case a := <-arrivals:
 			got = append(got, a)
 		case <-time.After(10 * time.Second):
 			t.Fatalf("node sent %d heartbeats", len(got))
+		}
+		if i == 2 {
+			// Inside the 503's Retry-After pause, status.json has been saved
+			// again since that heartbeat, not only before it.
+			time.Sleep(500 * time.Millisecond)
+			raw, err := readLocalFile(filepath.Join(c.StateDir, "status.json"), 16384)
+			var saved runtimeStatus
+			if err != nil || json.Unmarshal(raw, &saved) != nil || !saved.UpdatedAt.After(got[2].at) {
+				t.Fatalf("status during the pause was saved at %v, before the heartbeat at %v (%v)", saved.UpdatedAt, got[2].at, err)
+			}
 		}
 	}
 	if got[0].services == "null" || got[1].services != got[0].services {
@@ -731,5 +744,162 @@ func TestRunLoopHonoursRetryAfterAndBacksOffRejectedHeartbeat(t *testing.T) {
 		if gap := got[i+1].at.Sub(got[i].at); gap < want.min || gap > want.max {
 			t.Fatalf("heartbeat %d followed after %v, want [%v, %v]", i+1, gap, want.min, want.max)
 		}
+	}
+}
+
+// A pause between heartbeats saves status when it starts and at each interval
+// while it lasts, and a stop ends it at once.
+func TestWaitRefreshingSavesStatusDuringPause(t *testing.T) {
+	refreshes := 0
+	started := time.Now()
+	if !waitRefreshing(context.Background(), 260*time.Millisecond, 50*time.Millisecond, func() { refreshes++ }) {
+		t.Fatal("an uninterrupted pause reported a stop")
+	}
+	if took := time.Since(started); took < 260*time.Millisecond || refreshes < 4 {
+		t.Fatalf("paused %v with %d refreshes", took, refreshes)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	refreshes, started = 0, time.Now()
+	if waitRefreshing(ctx, time.Minute, time.Minute, func() { refreshes++ }) || time.Since(started) > time.Second || refreshes != 1 {
+		t.Fatalf("stop ended the pause after %v with %d refreshes", time.Since(started), refreshes)
+	}
+	if waitRefreshing(ctx, time.Minute, time.Minute, func() { t.Error("a stopped node saved status") }) {
+		t.Fatal("a stopped node paused")
+	}
+}
+
+// The run loop resets its failure schedule after any answered heartbeat: a
+// failure after an answer pauses for the first step again, not the next one.
+func TestRunLoopResetsBackoffAfterAnsweredHeartbeat(t *testing.T) {
+	var mu sync.Mutex
+	var spreads []time.Duration
+	restore := newHeartbeatBackoff
+	t.Cleanup(func() { newHeartbeatBackoff = restore })
+	newHeartbeatBackoff = func(bool) heartbeatBackoff {
+		// The full schedule at its least jitter. Each draw is offered the
+		// random half of its step, which records the step reached.
+		return heartbeatBackoff{jitter: func(n time.Duration) time.Duration {
+			mu.Lock()
+			spreads = append(spreads, n)
+			mu.Unlock()
+			return 0
+		}}
+	}
+	var n atomic.Int32
+	arrivals := make(chan struct{}, 8)
+	_, stop := startLongPollNode(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/node/v1/heartbeat" {
+			t.Error("unexpected request", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		// Read the body to its end, so that the server sees the node hang up
+		// on a held heartbeat.
+		_, _ = io.Copy(io.Discard, r.Body)
+		arrivals <- struct{}{}
+		switch n.Add(1) - 1 {
+		case 0, 1, 3:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			io.WriteString(w, `{"error":{"code":"network_unavailable","message":"synthetic"}}`)
+		case 2:
+			io.WriteString(w, `{"lease":null}`)
+		default:
+			<-r.Context().Done()
+		}
+	})
+	for i := range 5 {
+		select {
+		case <-arrivals:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("node sent %d heartbeats", i)
+		}
+	}
+	// Read before stopping: the stop aborts the held fifth heartbeat, which
+	// draws once more.
+	mu.Lock()
+	got := append([]time.Duration(nil), spreads...)
+	mu.Unlock()
+	stop()
+	// Two failures step from one second to two; the answer in between resets
+	// the schedule, so the third failure is a one-second step again, not four.
+	if want := []time.Duration{500 * time.Millisecond, time.Second, 500 * time.Millisecond}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("backoff steps drew %v, want %v", got, want)
+	}
+}
+
+// A lease that reaches a draining node is rejected with a single acceptance
+// request: a busy coordinator's 503 is not retried there, so the next
+// heartbeat follows after the usual drain-rejection pause.
+func TestRunLoopDrainRejectionDoesNotRetryBusyAcceptance(t *testing.T) {
+	offer := testLease()
+	offer.ServiceType, offer.AcceptanceRequired = "codex", true
+	offer.SettlementDeadline = offer.LeaseDeadline
+	offer.SignedJobID, offer.RequestSHA256 = strings.Repeat("a", 64), strings.Repeat("b", 64)
+	type arrival struct {
+		state string
+		at    time.Time
+	}
+	arrivals := make(chan arrival, 8)
+	leased := make(chan time.Time, 1)
+	var accepts atomic.Int32
+	var offered atomic.Bool
+	c, stop := startLongPollNode(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/node/v1/jobs/"+offer.JobID+"/accept" {
+			accepts.Add(1)
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			io.WriteString(w, `{"error":{"code":"dispatch_busy","message":"synthetic"}}`)
+			return
+		}
+		var h coordinator.Heartbeat
+		if r.URL.Path != "/api/node/v1/heartbeat" || json.NewDecoder(r.Body).Decode(&h) != nil {
+			t.Error("unexpected request", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		arrivals <- arrival{h.State, time.Now()}
+		if h.State == "exhausted" && offered.CompareAndSwap(false, true) {
+			json.NewEncoder(w).Encode(map[string]any{"lease": offer})
+			leased <- time.Now()
+			return
+		}
+		<-r.Context().Done()
+	})
+	next := func() arrival {
+		t.Helper()
+		select {
+		case a := <-arrivals:
+			return a
+		case <-time.After(10 * time.Second):
+			t.Fatal("node did not heartbeat")
+		}
+		return arrival{}
+	}
+	if first := next(); first.state != "available" {
+		t.Fatalf("first heartbeat advertised %q", first.state)
+	}
+	if err := writeLocalFile(c.StateDir, "drain", []byte("drained\n")); err != nil {
+		t.Fatal(err)
+	}
+	if drained := next(); drained.state != "exhausted" {
+		t.Fatalf("heartbeat after the drain advertised %q", drained.state)
+	}
+	var leasedAt time.Time
+	select {
+	case leasedAt = <-leased:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the draining node was never offered the lease")
+	}
+	after := next()
+	// The fixture's one-second drain-rejection pause, without three retry
+	// waits of a second or more before it.
+	if gap := after.at.Sub(leasedAt); gap < time.Second || gap > 2500*time.Millisecond {
+		t.Fatalf("heartbeat after the drain rejection followed after %v", gap)
+	}
+	stop()
+	if got := accepts.Load(); got != 1 {
+		t.Fatalf("drain rejection sent %d acceptance requests, want 1", got)
 	}
 }
