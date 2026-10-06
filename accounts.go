@@ -461,6 +461,14 @@ func replaceXSession(dir string, registry accountFile, id, profile string, input
 	}
 	identities, err := loadXIdentities(dir)
 	if err == nil {
+		// A warm client may authenticate this registration while the staged
+		// replacement is being checked. Preserve that newly verified user too.
+		latest := identities.Identities[filepath.Clean(account.Path)]
+		if validXIdentity(latest) && latest.ID != identity.ID {
+			err = errXIdentityMismatch
+		}
+	}
+	if err == nil {
 		err = rejectDuplicateXIdentity(current, identities, *account, identity)
 	}
 	if err != nil {

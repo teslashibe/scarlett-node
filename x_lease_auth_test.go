@@ -141,6 +141,11 @@ func TestXLeaseReplacementRetainsAccountWideQuota(t *testing.T) {
 			name := map[bool]string{false: "legacy", true: "managed"}[managed] + "/" + map[bool]string{false: "quota-after-replacement", true: "quota-before-replacement"}[beforeReplacement]
 			t.Run(name, func(t *testing.T) {
 				p := xLeasePool(t, managed)
+				if !managed {
+					// Account-wide quota requires authenticated evidence that the
+					// rotated sessions describe the same provider user.
+					p.xIdentityValidated(p.config.XSession, worker.VerifiedXIdentity{ID: "123", Username: "fixture_one", Stamp: worker.XSessionStamp(p.config.XSession)})
+				}
 				older, ok := p.acquireAccount("x_read")
 				if !ok {
 					t.Fatal("old lease unavailable")

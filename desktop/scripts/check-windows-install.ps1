@@ -76,6 +76,9 @@ public static class ScarlettAcceptanceWindow {
     public static void ControlKey(ushort key) {
         Send(new Input[] { Key(0x11, false), Key(key, false), Key(key, true), Key(0x11, true) });
     }
+    public static void Escape() {
+        Send(new Input[] { Key(0x1B, false), Key(0x1B, true) });
+    }
     public static void Click(int x, int y) {
         int left = GetSystemMetrics(76), top = GetSystemMetrics(77);
         int width = GetSystemMetrics(78), height = GetSystemMetrics(79);
@@ -717,8 +720,8 @@ function Set-Text([string]$Name, [string]$Value, [string]$NextName) {
     Wait-KeyboardTarget $control $handle 'Synthetic input did not reacquire keyboard focus'
     [ScarlettAcceptanceWindow]::UnicodeTextAndTab($Value)
     Wait-InputAdvanced $Name $NextName $handle $false 'Synthetic text input was not acknowledged by successor focus'
-    # Masked cookie fields may refuse value readback. Exact persistence is
-    # checked against the synthetic fixture after the Connect action.
+    # Masked cookie fields may refuse value readback. Submission is checked
+    # separately through a local duplicate-nickname rejection, without X I/O.
     if (-not $control.Current.IsPassword) {
         try {
             Wait-Check {
@@ -812,6 +815,93 @@ function Imported-Accounts {
     $script:importState = $registries[0]
     return @(([System.IO.File]::ReadAllText((Join-Path $script:importState 'accounts.json')) | ConvertFrom-Json).accounts)
 }
+function Invoke-SyntheticAccountCommand([string[]]$Arguments) {
+    $stateBefore, $accountsBefore = $env:SCARLETT_STATE_DIR, $env:SCARLETT_ACCOUNTS_FILE
+    try {
+        $env:SCARLETT_STATE_DIR, $env:SCARLETT_ACCOUNTS_FILE = $script:importState, (Join-Path $script:importState 'accounts.json')
+        $raw = & (Join-Path $install 'scarlett-node.exe') accounts @Arguments | Out-String
+        if ($LASTEXITCODE -ne 0) { throw 'Installed helper refused its private synthetic account fixture' }
+        return $raw
+    } finally { $env:SCARLETT_STATE_DIR, $env:SCARLETT_ACCOUNTS_FILE = $stateBefore, $accountsBefore }
+}
+function Check-SyntheticAccounts([string[]]$IDs) {
+    $registry = @(Imported-Accounts)
+    $inventory = Invoke-SyntheticAccountCommand @('list')
+    $listed = @($inventory | ConvertFrom-Json)
+    foreach ($records in @($registry, $listed)) {
+        if ($records.Count -ne $IDs.Count) { throw 'Synthetic account inventory count differs from its private registry' }
+        foreach ($id in $IDs) {
+            if (@($records | Where-Object { $_.service -ceq 'x_read' -and $_.id -ceq $id }).Count -ne 1) {
+                throw 'Synthetic account inventory differs from its private registry'
+            }
+        }
+    }
+    $credentialRoot = [System.IO.Path]::GetFullPath((Join-Path $script:importState 'accounts')).TrimEnd('\') + '\'
+    foreach ($record in $registry) {
+        if (-not [System.IO.Path]::GetFullPath($record.path).StartsWith($credentialRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Synthetic credential escaped disposable app state'
+        }
+        $session = [System.IO.File]::ReadAllText($record.path) | ConvertFrom-Json
+        if (@($session.PSObject.Properties).Count -ne 2 -or
+            $session.auth_token -cne $script:fixture.authToken -or $session.ct0 -cne $script:fixture.csrf) {
+            throw 'Private synthetic session differs from its fixture fields'
+        }
+    }
+    if ($inventory.Contains($script:fixture.authToken) -or $inventory.Contains($script:fixture.csrf) -or
+        (UI-Contains $script:fixture.authToken) -or (UI-Contains $script:fixture.csrf)) {
+        throw 'Synthetic account inventory exposed fixture credentials'
+    }
+}
+function Check-SyntheticRemoval {
+    $registryPath = Join-Path $script:importState 'accounts.json'
+    $removed = @(Imported-Accounts | Where-Object { $_.id -ceq 'removal-fixture' })
+    if ($removed.Count -ne 1) { throw 'Removal acceptance requires its own synthetic account' }
+    $credentialPath = $removed[0].path
+    $credentialHash = (Get-FileHash -LiteralPath $credentialPath -Algorithm SHA256).Hash
+    $before = (Get-FileHash -LiteralPath $registryPath -Algorithm SHA256).Hash
+    foreach ($cancel in @('Keep', 'Escape')) {
+        Click-Button 'Remove'
+        Wait-Check { UI-Contains 'Remove X account removal-fixture?' } 10 'Removal dialog selected another account'
+        Wait-Check { (Find-Button 'Keep account').Current.HasKeyboardFocus } 10 'Removal dialog did not default to Keep account'
+        if ($cancel -eq 'Keep') { Click-Button 'Keep account' }
+        else {
+            $keep = Find-Button 'Keep account'
+            Wait-KeyboardTarget $keep $application.MainWindowHandle 'Removal cancellation did not have native input focus'
+            [ScarlettAcceptanceWindow]::Escape()
+        }
+        Wait-Check { $keep = Find-Button 'Keep account'; $null -eq $keep -or $keep.Current.IsOffscreen } 10 'Removal cancellation left the dialog open'
+        if ((Get-FileHash -LiteralPath $registryPath -Algorithm SHA256).Hash -cne $before -or
+            (Get-FileHash -LiteralPath $credentialPath -Algorithm SHA256).Hash -cne $credentialHash) {
+            throw 'Cancelled removal changed private synthetic state'
+        }
+        Check-SyntheticAccounts @('removal-fixture', 'browser-firefox', 'browser-paste')
+    }
+    Click-Button 'Remove'
+    Wait-Check { UI-Contains 'Remove X account removal-fixture?' } 10 'Removal confirmation selected another account'
+    Click-Button 'Remove account'
+    Wait-Check { @(Imported-Accounts).Count -eq 2 -and -not (UI-Contains ('X ' + [char]0x00B7 + ' removal-fixture')) } 15 'Confirmed removal did not update the registry and installed UI'
+    Check-SyntheticAccounts @('browser-firefox', 'browser-paste')
+    if ((Get-FileHash -LiteralPath $credentialPath -Algorithm SHA256).Hash -cne $credentialHash) { throw 'Removal changed retained credential bytes' }
+    $after = (Get-FileHash -LiteralPath $registryPath -Algorithm SHA256).Hash
+    $ack = Invoke-SyntheticAccountCommand @('remove', 'x_read', 'removal-fixture') | ConvertFrom-Json
+    if ($ack.status -cne 'updated' -or
+        (Get-FileHash -LiteralPath $registryPath -Algorithm SHA256).Hash -cne $after -or
+        (Get-FileHash -LiteralPath $credentialPath -Algorithm SHA256).Hash -cne $credentialHash) {
+        throw 'Repeated removal changed private synthetic state'
+    }
+    Click-Button 'Quit Scarlett'
+    if (-not $application.WaitForExit(135000)) { throw 'Removal acceptance app did not quit' }
+    Start-App
+    Wait-Check { (UI-Contains ('X ' + [char]0x00B7 + ' browser-firefox')) -and (UI-Contains ('X ' + [char]0x00B7 + ' browser-paste')) } 15 'Restart lost the retained synthetic accounts'
+    if (UI-Contains ('X ' + [char]0x00B7 + ' removal-fixture')) { throw 'Removed synthetic account returned after restart' }
+    Check-SyntheticAccounts @('browser-firefox', 'browser-paste')
+    @{
+        keepCancellation = 'passed'; escapeCancellation = 'passed'; defaultKeepFocus = 'passed'
+        confirmedRemoval = 'passed'; registryAndInstalledHelperReadback = 'passed'; retainedCredentials = 'passed'
+        repeatedRemoval = 'passed'; restartPersistence = 'passed'; privateSeededInventory = $true
+        realAccountLoginTested = $false; realProviderJobs = 0; providerAuthenticationRequests = 0
+    } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-account-removal-ui.json')
+}
 function Check-BrowserImport {
     $root = [System.IO.Path]::GetFullPath((Split-Path -Parent $BrowserFixture))
     $temporary = [System.IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
@@ -821,6 +911,22 @@ function Check-BrowserImport {
     foreach ($path in @($script:fixture.roaming, $script:fixture.local) + @($script:fixture.stores | ForEach-Object { $_.path })) {
         if (-not [System.IO.Path]::GetFullPath($path).StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Browser fixture escaped its isolated home' }
     }
+    foreach ($store in $script:fixture.stores) {
+        if ((Get-FileHash -LiteralPath $store.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $store.sha256) { throw 'Browser fixture changed before preparation' }
+    }
+    # An incomplete Firefox session exercises the installed native cookie reader
+    # and its fixed error before Viewer. Successful extraction has source tests;
+    # complete fake credentials must never reach production authentication.
+    $firefox = @($script:fixture.stores | Where-Object { [IO.Path]::GetFileName($_.path) -ceq 'cookies.sqlite' })
+    if ($firefox.Count -ne 1) { throw 'Expected one isolated Firefox store' }
+    $prepareIncomplete = @'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as db:
+    db.execute('DELETE FROM moz_cookies WHERE name = ?', ('ct0',))
+'@
+    & $script:pythonExe -c $prepareIncomplete $firefox[0].path
+    if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the offline Firefox rejection fixture' }
+    $firefox[0].sha256 = (Get-FileHash -LiteralPath $firefox[0].path -Algorithm SHA256).Hash.ToLowerInvariant()
     $roamingBefore, $localBefore = $env:APPDATA, $env:LOCALAPPDATA
     try {
         $env:APPDATA, $env:LOCALAPPDATA = $script:fixture.roaming, $script:fixture.local
@@ -828,7 +934,6 @@ function Check-BrowserImport {
         Wait-Check { (Find-Input 'Browser profile').Current.IsEnabled } 15 'Isolated browser profiles were not discovered'
         if (@(Imported-Accounts).Count -ne 0) { throw 'Browser test encountered existing accounts' }
         if (-not (Checkbox-Is 'Import only X session cookies from this profile' $false) -or (Find-Button 'Import X account').Current.IsEnabled) { throw 'Browser import did not require opt-in consent' }
-        # The two fixture profiles sort Chrome, then Firefox after the prompt.
         Select-Browser 1 'Chrome'
         Set-Checkbox 'Import only X session cookies from this profile' $true
         Wait-Check { (Find-Button 'Import X account').Current.IsEnabled } 10 'Consent did not enable import'
@@ -836,107 +941,71 @@ function Check-BrowserImport {
         Wait-Check { Checkbox-Is 'Import only X session cookies from this profile' $false } 10 'Changing profile retained consent'
         Wait-Check { -not (Find-Button 'Import X account').Current.IsEnabled } 10 'Profile change allowed import without new consent'
         Verify-KeyboardDelivery
-        Set-Text 'Local X account ID' 'browser-firefox' 'Concurrent jobs'
+        Set-Text 'Local X account ID' 'incomplete-firefox' 'Concurrent jobs'
         Set-Checkbox 'Import only X session cookies from this profile' $true
         Click-Button 'Import X account'
-        try {
-            # The native import contract permits 45 seconds, then the UI refresh
-            # runs. Observe that complete contract rather than timing out at 20.
-            Wait-Check { @(Imported-Accounts).Count -eq 1 } 55 'Installed Firefox UI import did not persist'
-        } catch {
-            $errors = @{
-                invalid_input = 'Check the account ID, capacity and cookie values'
-                command_failed = 'The node could not complete that action'
-                command_timeout = 'The action timed out'
-                private_storage = 'Scarlett could not open its private local storage'
-                browser_protected = 'The browser or OS protected this profile'
-                browser_busy = 'Close the selected browser, then try importing again'
-                browser_invalid = 'Scarlett could not read this cookie store safely'
-                browser_no_x_session = 'No complete X session was found in that profile'
-                browser_ambiguous = 'This profile contains multiple X sessions'
-                browser_unsupported = 'This browser format is not supported on this device'
-            }
-            $classifications = @{}
-            foreach ($classification in $errors.Keys) { $classifications[$classification] = UI-Contains $errors[$classification] }
-            $failure = @{ accountCount = @(Imported-Accounts).Count
-                importButtonEnabled = (Find-Button 'Import X account').Current.IsEnabled
-                successNoticeVisible = (UI-Contains 'X account imported on this device')
-                errorClasses = $classifications; realProviderJobs = 0 }
-            $failure | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-browser-import-failure.json')
-            Write-Output ($failure | ConvertTo-Json -Depth 3 -Compress)
-            throw
-        }
-        Wait-Check { Checkbox-Is 'Import only X session cookies from this profile' $false } 10 'Successful import retained consent'
-        Wait-Check { UI-Contains 'access not verified' } 15 'Imported account claimed verified access'
+        Wait-Check { UI-Contains 'No complete X session was found in that profile' } 45 'Installed Firefox reader did not reject the incomplete synthetic session'
+        if (@(Imported-Accounts).Count -ne 0) { throw 'Incomplete Firefox import saved an account' }
         Select-Browser 1 'Chrome'
         Set-Text 'Local X account ID' 'protected-chrome' 'Concurrent jobs'
         Set-Checkbox 'Import only X session cookies from this profile' $true
         Click-Button 'Import X account'
         Wait-Check { UI-Contains 'The browser or OS protected this profile' } 20 'Protected Chrome did not show the paste fallback'
-        if (@(Imported-Accounts).Count -ne 1) { throw 'Protected Chrome import added an account' }
+        if (@(Imported-Accounts).Count -ne 0) { throw 'Protected Chrome import saved an account' }
+        Click-Button 'Quit Scarlett'
+        if (-not $application.WaitForExit(135000)) { throw 'Browser acceptance app did not quit before fixture seeding' }
+        # Resolve the app-owned home actually used by the two failed imports.
+        $homes = @(@($state, (Join-Path $script:fixture.roaming 'ai.scarlett.node')) | Select-Object -Unique |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_ 'accounts') -PathType Container })
+        if ($homes.Count -ne 1) { throw 'Synthetic account fixture has ambiguous app-owned storage' }
+        $script:importState = $homes[0]
+        $records = @()
+        foreach ($id in @('removal-fixture', 'browser-firefox', 'browser-paste')) {
+            $home = Join-Path (Join-Path $script:importState 'accounts') ('x_read-' + $id)
+            $privateOutput = & (Join-Path $install 'scarlett-node.exe') desktop private-dir $home | Out-String
+            $privateOutput = $null
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create private synthetic account directory' }
+            $session = Join-Path $home 'session.json'
+            Write-SyntheticPrivateJSON $session @{ auth_token = $script:fixture.authToken; ct0 = $script:fixture.csrf }
+            $records += @{ id = $id; service = 'x_read'; path = $session; concurrency = 1 }
+        }
+        Write-SyntheticPrivateJSON (Join-Path $script:importState 'accounts.json') @{ version = 1; accounts = $records }
+        Start-App
+        Wait-Check { UI-Contains ('X ' + [char]0x00B7 + ' removal-fixture') } 15 'Installed app did not render its private synthetic inventory'
+        Wait-Check { UI-Contains 'access not verified' } 15 'Private synthetic inventory claimed verified access'
+        Check-SyntheticAccounts @('removal-fixture', 'browser-firefox', 'browser-paste')
         foreach ($name in @('auth_token', 'ct0')) {
             if (-not (Find-Input $name).Current.IsPassword) { throw 'Cookie paste field was not masked' }
         }
+        # This existing nickname is rejected locally before reading the cookies
+        # or verifying identity. It proves masked input and native command routing.
         Set-Text 'Local X account ID' 'browser-paste' 'Concurrent jobs'
         Set-Text 'auth_token' $script:fixture.authToken 'ct0'
         Set-Text 'ct0' $script:fixture.csrf 'Connect X'
+        $before = (Get-FileHash -LiteralPath (Join-Path $script:importState 'accounts.json') -Algorithm SHA256).Hash
+        $sessionHashes = @{}
+        foreach ($record in (Imported-Accounts)) { $sessionHashes[$record.path] = (Get-FileHash -LiteralPath $record.path -Algorithm SHA256).Hash }
         Click-Button 'Connect X'
-        try { Wait-Check { @(Imported-Accounts).Count -eq 2 } 20 'Installed masked paste did not persist' }
-        catch {
-            $errorClasses = @{
-                invalidInput = (UI-Contains 'Check the account ID, capacity and cookie values')
-                commandFailed = (UI-Contains 'The node could not complete that action')
-                commandTimeout = (UI-Contains 'The action timed out')
-                privateStorage = (UI-Contains 'Scarlett could not open its private local storage')
-            }
-            $focus = @{}
-            foreach ($name in @('auth_token', 'ct0', 'Connect X')) {
-                $target = Find-Input $name
-                $focus[$name] = $null -ne $target -and $target.Current.HasKeyboardFocus
-            }
-            $connect = Find-Button 'Connect X'
-            $failure = @{ accountCount = @(Imported-Accounts).Count
-                connectEnabled = $null -ne $connect -and $connect.Current.IsEnabled
-                successNoticeVisible = (UI-Contains 'X account connected locally')
-                foregroundOwned = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $application.MainWindowHandle
-                focus = $focus; errorClasses = $errorClasses; realProviderJobs = 0 }
-            $failure | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-masked-input-failure.json')
-            Write-Output ($failure | ConvertTo-Json -Depth 3 -Compress)
-            throw
-        }
-        foreach ($record in (Imported-Accounts)) {
-            if ($record.service -ne 'x_read' -or $record.id -notin @('browser-firefox', 'browser-paste')) { throw 'Unexpected imported account' }
-            $credentialRoot = [System.IO.Path]::GetFullPath((Join-Path $script:importState 'accounts')).TrimEnd('\') + '\'
-            if (-not [System.IO.Path]::GetFullPath($record.path).StartsWith($credentialRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'Imported credential escaped disposable app state' }
-            $raw = [System.IO.File]::ReadAllText($record.path) | ConvertFrom-Json
-            if (@($raw.PSObject.Properties).Count -ne 2 -or $raw.auth_token -cne $script:fixture.authToken -or $raw.ct0 -cne $script:fixture.csrf) { throw 'Imported session differs from selected synthetic fields' }
-            $raw = $null
+        Wait-Check { UI-Contains 'The node could not complete that action' } 20 'Installed masked paste did not reject the existing local nickname'
+        Check-SyntheticAccounts @('removal-fixture', 'browser-firefox', 'browser-paste')
+        if ((Get-FileHash -LiteralPath (Join-Path $script:importState 'accounts.json') -Algorithm SHA256).Hash -cne $before) { throw 'Local nickname rejection changed the private registry' }
+        foreach ($path in $sessionHashes.Keys) {
+            if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -cne $sessionHashes[$path]) { throw 'Local nickname rejection changed private session bytes' }
         }
         foreach ($store in $script:fixture.stores) {
-            if ((Get-FileHash -LiteralPath $store.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $store.sha256) { throw 'Import modified its browser store' }
+            if ((Get-FileHash -LiteralPath $store.path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $store.sha256) { throw 'Import modified its prepared browser store' }
         }
-        # The installed helper checks native private ACLs before exposing its
-        # credential-free inventory. Never print cookie files or this output.
-        $stateBefore, $accountsBefore = $env:SCARLETT_STATE_DIR, $env:SCARLETT_ACCOUNTS_FILE
-        try {
-            $env:SCARLETT_STATE_DIR, $env:SCARLETT_ACCOUNTS_FILE = $script:importState, (Join-Path $script:importState 'accounts.json')
-            $inventory = & (Join-Path $install 'scarlett-node.exe') accounts list | Out-String
-            $inventoryExit = $LASTEXITCODE
-            $inventoryRecords = $inventory | ConvertFrom-Json
-            if ($inventoryExit -ne 0 -or @($inventoryRecords).Count -ne 2) { throw 'Installed helper refused private imported accounts' }
-            if ($inventory.Contains($script:fixture.authToken) -or $inventory.Contains($script:fixture.csrf) -or (UI-Contains $script:fixture.authToken) -or (UI-Contains $script:fixture.csrf)) { throw 'Import exposed fixture credentials in status' }
-            $inventory = $null
-            $inventoryRecords = $null
-        } finally { $env:SCARLETT_STATE_DIR, $env:SCARLETT_ACCOUNTS_FILE = $stateBefore, $accountsBefore }
+        Check-SyntheticRemoval
         Click-Button 'Quit Scarlett'
         if (-not $application.WaitForExit(135000)) { throw 'Browser acceptance app did not quit' }
         @{
             redirectedBrowserRoots = 'passed'; profileConsent = 'passed'; consentReset = 'passed'
-            firefoxUIImport = 'passed'; protectedChromeFallback = 'passed'; maskedPaste = 'passed'
-            privatePersistence = 'passed'; unchangedBrowserStores = 'passed'; accessUnverified = $true
-            realBrowserAccountsTested = $false; realProviderJobs = 0
+            firefoxIncompleteSessionRejected = 'passed'; protectedChromeFallback = 'passed'; maskedPasteLocalRejection = 'passed'
+            privateSeededInventory = 'passed'; unchangedPreparedBrowserStores = 'passed'; accessUnverified = $true
+            successfulIdentityVerificationTested = $false; successfulBrowserExtraction = 'source tests'
+            realBrowserAccountsTested = $false; realProviderJobs = 0; providerAuthenticationRequests = 0
         } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-browser-import-ui.json')
-        Write-Output 'Installed browser acceptance: consent, Firefox import, protected Chrome and masked paste passed'
+        Write-Output 'Installed browser acceptance: consent, offline reader rejection, protected Chrome and masked local rejection passed'
     } finally {
         $env:APPDATA, $env:LOCALAPPDATA = $roamingBefore, $localBefore
         $script:fixture = $null

@@ -206,7 +206,7 @@ Quit. Evidence is recorded only after these assertions pass. This tests the
 installation lifecycle for that version pair; signed installers, historical
 schema compatibility and the Mac upgrade/downgrade UI remain separate checks.
 
-Installed Windows import acceptance uses new synthetic Chrome/Firefox stores below RUNNER_TEMP and redirects only browser roots for the test app. It exercises profile-specific consent and reset, Firefox import, the protected Chrome paste fallback, masked paste, unchanged stores and native private account persistence. It makes no provider requests. Account ID fields have distinct X/Codex labels for assistive technology. This acceptance is a release gate; test configuration is not a browser import mode for operators.
+Installed Windows browser acceptance uses new synthetic Chrome/Firefox stores below RUNNER_TEMP and redirects only browser roots for the test app. It exercises profile-specific consent and reset, incomplete Firefox session rejection, the protected Chrome fallback and unchanged prepared stores. Protected synthetic inventory covers installed account removal, cancellation, readback, retained credentials and restart persistence. A duplicate local nickname exercises masked paste without authenticating synthetic cookies. It makes no provider requests. Successful cookie extraction is covered by source fixtures; real account authentication remains a separate release gate. Account ID fields have distinct X/Codex labels for assistive technology. Test configuration is not a browser import mode for operators.
 
 ## Windows release signature acceptance
 

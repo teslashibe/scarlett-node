@@ -129,29 +129,7 @@ func (p *servicePool) refreshXIdentities(now time.Time) {
 			a.identity = worker.VerifiedXIdentity{}
 			continue
 		}
-		if a.entry.xRestIdentity != "" && a.entry.xRestIdentity != identity.ID {
-			// A different authenticated user must not inherit the old user's rest.
-			if a.entry.lastError == "x_rate_limited" || a.entry.lastError == "capacity_unavailable" {
-				a.entry.restUntil = time.Time{}
-				a.entry.xRestIdentity = ""
-				a.entry.state, a.entry.lastError = "configured", ""
-			}
-		}
-		a.identity = identity
-		rest := p.xCooldowns[identity.ID]
-		if rest.Blocked {
-			a.entry.xRestIdentity = identity.ID
-			a.entry.state, a.entry.lastError = "auth_required", "auth_required"
-			a.entry.localAuthInvalid = false
-		} else if until := rest.Until; now.Before(until) {
-			a.entry.xRestIdentity = identity.ID
-			if until.After(a.entry.restUntil) {
-				a.entry.restUntil = until
-			}
-			if a.entry.state != "auth_required" {
-				a.entry.state, a.entry.lastError = "exhausted", "x_rate_limited"
-			}
-		}
+		p.applyXIdentity(a, identity, now)
 		keys = append(keys, key)
 	}
 	// Prefer a currently usable session, then a stable local nickname. Aliases
@@ -169,6 +147,62 @@ func (p *servicePool) refreshXIdentities(now time.Time) {
 		a := p.accounts[key]
 		a.duplicate = seen[a.identity.ID]
 		seen[a.identity.ID] = true
+	}
+}
+
+// Caller holds p.mu. A newly authenticated legacy session can bind attempts
+// admitted before the keeper knew its user, but only for their exact snapshot.
+func (p *servicePool) bindXLeases(a *pooledAccount, path string, identity worker.VerifiedXIdentity) {
+	for lease := range a.xLeases {
+		if lease.xIdentity == "" && lease.config.XSession == path && lease.xStamp == identity.Stamp {
+			lease.xIdentity = identity.ID
+			if p.xInFlight == nil {
+				p.xInFlight = map[string]int{}
+			}
+			p.xInFlight[identity.ID]++
+		}
+	}
+}
+
+func (p *servicePool) trackXLease(lease *accountLease) {
+	if lease.kind != "x_read" {
+		return
+	}
+	if lease.account.xLeases == nil {
+		lease.account.xLeases = map[*accountLease]struct{}{}
+	}
+	lease.account.xLeases[lease] = struct{}{}
+	if lease.xIdentity != "" {
+		if p.xInFlight == nil {
+			p.xInFlight = map[string]int{}
+		}
+		p.xInFlight[lease.xIdentity]++
+	}
+}
+
+func (p *servicePool) applyXIdentity(a *pooledAccount, identity worker.VerifiedXIdentity, now time.Time) {
+	if a.entry.xRestIdentity != "" && a.entry.xRestIdentity != identity.ID {
+		// A different authenticated user must not inherit the old user's rest.
+		if a.entry.lastError == "x_rate_limited" || a.entry.lastError == "capacity_unavailable" {
+			a.entry.restUntil = time.Time{}
+			a.entry.xRestIdentity = ""
+			a.entry.state, a.entry.lastError = "configured", ""
+		}
+	}
+	a.identity = identity
+	rest := p.xCooldowns[identity.ID]
+	if rest.Blocked {
+		a.entry.xRestIdentity = identity.ID
+		a.entry.state, a.entry.lastError = "auth_required", "auth_required"
+		a.entry.localAuthInvalid = false
+	} else if until := rest.Until; now.Before(until) {
+		a.entry.xRestIdentity = identity.ID
+		if until.After(a.entry.restUntil) {
+			a.entry.restUntil = until
+		}
+		if a.entry.state != "auth_required" {
+			a.entry.state, a.entry.lastError = "exhausted", "x_rate_limited"
+		}
 	}
 }
 
@@ -205,11 +239,16 @@ func (p *servicePool) xIdentityValidated(path string, identity worker.VerifiedXI
 	}
 	p.refresh(time.Now())
 	for _, a := range p.accounts {
-		if a.spec.Service != "x_read" || a.removed || a.spec.Path != path {
+		if a.spec.Service != "x_read" || a.spec.Path != path {
 			continue
 		}
+		p.bindXLeases(a, path, identity)
+		if a.removed {
+			continue // Bind accepted work without restoring a retired registration.
+		}
 		if p.config.StateDir == "" || !p.accountMode {
-			a.identity = identity
+			p.loadXCooldowns(time.Now())
+			p.applyXIdentity(a, identity, time.Now())
 			return
 		}
 		if a.identity == identity {

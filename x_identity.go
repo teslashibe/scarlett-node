@@ -274,7 +274,8 @@ func verifyRegisteredXIdentities(ctx context.Context, dir string, registry accou
 		if account.Service != "x_read" || account.Path == exclude {
 			continue
 		}
-		stamp := worker.XSessionStamp(account.Path)
+		// Proxy affinity affects proof readiness, not account identity admission.
+		stamp := xCredentialStamp(account.Path)
 		if stamp == "" {
 			continue
 		}
@@ -300,7 +301,7 @@ func rejectDuplicateXIdentity(registry accountFile, identities xIdentityFile, ca
 		if account.Service != "x_read" || account.ID == candidate.ID {
 			continue
 		}
-		stamp := worker.XSessionStamp(account.Path)
+		stamp := xCredentialStamp(account.Path)
 		if stamp == "" {
 			continue
 		}

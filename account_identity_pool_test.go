@@ -306,3 +306,162 @@ func TestUnchangedIdentityObservationDoesNotRewriteMetadata(t *testing.T) {
 		t.Fatal("unchanged keeper identity observation rewrote private metadata")
 	}
 }
+
+func TestInitiallyUnknownLegacyXAttemptPinsAuthenticatedIdentity(t *testing.T) {
+	for _, restBeforeReplacement := range []bool{false, true} {
+		t.Run(map[bool]string{false: "late-reset", true: "known-reset"}[restBeforeReplacement], func(t *testing.T) {
+			p := poolFixture(t, "x_read")
+			old, ok := p.acquireAccount("x_read")
+			if !ok || old.xIdentity != "" {
+				t.Fatal("fixture needs an admitted legacy attempt before identity validation")
+			}
+			identity := worker.VerifiedXIdentity{ID: "123", Username: "old_user", Stamp: old.xStamp}
+			p.xIdentityValidated(old.config.XSession, identity)
+			p.xIdentityValidated(old.config.XSession, identity)
+			if old.xIdentity != identity.ID || p.xInFlight[identity.ID] != 1 || old.config.ExpectedXIdentity != "" {
+				t.Fatal("validation did not bind exactly one admission without changing copied worker configuration")
+			}
+			if restBeforeReplacement {
+				old.config.AccountCooldown(2 * time.Hour)
+			}
+			if err := localfs.WriteAtomic(old.config.XSession, []byte(`{"auth_token":"replacement-user","ct0":"replacement-csrf"}`), true); err != nil {
+				t.Fatal(err)
+			}
+			p.xIdentityValidated(old.config.XSession, worker.VerifiedXIdentity{ID: "456", Username: "new_user", Stamp: worker.XSessionStamp(old.config.XSession)})
+			if old.xIdentity != identity.ID {
+				t.Fatal("replacement rebound an accepted attempt to another user")
+			}
+			if !restBeforeReplacement {
+				old.config.AccountCooldown(2 * time.Hour)
+			}
+			p.finishAccount(old, "x_rate_limited")
+			if len(old.account.xLeases) != 0 || len(p.xInFlight) != 0 {
+				t.Fatal("finished admission retained identity occupancy")
+			}
+			fresh, ok := p.acquireAccount("x_read")
+			if !ok || fresh.xIdentity != "456" {
+				t.Fatalf("replacement user inherited the old attempt's reset: %+v", p.accountStatus())
+			}
+			p.finishAccount(fresh, "")
+			restarted := newServicePool(p.config)
+			fresh, ok = restarted.acquireAccount("x_read")
+			if !ok {
+				t.Fatalf("replacement user inherited old reset after restart: %+v", restarted.accountStatus())
+			}
+			restarted.finishAccount(fresh, "")
+			if !p.xCooldowns[identity.ID].Until.After(time.Now().Add(time.Hour)) || !p.xCooldowns["456"].Until.IsZero() {
+				t.Fatal("reset was not persisted against the admitted user")
+			}
+		})
+	}
+}
+
+func TestInitiallyUnknownLegacyXAttemptOccupiesManagedIdentityLane(t *testing.T) {
+	p := poolFixture(t, "x_read")
+	p.config.XConcurrency = 2
+	p.entries["x_read"].capacity = 2
+	old, ok := p.acquireAccount("x_read")
+	if !ok || old.xIdentity != "" {
+		t.Fatal("fixture needs an admitted legacy attempt before identity validation")
+	}
+	p.xIdentityValidated(old.config.XSession, worker.VerifiedXIdentity{ID: "123", Username: "same_user", Stamp: old.xStamp})
+	path := filepath.Join(p.config.StateDir, "managed-session.json")
+	if err := localfs.WriteAtomic(path, []byte(`{"auth_token":"managed-same-user","ct0":"managed-csrf"}`), false); err != nil {
+		t.Fatal(err)
+	}
+	saveAccountFixture(t, p, accountFile{Version: 1, Accounts: []providerAccount{{ID: "managed", Service: "x_read", Path: path, Concurrency: 1}}})
+	saveVerifiedXFixture(t, p, path, "123", "same_user")
+	if _, ok := p.acquireAccount("x_read"); ok {
+		t.Fatal("managed alias bypassed the accepted legacy user's occupied lane")
+	}
+	p.finishAccount(old, "")
+	fresh, ok := p.acquireAccount("x_read")
+	if !ok || fresh.xIdentity != "123" {
+		t.Fatal("managed identity did not become available after the legacy attempt drained")
+	}
+	p.finishAccount(fresh, "")
+	if len(p.xInFlight) != 0 {
+		t.Fatal("drained identity retained occupied lanes")
+	}
+}
+
+func TestDrainingUnknownLegacyXAttemptBindsIdentityAndRest(t *testing.T) {
+	p := poolFixture(t, "x_read")
+	p.config.XConcurrency = 2
+	p.entries["x_read"].capacity = 2
+	old, ok := p.acquireAccount("x_read")
+	if !ok || old.xIdentity != "" {
+		t.Fatal("fixture needs an admitted legacy attempt before identity validation")
+	}
+	path := filepath.Join(p.config.StateDir, "managed-session.json")
+	if err := localfs.WriteAtomic(path, []byte(`{"auth_token":"managed-same-user","ct0":"managed-csrf"}`), false); err != nil {
+		t.Fatal(err)
+	}
+	saveAccountFixture(t, p, accountFile{Version: 1, Accounts: []providerAccount{{ID: "managed", Service: "x_read", Path: path, Concurrency: 1}}})
+	saveVerifiedXFixture(t, p, path, "123", "same_user")
+	_ = p.accountStatus() // The old registration now drains while validation finishes.
+	p.xIdentityValidated(old.config.XSession, worker.VerifiedXIdentity{ID: "123", Username: "same_user", Stamp: old.xStamp})
+	if old.xIdentity != "123" || !old.account.removed {
+		t.Fatal("late validation did not bind accepted work independently of registration")
+	}
+	old.config.AccountCooldown(2 * time.Hour)
+	p.finishAccount(old, "x_rate_limited")
+	for _, pool := range []*servicePool{p, newServicePool(p.config)} {
+		if _, ok := pool.acquireAccount("x_read"); ok {
+			t.Fatal("managed alias bypassed the quota observed by draining legacy work")
+		}
+		statuses := pool.accountStatus()
+		if len(statuses) != 1 || statuses[0].ID != "managed" || statuses[0].State != "exhausted" || !statuses[0].RestUntil.After(time.Now().Add(time.Hour)) {
+			t.Fatalf("late validation resurrected removal or lost the durable identity reset: %+v", statuses)
+		}
+	}
+}
+
+func TestLegacyXAdmissionDoesNotPinStaleCredentialIdentity(t *testing.T) {
+	p := poolFixture(t, "x_read")
+	path := p.config.XSession
+	p.xIdentityValidated(path, worker.VerifiedXIdentity{ID: "123", Username: "old_user", Stamp: worker.XSessionStamp(path)})
+	if err := localfs.WriteAtomic(path, []byte(`{"auth_token":"replacement-user","ct0":"replacement-csrf"}`), true); err != nil {
+		t.Fatal(err)
+	}
+	lease, ok := p.acquireAccount("x_read")
+	if !ok || lease.xIdentity != "" || lease.config.ExpectedXIdentity != "" {
+		t.Fatal("legacy admission reused a verified identity from different credentials")
+	}
+	p.xIdentityValidated(path, worker.VerifiedXIdentity{ID: "456", Username: "new_user", Stamp: lease.xStamp})
+	if lease.xIdentity != "456" || p.xInFlight["456"] != 1 || p.xInFlight["123"] != 0 {
+		t.Fatal("new legacy credentials were not bound to their authenticated user")
+	}
+	p.finishAccount(lease, "")
+}
+
+func TestUnknownLegacyXBootstrapQuotaCannotPoisonReplacement(t *testing.T) {
+	for _, wait := range []time.Duration{2 * time.Hour, 31 * 24 * time.Hour} {
+		t.Run(wait.String(), func(t *testing.T) {
+			p := poolFixture(t, "x_read")
+			old, ok := p.acquireAccount("x_read")
+			if !ok || old.xIdentity != "" {
+				t.Fatal("fixture needs a legacy attempt whose bootstrap has not authenticated a user")
+			}
+			if err := localfs.WriteAtomic(old.config.XSession, []byte(`{"auth_token":"replacement-user","ct0":"replacement-csrf"}`), true); err != nil {
+				t.Fatal(err)
+			}
+			p.xIdentityValidated(old.config.XSession, worker.VerifiedXIdentity{ID: "456", Username: "new_user", Stamp: worker.XSessionStamp(old.config.XSession)})
+			if old.xIdentity != "" {
+				t.Fatal("replacement callback invented the bootstrap attempt's historical identity")
+			}
+			old.config.AccountCooldown(wait)
+			p.finishAccount(old, "x_rate_limited")
+			for _, pool := range []*servicePool{p, newServicePool(p.config)} {
+				fresh, ok := pool.acquireAccount("x_read")
+				if !ok {
+					t.Fatalf("old unknown bootstrap quota poisoned replacement credentials: %+v", pool.accountStatus())
+				}
+				pool.finishAccount(fresh, "")
+			}
+			if len(p.xCooldowns) != 0 {
+				t.Fatal("unknown bootstrap outcome invented a durable provider identity")
+			}
+		})
+	}
+}

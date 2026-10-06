@@ -341,6 +341,66 @@ func TestInteractiveProxyIdentityDoesNotEnableProofExecution(t *testing.T) {
 	}
 }
 
+func TestXAccountCLIRejectsVerifiedProxyIdentityAlias(t *testing.T) {
+	o, _, message := loginFixture(t)
+	t.Setenv("SCARLETT_STATE_DIR", o.dir)
+	message.Reconnect = true
+	path := filepath.Join(o.dir, "accounts", "x_read-"+message.ID, "session.json")
+	if err := prepareStateDir(filepath.Dir(filepath.Dir(path))); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareStateDir(filepath.Dir(path)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeLocalFile(filepath.Dir(path), "session.json", []byte(`{"auth_token":"previous","ct0":"previous-csrf","proxy":"http://localhost:8888"}`)); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(accountFile{Version: 1, Accounts: []providerAccount{{ID: message.ID, Service: "x_read", Path: path, Concurrency: 1}}})
+	if err := writeLocalFile(o.dir, "accounts.json", body); err != nil {
+		t.Fatal(err)
+	}
+	if result := o.handle(context.Background(), message); result.Status != "updated" {
+		t.Fatal("existing proxy session reconnect failed", result)
+	}
+	if _, err := verifiedXIdentity(o.dir, path); err != nil {
+		t.Fatal("verified proxy identity missing", err)
+	}
+	var output bytes.Buffer
+	err := fixtureAccountsCommand([]string{"connect", "x_read", "alias", "1"}, strings.NewReader(`{"auth_token":"synthetic-alias","ct0":"csrf"}`), &output)
+	if err == nil || !strings.Contains(output.String(), `"code":"duplicate_account"`) {
+		t.Fatal("verified proxy identity admitted an alias", err)
+	}
+	registry, err := loadAccounts(accountFilePath(o.dir))
+	if err != nil || len(registry.Accounts) != 1 || registry.Accounts[0].ID != message.ID {
+		t.Fatal("duplicate rejection changed proxy registration", err)
+	}
+}
+
+func TestXIdentityPreflightIncludesProxyRegistrations(t *testing.T) {
+	dir := identityRegistryFixture(t)
+	path := filepath.Join(dir, "legacy-proxy.json")
+	writePrivateFixture(path, []byte(`{"auth_token":"synthetic","ct0":"csrf","proxy":"http://localhost:8888"}`), 0600)
+	registry := accountFile{Version: 1, Accounts: []providerAccount{{"legacy-name", "x_read", path, 1}}}
+	body, _ := json.Marshal(registry)
+	if err := writeLocalFile(dir, "accounts.json", body); err != nil {
+		t.Fatal(err)
+	}
+	verify := func(context.Context, x.Session) (worker.VerifiedXIdentity, error) {
+		t.Fatal("preflight attempted to verify an unsupported proof session")
+		return worker.VerifiedXIdentity{}, nil
+	}
+	if err := verifyRegisteredXIdentities(context.Background(), dir, registry, "", verify); !errors.Is(err, errXIdentityUnverified) {
+		t.Fatal("unknown proxy identity silently passed admission", err)
+	}
+	identity := worker.VerifiedXIdentity{ID: "123", Username: "fixture", Stamp: xCredentialStamp(path)}
+	if err := saveXIdentity(dir, path, identity); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyRegisteredXIdentities(context.Background(), dir, registry, "", verify); err != nil {
+		t.Fatal("verified proxy identity failed admission preflight", err)
+	}
+}
+
 func TestXAccountCLIRegistryLockIsFreeDuringProviderVerification(t *testing.T) {
 	dir := identityRegistryFixture(t)
 	var output bytes.Buffer

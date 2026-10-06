@@ -137,6 +137,10 @@ func (p *servicePool) finish(kind, code string) {
 	if a != nil && kind == "x_read" {
 		lease.xStamp = worker.XSessionStamp(a.spec.Path)
 		lease.xIdentity = a.identity.ID
+		for admitted := range a.xLeases {
+			lease = admitted
+			break
+		}
 	}
 	p.mu.Unlock()
 	if a != nil {

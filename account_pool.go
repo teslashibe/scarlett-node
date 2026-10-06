@@ -22,6 +22,7 @@ type pooledAccount struct {
 	renewAfter time.Time
 	identity   worker.VerifiedXIdentity
 	duplicate  bool
+	xLeases    map[*accountLease]struct{}
 }
 type accountLease struct {
 	id, kind  string
@@ -386,11 +387,14 @@ func (p *servicePool) acquireAccount(kind string) (*accountLease, bool) {
 			return nil, false
 		}
 		a := p.accounts[kind+":legacy"]
-		stamp := ""
+		stamp, identity := "", ""
 		if kind == "x_read" {
 			stamp = worker.XSessionStamp(a.spec.Path)
 			if stamp == "" {
 				return nil, false
+			}
+			if a.identity.Stamp == stamp {
+				identity = a.identity.ID
 			}
 		}
 		s.inFlight++
@@ -398,16 +402,12 @@ func (p *servicePool) acquireAccount(kind string) (*accountLease, bool) {
 		c.LocalAccountID = "legacy"
 		if kind == "x_read" {
 			c.ExpectedXStamp = stamp
-			c.ExpectedXIdentity = a.identity.ID
-			if a.identity.ID != "" {
-				if p.xInFlight == nil {
-					p.xInFlight = map[string]int{}
-				}
-				p.xInFlight[a.identity.ID]++
-			}
+			c.ExpectedXIdentity = identity
 		}
-		c.AccountCooldown = p.cooldown(a)
-		return &accountLease{id: "legacy", kind: kind, config: c, account: a, xStamp: stamp, xIdentity: a.identity.ID}, true
+		lease := &accountLease{id: "legacy", kind: kind, config: c, account: a, xStamp: stamp, xIdentity: identity}
+		p.trackXLease(lease)
+		lease.config.AccountCooldown = p.cooldown(lease)
+		return lease, true
 	}
 	keys := []string{}
 	for key, a := range p.accounts {
@@ -432,24 +432,22 @@ func (p *servicePool) acquireAccount(kind string) (*accountLease, bool) {
 			if stamp == "" || stamp != a.identity.Stamp || p.xGroupAvailable(a) == 0 {
 				continue
 			}
-			if p.xInFlight == nil {
-				p.xInFlight = map[string]int{}
-			}
-			p.xInFlight[a.identity.ID]++
 		}
 		e.inFlight++
 		s.inFlight++
 		p.next[kind] = (idx + 1) % len(keys)
 		c := p.config
 		c.LocalAccountID = a.spec.ID
-		c.AccountCooldown = p.cooldown(a)
 		if kind == "codex" {
 			c.CodexHome = a.spec.Path
 		} else {
 			c.XSession = a.spec.Path
 			c.ExpectedXStamp, c.ExpectedXIdentity = stamp, a.identity.ID
 		}
-		return &accountLease{id: a.spec.ID, kind: kind, config: c, account: a, xStamp: stamp, xIdentity: a.identity.ID}, true
+		lease := &accountLease{id: a.spec.ID, kind: kind, config: c, account: a, xStamp: stamp, xIdentity: a.identity.ID}
+		p.trackXLease(lease)
+		lease.config.AccountCooldown = p.cooldown(lease)
+		return lease, true
 	}
 	return nil, false
 }
@@ -460,6 +458,7 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	s := l.account.entry
+	delete(l.account.xLeases, l)
 	if s.inFlight > 0 {
 		s.inFlight--
 	}
@@ -467,6 +466,12 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 		p.xInFlight[l.xIdentity]--
 		if p.xInFlight[l.xIdentity] == 0 {
 			delete(p.xInFlight, l.xIdentity)
+		}
+	}
+	if l.kind == "x_read" && l.xIdentity == "" && (code == "x_rate_limited" || code == "capacity_unavailable") {
+		p.refresh(time.Now())
+		if l.xStamp == "" || l.account.spec.Path != l.config.XSession || worker.XSessionStamp(l.account.spec.Path) != l.xStamp {
+			return // An unverified user cannot transfer quota to replacement credentials.
 		}
 	}
 	if l.kind == "x_read" && l.xIdentity != "" && (code == "x_rate_limited" || code == "capacity_unavailable") {
@@ -485,8 +490,8 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 			return
 		}
 	}
-	// Rate limits apply to the account across credential replacement; only
-	// authentication refusals are fenced by the admitted credential snapshot.
+	// Authenticated quota follows the admitted user across replacement.
+	// Without verified identity, quota applies only to the admitted credentials.
 	p.settle(l.account, code, false)
 }
 
@@ -645,11 +650,14 @@ func (p *servicePool) accountStatus() []accountStatus {
 	return out
 }
 
-func (p *servicePool) cooldown(a *pooledAccount) func(time.Duration) {
-	identity := a.identity.ID
+func (p *servicePool) cooldown(lease *accountLease) func(time.Duration) {
 	return func(wait time.Duration) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
+		a, identity := lease.account, lease.xIdentity
+		if lease.kind == "x_read" && identity == "" && (lease.xStamp == "" || a.spec.Path != lease.config.XSession || worker.XSessionStamp(a.spec.Path) != lease.xStamp) {
+			return
+		}
 		if wait < 15*time.Minute {
 			wait = 15 * time.Minute
 		}
