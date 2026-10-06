@@ -961,11 +961,11 @@ with sqlite3.connect(sys.argv[1]) as db:
         $script:importState = $homes[0]
         $records = @()
         foreach ($id in @('removal-fixture', 'browser-firefox', 'browser-paste')) {
-            $home = Join-Path (Join-Path $script:importState 'accounts') ('x_read-' + $id)
-            $privateOutput = & (Join-Path $install 'scarlett-node.exe') desktop private-dir $home | Out-String
+            $accountHome = Join-Path (Join-Path $script:importState 'accounts') ('x_read-' + $id)
+            $privateOutput = & (Join-Path $install 'scarlett-node.exe') desktop private-dir $accountHome | Out-String
             $privateOutput = $null
             if ($LASTEXITCODE -ne 0) { throw 'Could not create private synthetic account directory' }
-            $session = Join-Path $home 'session.json'
+            $session = Join-Path $accountHome 'session.json'
             Write-SyntheticPrivateJSON $session @{ auth_token = $script:fixture.authToken; ct0 = $script:fixture.csrf }
             $records += @{ id = $id; service = 'x_read'; path = $session; concurrency = 1 }
         }
