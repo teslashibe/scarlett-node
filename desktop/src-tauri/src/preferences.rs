@@ -15,10 +15,16 @@ pub struct Data {
     pub schema: u8,
     pub local_api_port: u16,
     pub background: bool,
+    #[serde(default = "default_x_concurrency")]
+    pub x_concurrency: u8,
+}
+pub const fn default_x_concurrency() -> u8 {
+    2
 }
 impl Data {
     pub fn validate(&self) -> Result<()> {
-        if self.schema != 1 || self.local_api_port < 1024 {
+        if self.schema != 1 || self.local_api_port < 1024 || !(1..=8).contains(&self.x_concurrency)
+        {
             return Err(Error::InvalidInput);
         }
         Ok(())
@@ -68,6 +74,19 @@ impl Preferences {
 mod tests {
     use super::*;
     #[test]
+    fn legacy_settings_default_to_two_x_slots_and_require_bounded_values() {
+        let legacy: Data =
+            serde_json::from_str(r#"{"schema":1,"local_api_port":18088,"background":true}"#)
+                .unwrap();
+        assert_eq!(legacy.x_concurrency, 2);
+        assert!(legacy.validate().is_ok());
+        for limit in [0, 9, u8::MAX] {
+            let mut invalid = legacy.clone();
+            invalid.x_concurrency = limit;
+            assert_eq!(invalid.validate(), Err(Error::InvalidInput));
+        }
+    }
+    #[test]
     fn settings_require_versioned_ports_and_exclude_credentials() {
         for raw in [
             r#"{"schema":2,"local_api_port":8088,"background":false}"#,
@@ -87,6 +106,7 @@ mod tests {
                 schema: 1,
                 local_api_port: 8088,
                 background: false,
+                x_concurrency: 2,
             }),
             background: AtomicBool::new(false),
         };
@@ -96,6 +116,7 @@ mod tests {
                 schema: 1,
                 local_api_port: 18088,
                 background: true,
+                x_concurrency: 3,
             })
             .unwrap();
         assert!(prefs.background());

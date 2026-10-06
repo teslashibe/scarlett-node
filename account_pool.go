@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/teslashibe/scarlett-node/internal/config"
+	"github.com/teslashibe/scarlett-node/internal/coordinator"
 	"github.com/teslashibe/scarlett-node/internal/localfs"
 	"github.com/teslashibe/scarlett-node/internal/worker"
 )
@@ -451,6 +452,33 @@ func (p *servicePool) acquireAccount(kind string) (*accountLease, bool) {
 	}
 	return nil, false
 }
+
+// bindCoordinatorLease attaches public coordinator identifiers to the selected
+// account's occupied slot. It runs before worker execution; references remain
+// until its report returns and finishAccount releases the account.
+func (p *servicePool) bindCoordinatorLease(account *accountLease, l coordinator.Lease) {
+	if account == nil || l.ServiceType != account.kind {
+		return
+	}
+	ref := coordinator.ActiveLease{JobID: l.JobID, Attempt: l.Attempt, Fence: l.Fence}
+	if !ref.Valid() {
+		return
+	} // Opaque legacy or synthetic identifiers stay additive.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.activeCoordinatorLeases == nil {
+		p.activeCoordinatorLeases = map[*accountLease]coordinator.ActiveLease{}
+	}
+	if account.account.entry.inFlight < 1 {
+		return
+	}
+	for other, prior := range p.activeCoordinatorLeases {
+		if other != account && prior.JobID == ref.JobID {
+			return
+		}
+	}
+	p.activeCoordinatorLeases[account] = ref
+}
 func (p *servicePool) finishAccount(l *accountLease, code string) {
 	if l == nil {
 		return
@@ -458,6 +486,7 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	s := l.account.entry
+	delete(p.activeCoordinatorLeases, l)
 	delete(l.account.xLeases, l)
 	if s.inFlight > 0 {
 		s.inFlight--

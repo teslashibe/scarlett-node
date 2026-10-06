@@ -30,7 +30,7 @@ Then run `npm run tauri build -- --bundles app` from `desktop` on Mac. The sidec
 - Services: `codex` and `x_read`. IDs use lowercase letters/digits/underscore/hyphen, 1–32 characters; `legacy` is reserved. The binary owns maximum eight accounts/provider, concurrency, cooldown and pinned-attempt recovery.
 - Press **Connect Codex** and sign in with your ChatGPT account in the browser. Scarlett assigns a local name such as `codex-1`, reserves a new private profile and registers it after successful login, with one concurrent job per account. Repeat to connect another account, up to eight Codex accounts; at eight, Connect Codex is disabled until you remove one. Existing profiles, including cancelled login directories, are never reused. On Windows the profile is created by the fixed `desktop private-dir-new` helper with its current-user/SYSTEM protected ACL applied at creation; an existing name, including an older unprotected directory, is skipped and never adopted or repaired. No OpenAI account ID or local nickname is required. The native CLI is fixed to the bundled `codex-cli 0.159.2`, with file credential storage explicitly selected; it does not reuse `~/.codex` or discover a CLI on PATH. Missing or incompatible bundled CLI disables Connect Codex. Login and model entitlement remain distinct.
 - X connects only the two approved cookie fields through protected stdin, preserving node validation and storage. Remove updates the private registry; the running node stops new admission on its next scheduling observation and retains credentials until safe explicit disposal after drain; it does not revoke the upstream session.
-- Total service concurrency remains the native default of one per service in this slice. Per-account limits cannot increase that total. Broader local capacity/preferences belong in the account-management integration.
+- This device saves a maximum simultaneous X job setting, default 2 and bounded 1–8. The launcher passes it explicitly to the node and caps each authenticated X identity at one job, including aliases. Actual advertised capacity is limited by distinct, ready accounts. Changes apply on the next Stop/Start; saving preferences never restarts accepted work. Codex keeps its native default of one total job. Existing schema-1 preference files load with X concurrency 2 and retain their other values without being rewritten on reads. Saving X concurrency writes a separate private `throughput-preferences-v1.json` extension; `preferences.json` retains the representation desktop 0.1.3 understands for rollback. An invalid extension fails closed.
 
 The native pool contract landed in [node PR 27](https://github.com/teslashibe/scarlett-node/pull/27), merged at `5ea00650`. This desktop branch includes that main revision. Rebuild both sidecars from the reviewed combined checkout before real account testing. An explicit missing app-owned registry lists no accounts and fails closed for new work; unrelated host profiles are not inherited.
 
@@ -160,7 +160,7 @@ The Windows bridge creates or checks private directories before starting the web
 
 ## Import an X browser account
 
-Choose a local account ID and concurrency, select a browser profile, tick the X-session consent box, then press **Import X account**. Close the selected browser first so its cookie database has no active journal. Browsers with custom profile locations can use the existing masked cookie-paste form.
+Choose a local account ID, select a browser profile, tick the X-session consent box, then press **Import X account**. Close the selected browser first so its cookie database has no active journal. Browsers with custom profile locations can use the existing masked cookie-paste form.
 
 Profile discovery reads directory/file metadata only. It returns opaque profile IDs and labels, without cookie-store paths or account credentials. Import reads only `auth_token` and `ct0` for a complete, secure, unexpired root-domain X/Twitter session at `/`. It keeps container/partition sessions separate and refuses conflicting identities. Credentials go directly from the native reader to the private account file; the renderer receives only success or a fixed error code. Existing accounts are never overwritten.
 
@@ -391,3 +391,7 @@ through PATH. Missing prerequisites return an unavailable result. The local help
 uses loopback authentication and private persistent browser profiles. Read
 [the runtime preparation and release gates](../docs/x-browser-runtime.md) before
 building or testing this component.
+
+### Occupied lease references
+
+The native heartbeat optionally includes `active_leases[{job_id,attempt,fence}]` per service, bounded by its in-flight count and containing only canonical coordinator UUIDs. Account admission and release own these references; accepted work keeps them until reporting returns. They let a supporting coordinator deduplicate its committed live lease from the same reported local work. Unknown work remains additive. A rejected extended heartbeat falls back to the older shape with both `active_leases` and `proof_modes` removed. The desktop status projection omits lease identifiers.

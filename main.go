@@ -132,35 +132,28 @@ var errHeartbeatStale = errors.New("heartbeat availability changed while held")
 // availability is every local input to a heartbeat's advertised state that can
 // change while the coordinator holds it: an operator drain, a rest after the
 // gateway ran out of capacity, the local Codex admission guard, and each
-// service's state, proof modes and offerable capacity. In-flight counts are
-// left out: work that finishes during a hold only frees capacity.
+// service's health, including occupancy and active coordinator lease references.
 type availability struct {
 	drained, drainUnreadable, resting, codexBlocked bool
 	services                                        string
 }
 
-// serviceStates is the part of service health that decides whether and how
-// much work a service takes: its state, the proof modes it offers and, while
-// it is offerable, its capacity. Capacity then counts usable accounts and does
-// not move as jobs start and finish; in any other state it is only the
-// in-flight count, which is left out like every in-flight count.
+// serviceStates snapshots service admission and occupancy. health returns
+// services and active lease references in a stable order. The exact in-flight
+// count and references matter even while a service remains offerable or blocked:
+// the coordinator uses both to account for occupied capacity conservatively.
 func serviceStates(health []coordinator.ServiceHealth) string {
-	out := ""
-	for _, s := range health {
-		out += fmt.Sprintf("%s=%s%q", s.Kind, s.State, s.ProofModes)
-		if s.State == "configured" || s.State == "ready" {
-			out += fmt.Sprintf("x%d", s.Capacity)
-		}
-		out += ";"
-	}
-	return out
+	// ServiceHealth contains only JSON-safe scalar values and slices.
+	snapshot, _ := json.Marshal(health)
+	return string(snapshot)
 }
 
 // watchHeartbeat cancels a held heartbeat with errHeartbeatStale as soon as
-// current() no longer matches what it advertised. Otherwise the hold could
-// still return a lease up to HeartbeatWaitSeconds after the node stopped taking
-// work, and the coordinator would go on seeing the old state for as long.
-func watchHeartbeat(ctx context.Context, cancel context.CancelCauseFunc, sent availability, current func() availability) {
+// current() no longer matches what it advertised. A worker completion wakes the
+// check immediately; an already reflected completion leaves the heartbeat held.
+// Otherwise the coordinator could see the old state for HeartbeatWaitSeconds
+// or return a lease after admission stopped.
+func watchHeartbeat(ctx context.Context, cancel context.CancelCauseFunc, sent availability, current func() availability, changes <-chan struct{}) {
 	tick := time.NewTicker(heartbeatWatchInterval)
 	defer tick.Stop()
 	for {
@@ -168,10 +161,11 @@ func watchHeartbeat(ctx context.Context, cancel context.CancelCauseFunc, sent av
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			if current() != sent {
-				cancel(errHeartbeatStale)
-				return
-			}
+		case <-changes:
+		}
+		if current() != sent {
+			cancel(errHeartbeatStale)
+			return
 		}
 	}
 }
@@ -323,6 +317,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 		}()
 	}
 	slots := make(chan struct{}, capacity)
+	availabilityChanges := make(chan struct{}, 1)
 	var running sync.WaitGroup
 	status := runtimeStatus{Version: coordinator.Version, State: "running", NodeID: nodeID, Services: []coordinator.ServiceHealth{}}
 	defer func() {
@@ -349,8 +344,8 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	var restUntil time.Time
 	inFlight := map[string]struct{}{}
 	legacyCodexBlocked := false
-	// legacyHeartbeat is set once the coordinator has rejected a heartbeat that
-	// carried proof_modes; from then on the node sends the older shape.
+	// legacyHeartbeat is set once the coordinator has rejected optional service
+	// extensions; from then on the node sends the older shape.
 	legacyHeartbeat := false
 	// currentAvailability rereads, without the loop's side effects, what a
 	// heartbeat's advertised state is built from.
@@ -409,7 +404,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			h.Services = services.health()
 			sent.services = serviceStates(h.Services)
 			if legacyHeartbeat {
-				h.Services, _ = coordinator.WithoutProofModes(h.Services)
+				h.Services, _ = coordinator.WithoutExtensions(h.Services)
 			}
 			h.Capacity = 0
 			for _, service := range h.Services {
@@ -463,19 +458,17 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 		watched := make(chan struct{})
 		go func() {
 			defer close(watched)
-			watchHeartbeat(pollCtx, cancelPoll, sent, currentAvailability)
+			watchHeartbeat(pollCtx, cancelPoll, sent, currentAvailability, availabilityChanges)
 		}()
 		reply, err := client.Poll(pollCtx, h)
 		if errors.Is(err, coordinator.ErrHeartbeatRejected) && !legacyHeartbeat {
-			// A coordinator older than proof_modes rejects the whole heartbeat.
-			// Send it the heartbeat it knows, and keep doing so: it cannot
-			// offer relay work anyway. Without this a coordinator rollback
-			// would take every node that advertises relay offline.
-			if stripped, removed := coordinator.WithoutProofModes(h.Services); removed {
+			// A coordinator that rejects optional service extensions still gets
+			// the heartbeat shape it knows, including after a rollback.
+			if stripped, removed := coordinator.WithoutExtensions(h.Services); removed {
 				h.Services = stripped
 				if reply, err = client.Poll(pollCtx, h); err == nil {
 					legacyHeartbeat = true
-					fmt.Fprintln(os.Stderr, "heartbeat: coordinator rejected proof_modes; advertising MPC-TLS only until restart")
+					fmt.Fprintln(os.Stderr, "heartbeat: coordinator rejected optional service extensions; advertising the legacy service shape until restart")
 				}
 			}
 		}
@@ -551,6 +544,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 					endAccountAcquire("service_unavailable")
 				}
 				if serviceAvailable {
+					services.bindCoordinatorLease(account, l)
 					selected = account.config
 				}
 			}
@@ -562,7 +556,17 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			go func() {
 				defer running.Done()
 				defer active.done(key)
-				defer func() { <-slots }()
+				defer func() {
+					<-slots
+					// Account release and the rest state are already final. Refresh
+					// the held heartbeat's capacity and active lease references now
+					// that the worker slot is free. Completions coalesce while the
+					// loop prepares its next heartbeat.
+					select {
+					case availabilityChanges <- struct{}{}:
+					default:
+					}
+				}()
 				defer func() {
 					mu.Lock()
 					delete(inFlight, l.JobID)

@@ -20,13 +20,13 @@ func TestDesktopPreferencesPersistPrivatelyWithoutChangingDefaultsOnReads(t *tes
 	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil {
 		t.Fatal(err)
 	}
-	if out.String() != "{\"schema\":1,\"local_api_port\":8088,\"background\":false}\n" {
+	if out.String() != "{\"schema\":1,\"local_api_port\":8088,\"background\":false,\"x_concurrency\":2}\n" {
 		t.Fatal("unexpected defaults")
 	}
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
 		t.Fatal("read wrote preferences")
 	}
-	value := `{"schema":1,"local_api_port":18088,"background":true}`
+	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":3}`
 	out.Reset()
 	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(value), &out); err != nil {
 		t.Fatal(err)
@@ -76,5 +76,70 @@ func TestDesktopPreferencesRefuseInvalidPathsAndCorruption(t *testing.T) {
 	}
 	if desktopCommand([]string{"preferences-get", path}, nil, &out) == nil {
 		t.Fatal("corruption silently reset preferences")
+	}
+}
+
+func TestDesktopPreferencesMigrateExistingSettingsAndBoundXConcurrency(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "private")
+	if err := localfs.EnsureDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "preferences.json")
+	old := []byte(`{"schema":1,"local_api_port":18088,"background":true}`)
+	if err := localfs.WriteAtomic(path, old, false); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(out.String()) != `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":2}` {
+		t.Fatal("old preferences did not retain values with default concurrency")
+	}
+	stored, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(stored, old) {
+		t.Fatal("reading old preferences rewrote disk")
+	}
+	for _, input := range []string{
+		`{"schema":1,"local_api_port":8088,"background":false,"x_concurrency":0}`,
+		`{"schema":1,"local_api_port":8088,"background":false,"x_concurrency":9}`,
+		`{"schema":1,"local_api_port":8088,"background":false,"x_concurrency":1.5}`,
+		`{"schema":1,"local_api_port":8088,"background":false,"x_concurrency":"2"}`,
+	} {
+		if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(input), &out); err == nil {
+			t.Fatal("invalid concurrency accepted")
+		}
+	}
+}
+
+func TestSavedThroughputPreferencesRetainDesktop013RollbackRepresentation(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "private")
+	if err := localfs.EnsureDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "preferences.json")
+	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":4}`
+	var out bytes.Buffer
+	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(value), &out); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil || string(raw) != `{"schema":1,"local_api_port":18088,"background":true}` {
+		t.Fatal("old installer preference representation changed")
+	}
+	extension, err := localfs.OpenPrivate(filepath.Join(dir, "throughput-preferences-v1.json"))
+	if err != nil {
+		t.Fatal("capacity extension not private", err)
+	}
+	extension.Close()
+	out.Reset()
+	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil || strings.TrimSpace(out.String()) != value {
+		t.Fatal("capacity extension did not survive reopen")
+	}
+	if err := localfs.WriteAtomic(filepath.Join(dir, "throughput-preferences-v1.json"), []byte(`{"schema":1,"x_concurrency":99}`), true); err != nil {
+		t.Fatal(err)
+	}
+	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err == nil {
+		t.Fatal("corrupt capacity extension did not fail closed")
 	}
 }

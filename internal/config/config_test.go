@@ -109,7 +109,7 @@ func TestIndependentProvenServices(t *testing.T) {
 			t.Fatal("accepted invalid services")
 		}
 	}
-	for _, change := range []func(*Config){func(c *Config) { c.XSession = "relative" }, func(c *Config) { c.CodexHome = "" }, func(c *Config) { c.XConcurrency = 33 }, func(c *Config) { c.CodexConcurrency = 0 }, func(c *Config) { c.LocalFixture = true }, func(c *Config) { c.Verifier = "https://arbitrary/path" }} {
+	for _, change := range []func(*Config){func(c *Config) { c.XSession = "relative" }, func(c *Config) { c.CodexHome = "" }, func(c *Config) { c.XConcurrency = 33 }, func(c *Config) { c.XAccountConcurrency = -1 }, func(c *Config) { c.XAccountConcurrency = 33 }, func(c *Config) { c.CodexConcurrency = 0 }, func(c *Config) { c.LocalFixture = true }, func(c *Config) { c.Verifier = "https://arbitrary/path" }} {
 		bad := c
 		change(&bad)
 		if bad.Validate() == nil {

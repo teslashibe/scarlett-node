@@ -465,3 +465,42 @@ func TestUnknownLegacyXBootstrapQuotaCannotPoisonReplacement(t *testing.T) {
 		})
 	}
 }
+
+func TestDesktopXCeilingUsesDistinctAccountsWithOneLaneEach(t *testing.T) {
+	p := multiPool(t)
+	p.config.XAccountConcurrency = 1
+	f := xOnlyRegistry(t, p)
+	for i := range f.Accounts {
+		f.Accounts[i].Concurrency = 32
+	}
+	saveAccountFixture(t, p, f)
+	h := healthKind(t, p, "x_read")
+	if h.Capacity != 2 {
+		t.Fatalf("distinct authenticated users did not provide two slots: %+v", h)
+	}
+	one, ok := p.acquireAccount("x_read")
+	if !ok {
+		t.Fatal("first X lane unavailable")
+	}
+	two, ok := p.acquireAccount("x_read")
+	if !ok || one.xIdentity == two.xIdentity {
+		t.Fatal("concurrent X work was not bound to distinct users")
+	}
+	if _, ok := p.acquireAccount("x_read"); ok {
+		t.Fatal("desktop ceiling exceeded")
+	}
+	p.finishAccount(one, "")
+	again, ok := p.acquireAccount("x_read")
+	if !ok || again.xIdentity != one.xIdentity {
+		t.Fatal("completed lane was not immediately reusable")
+	}
+	if _, ok := p.acquireAccount("x_read"); ok {
+		t.Fatal("a permissive account limit expanded an authenticated user lane")
+	}
+	p.finishAccount(again, "")
+	p.finishAccount(two, "")
+	p.config.XConcurrency = 1
+	if h = healthKind(t, p, "x_read"); h.Capacity != 1 {
+		t.Fatalf("configured device limit ignored: %+v", h)
+	}
+}
