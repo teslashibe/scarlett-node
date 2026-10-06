@@ -679,7 +679,10 @@ func (a *xAccount) construct(ctx context.Context, prior *xWarm, ids map[string]s
 	}
 	defer con.done.Store(true)
 	hc := &http.Client{Transport: a.board, Timeout: a.timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	client, err := session.NewClient(withXConstruction(ctx, con), x.WithHTTPClient(hc), x.WithRetry(1, time.Millisecond), x.WithQueryIDs(ids), x.WithMinRequestGap(a.clients.gap()), x.WithIdentityPacing(a.pacingFor))
+	// Each shared identity reserves up to a quarter of the minimum gap as extra
+	// delay (250 ms in production), including requests after an idle interval.
+	gap := a.clients.gap()
+	client, err := session.NewClient(withXConstruction(ctx, con), x.WithHTTPClient(hc), x.WithRetry(1, time.Millisecond), x.WithQueryIDs(ids), x.WithMinRequestGap(gap), x.WithRequestJitter(gap/4), x.WithIdentityPacing(a.pacingFor))
 	if err != nil {
 		return nil, stamp, con.asked.Load(), err
 	}

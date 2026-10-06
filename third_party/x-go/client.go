@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -350,9 +351,15 @@ func (c *Client) queryID(name string) string {
 
 // waitForGap enforces the leaky-bucket minimum request gap, adapting based
 // on X's rate limit headers. When remaining requests are low, the gap widens
-// automatically to spread requests across the remaining window.
+// automatically to spread requests across the remaining window. Optional
+// positive jitter is part of the shared reservation, so neighboring requests
+// cannot consume the same slot while either request waits.
 func (c *Client) waitForGap(ctx context.Context) {
 	gap, reason := c.adaptiveGapReason()
+	var jitter time.Duration
+	if c.requestJitter > 0 {
+		jitter = time.Duration(1 + rand.Int64N(int64(c.requestJitter)))
+	}
 
 	c.pacing.gapMu.Lock()
 	now := time.Now()
@@ -360,6 +367,7 @@ func (c *Client) waitForGap(ctx context.Context) {
 	if now.After(nextSlot) {
 		nextSlot = now
 	}
+	nextSlot = nextSlot.Add(jitter)
 	c.pacing.lastReqAt = nextSlot
 	c.pacing.gapMu.Unlock()
 
