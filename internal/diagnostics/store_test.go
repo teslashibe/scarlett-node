@@ -50,6 +50,23 @@ func controlled(t *testing.T) (*Store, *time.Time) {
 	return s, &now
 }
 
+func waitForClose(t *testing.T, s *Store) {
+	t.Helper()
+	// Close has a bounded shutdown budget; persistence assertions need the
+	// optional final flush to finish even when that budget expires.
+	wait := 10 * time.Second
+	if deadline, ok := t.Deadline(); ok && time.Until(deadline) < wait {
+		wait = time.Until(deadline)
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-s.closeDone:
+	case <-timer.C:
+		t.Fatalf("diagnostics final flush did not finish within %s", wait)
+	}
+}
+
 func TestAbsentContextAndInvalidTelemetry(t *testing.T) {
 	var s *Store
 	a := s.Begin(metadata("missing"))
@@ -132,6 +149,7 @@ func TestFailurePrefixAndInterruptedHistory(t *testing.T) {
 	Start(running.Context(context.Background()), "accept_http", 0)
 	*now = now.Add(15 * time.Millisecond)
 	s.Close()
+	waitForClose(t, s)
 	live := Read(s.dir)
 	if live.LoadError != "" || len(live.Attempts) != 2 || live.Attempts[1].Outcome != "running" {
 		t.Fatal("live CLI read lost the running attempt", live.LoadError, len(live.Attempts))
@@ -146,6 +164,7 @@ func TestFailurePrefixAndInterruptedHistory(t *testing.T) {
 		t.Fatalf("fabricated finished timing after crash: %+v", r)
 	}
 	restarted.Close()
+	waitForClose(t, restarted)
 	persisted := Read(s.dir)
 	if persisted.LoadError != "" || len(persisted.Attempts) != 2 || persisted.Attempts[1].Outcome != "interrupted" || persisted.Attempts[1].DurationMS != nil {
 		t.Fatalf("restart without jobs did not persist unknown interruption: %+v", persisted)
@@ -285,6 +304,7 @@ func TestBoundsPriorityRetentionAndLateCallbacks(t *testing.T) {
 		t.Fatalf("memory/attempt bounds: %d %d", len(snap.Attempts), s.retainedBytes)
 	}
 	s.Close()
+	waitForClose(t, s)
 	info := privateHistoryInfo(t, s.dir)
 	if info.Size() > MaxHistoryBytes {
 		t.Fatalf("private bounded history exceeded size limit: %v", info)
@@ -363,6 +383,7 @@ func TestCorruptOversizedPublicAndDiskFailureAreDiagnosticsOnly(t *testing.T) {
 	Start(a.Context(context.Background()), "accept_http", 0)("success")
 	a.Finish("success")
 	s.Close()
+	waitForClose(t, s)
 	if snap := s.Snapshot(); len(snap.Attempts) != 1 || snap.Attempts[0].Outcome != "success" || snap.LoadError != "write_error" {
 		t.Fatalf("disk failure affected job: %+v", snap)
 	}
@@ -445,21 +466,29 @@ func TestRestartPublishesExpiredHistoryCleanupWithoutNewWork(t *testing.T) {
 			if keepRecent {
 				want = 1
 			}
-			if !s.dirty || s.loadError != "" || len(s.attempts) != want {
-				t.Fatal("restart did not schedule validated retention cleanup")
+			s.mu.Lock()
+			dirty, loadError, count := s.dirty, s.loadError, len(s.attempts)
+			s.mu.Unlock()
+			if !dirty || loadError != "" || count != want {
+				t.Fatalf("restart did not schedule validated retention cleanup: count=%d want=%d dirty=%t load_error=%q", count, want, dirty, loadError)
 			}
 			beforeFlush, err := os.ReadFile(path)
 			if err != nil || string(beforeFlush) != string(raw) {
 				t.Fatal("startup performed synchronous history cleanup", err)
 			}
 			s.Close()
+			waitForClose(t, s)
 			cleaned, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatal(err)
 			}
 			var persisted history
-			if strictJSON(cleaned, &persisted) != nil || len(persisted.Attempts) != want || s.dirty || s.loadError != "" {
-				t.Fatal("restart without new jobs did not publish retention cleanup")
+			decodeErr := strictJSON(cleaned, &persisted)
+			s.mu.Lock()
+			dirty, loadError = s.dirty, s.loadError
+			s.mu.Unlock()
+			if decodeErr != nil || len(persisted.Attempts) != want || dirty || loadError != "" {
+				t.Fatalf("restart without new jobs did not publish retention cleanup: count=%d want=%d dirty=%t load_error=%q decode_error=%v", len(persisted.Attempts), want, dirty, loadError, decodeErr)
 			}
 			if keepRecent && persisted.Attempts[0].ID != strings.Repeat("b", 64) {
 				t.Fatal("retention cleanup removed the recent attempt")
@@ -484,6 +513,7 @@ func TestExpiredHistoryCleanupWaitsForValidHistory(t *testing.T) {
 	}
 	s := New(dir)
 	s.Close()
+	waitForClose(t, s)
 	if s.dirty || s.loadError != "corrupt" || len(s.attempts) != 0 {
 		t.Fatal("invalid history was scheduled for retention cleanup")
 	}
@@ -513,6 +543,7 @@ func TestCoalescedFlushAndBoundedClose(t *testing.T) {
 		t.Fatal("diagnostics added more than one flush in a second")
 	}
 	s.Close()
+	waitForClose(t, s)
 	if len(Read(s.dir).Attempts) != 2 {
 		t.Fatal("final coalesced flush lost attempt")
 	}
@@ -527,11 +558,7 @@ func TestCoalescedFlushAndBoundedClose(t *testing.T) {
 		t.Fatal("blocked diagnostics prevented shutdown")
 	}
 	blocked.flushMu.Unlock()
-	select {
-	case <-blocked.closeDone:
-	case <-time.After(time.Second):
-		t.Fatal("optional flush did not finish after filesystem unblocked")
-	}
+	waitForClose(t, blocked)
 }
 
 // BenchmarkAttemptRecording isolates optional collector cost. Production-like
