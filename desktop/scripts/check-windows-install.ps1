@@ -406,13 +406,15 @@ function Verify-KeyboardDelivery {
     [ScarlettAcceptanceWindow]::SetForegroundWindow($handle) | Out-Null
     $target.SetFocus()
     Wait-KeyboardTarget $target $handle 'Keyboard probe did not acquire foreground and field focus'
+    $nextName = X-AccountIDSuccessor
     [ScarlettAcceptanceWindow]::UnicodeTextAndTab('keyboard-probe')
-    Wait-Check { Input-Advanced $name 'Concurrent jobs' $handle } 10 'Keyboard probe text was not acknowledged by successor focus'
+    Wait-InputAdvanced $name $nextName $handle $false 'Keyboard probe text was not acknowledged by successor focus'
     Wait-Check { $value.Current.Value -ceq 'keyboard-probe' } 10 'CI keyboard injection did not reach the editable control'
     $target.SetFocus()
     Wait-KeyboardTarget $target $handle 'Keyboard probe did not reacquire field focus'
+    $nextName = X-AccountIDSuccessor
     [ScarlettAcceptanceWindow]::SelectAllClearAndTab()
-    Wait-Check { Input-Advanced $name 'Concurrent jobs' $handle } 10 'Keyboard probe clear was not acknowledged by successor focus'
+    Wait-InputAdvanced $name $nextName $handle $true 'Keyboard probe clear was not acknowledged by successor focus'
     Wait-Check { $value.Current.Value -ceq '' } 10 'Native control-key input did not clear the disposable field'
     Write-Output 'Installed acceptance: text and native control-key delivery verified'
 }
@@ -426,6 +428,19 @@ function Find-Input([string]$Name) {
             [System.Windows.Automation.AutomationElement]::IsKeyboardFocusableProperty, $true)
     )
     return $script:window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+}
+function X-AccountIDSuccessor {
+    # Per-account capacity is fixed and hidden. Tab reaches the profile picker
+    # when profiles are available, otherwise it skips the disabled import controls.
+    $profile = Find-Input 'Browser profile'
+    if ($null -ne $profile -and $profile.Current.IsEnabled) { return 'Browser profile' }
+    $consent = Find-Input 'Import only X session cookies from this profile'
+    $import = Find-Button 'Import X account'
+    if (($null -ne $consent -and $consent.Current.IsEnabled) -or
+        ($null -ne $import -and $import.Current.IsEnabled)) {
+        throw 'X account input successor has inconsistent import controls'
+    }
+    return 'auth_token'
 }
 function Set-Number([string]$Name, [int]$Value) {
     $inputControl = Find-Input $Name
@@ -672,7 +687,7 @@ function Input-Advanced([string]$Name, [string]$NextName, [IntPtr]$Handle, [hash
         }
         if ($enabled -and $hasFocus -and $sameProcess -and $actualFocusMatches) { $focusedCount++ }
     }
-    # Concurrent jobs appears in both forms; require the actually focused one.
+    # Require exactly one reviewed successor to own actual keyboard focus.
     if ($null -ne $Diagnostic) { $Diagnostic.successorUniqueFocused = $focusedCount -eq 1 }
     return $sourcePresent -and -not $sourceFocused -and $foregroundOwned -and $focusedCount -eq 1
 }
@@ -695,10 +710,11 @@ function Set-Text([string]$Name, [string]$Value, [string]$NextName) {
     # All inputs are disposable fixtures, never real credentials. Use one native
     # text/Tab stream and acknowledge focus changes instead of SendKeys timing.
     if ($Value -notmatch '^[a-z0-9-]+$' -or $Value.Length -gt 512) { throw 'Synthetic input contains unsupported characters' }
-    if (-not (($Name -eq 'Local X account ID' -and $NextName -eq 'Concurrent jobs') -or
+    if (-not (($Name -eq 'Local X account ID' -and $NextName -in @('Browser profile', 'auth_token')) -or
         ($Name -eq 'auth_token' -and $NextName -eq 'ct0') -or
         ($Name -eq 'ct0' -and $NextName -eq 'Connect X'))) { throw 'Synthetic input requires its reviewed successor control' }
     Wait-Check { (Find-Input $Name).Current.IsEnabled } 15 "Text input did not become ready: $Name"
+    Wait-Check { (Find-Input $NextName).Current.IsEnabled } 15 "Synthetic input successor did not become ready: $NextName"
     $control = Find-Input $Name
     if (-not $control -or -not $control.Current.IsEnabled) { throw "Text input unavailable: $Name" }
     $handle = $application.MainWindowHandle
@@ -942,13 +958,13 @@ with sqlite3.connect(sys.argv[1]) as db:
         Wait-Check { Checkbox-Is 'Import only X session cookies from this profile' $false } 10 'Changing profile retained consent'
         Wait-Check { -not (Find-Button 'Import X account').Current.IsEnabled } 10 'Profile change allowed import without new consent'
         Verify-KeyboardDelivery
-        Set-Text 'Local X account ID' 'incomplete-firefox' 'Concurrent jobs'
+        Set-Text 'Local X account ID' 'incomplete-firefox' 'Browser profile'
         Set-Checkbox 'Import only X session cookies from this profile' $true
         Click-Button 'Import X account'
         Wait-Check { UI-Contains 'No complete X session was found in that profile' } 45 'Installed Firefox reader did not reject the incomplete synthetic session'
         if (@(Imported-Accounts).Count -ne 0) { throw 'Incomplete Firefox import saved an account' }
         Select-Browser 1 'Chrome'
-        Set-Text 'Local X account ID' 'protected-chrome' 'Concurrent jobs'
+        Set-Text 'Local X account ID' 'protected-chrome' 'Browser profile'
         Set-Checkbox 'Import only X session cookies from this profile' $true
         Click-Button 'Import X account'
         Wait-Check { UI-Contains 'The browser or OS protected this profile' } 20 'Protected Chrome did not show the paste fallback'
@@ -980,7 +996,7 @@ with sqlite3.connect(sys.argv[1]) as db:
         }
         # This existing nickname is rejected locally before reading the cookies
         # or verifying identity. It proves masked input and native command routing.
-        Set-Text 'Local X account ID' 'browser-paste' 'Concurrent jobs'
+        Set-Text 'Local X account ID' 'browser-paste' 'Browser profile'
         Set-Text 'auth_token' $script:fixture.authToken 'ct0'
         Set-Text 'ct0' $script:fixture.csrf 'Connect X'
         $before = (Get-FileHash -LiteralPath (Join-Path $script:importState 'accounts.json') -Algorithm SHA256).Hash

@@ -44,3 +44,43 @@ foreach ($scenario in $scenarios) {
     }
 }
 Write-Output 'Synthetic inventory normalization preserved 0/1/3 records and identities'
+
+# Exercise the exact reviewed successor resolver without UIA or native input.
+$successors = @($ast.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ceq 'X-AccountIDSuccessor'
+}, $true))
+if ($successors.Count -ne 1) { throw 'Expected exactly one X account input successor resolver' }
+Invoke-Expression $successors[0].Extent.Text
+function Find-Input([string]$Name) {
+    switch ($Name) {
+        'Browser profile' { return $script:successorScenario.profile }
+        'Import only X session cookies from this profile' { return $script:successorScenario.consent }
+        default { throw 'Unexpected input lookup in successor resolver' }
+    }
+}
+function Find-Button([string]$Name) {
+    if ($Name -cne 'Import X account') { throw 'Unexpected button lookup in successor resolver' }
+    return $script:successorScenario.import
+}
+$enabled = [pscustomobject]@{ Current = [pscustomobject]@{ IsEnabled = $true } }
+$disabled = [pscustomobject]@{ Current = [pscustomobject]@{ IsEnabled = $false } }
+foreach ($scenario in @(
+    @{ profile = $enabled; consent = $enabled; import = $disabled; expected = 'Browser profile' },
+    @{ profile = $disabled; consent = $disabled; import = $disabled; expected = 'auth_token' },
+    @{ profile = $null; consent = $null; import = $disabled; expected = 'auth_token' }
+)) {
+    $script:successorScenario = $scenario
+    if ((X-AccountIDSuccessor) -cne $scenario.expected) { throw 'X account input successor differs from its enabled controls' }
+}
+foreach ($scenario in @(
+    @{ profile = $disabled; consent = $enabled; import = $disabled },
+    @{ profile = $disabled; consent = $disabled; import = $enabled }
+)) {
+    $script:successorScenario = $scenario
+    $rejected = $false
+    try { X-AccountIDSuccessor | Out-Null } catch { $rejected = $true }
+    if (-not $rejected) { throw 'X account input successor accepted inconsistent import controls' }
+}
+Write-Output 'X account input successor covered enabled, disabled, absent and inconsistent import controls; no input injected'
