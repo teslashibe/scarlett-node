@@ -101,6 +101,10 @@ const NODE_PHASES: &[&str] = &[
     "page_wall",
     "pacing_wait",
     "quota_wait",
+    "fixed_gap_wait",
+    "jitter_wait",
+    "quota_spread_wait",
+    "quota_reset_wait",
     "request_encode",
     "proof_journal_begin",
     "helper_wall",
@@ -258,6 +262,62 @@ mod tests {
             "missing_phases":[],"unclassified_ms":1000}],"summaries":[{
             "operation":"search","pages":1,"proof_mode":"relay","samples":1,
             "p50_ms":3000,"p95_ms":3000,"newest_at":"2026-10-05T12:34:56Z"}]})
+    }
+    #[test]
+    fn emitted_pacing_history_remains_available_without_private_quota_fields() {
+        let raw = include_bytes!("../../tests/fixtures/pacing-diagnostics-v1.json");
+        let safe = project(raw).expect("Go-emitted pacing history must remain available");
+        assert_eq!(safe.attempts.len(), 31);
+        for (phase, count) in [
+            ("fixed_gap_wait", 3),
+            ("jitter_wait", 9),
+            ("quota_spread_wait", 3),
+            ("quota_reset_wait", 3),
+        ] {
+            assert_eq!(
+                safe.attempts
+                    .iter()
+                    .flat_map(|r| &r.spans)
+                    .filter(|s| s.phase == phase && s.source == "node")
+                    .count(),
+                count,
+                "missing emitted {phase} spans"
+            );
+        }
+        let output = serde_json::to_string(&safe).unwrap();
+        assert!(std::str::from_utf8(raw)
+            .unwrap()
+            .contains("quota_snapshots"));
+        assert!(!output.contains("quota_snapshots"));
+        assert!(!output.contains("remaining"));
+        assert!(safe.summaries.iter().any(|s| s.samples == 31));
+    }
+    #[test]
+    fn emitted_history_still_rejects_unknown_or_misclassified_pacing_spans() {
+        let raw = include_bytes!("../../tests/fixtures/pacing-diagnostics-v1.json");
+        let original: serde_json::Value = serde_json::from_slice(raw).unwrap();
+        for phase in ["future_pacing_wait", "SECRET_PROVIDER_DETAIL"] {
+            let mut value = original.clone();
+            let span = value["attempts"][22]["spans"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|s| s["phase"] == "jitter_wait")
+                .unwrap();
+            span["phase"] = json!(phase);
+            assert!(project(&serde_json::to_vec(&value).unwrap()).is_none());
+        }
+        for (field, bad) in [("source", json!("helper")), ("exchange", json!(4))] {
+            let mut value = original.clone();
+            let span = value["attempts"][22]["spans"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|s| s["phase"] == "jitter_wait")
+                .unwrap();
+            span[field] = bad;
+            assert!(project(&serde_json::to_vec(&value).unwrap()).is_none());
+        }
     }
     #[test]
     fn projection_discards_every_unknown_field_at_every_level() {

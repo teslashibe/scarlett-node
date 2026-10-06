@@ -1,0 +1,2497 @@
+{
+  "version": 1,
+  "updated_at": "2026-10-06T12:30:05.041Z",
+  "attempts": [
+    {
+      "id": "060543abd0c52d45f6136c7a446bc734b50eeb92664022ad481db28186cd7846",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:00:00Z",
+      "outcome": "success",
+      "duration_ms": 2041,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2001,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 800,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 820,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 821,
+          "duration_ms": 1200,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2021,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "2ee615ce914b0fec815aaea60c5d683eac89775dce3cefd62fc6ac5a36ad557e",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:01:00Z",
+      "outcome": "success",
+      "duration_ms": 2061,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2021,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 810,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 830,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 831,
+          "duration_ms": 1210,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2041,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "cf7df21818d54787b34664ff336789ff378fdb20c2684eb93d37cdd33492c9f6",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:02:00Z",
+      "outcome": "success",
+      "duration_ms": 2081,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2041,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 820,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 840,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 841,
+          "duration_ms": 1220,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2061,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "bd6183c271e38b35b4f1b6aca863da0384eb1f6268b34cb5744f84deee73ad1c",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:03:00Z",
+      "outcome": "success",
+      "duration_ms": 2101,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2061,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 830,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 850,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 851,
+          "duration_ms": 1230,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2081,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "de445b8d200e06b3a7576e127e90553d6c00a8a1c3a84cb5375707bd987951e7",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:04:00Z",
+      "outcome": "success",
+      "duration_ms": 2121,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2081,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 840,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 860,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 861,
+          "duration_ms": 1240,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2101,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "c5973b171cf9b9738607ca6ef074889a71b7eece45e43dc56090bd2b5dddff3a",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:05:00Z",
+      "outcome": "success",
+      "duration_ms": 2141,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2101,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 850,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 870,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 871,
+          "duration_ms": 1250,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2121,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "f3557b2e3a2c583ad19e88fd69ff6afb1e782277801427f1c3c47c555a9828c9",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:06:00Z",
+      "outcome": "success",
+      "duration_ms": 2161,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2121,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 860,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 880,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 881,
+          "duration_ms": 1260,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2141,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "e3748315d07e758a640868882604b654ba964c056be184b6cf8da6fd8a289e47",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:07:00Z",
+      "outcome": "success",
+      "duration_ms": 2181,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2141,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 870,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 890,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 891,
+          "duration_ms": 1270,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2161,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "37b7523ae6d63d7f29e8ca76641c171ccf768e5c4469b8f46eb779b6d84768cc",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:08:00Z",
+      "outcome": "success",
+      "duration_ms": 2201,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2161,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 880,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 900,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 901,
+          "duration_ms": 1280,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2181,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "8b14ba3655cd32f0bb271d1376db315e10eeeb9763f3a1eda27d309f662a6472",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:09:00Z",
+      "outcome": "success",
+      "duration_ms": 2221,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2181,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 890,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 910,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 911,
+          "duration_ms": 1290,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2201,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "c750202be7c1c45e92ef10e3be3bab67bac268d709f58ac1d4e7e2aa58a2438c",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:10:00Z",
+      "outcome": "success",
+      "duration_ms": 2241,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2201,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 900,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 920,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 921,
+          "duration_ms": 1300,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2221,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "bdcfdffc2576776e569858d9fdd5a1a377f10fea0c339ff05f732cb34c1b2f56",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:11:00Z",
+      "outcome": "success",
+      "duration_ms": 2261,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2221,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 910,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 930,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 931,
+          "duration_ms": 1310,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2241,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "267888d4ac3cf68baa619b54cd1916903e740ac1d954e7442232f52dac84bc5b",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:12:00Z",
+      "outcome": "success",
+      "duration_ms": 2281,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2241,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 920,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 940,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 941,
+          "duration_ms": 1320,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2261,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "4e7eda0ac5bf7056c103946cf99194c73972ff79fca7777ba512364f3d3007d9",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:13:00Z",
+      "outcome": "success",
+      "duration_ms": 2301,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2261,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 930,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 950,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 951,
+          "duration_ms": 1330,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2281,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "a7fe65cc383624f1bd2f40fc4399c2505215592b06b5af76cce0cddac534733d",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:14:00Z",
+      "outcome": "success",
+      "duration_ms": 2321,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2281,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 940,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 960,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 961,
+          "duration_ms": 1340,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2301,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "3cffdc608d5b3498546251db99d9c00f428d117e4e5c35babeb19862778962e7",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:15:00Z",
+      "outcome": "success",
+      "duration_ms": 2341,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2301,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 950,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 970,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 971,
+          "duration_ms": 1350,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2321,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "d610a12beec39dc5ef82e65e176df87c24cb8c2079e7a9659e5f3006e4ac6230",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:16:00Z",
+      "outcome": "success",
+      "duration_ms": 2361,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2321,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 960,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 980,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 981,
+          "duration_ms": 1360,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2341,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "357e20cdc01b537f213a206050090faa2132f7575f0f602008f9fb2628806ea6",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:17:00Z",
+      "outcome": "success",
+      "duration_ms": 2381,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2341,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 970,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 990,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 991,
+          "duration_ms": 1370,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2361,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "cf8705b146e69d32954b28b3158ff8412ea85c7793055492c1ee2becba554f4d",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:18:00Z",
+      "outcome": "success",
+      "duration_ms": 2401,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2361,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 980,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1000,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1001,
+          "duration_ms": 1380,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2381,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "20c7e354fe3a468755977bf053e796bb292e9c35c54ce5acd29109ab5582062a",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:19:00Z",
+      "outcome": "success",
+      "duration_ms": 2421,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2381,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 990,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1010,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1011,
+          "duration_ms": 1390,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2401,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "e5a125ec12ab644e264a42da524c9bc6bcf63e6f9bd7ad77de3719eaa0b2591d",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:20:00Z",
+      "outcome": "success",
+      "duration_ms": 2441,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2401,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 1000,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1020,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1021,
+          "duration_ms": 1400,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2421,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "dba5c63b234e5f9530a3af23c70c9da66ba66d1f21bf3fe8dcfeecd756ee01be",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:21:00Z",
+      "outcome": "success",
+      "duration_ms": 2461,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2421,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 1010,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1030,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1031,
+          "duration_ms": 1410,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2441,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0
+    },
+    {
+      "id": "a2f859d1f7d6956271a7913180a123c240d91752187b1a6bb4cc0bbb9901cead",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:22:00Z",
+      "outcome": "success",
+      "duration_ms": 2461,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2421,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 1000,
+          "outcome": "success"
+        },
+        {
+          "phase": "fixed_gap_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 750,
+          "outcome": "success"
+        },
+        {
+          "phase": "jitter_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 770,
+          "duration_ms": 250,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1020,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1021,
+          "duration_ms": 1420,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2441,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0,
+      "quota_snapshots": [
+        {
+          "observed_at": "2026-10-06T12:21:59.82Z",
+          "captured_at": "2026-10-06T12:22:00.02Z",
+          "next_eligible_at": "2026-10-06T12:22:00.77Z",
+          "exchange": 1,
+          "operation": "search",
+          "mode": "conservative",
+          "limit": 100,
+          "remaining": 78,
+          "reset": "2026-10-06T12:22:45.02Z",
+          "complete": true,
+          "authoritative": true
+        }
+      ]
+    },
+    {
+      "id": "1cc90e3332ca50e7f2966ca3ee079e08d89c6fe633349581ae297fcf552fbeee",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:23:00Z",
+      "outcome": "success",
+      "duration_ms": 2496,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2456,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 1025,
+          "outcome": "success"
+        },
+        {
+          "phase": "fixed_gap_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 750,
+          "outcome": "success"
+        },
+        {
+          "phase": "jitter_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 770,
+          "duration_ms": 275,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1045,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1046,
+          "duration_ms": 1430,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2476,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0,
+      "quota_snapshots": [
+        {
+          "observed_at": "2026-10-06T12:22:59.82Z",
+          "captured_at": "2026-10-06T12:23:00.02Z",
+          "next_eligible_at": "2026-10-06T12:23:00.77Z",
+          "exchange": 1,
+          "operation": "search",
+          "mode": "conservative",
+          "limit": 100,
+          "remaining": 77,
+          "reset": "2026-10-06T12:23:45.02Z",
+          "complete": true,
+          "authoritative": true
+        }
+      ]
+    },
+    {
+      "id": "87078d07e760dbc3a7b890e08b0c78bafcf210201cff595d75f473e3b8460598",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:24:00Z",
+      "outcome": "success",
+      "duration_ms": 2531,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 2491,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 1050,
+          "outcome": "success"
+        },
+        {
+          "phase": "fixed_gap_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 750,
+          "outcome": "success"
+        },
+        {
+          "phase": "jitter_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 770,
+          "duration_ms": 300,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1070,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1071,
+          "duration_ms": 1440,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 2511,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0,
+      "quota_snapshots": [
+        {
+          "observed_at": "2026-10-06T12:23:59.82Z",
+          "captured_at": "2026-10-06T12:24:00.02Z",
+          "next_eligible_at": "2026-10-06T12:24:00.77Z",
+          "exchange": 1,
+          "operation": "search",
+          "mode": "conservative",
+          "limit": 100,
+          "remaining": 76,
+          "reset": "2026-10-06T12:24:45.02Z",
+          "complete": true,
+          "authoritative": true
+        }
+      ]
+    },
+    {
+      "id": "c1d66c53f3c70a5ca2c72524951ca09c3d93aa257d24641ec08c5a5376d420d5",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:25:00Z",
+      "outcome": "success",
+      "duration_ms": 3216,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 3176,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 1725,
+          "outcome": "success"
+        },
+        {
+          "phase": "quota_spread_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 1400,
+          "outcome": "success"
+        },
+        {
+          "phase": "jitter_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1420,
+          "duration_ms": 325,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1745,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1746,
+          "duration_ms": 1450,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 3196,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0,
+      "quota_snapshots": [
+        {
+          "observed_at": "2026-10-06T12:24:59.82Z",
+          "captured_at": "2026-10-06T12:25:00.02Z",
+          "next_eligible_at": "2026-10-06T12:25:01.42Z",
+          "exchange": 1,
+          "operation": "search",
+          "mode": "quota_budget",
+          "limit": 100,
+          "remaining": 18,
+          "reset": "2026-10-06T12:25:45.02Z",
+          "complete": true,
+          "authoritative": true
+        }
+      ]
+    },
+    {
+      "id": "a8929e7d34e826d78664b4496ef00bb98759a9f9e834528a1bf7ed1fe2ab1173",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:26:00Z",
+      "outcome": "success",
+      "duration_ms": 3251,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 3211,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 1750,
+          "outcome": "success"
+        },
+        {
+          "phase": "quota_spread_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 1400,
+          "outcome": "success"
+        },
+        {
+          "phase": "jitter_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1420,
+          "duration_ms": 350,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1770,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1771,
+          "duration_ms": 1460,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 3231,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0,
+      "quota_snapshots": [
+        {
+          "observed_at": "2026-10-06T12:25:59.82Z",
+          "captured_at": "2026-10-06T12:26:00.02Z",
+          "next_eligible_at": "2026-10-06T12:26:01.42Z",
+          "exchange": 1,
+          "operation": "search",
+          "mode": "quota_budget",
+          "limit": 100,
+          "remaining": 17,
+          "reset": "2026-10-06T12:26:45.02Z",
+          "complete": true,
+          "authoritative": true
+        }
+      ]
+    },
+    {
+      "id": "30544f862ac696abd6499cea571d133c44a13ed53a3b29952f262d792a6f0cc3",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:27:00Z",
+      "outcome": "success",
+      "duration_ms": 3286,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 3246,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 1775,
+          "outcome": "success"
+        },
+        {
+          "phase": "quota_spread_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 1400,
+          "outcome": "success"
+        },
+        {
+          "phase": "jitter_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1420,
+          "duration_ms": 375,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1795,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 1796,
+          "duration_ms": 1470,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 3266,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0,
+      "quota_snapshots": [
+        {
+          "observed_at": "2026-10-06T12:26:59.82Z",
+          "captured_at": "2026-10-06T12:27:00.02Z",
+          "next_eligible_at": "2026-10-06T12:27:01.42Z",
+          "exchange": 1,
+          "operation": "search",
+          "mode": "quota_budget",
+          "limit": 100,
+          "remaining": 16,
+          "reset": "2026-10-06T12:27:45.02Z",
+          "complete": true,
+          "authoritative": true
+        }
+      ]
+    },
+    {
+      "id": "1d00bd3ded3b0cb2855a6a92a8359f2bc14176f11ba9142ed1ef8c46b0a90b79",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:28:00Z",
+      "outcome": "success",
+      "duration_ms": 4971,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 4931,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 3450,
+          "outcome": "success"
+        },
+        {
+          "phase": "quota_reset_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 3050,
+          "outcome": "success"
+        },
+        {
+          "phase": "jitter_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 3070,
+          "duration_ms": 400,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 3470,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 3471,
+          "duration_ms": 1480,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 4951,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0,
+      "quota_snapshots": [
+        {
+          "observed_at": "2026-10-06T12:27:59.82Z",
+          "captured_at": "2026-10-06T12:28:00.02Z",
+          "next_eligible_at": "2026-10-06T12:28:03.07Z",
+          "exchange": 1,
+          "operation": "search",
+          "mode": "quota_budget",
+          "limit": 100,
+          "remaining": 0,
+          "reset": "2026-10-06T12:28:03.02Z",
+          "complete": true,
+          "authoritative": true
+        }
+      ]
+    },
+    {
+      "id": "e6546740c6ee9adb240c4fdfad9798573d2b7cd4f83aec579ee1413ace1d6ca4",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:29:00Z",
+      "outcome": "success",
+      "duration_ms": 5006,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 4966,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 3475,
+          "outcome": "success"
+        },
+        {
+          "phase": "quota_reset_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 3050,
+          "outcome": "success"
+        },
+        {
+          "phase": "jitter_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 3070,
+          "duration_ms": 425,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 3495,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 3496,
+          "duration_ms": 1490,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 4986,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0,
+      "quota_snapshots": [
+        {
+          "observed_at": "2026-10-06T12:28:59.82Z",
+          "captured_at": "2026-10-06T12:29:00.02Z",
+          "next_eligible_at": "2026-10-06T12:29:03.07Z",
+          "exchange": 1,
+          "operation": "search",
+          "mode": "quota_budget",
+          "limit": 100,
+          "remaining": 0,
+          "reset": "2026-10-06T12:29:03.02Z",
+          "complete": true,
+          "authoritative": true
+        }
+      ]
+    },
+    {
+      "id": "df2efc9b9b3827708845ea218ae75da2093a9b497da22f1c91c0ac946d667ef6",
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "started_at": "2026-10-06T12:30:00Z",
+      "outcome": "success",
+      "duration_ms": 5041,
+      "spans": [
+        {
+          "phase": "account_acquire",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 0,
+          "duration_ms": 5,
+          "outcome": "success"
+        },
+        {
+          "phase": "accept_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5,
+          "duration_ms": 15,
+          "outcome": "success"
+        },
+        {
+          "phase": "worker",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 20,
+          "duration_ms": 5001,
+          "outcome": "success"
+        },
+        {
+          "phase": "pacing_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 3500,
+          "outcome": "success"
+        },
+        {
+          "phase": "quota_reset_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 20,
+          "duration_ms": 3050,
+          "outcome": "success"
+        },
+        {
+          "phase": "jitter_wait",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 3070,
+          "duration_ms": 450,
+          "outcome": "success"
+        },
+        {
+          "phase": "request_encode",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 3520,
+          "duration_ms": 1,
+          "outcome": "success"
+        },
+        {
+          "phase": "helper_wall",
+          "source": "node",
+          "exchange": 1,
+          "start_ms": 3521,
+          "duration_ms": 1500,
+          "outcome": "success"
+        },
+        {
+          "phase": "report_http",
+          "source": "node",
+          "exchange": 0,
+          "start_ms": 5021,
+          "duration_ms": 20,
+          "outcome": "success"
+        }
+      ],
+      "missing_phases": [
+        "helper_total"
+      ],
+      "unclassified_ms": 0,
+      "quota_snapshots": [
+        {
+          "observed_at": "2026-10-06T12:29:59.82Z",
+          "captured_at": "2026-10-06T12:30:00.02Z",
+          "next_eligible_at": "2026-10-06T12:30:03.07Z",
+          "exchange": 1,
+          "operation": "search",
+          "mode": "quota_budget",
+          "limit": 100,
+          "remaining": 0,
+          "reset": "2026-10-06T12:30:03.02Z",
+          "complete": true,
+          "authoritative": true
+        }
+      ]
+    }
+  ],
+  "summaries": [
+    {
+      "operation": "search",
+      "pages": 1,
+      "proof_mode": "relay",
+      "samples": 31,
+      "p50_ms": 2341,
+      "p95_ms": 5006,
+      "newest_at": "2026-10-06T12:30:00Z"
+    }
+  ]
+}
