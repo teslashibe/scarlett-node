@@ -714,11 +714,37 @@ mod tests {
             resources,
         );
         if supplied.is_some() {
+            // Seed protected synthetic inventory without authenticating with X.
+            // The helper creates the same private files and ACLs used by the app.
+            let homes = state.join("accounts");
+            node::private_dir_with_helper(&homes, &binary).unwrap();
+            let mut accounts = Vec::new();
             for id in ["browser-firefox", "browser-paste"] {
-                node.connect_x(id.into(), 1, "a".repeat(40), "b".repeat(64))
-                    .await
-                    .unwrap();
+                let home = homes.join(format!("x_read-{id}"));
+                node::private_dir_with_helper(&home, &binary).unwrap();
+                let seed = home.join("bearer");
+                node::private_helper(&binary, "bearer", &seed).unwrap();
+                let session = home.join("session.json");
+                std::fs::rename(seed, &session).unwrap();
+                std::fs::write(
+                    &session,
+                    br#"{"auth_token":"synthetic-auth","ct0":"synthetic-csrf"}"#,
+                )
+                .unwrap();
+                accounts.push(serde_json::json!({
+                    "id": id, "service": "x_read", "path": session, "concurrency": 1
+                }));
             }
+            let seed = state.join("bearer");
+            node::private_helper(&binary, "bearer", &seed).unwrap();
+            let registry = state.join("accounts.json");
+            std::fs::rename(seed, &registry).unwrap();
+            std::fs::write(
+                registry,
+                serde_json::to_vec(&serde_json::json!({"version": 1, "accounts": accounts}))
+                    .unwrap(),
+            )
+            .unwrap();
         }
         std::fs::write(
             state.join("identity.json"),
