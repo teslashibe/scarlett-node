@@ -46,6 +46,10 @@ func TestMain(m *testing.M) {
 	case "auth":
 		fmt.Fprintln(os.Stderr, "Error: Codex provider error: unauthenticated")
 		os.Exit(1)
+	case "authdiag":
+		fmt.Fprintln(os.Stderr, `SCARLETT_DIAGNOSTICS={"version":1,"duration_ms":4,"outcome":"error","spans":[{"phase":"proof_finalize","start_ms":0,"duration_ms":4,"outcome":"error"}]}`)
+		fmt.Fprintln(os.Stderr, "Error: Codex provider error: unauthenticated")
+		os.Exit(1)
 	case "quota":
 		fmt.Fprintln(os.Stderr, "Error: Codex provider error: rate_limited")
 		os.Exit(1)
@@ -77,6 +81,7 @@ func TestProverRun(t *testing.T) {
 		{"proof sent", "ok", func(*coordinator.Lease) {}, ""},
 		{"prover failure", "fail", func(*coordinator.Lease) {}, "prover_error"},
 		{"safe authentication failure", "auth", func(*coordinator.Lease) {}, "auth_required"},
+		{"authentication failure with optional diagnostics", "authdiag", func(*coordinator.Lease) {}, "auth_required"},
 		{"safe rate-limit failure", "quota", func(*coordinator.Lease) {}, "capacity_unavailable"},
 		{"unrecognized error cannot claim quota", "raw-quota", func(*coordinator.Lease) {}, "prover_error"},
 		{"unexpected output", "garbage", func(*coordinator.Lease) {}, "prover_error"},

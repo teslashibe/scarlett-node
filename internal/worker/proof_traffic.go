@@ -1,14 +1,18 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"strconv"
 	"sync"
 
 	"github.com/teslashibe/scarlett-node/internal/attempts"
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
+	"github.com/teslashibe/scarlett-node/internal/diagnostics"
 )
 
 // ProofObserver belongs to one already accepted lease. Begin must persist before
@@ -38,7 +42,13 @@ func beginProofObservation(ctx context.Context) (func([]byte, bool), error) {
 	if observer == nil {
 		return func([]byte, bool) {}, nil
 	}
+	exchange := xExchange(ctx)
+	if exchange == 0 {
+		exchange = 1
+	}
+	endBegin := diagnostics.Start(ctx, "proof_journal_begin", exchange)
 	complete, err := observer()
+	endBegin(diagnosticOutcome(ctx, err))
 	if err != nil {
 		return nil, err
 	}
@@ -47,7 +57,9 @@ func beginProofObservation(ctx context.Context) (func([]byte, bool), error) {
 		once.Do(func() {
 			// A failed completion write leaves the durable started sample unknown.
 			// It cannot become complete merely because the worker later finishes.
-			_ = complete(proofSample(raw, helperOK))
+			endComplete := diagnostics.Start(ctx, "proof_journal_complete", exchange)
+			err := complete(proofSample(raw, helperOK))
+			endComplete(diagnosticOutcome(ctx, err))
 		})
 	}, nil
 }
@@ -59,9 +71,8 @@ func proofSample(raw []byte, helperOK bool) attempts.ProofSample {
 	if !helperOK {
 		return incomplete("helper_failed")
 	}
-	value, err := uniqueJSON(raw)
-	v, ok := value.(map[string]any)
-	if err != nil || !ok || v["status"] != "proof_sent" {
+	v, err := proofSummaryJSON(raw)
+	if err != nil || v["status"] != "proof_sent" {
 		return incomplete("invalid")
 	}
 	for _, field := range []string{"verifier_sent_bytes", "verifier_received_bytes", "verifier_transport_layer"} {
@@ -98,4 +109,44 @@ func proofSample(raw []byte, helperOK bool) attempts.ProofSample {
 		sample.State, sample.Reason, sample.Saturated = "incomplete", "saturated", true
 	}
 	return sample
+}
+
+// Operational fields are optional and cannot invalidate the independent byte
+// sample. All remaining fields retain unique-key and integer-JSON validation.
+func proofSummaryJSON(raw []byte) (map[string]any, error) {
+	d := json.NewDecoder(bytes.NewReader(raw))
+	token, err := d.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, errors.New("invalid proof summary")
+	}
+	value := map[string]any{}
+	for d.More() {
+		token, err := d.Token()
+		key, ok := token.(string)
+		if err != nil || !ok {
+			return nil, errors.New("invalid proof summary key")
+		}
+		var field json.RawMessage
+		if d.Decode(&field) != nil {
+			return nil, errors.New("invalid proof summary field")
+		}
+		if key == "diagnostics" || key == "duration_ms" {
+			continue
+		}
+		if _, exists := value[key]; exists {
+			return nil, errors.New("duplicate proof summary key")
+		}
+		fieldValue, err := uniqueJSON(field)
+		if err != nil {
+			return nil, err
+		}
+		value[key] = fieldValue
+	}
+	if token, err := d.Token(); err != nil || token != json.Delim('}') {
+		return nil, errors.New("invalid proof summary end")
+	}
+	if _, err := d.Token(); err != io.EOF {
+		return nil, errors.New("trailing proof summary")
+	}
+	return value, nil
 }

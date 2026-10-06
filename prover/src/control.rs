@@ -18,6 +18,7 @@ use tokio::{
     net::TcpStream,
 };
 use tokio_rustls::TlsConnector;
+use crate::diagnostics::{Phase, Trace};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(windows)]
@@ -164,30 +165,51 @@ fn client(ca: Option<&str>) -> Result<TlsConnector> {
         .with_no_client_auth();
     Ok(TlsConnector::from(Arc::new(config)))
 }
+#[cfg(test)]
 pub async fn connect(address: &str, ca: Option<&str>, plaintext_fixture: bool) -> Result<(Socket, Traffic)> {
-    if plaintext_fixture && (!fixture_address(address) || ca.is_some()) {
-        bail!("plaintext is restricted to explicit unpaid fixtures");
-    }
-    let connector = if plaintext_fixture { None } else { Some(client(ca)?) };
-    // Bracket an IPv6 literal only for parsing; certificate validation uses its IP.
-    let host = if let Ok(parsed) = address.parse::<std::net::SocketAddr>() {
-        parsed.ip().to_string()
-    } else {
-        let (host, port) = address.rsplit_once(':').context("verifier must be host:port")?;
-        let port: u16 = port.parse()?;
-        if host.is_empty() || port == 0 {
-            bail!("invalid verifier address");
+    connect_observed(address, ca, plaintext_fixture, None).await
+}
+
+pub async fn connect_observed(address: &str, ca: Option<&str>, plaintext_fixture: bool, trace: Option<&Trace>) -> Result<(Socket, Traffic)> {
+    let configure = || -> Result<_> {
+        if plaintext_fixture && (!fixture_address(address) || ca.is_some()) {
+            bail!("plaintext is restricted to explicit unpaid fixtures");
         }
-        host.to_owned()
+        let connector = if plaintext_fixture { None } else { Some(client(ca)?) };
+        // Bracket an IPv6 literal only for parsing; certificate validation uses its IP.
+        let host = if let Ok(parsed) = address.parse::<std::net::SocketAddr>() {
+            parsed.ip().to_string()
+        } else {
+            let (host, port) = address.rsplit_once(':').context("verifier must be host:port")?;
+            let port: u16 = port.parse()?;
+            if host.is_empty() || port == 0 {
+                bail!("invalid verifier address");
+            }
+            host.to_owned()
+        };
+        Ok((connector, host))
+    };
+    let (connector, host) = match trace {
+        Some(trace) => trace.measure_sync(Phase::ControlConfig, configure)?,
+        None => configure()?,
     };
     tokio::time::timeout(Duration::from_secs(10), async {
-        let socket = TcpStream::connect(address).await.context("verifier unreachable")?;
+        let dial = async { TcpStream::connect(address).await.context("verifier unreachable") };
+        let socket = match trace {
+            Some(trace) => trace.measure(Phase::VerifierTcpConnect, dial).await?,
+            None => dial.await?,
+        };
         socket.set_nodelay(true)?;
         let traffic = Traffic::default();
         let socket = Metered { inner: socket, traffic: traffic.clone() };
         if let Some(connector) = connector {
             let name = ServerName::try_from(host).context("invalid verifier TLS name")?;
-            Ok((Box::new(connector.connect(name, socket).await.context("verifier TLS verification failed")?) as Socket, traffic))
+            let handshake = async { connector.connect(name, socket).await.context("verifier TLS verification failed") };
+            let socket = match trace {
+                Some(trace) => trace.measure(Phase::VerifierTls, handshake).await?,
+                None => handshake.await?,
+            };
+            Ok((Box::new(socket) as Socket, traffic))
         } else {
             Ok((Box::new(socket) as Socket, traffic))
         }
@@ -302,6 +324,37 @@ mod tests {
         socket.write_all(b"token").await.unwrap();
         assert!(server.await.unwrap());
         assert!(traffic.snapshot().verifier_sent_bytes > handshake.verifier_sent_bytes + 5);
+    }
+    #[tokio::test]
+    async fn observed_control_tls_records_a_fixture_delay_without_changing_transport() {
+        let dir = Temp::new();
+        let (cert, key, ca) = certificate(&dir, false);
+        let acceptor = acceptor(&cert, &key).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            // Wait for the ClientHello so the observed TLS span has begun.
+            let mut hello = [0; 1];
+            assert_eq!(tcp.peek(&mut hello).await.unwrap(), 1);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let mut bytes = [0; 5];
+            tls.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(bytes, *b"token");
+        });
+        let trace = Trace::new();
+        let (mut socket, _) = connect_observed(&format!("localhost:{port}"), Some(&ca), false, Some(&trace)).await.unwrap();
+        socket.write_all(b"token").await.unwrap();
+        server.await.unwrap();
+        let snapshot = serde_json::to_value(trace.snapshot()).unwrap();
+        let spans = snapshot["spans"].as_array().unwrap();
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0]["phase"], "control_config");
+        assert_eq!(spans[1]["phase"], "verifier_tcp_connect");
+        assert_eq!(spans[2]["phase"], "verifier_tls");
+        assert!(spans[2]["duration_ms"].as_u64().unwrap() >= 25);
+        assert!(spans.iter().all(|span| span["outcome"] == "success"));
     }
     #[tokio::test]
     async fn wrong_hostname_untrusted_root_and_expired_certificate_reject_before_token() {

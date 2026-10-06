@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/teslashibe/scarlett-node/internal/diagnostics"
 	"github.com/teslashibe/scarlett-node/internal/process"
 	"io"
 	"net/http"
@@ -49,8 +50,14 @@ func (t XTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	r := req.Clone(req.Context())
 	r.Close = true
 	r.Header.Set("Accept-Encoding", "gzip")
+	exchange := xExchange(req.Context())
+	if exchange == 0 {
+		exchange = 1
+	}
+	endEncode := diagnostics.Start(req.Context(), "request_encode", exchange)
 	var raw bytes.Buffer
 	if err := r.Write(&raw); err != nil {
+		endEncode("error")
 		return nil, err
 	}
 	input, err := json.Marshal(struct {
@@ -60,6 +67,7 @@ func (t XTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		Token            string `json:"token"`
 		Request          string `json:"request"`
 	}{t.Verifier, t.VerifierCA, t.PlaintextFixture, t.Token, base64.StdEncoding.EncodeToString(raw.Bytes())})
+	endEncode(diagnosticOutcome(req.Context(), err))
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +78,7 @@ func (t XTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	cmd := exec.CommandContext(req.Context(), t.Prover, command)
 	cmd.Stdin = bytes.NewReader(input)
 	var stdout, stderr limitedBuffer
-	stdout.max, stderr.max = 4<<20, 4096
+	stdout.max, stderr.max = 4<<20, 16<<10
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	observe, err := beginProofObservation(req.Context())
 	if err != nil {
@@ -78,15 +86,27 @@ func (t XTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	helperOK := false
 	defer func() { observe(stdout.Bytes(), helperOK) }()
-	if err := process.Run(cmd); err != nil {
-		return nil, fmt.Errorf("prover: %v: %s", err, strings.TrimSpace(stderr.String()))
+	endHelper := diagnostics.Start(req.Context(), "helper_wall", exchange)
+	err = process.Run(cmd)
+	endHelper(diagnosticOutcome(req.Context(), err))
+	detail := helperStderr(req.Context(), exchange, stderr.String())
+	if err != nil {
+		return nil, fmt.Errorf("prover: %v: %s", err, detail)
 	}
 	helperOK = true
+	helperDiagnostics(req.Context(), exchange, stdout.Bytes())
+	endDecode := diagnostics.Start(req.Context(), "helper_stdout_decode", exchange)
+	resp, err := readXHelperResponse(req, stdout.Bytes())
+	endDecode(diagnosticOutcome(req.Context(), err))
+	return resp, err
+}
+
+func readXHelperResponse(req *http.Request, raw []byte) (*http.Response, error) {
 	var summary struct {
 		Status   string `json:"status"`
 		Response string `json:"response"`
 	}
-	if json.Unmarshal(stdout.Bytes(), &summary) != nil || summary.Status != "proof_sent" {
+	if json.Unmarshal(raw, &summary) != nil || summary.Status != "proof_sent" {
 		return nil, errors.New("prover: unexpected output")
 	}
 	body, err := base64.StdEncoding.DecodeString(summary.Response)

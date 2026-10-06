@@ -33,6 +33,7 @@ use tokio::{
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use crate::{
+    diagnostics::{Phase, Run, Snapshot, Trace},
     policy::find,
     prove::Driver,
     xpolicy::{self, HOST},
@@ -65,9 +66,18 @@ pub struct Summary {
     pub sent_bytes: usize,
     pub received_bytes: usize,
     pub duration_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Snapshot>,
 }
 
 pub async fn run(request: Request) -> Result<Summary> {
+    let diagnostics = Run::new();
+    let mut summary = run_observed(request, &diagnostics.trace()).await?;
+    summary.diagnostics = Some(diagnostics.success());
+    Ok(summary)
+}
+
+async fn run_observed(request: Request, trace: &Trace) -> Result<Summary> {
     let raw = STANDARD.decode(request.request.as_bytes()).context("request is not base64")?;
     if raw.len() > MAX_SENT || !raw.starts_with(b"GET /i/api/graphql/") {
         bail!("request must be an X GraphQL GET of at most {MAX_SENT} bytes");
@@ -78,16 +88,19 @@ pub async fn run(request: Request) -> Result<Summary> {
     let max_recv = request.max_recv.unwrap_or(MAX_RECV).min(MAX_RECV);
     let started = Instant::now();
 
-    let (mut socket, traffic) = crate::control::connect(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture).await?;
+    let (mut socket, traffic) = crate::control::connect_observed(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture, Some(trace)).await?;
     socket.write_all(format!("{}\n", request.token).as_bytes()).await?;
     let (driver, mut handle) = Session::new(socket.compat()).split();
     let mut session = Driver::new(tokio::spawn(driver));
     let work = async {
-        let prover = handle
-            .new_prover(ProverConfig::builder().build()?)?
-            .commit(MpcTlsConfig::builder().max_sent_data(raw.len()).max_recv_data(max_recv).build()?)
-            .await?;
-        let tcp = TcpStream::connect((HOST, 443)).await.context("x.com unreachable")?;
+        // TLSNotary commit includes its MPC preprocessing and verifier admission.
+        let prover = trace.measure(Phase::OtReady, async {
+            Ok::<_, anyhow::Error>(handle
+                .new_prover(ProverConfig::builder().build()?)?
+                .commit(MpcTlsConfig::builder().max_sent_data(raw.len()).max_recv_data(max_recv).build()?)
+                .await?)
+        }).await?;
+        let tcp = trace.measure(Phase::XTcpConnect, async { TcpStream::connect((HOST, 443)).await.context("x.com unreachable") }).await?;
         tcp.set_nodelay(true)?;
         let end = Arc::new(End::default());
         let (mut tls, prover) = prover.connect(
@@ -95,8 +108,14 @@ pub async fn run(request: Request) -> Result<Summary> {
             Server { tcp, end: end.clone() }.compat(),
         )?;
         let prover_task = tokio::spawn(prover.into_future());
-        tls.write_all(&raw).await?;
-        tls.flush().await?;
+        // The MPC handshake is driven lazily by the first write. This boundary
+        // includes that write and marks locally observed readiness, not pure TLS.
+        trace.measure(Phase::XTlsReady, async {
+            tls.write_all(&raw).await?;
+            tls.flush().await?;
+            anyhow::Ok(())
+        }).await?;
+        trace.milestone(Phase::RequestSent);
         // X does not always close after `Connection: close`, so stop at the end of
         // the framed response rather than waiting for the connection to end.
         let mut response = Vec::new();
@@ -107,28 +126,36 @@ pub async fn run(request: Request) -> Result<Summary> {
                 if n == 0 {
                     break;
                 }
+                if response.is_empty() {
+                    trace.milestone(Phase::ResponseFirstByte);
+                }
                 response.extend_from_slice(&chunk[..n]);
             }
             anyhow::Ok(())
         })
         .await
         .context("timed out waiting for X")??;
+        if xpolicy::response_complete(&response) {
+            trace.milestone(Phase::ResponseComplete);
+        }
         // tlsn finalizes only once the server stream ends, and X may hold the
         // connection open indefinitely, so end it here.
         end.finish();
         drop(tls);
 
-        let mut prover = prover_task.await??;
-        let sent = prover.transcript().sent().to_vec();
-        let received_bytes = prover.transcript().received().len();
-        let mut builder = ProveConfig::builder(prover.transcript());
-        builder.server_identity();
-        for range in reveal(&sent)? {
-            builder.reveal_sent(&range)?;
-        }
-        builder.reveal_recv(&(0..received_bytes))?;
-        prover.prove(&builder.build()?).await?;
-        anyhow::Ok((prover, response, sent.len(), received_bytes))
+        trace.measure(Phase::ProofFinalize, async {
+            let mut prover = prover_task.await??;
+            let sent = prover.transcript().sent().to_vec();
+            let received_bytes = prover.transcript().received().len();
+            let mut builder = ProveConfig::builder(prover.transcript());
+            builder.server_identity();
+            for range in reveal(&sent)? {
+                builder.reveal_sent(&range)?;
+            }
+            builder.reveal_recv(&(0..received_bytes))?;
+            prover.prove(&builder.build()?).await?;
+            anyhow::Ok((prover, response, sent.len(), received_bytes))
+        }).await
     };
     let (prover, response, sent_bytes, received_bytes) = session.step(work).await?;
     session.finish(async { Ok(prover.close().await?) }, || handle.close()).await?;
@@ -140,6 +167,7 @@ pub async fn run(request: Request) -> Result<Summary> {
         sent_bytes,
         received_bytes,
         duration_ms: started.elapsed().as_millis(),
+        diagnostics: None,
     })
 }
 

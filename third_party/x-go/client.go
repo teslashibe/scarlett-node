@@ -90,7 +90,7 @@ func retryWait(lastErr error, base time.Duration, attempt int) time.Duration {
 }
 
 // doGraphQLGET performs a single GraphQL GET request.
-func (c *Client) doGraphQLGET(ctx context.Context, qid, operationName string, varsJSON, featsJSON []byte) (json.RawMessage, error) {
+func (c *Client) doGraphQLGET(ctx context.Context, qid, operationName string, varsJSON, featsJSON []byte) (result json.RawMessage, err error) {
 	c.waitForGap(ctx)
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
@@ -112,6 +112,8 @@ func (c *Client) doGraphQLGET(ctx context.Context, qid, operationName string, va
 		return nil, fmt.Errorf("%w: %v", ErrRequestFailed, err)
 	}
 	defer resp.Body.Close()
+	decoded := beginObservedDecode(ctx)
+	defer func() { decoded(err != nil) }()
 
 	if err := c.checkStatus(resp); err != nil {
 		return nil, c.operationError(operationName, req, resp, err)
@@ -350,7 +352,7 @@ func (c *Client) queryID(name string) string {
 // on X's rate limit headers. When remaining requests are low, the gap widens
 // automatically to spread requests across the remaining window.
 func (c *Client) waitForGap(ctx context.Context) {
-	gap := c.adaptiveGap()
+	gap, reason := c.adaptiveGapReason()
 
 	c.pacing.gapMu.Lock()
 	now := time.Now()
@@ -362,9 +364,12 @@ func (c *Client) waitForGap(ctx context.Context) {
 	c.pacing.gapMu.Unlock()
 
 	if wait := time.Until(nextSlot); wait > 0 {
+		done := beginObservedWait(ctx, reason)
 		select {
 		case <-ctx.Done():
+			done(true)
 		case <-time.After(wait):
+			done(false)
 		}
 	}
 	// Cancellation must not erase a provider cooldown that remains active.
@@ -383,6 +388,11 @@ func (c *Client) waitForGap(ctx context.Context) {
 // rate-limit state. Spreads requests across the window when quota is low;
 // waits for reset when quota is exhausted.
 func (c *Client) adaptiveGap() time.Duration {
+	gap, _ := c.adaptiveGapReason()
+	return gap
+}
+
+func (c *Client) adaptiveGapReason() (time.Duration, string) {
 	c.pacing.rlMu.Lock()
 	rs := c.pacing.rlState
 	c.pacing.rlMu.Unlock()
@@ -390,7 +400,7 @@ func (c *Client) adaptiveGap() time.Duration {
 	// Quota exhausted — wait for the window to reset.
 	if rs.Remaining == 0 && !rs.Reset.IsZero() {
 		if d := time.Until(rs.Reset); d > 0 {
-			return d + 50*time.Millisecond
+			return d + 50*time.Millisecond, "quota"
 		}
 	}
 	// Spread remaining quota evenly across the reset window (90% safety margin).
@@ -399,11 +409,11 @@ func (c *Client) adaptiveGap() time.Duration {
 			slots := max(int64(float64(rs.Remaining)*0.9), 1)
 			spread := d / time.Duration(slots)
 			if spread > c.minGap {
-				return spread
+				return spread, "quota"
 			}
 		}
 	}
-	return c.minGap
+	return c.minGap, "gap"
 }
 
 // updateRateLimit reads rate-limit headers from a response and updates

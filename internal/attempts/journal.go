@@ -3,6 +3,7 @@
 package attempts
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/teslashibe/scarlett-node/internal/diagnostics"
 	"github.com/teslashibe/scarlett-node/internal/localfs"
 )
 
@@ -193,6 +195,10 @@ func (j *Journal) read(name string) (Record, error) {
 	return r, nil
 }
 func (j *Journal) write(r Record) error {
+	return j.writeContext(context.Background(), r)
+}
+
+func (j *Journal) writeContext(ctx context.Context, r Record) error {
 	if j.lock == nil {
 		return errors.New("journal closed")
 	}
@@ -203,7 +209,7 @@ func (j *Journal) write(r Record) error {
 	if err != nil || len(data) > j.limits.MaxRecordBytes {
 		return errors.New("attempt record too large")
 	}
-	records, err := j.records()
+	records, err := j.recordsContext(ctx)
 	if err != nil {
 		return err
 	}
@@ -230,9 +236,18 @@ func (j *Journal) write(r Record) error {
 	if reserved > j.limits.MaxTotalBytes {
 		return errors.New("attempt journal storage full")
 	}
-	return localfs.WriteAtomic(filepath.Join(j.dir, key(r)+".json"), data, true)
+	finish := diagnostics.Start(ctx, "journal_write", 0)
+	err = localfs.WriteAtomic(filepath.Join(j.dir, key(r)+".json"), data, true)
+	finish(journalOutcome(err))
+	return err
 }
 func (j *Journal) records() ([]Record, error) {
+	return j.recordsContext(context.Background())
+}
+
+func (j *Journal) recordsContext(ctx context.Context) (records []Record, err error) {
+	finish := diagnostics.Start(ctx, "journal_scan", 0)
+	defer func() { finish(journalOutcome(err)) }()
 	if j.lock == nil {
 		return nil, errors.New("journal closed")
 	}
@@ -299,7 +314,12 @@ func (j *Journal) Capacity() (Capacity, error) {
 }
 
 func (j *Journal) Begin(r Record) error {
-	j.mu.Lock()
+	return j.BeginContext(context.Background(), r)
+}
+
+// BeginContext records local timings without changing the durable attempt.
+func (j *Journal) BeginContext(ctx context.Context, r Record) error {
+	j.lockContext(ctx)
 	defer j.mu.Unlock()
 	r.State = "started"
 	r.Kind = ""
@@ -319,7 +339,7 @@ func (j *Journal) Begin(r Record) error {
 	if !os.IsNotExist(err) {
 		return err
 	}
-	records, err := j.records()
+	records, err := j.recordsContext(ctx)
 	if err != nil {
 		return err
 	}
@@ -330,10 +350,15 @@ func (j *Journal) Begin(r Record) error {
 	if capacity.AvailableRecords < 1 {
 		return errors.New("attempt journal full; reconcile before accepting work")
 	}
-	return j.write(r)
+	return j.writeContext(ctx, r)
 }
 func (j *Journal) Ready(r Record, kind string, body []byte) (Record, error) {
-	j.mu.Lock()
+	return j.ReadyContext(context.Background(), r, kind, body)
+}
+
+// ReadyContext preserves the exact report bytes while recording local timings.
+func (j *Journal) ReadyContext(ctx context.Context, r Record, kind string, body []byte) (Record, error) {
+	j.lockContext(ctx)
 	defer j.mu.Unlock()
 	old, err := j.read(filepath.Join(j.dir, key(r)+".json"))
 	if err != nil {
@@ -353,7 +378,7 @@ func (j *Journal) Ready(r Record, kind string, body []byte) (Record, error) {
 	old.Body = append([]byte(nil), body...)
 	old.SubmissionSHA256 = Hash(body)
 	old.UpdatedAt = time.Now().UTC()
-	if err = j.write(old); err != nil {
+	if err = j.writeContext(ctx, old); err != nil {
 		return Record{}, err
 	}
 	return old, nil
@@ -361,7 +386,12 @@ func (j *Journal) Ready(r Record, kind string, body []byte) (Record, error) {
 
 // Terminal removes private result content immediately, preserving replay metadata.
 func (j *Journal) Terminal(r Record) error {
-	j.mu.Lock()
+	return j.TerminalContext(context.Background(), r)
+}
+
+// TerminalContext records local timings while removing private result content.
+func (j *Journal) TerminalContext(ctx context.Context, r Record) error {
+	j.lockContext(ctx)
 	defer j.mu.Unlock()
 	old, err := j.read(filepath.Join(j.dir, key(r)+".json"))
 	if err != nil {
@@ -373,7 +403,7 @@ func (j *Journal) Terminal(r Record) error {
 	old.State = "terminal"
 	old.Body = nil
 	old.UpdatedAt = time.Now().UTC()
-	return j.write(old)
+	return j.writeContext(ctx, old)
 }
 func (j *Journal) Pending() ([]Record, error) {
 	j.mu.Lock()
@@ -418,4 +448,18 @@ func (j *Journal) Purge(now time.Time) error {
 		}
 	}
 	return localfs.SyncDir(j.dir)
+}
+
+// lockContext measures only the wait for the journal's existing mutex.
+func (j *Journal) lockContext(ctx context.Context) {
+	finish := diagnostics.Start(ctx, "journal_lock", 0)
+	j.mu.Lock()
+	finish("success")
+}
+
+func journalOutcome(err error) string {
+	if err != nil {
+		return "error"
+	}
+	return "success"
 }

@@ -286,3 +286,13 @@ dialog::backdrop {
 dialog .actions {
   justify-content: flex-end;
 }
+.diagnostics-scroll { overflow-x: auto; }
+.diagnostics-table { border-collapse: collapse; width: 100%; font-size: 12px; }
+.diagnostics-table caption { text-align: left; color: #aaa19c; margin-bottom: 12px; }
+.diagnostics-table th, .diagnostics-table td { padding: 10px 8px; text-align: left; border-bottom: 1px solid #332c28; }
+.diagnostics-table th { color: #d9cbc4; }
+.diagnostics-attempt { border-top: 1px solid #332c28; padding: 14px 0; font-size: 12px; }
+.diagnostics-attempt summary { cursor: pointer; color: #d9cbc4; line-height: 1.7; }
+.diagnostics-attempt summary:focus-visible { outline: 2px solid #fa8277; outline-offset: 3px; }
+.diagnostics-attempt h3 { font-size: 12px; margin: 14px 0 8px; }
+.diagnostics-spans { padding-left: 22px; color: #aaa19c; line-height: 1.8; }

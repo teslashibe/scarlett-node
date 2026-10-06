@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeXProver answers `prove-x` with a gzipped, chunked X response echoing the
@@ -35,12 +36,41 @@ func fakeXProver(mode string) {
 		fmt.Fprintln(os.Stderr, "bad prove-x input")
 		os.Exit(1)
 	}
+	if mode == "xdiagfail" || mode == "xdiagcancel" {
+		fmt.Fprintln(os.Stderr, `SCARLETT_DIAGNOSTICS={"version":1,"duration_ms":4,"outcome":"error","spans":[{"phase":"x_tcp_connect","start_ms":0,"duration_ms":4,"outcome":"error"}]}`)
+		if mode == "xdiagcancel" {
+			if marker := os.Getenv("SCARLETT_FAKE_DIAG_READY"); marker != "" {
+				_ = os.WriteFile(marker, []byte("synthetic diagnostic emitted"), 0600)
+			}
+			time.Sleep(time.Second)
+		}
+		fmt.Fprintln(os.Stderr, "synthetic helper failure")
+		os.Exit(1)
+	}
 	var gz bytes.Buffer
 	zw := gzip.NewWriter(&gz)
 	fmt.Fprintf(zw, `{"echo":%q}`, strings.SplitN(req, "\r\n", 2)[0])
 	zw.Close()
 	resp := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n0\r\n\r\n", gz.Len(), gz.String())
 	summary := map[string]any{"status": "proof_sent", "response": base64.StdEncoding.EncodeToString([]byte(resp))}
+	if strings.HasPrefix(mode, "xdiag") {
+		time.Sleep(25 * time.Millisecond)
+		summary["verifier_sent_bytes"] = 41
+		summary["verifier_received_bytes"] = 71
+		summary["verifier_transport_layer"] = "tcp_payload"
+		switch mode {
+		case "xdiag":
+			summary["diagnostics"] = json.RawMessage(`{"version":1,"duration_ms":20,"outcome":"success","spans":[{"phase":"x_tcp_connect","start_ms":0,"duration_ms":10,"outcome":"success"}]}`)
+		case "xdiaglegacy":
+			summary["duration_ms"] = 20
+		case "xdiagbad":
+			summary["diagnostics"] = json.RawMessage(`{"version":1,"duration_ms":20.1,"duration_ms":10.1,"spans":[],"secret":"SECRET_PRIVATE_DIAGNOSTIC"}`)
+		case "xdiagnull":
+			summary["diagnostics"] = json.RawMessage(`{"version":1,"duration_ms":null,"outcome":"success","spans":[]}`)
+		case "xdiaglegacynull":
+			summary["duration_ms"] = nil
+		}
+	}
 	// "...traffic" adds the verifier counters both X helpers flatten into their summary.
 	if strings.HasSuffix(mode, "traffic") {
 		summary["verifier_sent_bytes"] = 41

@@ -8,10 +8,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strings"
 
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
+	"github.com/teslashibe/scarlett-node/internal/diagnostics"
 	"github.com/teslashibe/scarlett-node/internal/process"
 )
 
@@ -35,6 +35,7 @@ func (p Prover) Run(ctx context.Context, l coordinator.Lease) (code, detail stri
 	if base, _ := config.Serves(l.ModelID); base != l.ModelID || !validPayload(l) || len(l.VerifierToken) != 64 || !isHex(l.VerifierToken) {
 		return "invalid_lease", ""
 	}
+	endEncode := diagnostics.Start(ctx, "request_encode", 1)
 	input, err := json.Marshal(struct {
 		Verifier         string          `json:"verifier"`
 		VerifierCA       string          `json:"verifier_ca_file,omitempty"`
@@ -42,6 +43,7 @@ func (p Prover) Run(ctx context.Context, l coordinator.Lease) (code, detail stri
 		Token            string          `json:"token"`
 		Payload          json.RawMessage `json:"payload"`
 	}{c.Verifier, c.VerifierCA, c.VerifierPlaintextFixture, l.VerifierToken, l.CodexPayload})
+	endEncode(diagnosticOutcome(ctx, err))
 	if err != nil {
 		return "invalid_lease", ""
 	}
@@ -53,7 +55,7 @@ func (p Prover) Run(ctx context.Context, l coordinator.Lease) (code, detail stri
 	}
 	cmd.Stdin = bytes.NewReader(input)
 	var stdout, stderr limitedBuffer
-	stdout.max, stderr.max = 4096, 4096
+	stdout.max, stderr.max = 16<<10, 16<<10
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	observe, err := beginProofObservation(ctx)
 	if err != nil {
@@ -61,11 +63,14 @@ func (p Prover) Run(ctx context.Context, l coordinator.Lease) (code, detail stri
 	}
 	helperOK := false
 	defer func() { observe(stdout.Bytes(), helperOK) }()
-	if err := process.Run(cmd); err != nil {
+	endHelper := diagnostics.Start(ctx, "helper_wall", 1)
+	err = process.Run(cmd)
+	endHelper(diagnosticOutcome(ctx, err))
+	diagnostic := helperStderr(ctx, 1, stderr.String())
+	if err != nil {
 		if ctx.Err() != nil {
 			return "expired", "prover timed out"
 		}
-		diagnostic := strings.TrimSpace(stderr.String())
 		switch diagnostic {
 		case "Error: Codex provider error: unauthenticated":
 			return "auth_required", "Codex authentication required"
@@ -75,12 +80,16 @@ func (p Prover) Run(ctx context.Context, l coordinator.Lease) (code, detail stri
 		return "prover_error", diagnostic
 	}
 	helperOK = true
+	helperDiagnostics(ctx, 1, stdout.Bytes())
+	endDecode := diagnostics.Start(ctx, "helper_stdout_decode", 1)
 	var summary struct {
 		Status string `json:"status"`
 	}
 	if json.Unmarshal(stdout.Bytes(), &summary) != nil || summary.Status != "proof_sent" {
+		endDecode("error")
 		return "prover_error", "unexpected prover output"
 	}
+	endDecode("success")
 	return "", fmt.Sprintf("proof sent for job %s", l.JobID)
 }
 

@@ -13,6 +13,7 @@ import (
 	"github.com/teslashibe/scarlett-node/internal/attempts"
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
+	"github.com/teslashibe/scarlett-node/internal/diagnostics"
 	"github.com/teslashibe/scarlett-node/internal/localfs"
 	"github.com/teslashibe/scarlett-node/internal/worker"
 )
@@ -56,6 +57,9 @@ func localCommand(command string, output io.Writer) error {
 	}
 	if err := prepareStateDir(dir); err != nil {
 		return err
+	}
+	if command == "diagnostics" {
+		return json.NewEncoder(output).Encode(diagnostics.Read(dir))
 	}
 	switch command {
 	case "drain":

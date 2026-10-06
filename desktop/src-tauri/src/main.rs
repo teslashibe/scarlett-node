@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod claude_auth;
+mod diagnostics;
 mod local_api;
 mod node;
 mod preferences;
@@ -55,6 +56,14 @@ async fn desktop_status(
 ) -> node::Result<node::Snapshot> {
     local_window(&window)?;
     Ok(status(&node, &api).await)
+}
+#[tauri::command]
+async fn desktop_diagnostics(
+    window: WebviewWindow,
+    node: State<'_, Arc<Node>>,
+) -> node::Result<diagnostics::Diagnostics> {
+    local_window(&window)?;
+    Ok(node.diagnostics().await)
 }
 /// Node and local API status only. Claude status is its own command: it hashes
 /// the whole bundled Claude binary and launches its CLI, and waiting on that
@@ -482,6 +491,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             desktop_status,
+            desktop_diagnostics,
             claude_status,
             quit_desktop,
             pair_node,

@@ -775,6 +775,15 @@ impl Node {
         Ok(cmd)
     }
     async fn call(&self, args: &[&str], input: Option<Vec<u8>>, seconds: u64) -> Result<Vec<u8>> {
+        self.call_bounded(args, input, seconds, OUTPUT_LIMIT).await
+    }
+    async fn call_bounded(
+        &self,
+        args: &[&str],
+        input: Option<Vec<u8>>,
+        seconds: u64,
+        output_limit: usize,
+    ) -> Result<Vec<u8>> {
         let mut child = self
             .command(args)?
             .spawn()
@@ -792,13 +801,13 @@ impl Node {
                 pipe.shutdown().await.map_err(|_| Error::CommandFailed)?;
             }
             drop(child.stdin.take());
-            let mut reader = stdout.take((OUTPUT_LIMIT + 1) as u64);
+            let mut reader = stdout.take((output_limit + 1) as u64);
             let mut output = Vec::new();
             reader
                 .read_to_end(&mut output)
                 .await
                 .map_err(|_| Error::CommandFailed)?;
-            if output.len() > OUTPUT_LIMIT {
+            if output.len() > output_limit {
                 return Err(Error::CommandFailed);
             }
             if !child
@@ -823,6 +832,19 @@ impl Node {
         .map_err(|_| Error::CommandTimeout)?;
         // kill_on_drop also covers timeout, malformed output and early pipe errors.
         result
+    }
+    pub async fn diagnostics(&self) -> crate::diagnostics::Diagnostics {
+        let Ok(raw) = self
+            .call_bounded(&["diagnostics"], None, 5, crate::diagnostics::OUTPUT_LIMIT)
+            .await
+        else {
+            return crate::diagnostics::Diagnostics::default();
+        };
+        let snapshot = crate::diagnostics::project(&raw);
+        crate::diagnostics::Diagnostics {
+            available: snapshot.is_some(),
+            snapshot,
+        }
     }
     pub async fn accounts(&self) -> Result<Vec<Account>> {
         let raw = self
@@ -1431,6 +1453,90 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diagnostics_use_only_a_fixed_bounded_read_and_do_not_change_running_work() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("node");
+        std::fs::write(
+            &binary,
+            r##"#!/bin/sh
+printf '%s\n' "$*" >> "$SCARLETT_STATE_DIR/calls"
+case "$1" in
+diagnostics) cat "$SCARLETT_STATE_DIR/diagnostics-fixture";;
+*) exit 1;;
+esac
+"##,
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let node = Node::new(
+            temp.path().join("state"),
+            binary,
+            temp.path().join("helper"),
+        );
+        node.prepare().unwrap();
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        *node.running.lock().await = Some(child);
+        let path = node.state.join("diagnostics-fixture");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"token":"SECRET","attempts":[],"summaries":[]}"#,
+        )
+        .unwrap();
+        let safe = node.diagnostics().await;
+        assert!(safe.available);
+        assert!(!serde_json::to_string(&safe).unwrap().contains("SECRET"));
+        for raw in [
+            br#"{"version":1,"load_error":"SECRET","attempts":[],"summaries":[]}"#.as_slice(),
+            b"older CLI: unknown command diagnostics",
+        ] {
+            std::fs::write(&path, raw).unwrap();
+            let safe = node.diagnostics().await;
+            assert!(!safe.available);
+            assert!(safe.snapshot.is_none());
+        }
+        std::fs::write(&path, vec![b' '; crate::diagnostics::OUTPUT_LIMIT + 1]).unwrap();
+        assert!(!node.diagnostics().await.available);
+        assert!(
+            node.running
+                .lock()
+                .await
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_none()
+        );
+        let calls = std::fs::read_to_string(node.state.join("calls")).unwrap();
+        assert_eq!(calls.lines().collect::<Vec<_>>(), vec!["diagnostics"; 4]);
+    }
+    #[tokio::test]
+    async fn diagnostics_read_the_actual_node_with_an_empty_private_history() {
+        let Some(binary) = test_node_helper() else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node::new(
+            temp.path().join("state"),
+            binary,
+            temp.path().join("helper"),
+        );
+        let safe = node.diagnostics().await;
+        assert!(
+            safe.available,
+            "actual node must support optional diagnostics"
+        );
+        let v = serde_json::to_value(safe.snapshot.unwrap()).unwrap();
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["attempts"], json!([]));
+        assert_eq!(v["summaries"], json!([]));
+    }
     #[test]
     fn browser_inventory_and_failures_never_project_paths_or_credentials() {
         let profile = json!({"id":"firefox_0123456789abcdef0123456789abcdef", "browser":"firefox", "label":"Firefox / Isolated"});

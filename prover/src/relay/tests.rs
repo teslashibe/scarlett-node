@@ -278,6 +278,53 @@ async fn honest_session_proves_the_read_and_the_verifier_never_sees_a_secret() {
 }
 
 #[tokio::test]
+async fn local_timings_preserve_relay_results_and_failed_opening_prefixes() {
+    use crate::diagnostics::{Phase, Trace};
+
+    for corrupt_opening in [false, true] {
+        let server = server(response(), |_| {}).await;
+        let (node_end, verifier_end) = link(move |from_node, kind, payload| {
+            if corrupt_opening && !from_node && kind == wire::OPENING {
+                let mut changed = payload.to_vec();
+                changed[0] ^= 1;
+                Verdict::Replace(changed)
+            } else {
+                Verdict::Pass
+            }
+        });
+        let tcp = TcpStream::connect(server.addr).await.unwrap();
+        let trace = Trace::new();
+        let supplier_trace = trace.clone();
+        let raw = request();
+        let supplier = tokio::spawn(async move {
+            supplier_trace.measure(Phase::RelaySession, node::session_observed(node_end, tcp, &raw, xpolicy::HOST, &supplier_trace)).await
+        });
+        let outcome = within(verifier::run(verifier_end, verifier::tls_config(server.roots).unwrap(), xpolicy::HOST, verifier::authorize_x)).await.unwrap();
+        assert_eq!(outcome.received, response());
+        let received = within(supplier).await.unwrap();
+        if corrupt_opening {
+            assert!(received.unwrap_err().to_string().starts_with(node::MISUSE));
+        } else {
+            assert_eq!(received.unwrap(), response());
+        }
+        let diagnostics = serde_json::to_value(trace.snapshot()).unwrap();
+        let spans = diagnostics["spans"].as_array().unwrap();
+        let phase = |name: &str| spans.iter().find(|span| span["phase"] == name).unwrap();
+        // TLS and OT start on the same local axis and remain overlapping spans.
+        assert!(phase("x_tls_ready")["start_ms"].as_u64().unwrap() <= phase("ot_ready")["start_ms"].as_u64().unwrap());
+        assert_eq!(phase("response_complete")["outcome"], "success");
+        assert_eq!(phase("opening_check")["outcome"], if corrupt_opening { "error" } else { "success" });
+        assert_eq!(phase("relay_session")["outcome"], if corrupt_opening { "error" } else { "success" });
+        assert!(phase("request_sent")["start_ms"].as_u64().unwrap() <= phase("response_first_byte")["start_ms"].as_u64().unwrap());
+        assert!(phase("response_first_byte")["start_ms"].as_u64().unwrap() <= phase("response_complete")["start_ms"].as_u64().unwrap());
+        let json = diagnostics.to_string();
+        for secret in [AUTH, &csrf(), RESPONSE_BODY, "/i/api/graphql/"] {
+            assert!(!json.contains(secret), "content leaked into timings");
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_close_that_arrives_with_the_last_data_record_still_completes() {
     // X answers `Connection: close` with the response and its closing alert
     // back to back. Deliver both in one read, as a real network often does.

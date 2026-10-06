@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Snapshot, BrowserProfile, Preferences, ClaudeStatus, XLoginStatus } from "./model.ts";
+import type { Diagnostics } from "./diagnostics.ts";
 export const api = {
   preferences: () => invoke<Preferences>("desktop_preferences"),
   savePreferences: (data: Preferences) => invoke<void>("save_desktop_preferences", { data }),
@@ -7,6 +8,7 @@ export const api = {
   setAutostart: (enabled: boolean) => invoke<void>("set_desktop_autostart", { enabled }),
   quit: () => invoke<void>("quit_desktop"),
   status: () => invoke<Snapshot>("desktop_status"),
+  diagnostics: () => invoke<Diagnostics>("desktop_diagnostics"),
   claudeStatus: () => invoke<ClaudeStatus>("claude_status"),
   open: (destination: "setup" | "dashboard" | "settings") =>
     invoke<void>("open_network", { destination }),

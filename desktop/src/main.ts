@@ -3,6 +3,7 @@ import "./styles.css";
 import { api } from "./api.ts";
 import { scheduleXLoginExpiry } from "./x-login-expiry.ts";
 import { accountRemovalConfirmation } from "./account-removal.ts";
+import { diagnosticsNote, localCapacity, renderDiagnostics, type Diagnostics } from "./diagnostics.ts";
 import {
   accountHealth,
   accountTitle,
@@ -31,6 +32,7 @@ app.innerHTML = `<header><span class="brand">SCARLETT <small>Node</small></span>
 <p id="notice" role="status" aria-live="polite" hidden></p>
 <section id="relay-banner" class="relay-banner" aria-labelledby="relay-heading" hidden><h2 id="relay-heading">Keyed relay is paused on this node</h2><p id="relay-detail" tabindex="-1"></p><div class="actions"><button id="relay-resume" type="button">Resume relay</button></div></section>
 <section aria-labelledby="runtime-heading"><div class="section-head"><h2 id="runtime-heading">Your node</h2><strong id="status">Checking local runtime</strong></div><p id="runtime-note">Connecting to the installed node</p><div class="actions"><button id="start">Start node</button><button id="pause" class="secondary">Pause</button><button id="resume" class="secondary">Resume</button><button id="stop" class="quiet">Stop</button></div><p id="work" class="muted"></p><p id="x-proofs" class="muted" hidden></p></section>
+<section aria-labelledby="diagnostics-heading"><h2 id="diagnostics-heading" tabindex="-1">Local request measurements</h2><p id="diagnostics-note" class="muted">Checking local measurements</p><p id="diagnostics-capacity" class="muted"></p><p class="muted">Recent attempts stay on this device for 24 hours, up to 200 attempts. Times use local monotonic clocks. Helper clocks start separately for each page; spans can overlap. Handshake milestones can include protocol setup and verifier admission, and first-response timing includes transport through the proof path. Unclassified time means it has not been assigned to a measured phase</p><div id="diagnostics-history"></div></section>
 <section aria-labelledby="pair-heading"><div class="section-head"><h2 id="pair-heading">Pair with Scarlett</h2><button id="setup" class="quiet">Open setup ↗</button></div><p>Sign in, redeem your invite and bind your wallet in your browser. Then paste the one-time pairing code here</p><form id="pair-form"><label>Pairing code<input id="pair-code" type="password" autocomplete="off" spellcheck="false" maxlength="64" required></label><button type="submit">Pair node</button></form></section>
 <section aria-labelledby="accounts-heading"><div class="section-head"><h2 id="accounts-heading" tabindex="-1">Connected accounts</h2><span id="account-note" class="muted"></span></div><div id="accounts"></div><div class="account-forms">
 <form id="codex-form"><h3>Connect Codex</h3><p>Sign in with your ChatGPT account in your browser. Scarlett creates a private profile on this device for each account</p><button type="submit">Connect Codex</button><button id="cancel-login" type="button" class="quiet" hidden>Cancel login</button><p id="codex-note" class="muted"></p></form>
@@ -54,6 +56,8 @@ const confirmRemoval = accountRemovalConfirmation({
 });
 let snapshot: Snapshot | undefined;
 let claudeStatus: ClaudeStatus | undefined;
+let diagnostics: Diagnostics | undefined;
+let diagnosticsPolling = false;
 let busy = false;
 let polling: Promise<void> | undefined;
 let mutationEpoch = 0;
@@ -93,6 +97,7 @@ document.addEventListener("keydown", (event) => {
 }, true);
 function render(s: Snapshot) {
   snapshot = s;
+  setText($("diagnostics-capacity"), localCapacity(s));
   $("x-profile").toggleAttribute("disabled", busy || !browserProfilesAvailable);
   $("x-consent").toggleAttribute("disabled", busy || !browserProfilesAvailable);
   $("x-import").toggleAttribute("disabled", busy || !s.accounts_available || !browserProfilesAvailable || !$<HTMLSelectElement>("x-profile").value || !$<HTMLInputElement>("x-consent").checked);
@@ -233,6 +238,7 @@ function render(s: Snapshot) {
 }
 async function refresh(afterMutation = false) {
   void refreshClaude();
+  void refreshDiagnostics();
   if (polling) {
     if (!afterMutation) return;
     await polling;
@@ -266,6 +272,17 @@ async function refreshClaude() {
   } finally {
     claudePolling = false;
   }
+}
+// Diagnostics are optional and poll independently. A slow or older node must
+// not delay account actions, node status, or replace their feedback.
+async function refreshDiagnostics() {
+  if (diagnosticsPolling) return;
+  diagnosticsPolling = true;
+  try { diagnostics = await api.diagnostics(); }
+  catch { diagnostics = { available: false }; }
+  finally { diagnosticsPolling = false; }
+  setText($("diagnostics-note"), diagnosticsNote(diagnostics));
+  renderDiagnostics($("diagnostics-history"), diagnostics);
 }
 async function act(fn: () => Promise<void>, success: string) {
   if (busy) return;

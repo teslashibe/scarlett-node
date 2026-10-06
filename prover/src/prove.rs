@@ -24,6 +24,7 @@ use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest, http::H
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
 use crate::policy::{HOST, PATH, find, validate_job};
+use crate::diagnostics::{Phase, Run, Snapshot, Trace};
 
 #[derive(Deserialize)]
 pub struct Request {
@@ -44,6 +45,8 @@ pub struct Summary {
     pub codex_ms: u128,
     pub sent_bytes: usize,
     pub received_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Snapshot>,
 }
 
 // Provider errors can contain prompts, authentication headers, and account IDs.
@@ -106,6 +109,13 @@ fn codex_websocket_request() -> Result<tokio_tungstenite::tungstenite::http::Req
 }
 
 pub async fn run(request: Request) -> Result<Summary> {
+    let diagnostics = Run::new();
+    let mut summary = run_observed(request, &diagnostics.trace()).await?;
+    summary.diagnostics = Some(diagnostics.success());
+    Ok(summary)
+}
+
+async fn run_observed(request: Request, trace: &Trace) -> Result<Summary> {
     validate_job(&request.payload)?;
     if request.token.len() != 64 || !request.token.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("verifier token must be 64 hex characters");
@@ -128,7 +138,7 @@ pub async fn run(request: Request) -> Result<Summary> {
     };
     let creds = load_creds()?;
 
-    let (mut socket, traffic) = crate::control::connect(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture).await?;
+    let (mut socket, traffic) = crate::control::connect_observed(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture, Some(trace)).await?;
     socket.write_all(format!("{}\n", request.token).as_bytes()).await?;
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();
@@ -152,15 +162,24 @@ pub async fn run(request: Request) -> Result<Summary> {
             .await
             .context("Codex WebSocket handshake failed")?;
         ws.send(Message::text(payload.to_string())).await?;
+        trace.milestone(Phase::RequestSent);
+        let mut response_started = false;
         loop {
             let message = tokio::time::timeout(Duration::from_secs(240), ws.next())
                 .await
                 .context("timed out waiting for Codex")?
                 .ok_or_else(|| anyhow!("Codex closed the stream before completing"))??;
             let Message::Text(text) = message else { continue };
+            if !response_started {
+                trace.milestone(Phase::ResponseFirstByte);
+                response_started = true;
+            }
             let event: Value = serde_json::from_str(&text)?;
             match event["type"].as_str() {
-                Some("response.completed") => break,
+                Some("response.completed") => {
+                    trace.milestone(Phase::ResponseComplete);
+                    break;
+                }
                 Some("response.failed" | "error") => bail!("Codex provider error: {}", provider_error_kind(&event)),
                 _ => {}
             }
@@ -170,41 +189,43 @@ pub async fn run(request: Request) -> Result<Summary> {
         while let Ok(Some(Ok(_))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await {}
         drop(ws);
 
-        let mut prover =
-            tokio::time::timeout(Duration::from_secs(30), prover_task).await.context("TLS connection did not close")???;
-        let sent = prover.transcript().sent().to_vec();
-        let received = prover.transcript().received().to_vec();
-        let mut hide_sent = occurrences(&sent, creds.access_token.as_bytes());
-        if hide_sent.is_empty() {
-            bail!("login token not found in the request; refusing to guess what to hide");
-        }
-        let mut hide_recv = Vec::new();
-        match cheat.as_str() {
-            "hide-model" => hide_recv = occurrences(&received, request.payload["model"].as_str().unwrap_or_default().as_bytes()),
-            "hide-account" => hide_sent.extend(occurrences(&sent, creds.account_id.as_bytes())),
-            "hide-request" => {
-                let body = find(&sent, b"\r\n\r\n").context("no request header")? + 4;
-                hide_sent.push(body + 8..(body + 40).min(sent.len()));
+        trace.measure(Phase::ProofFinalize, async {
+            let mut prover =
+                tokio::time::timeout(Duration::from_secs(30), prover_task).await.context("TLS connection did not close")???;
+            let sent = prover.transcript().sent().to_vec();
+            let received = prover.transcript().received().to_vec();
+            let mut hide_sent = occurrences(&sent, creds.access_token.as_bytes());
+            if hide_sent.is_empty() {
+                bail!("login token not found in the request; refusing to guess what to hide");
             }
-            _ => {}
-        }
+            let mut hide_recv = Vec::new();
+            match cheat.as_str() {
+                "hide-model" => hide_recv = occurrences(&received, request.payload["model"].as_str().unwrap_or_default().as_bytes()),
+                "hide-account" => hide_sent.extend(occurrences(&sent, creds.account_id.as_bytes())),
+                "hide-request" => {
+                    let body = find(&sent, b"\r\n\r\n").context("no request header")? + 4;
+                    hide_sent.push(body + 8..(body + 40).min(sent.len()));
+                }
+                _ => {}
+            }
 
-        let mut builder = ProveConfig::builder(prover.transcript());
-        builder.server_identity();
-        for range in complement(sent.len(), hide_sent) {
-            builder.reveal_sent(&range)?;
-        }
-        for range in complement(received.len(), hide_recv) {
-            builder.reveal_recv(&range)?;
-        }
-        let config = builder.build()?;
-        prover.prove(&config).await?;
-        anyhow::Ok((prover, codex_ms, sent.len(), received.len()))
+            let mut builder = ProveConfig::builder(prover.transcript());
+            builder.server_identity();
+            for range in complement(sent.len(), hide_sent) {
+                builder.reveal_sent(&range)?;
+            }
+            for range in complement(received.len(), hide_recv) {
+                builder.reveal_recv(&range)?;
+            }
+            let config = builder.build()?;
+            prover.prove(&config).await?;
+            anyhow::Ok((prover, codex_ms, sent.len(), received.len()))
+        }).await
     };
     let (prover, codex_ms, sent_bytes, received_bytes) = session.step(work).await?;
     session.finish(async { Ok(prover.close().await?) }, || handle.close()).await?;
 
-    Ok(Summary { status: "proof_sent", codex_ms, sent_bytes, received_bytes, verifier_transport: traffic.snapshot() })
+    Ok(Summary { status: "proof_sent", codex_ms, sent_bytes, received_bytes, verifier_transport: traffic.snapshot(), diagnostics: None })
 }
 
 /// The task driving a prover's TLSNotary session. tlsn's handle waits
@@ -383,5 +404,54 @@ mod provider_error_tests {
         ] {
             assert_eq!(provider_error_kind(&event), "provider_error");
         }
+    }
+}
+
+#[cfg(test)]
+mod driver_tests {
+    use super::*;
+    use std::future::pending;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn proof_finalization_error_keeps_its_error_and_measured_outcome() {
+        let trace = Trace::new();
+        let mut driver = Driver::new(tokio::spawn(pending::<Result<()>>()));
+        let result = driver
+            .step(trace.measure(Phase::ProofFinalize, async {
+                Err::<(), _>(anyhow!("synthetic finalization failure"))
+            }))
+            .await;
+        driver.task.abort();
+
+        assert_eq!(result.unwrap_err().to_string(), "synthetic finalization failure");
+        let snapshot = serde_json::to_value(trace.snapshot()).unwrap();
+        assert_eq!(snapshot["spans"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["spans"][0]["phase"], "proof_finalize");
+        assert_eq!(snapshot["spans"][0]["outcome"], "error");
+    }
+
+    #[tokio::test]
+    async fn session_failure_cancels_pending_proof_finalization() {
+        let trace = Trace::new();
+        let (release, started) = oneshot::channel();
+        let mut driver = Driver::new(tokio::spawn(async {
+            started.await.unwrap();
+            Err::<(), _>(anyhow!("synthetic session failure"))
+        }));
+        let result = driver
+            .step(trace.measure(Phase::ProofFinalize, async {
+                release.send(()).unwrap();
+                pending::<Result<()>>().await
+            }))
+            .await;
+
+        let err = result.unwrap_err();
+        assert_eq!(err.to_string(), "verifier session failed");
+        assert_eq!(err.root_cause().to_string(), "synthetic session failure");
+        let snapshot = serde_json::to_value(trace.snapshot()).unwrap();
+        assert_eq!(snapshot["spans"].as_array().unwrap().len(), 1);
+        assert_eq!(snapshot["spans"][0]["phase"], "proof_finalize");
+        assert_eq!(snapshot["spans"][0]["outcome"], "cancelled");
     }
 }

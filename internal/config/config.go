@@ -20,9 +20,10 @@ const (
 )
 
 type Config struct {
-	JournalLimits attempts.Limits
-	Coordinator   string
-	CoordinatorCA string
+	DiagnosticsDisabled bool // local observations only; never changes the node-v1 wire contract
+	JournalLimits       attempts.Limits
+	Coordinator         string
+	CoordinatorCA       string
 	// Executor is "gateway" (reported usage from an HTTP gateway), "codex" (the same
 	// Codex client run in-process from this node's own login) or "codex-tlsn"
 	// (Codex job proven to a verifier).
@@ -90,6 +91,13 @@ func Load() (Config, error) {
 	}
 	c := Config{Coordinator: os.Getenv("SCARLETT_COORDINATOR"), CoordinatorCA: os.Getenv("SCARLETT_COORDINATOR_CA_FILE"), Executor: os.Getenv("SCARLETT_EXECUTOR"), Verifier: os.Getenv("SCARLETT_VERIFIER"), VerifierCA: os.Getenv("SCARLETT_VERIFIER_CA_FILE"), VerifierPlaintextFixture: os.Getenv("SCARLETT_VERIFIER_PLAINTEXT_FIXTURE") == "1", Prover: os.Getenv("SCARLETT_PROVER"), Gateway: os.Getenv("SCARLETT_GATEWAY"), Profile: os.Getenv("SCARLETT_PROFILE"), StateDir: os.Getenv("SCARLETT_STATE_DIR"), GatewayKey: os.Getenv("SCARLETT_GATEWAY_KEY"), Credential: os.Getenv("SCARLETT_CREDENTIAL"), NodeID: os.Getenv("SCARLETT_NODE_ID"), CodexManagedRoot: os.Getenv("SCARLETT_CODEX_MANAGED_ROOT"), CodexHome: os.Getenv("SCARLETT_CODEX_HOME"), CodexProfile: os.Getenv("SCARLETT_CODEX_PROFILE"), CodexScaffold: os.Getenv("SCARLETT_CODEX_SCAFFOLD"), Bid: 100, LocalFixture: os.Getenv("SCARLETT_LOCAL_FIXTURE") == "1", InferenceTimeout: 45 * time.Second, MaxInputBytes: 32768, MaxOutputTokens: 2048}
 	c.JournalLimits = attempts.DefaultLimits()
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SCARLETT_DIAGNOSTICS"))) {
+	case "", "1", "true", "on":
+	case "0", "false", "off":
+		c.DiagnosticsDisabled = true
+	default:
+		return c, errors.New("invalid SCARLETT_DIAGNOSTICS")
+	}
 	for name, destination := range map[string]*int{"SCARLETT_JOURNAL_MAX_RECORDS": &c.JournalLimits.MaxRecords, "SCARLETT_JOURNAL_MAX_RECORD_BYTES": &c.JournalLimits.MaxRecordBytes} {
 		if raw := os.Getenv(name); raw != "" {
 			value, err := strconv.Atoi(raw)
