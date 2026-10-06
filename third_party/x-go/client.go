@@ -476,6 +476,8 @@ func (c *Client) checkStatus(resp *http.Response, operation ...string) error {
 // recordRateLimit keeps later calls behind the same provider cooldown.
 func (c *Client) recordRateLimit(wait time.Duration, authoritative ...bool) {
 	c.pacing.rlMu.Lock()
+	c.pacing.rlKnown, c.pacing.rlOperation = false, ""
+	c.pacing.rlHasRemaining, c.pacing.rlHasReset = true, true
 	c.pacing.resetKnown = len(authoritative) == 1 && authoritative[0]
 	c.pacing.rlState.Remaining = 0
 	c.pacing.rlState.RetryAfter = wait

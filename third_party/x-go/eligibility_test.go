@@ -82,6 +82,59 @@ func TestAtomicDispatchCannotSpendBurstReserveConcurrently(t *testing.T) {
 	}
 }
 
+func TestPartialAfterCompleteRevokesChangedBurstAuthority(t *testing.T) {
+	now := time.Now()
+	initial := RateLimitState{Limit: 50, Remaining: 30, Reset: now.Add(time.Minute)}
+	for _, tc := range []struct {
+		name                    string
+		partial                 RateLimitState
+		limit, remaining, reset bool
+		operation               string
+	}{
+		{"later-reset", RateLimitState{Reset: initial.Reset.Add(time.Second)}, false, false, true, "SearchTimeline"},
+		{"lower-remaining", RateLimitState{Remaining: 29}, false, true, false, "SearchTimeline"},
+		{"lower-limit", RateLimitState{Limit: 40}, true, false, false, "SearchTimeline"},
+		{"inconsistent-lower-limit", RateLimitState{Limit: 10}, true, false, false, "SearchTimeline"},
+		{"other-operation", RateLimitState{Remaining: 28}, false, true, false, "UserByScreenName"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &RequestPacing{burst: true, lastReqAt: now}
+			p.observe(initial, true, true, true, "SearchTimeline")
+			if e := p.Eligibility(time.Millisecond, now, "SearchTimeline"); !e.Complete || e.Reason != "gap" {
+				t.Fatal("fixture lacks complete burst authority", e)
+			}
+			p.observe(tc.partial, tc.limit, tc.remaining, tc.reset, tc.operation)
+			e := p.Eligibility(time.Millisecond, now, "SearchTimeline")
+			if e.Complete || e.Reason != "spread" || !e.At.After(now.Add(time.Second)) || e.Quota.Remaining > initial.Remaining || e.Quota.Reset.Before(initial.Reset) {
+				t.Fatal("partial response retained complete burst authority or relaxed quota", e)
+			}
+			// A later complete triplet can restore same-operation authority but
+			// cannot renew the stricter remaining budget within this window.
+			p.observe(RateLimitState{Limit: 50, Remaining: 30, Reset: e.Quota.Reset}, true, true, true, "SearchTimeline")
+			if got := p.Eligibility(time.Millisecond, now, "SearchTimeline"); got.Complete != (e.Quota.Remaining <= e.Quota.Limit) || got.Quota.Remaining != e.Quota.Remaining {
+				t.Fatal("complete evidence renewed budget", got)
+			}
+			if e.Quota.Remaining > e.Quota.Limit {
+				p.observe(RateLimitState{Limit: 10, Remaining: 9, Reset: e.Quota.Reset}, true, true, true, "SearchTimeline")
+				if got := p.Eligibility(time.Millisecond, now, "SearchTimeline"); !got.Complete || got.Quota.Limit != 10 || got.Quota.Remaining != 9 {
+					t.Fatal("consistent stricter complete triplet failed to restore authority", got)
+				}
+			}
+		})
+	}
+	p := &RequestPacing{burst: true}
+	p.observe(initial, true, true, true, "SearchTimeline")
+	observedAt := p.observedAt
+	p.observe(RateLimitState{Remaining: 99}, false, true, false, "SearchTimeline")
+	if e := p.Eligibility(time.Millisecond, now, "SearchTimeline"); !e.Complete || e.Quota != initial || p.observedAt != observedAt {
+		t.Fatal("ignored stale partial changed retained evidence", e)
+	}
+	p.observe(RateLimitState{Remaining: 0}, false, true, false, "SearchTimeline")
+	if e := p.Eligibility(time.Millisecond, now, "SearchTimeline"); e.Complete || e.At != initial.Reset.Add(50*time.Millisecond) || !e.Authoritative {
+		t.Fatal("partial exhaustion weakened explicit reset floor", e)
+	}
+}
+
 type nilReader struct{}
 
 func (nilReader) Read([]byte) (int, error) { return 0, io.EOF }
@@ -191,5 +244,44 @@ func TestRemovedDomainRetentionIncludesActualDispatchAndOriginalObservation(t *t
 	p.merge(local)
 	if got := p.RetainUntil(time.Second); got != now.Add(time.Second) || p.observedAt != local.observedAt {
 		t.Fatal("merge lost sent floor or refreshed header age", got, p.observedAt)
+	}
+}
+
+func TestValidationMergePreservesPartialPresenceAndNoInventedZero(t *testing.T) {
+	now := time.Now()
+	initial := RateLimitState{Limit: 100, Remaining: 80, Reset: now.Add(time.Minute)}
+	for _, tc := range []struct {
+		name                    string
+		partial                 RateLimitState
+		limit, remaining, reset bool
+		wantRemaining           int
+		wantReset               time.Time
+	}{
+		{"explicit-zero-without-reset", RateLimitState{Remaining: 0}, false, true, false, 0, initial.Reset},
+		{"reset-without-remaining", RateLimitState{Reset: initial.Reset.Add(time.Second)}, false, false, true, 80, initial.Reset.Add(time.Second)},
+		{"stricter-limit-without-remaining", RateLimitState{Limit: 50}, true, false, false, 80, initial.Reset},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shared := &RequestPacing{burst: true}
+			shared.observe(initial, true, true, true, "SearchTimeline")
+			local := &RequestPacing{}
+			local.observe(tc.partial, tc.limit, tc.remaining, tc.reset, "UserByScreenName")
+			shared.merge(local)
+			e := shared.Eligibility(time.Millisecond, now, "SearchTimeline")
+			if e.Complete || e.Quota.Remaining != tc.wantRemaining || e.Quota.Reset != tc.wantReset {
+				t.Fatal("merge dropped partial floor or invented absent zero", e)
+			}
+			if tc.wantRemaining == 0 && e.At != tc.wantReset.Add(50*time.Millisecond) {
+				t.Fatal("explicit zero lost retained absolute reset floor", e)
+			}
+		})
+	}
+	shared := &RequestPacing{burst: true}
+	shared.observe(initial, true, true, true, "SearchTimeline")
+	local := &RequestPacing{}
+	(&Client{pacing: local}).recordRateLimit(2 * time.Minute)
+	shared.merge(local)
+	if e := shared.Eligibility(time.Millisecond, now, "SearchTimeline"); e.Complete || e.Quota.Remaining != 0 || e.Quota.Reset.Before(now.Add(2*time.Minute)) || e.Authoritative {
+		t.Fatal("synthetic denial merge lost unknown floor", e)
 	}
 }
