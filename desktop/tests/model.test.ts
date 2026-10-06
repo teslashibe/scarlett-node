@@ -11,6 +11,7 @@ import {
   errorMessage,
   validId,
   accountHealth,
+  accountTitle,
   drainingAccounts,
   needsXReimport,
   relayState,
@@ -217,4 +218,16 @@ test("Claude status is checked separately and is never mistaken for a missing ru
   assert.equal(claudeStatusText({ ...idle, pending: true }), "Finish Claude login in your browser");
   assert.equal(claudeStatusText({ ...idle, connected: true }), "Claude subscription connected on this device");
   assert.equal(claudeStatusText({ ...idle, error: "claude_login_failed" }), errorMessage("claude_login_failed"));
+});
+test("X rows distinguish verified handles, unverified identity and duplicate quota", () => {
+  const named = { ...xAccount, username: "known_user" };
+  assert.equal(accountTitle(base, named), "X · @known_user · personal-x");
+  assert.equal(accountTitle(base, xAccount), "X · personal-x");
+  assert.equal(accountTitle(base, base.accounts[0]), "Codex · work");
+  const observed = withX("ready");
+  observed.observation!.accounts![1].username = "verified_user";
+  assert.equal(accountTitle(observed, xAccount), "X · @verified_user · personal-x");
+  assert.match(accountHealth(withX("identity_unverified"), xAccount), /identity not verified/);
+  assert.match(accountHealth(withX("duplicate_account"), xAccount), /shares quota/);
+  assert.match(errorMessage("duplicate_account"), /already connected under another local name/);
 });

@@ -37,6 +37,15 @@ func xBootstrap(r *http.Request) (*http.Response, error) {
 }
 func xFixture(t *testing.T, request coordinator.XRequest) (config.Config, coordinator.Lease, xPlan) {
 	t.Helper()
+	// Synthetic fixtures all authenticate user 12. Keep their process-wide
+	// domain isolated across test cases while production retains real users'
+	// quota across separate session files and account re-registration.
+	t.Cleanup(func() {
+		defaultXClients.Stop()
+		defaultXClients.mu.Lock()
+		defaultXClients.identities = nil
+		defaultXClients.mu.Unlock()
+	})
 	ctx := context.Background()
 	session := x.Session{AuthToken: "synthetic-auth", CT0: "synthetic-csrf"}
 	var spec xSpec

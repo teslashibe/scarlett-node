@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/teslashibe/scarlett-node/internal/worker"
 )
 
 func multiPool(t *testing.T) *servicePool {
@@ -28,13 +30,27 @@ func multiPool(t *testing.T) *servicePool {
 				privateFixtureMkdir(path, 0700)
 				writePrivateFixture(filepath.Join(path, "auth.json"), freshSyntheticCodexAuth(), 0600)
 			} else {
-				writePrivateFixture(path, []byte(`{"auth_token":"synthetic-private-auth","ct0":"synthetic-private-csrf"}`), 0600)
+				writePrivateFixture(path, []byte(`{"auth_token":"synthetic-private-auth-`+id+`","ct0":"synthetic-private-csrf"}`), 0600)
 			}
 			f.Accounts = append(f.Accounts, providerAccount{id, kind, path, 1})
 		}
 	}
 	saveAccountFixture(t, p, f)
+	for _, a := range f.Accounts {
+		if a.Service == "x_read" {
+			id := map[string]string{"one": "123", "two": "456"}[a.ID]
+			saveVerifiedXFixture(t, p, a.Path, id, "fixture_"+a.ID)
+		}
+	}
 	return p
+}
+
+func saveVerifiedXFixture(t *testing.T, p *servicePool, path, id, username string) {
+	t.Helper()
+	identity := worker.VerifiedXIdentity{ID: id, Username: username, Stamp: worker.XSessionStamp(path)}
+	if err := saveXIdentity(p.config.StateDir, path, identity); err != nil {
+		t.Fatal("persist synthetic verified X identity:", err)
+	}
 }
 func saveAccountFixture(t *testing.T, p *servicePool, f accountFile) {
 	t.Helper()

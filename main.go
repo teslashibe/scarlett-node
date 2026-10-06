@@ -305,6 +305,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 		// the account's advertised state.
 		stopKeeping := func() {}
 		if c.Enabled("x_read") {
+			worker.DefaultXClients().ObserveIdentity(services.xIdentityValidated)
 			worker.DefaultXClients().Observe(services.xValidated)
 			stopKeeping = startXKeeper(workCtx, c, worker.DefaultXClients(), services, xKeepInterval)
 		}

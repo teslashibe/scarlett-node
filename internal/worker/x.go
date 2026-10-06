@@ -437,6 +437,9 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 	}
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
+	if w.Config.ExpectedXStamp != "" && XSessionStamp(w.Config.XSession) != w.Config.ExpectedXStamp {
+		return "auth_required"
+	}
 	clients := w.Clients
 	if clients == nil {
 		clients = defaultXClients
@@ -446,9 +449,13 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 	if proof == nil {
 		proof = xTransport(w.Config, plan, l.VerifierToken)
 	}
-	warm, e := account.acquire(ctx, ids, false)
+	warm, releaseIdentity, e := account.acquireJob(ctx, ids, false)
 	if e != nil {
 		return w.failure(ctx, e)
+	}
+	defer releaseIdentity()
+	if !w.expectedIdentity(warm) {
+		return "auth_required"
 	}
 	// X's last reported quota on this account makes x-go hold the next read
 	// back. When that wait cannot fit in the lease, the job would only burn its
@@ -482,6 +489,9 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 		// Build once with the lease's override and try again.
 		if attempt == 0 && binding.wasStale() && binding.proven() == 0 {
 			if warm, e = account.acquire(ctx, ids, true); e == nil {
+				if !w.expectedIdentity(warm) {
+					return "auth_required"
+				}
 				continue
 			}
 			return w.failure(ctx, e)
@@ -500,6 +510,12 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 		}
 		return w.failure(ctx, e)
 	}
+}
+
+func (w X) expectedIdentity(warm *xWarm) bool {
+	return warm != nil && warm.stamp == XSessionStamp(w.Config.XSession) &&
+		(w.Config.ExpectedXStamp == "" || warm.stamp == w.Config.ExpectedXStamp) &&
+		(w.Config.ExpectedXIdentity == "" || warm.identity.ID == w.Config.ExpectedXIdentity)
 }
 
 // limited is a job that cannot be served before X's quota window resets: the

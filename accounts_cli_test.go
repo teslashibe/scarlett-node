@@ -18,7 +18,7 @@ func TestAccountCLIConnectAddListRemovePrivateAndNoCredentialOverwrite(t *testin
 	var out bytes.Buffer
 	call := func(args []string, input string) error {
 		out.Reset()
-		return accountsCommand(args, strings.NewReader(input), &out)
+		return fixtureAccountsCommand(args, strings.NewReader(input), &out)
 	}
 	if e := call([]string{"connect", "x_read", "first", "1"}, `{"auth_token":"synthetic-private-auth","ct0":"synthetic-private-csrf"}`); e != nil {
 		t.Fatal(e)
@@ -78,11 +78,11 @@ func TestAccountCLIRejectsSymlinkAndOversizedSecretInput(t *testing.T) {
 	writePrivateFixture(target, []byte(`{"version":1,"accounts":[]}`), 0600)
 	os.Symlink(target, filepath.Join(dir, "accounts.json"))
 	var out bytes.Buffer
-	if e := accountsCommand([]string{"list"}, strings.NewReader(""), &out); e == nil {
+	if e := fixtureAccountsCommand([]string{"list"}, strings.NewReader(""), &out); e == nil {
 		t.Fatal("symlink configuration accepted")
 	}
 	os.Remove(filepath.Join(dir, "accounts.json"))
-	if e := accountsCommand([]string{"connect", "codex", "one", "1"}, strings.NewReader(strings.Repeat("x", 65537)), &out); e == nil {
+	if e := fixtureAccountsCommand([]string{"connect", "codex", "one", "1"}, strings.NewReader(strings.Repeat("x", 65537)), &out); e == nil {
 		t.Fatal("oversized secret input accepted")
 	}
 }
@@ -92,7 +92,7 @@ func TestNativeBinaryAccountCLIUsesPrivateStdin(t *testing.T) {
 		t.Skip("set SCARLETT_TEST_NODE_BINARY for native CLI coverage")
 	}
 	dir := privateTestDir(t)
-	cmd := exec.Command(binary, "accounts", "connect", "x_read", "native", "1")
+	cmd := exec.Command(binary, "accounts", "connect", "codex", "native", "1")
 	cmd.Env = append(os.Environ(), "SCARLETT_STATE_DIR="+dir, "SCARLETT_ACCOUNTS_FILE=")
 	cmd.Stdin = strings.NewReader(`{"auth_token":"synthetic-native-auth","ct0":"synthetic-native-csrf"}`)
 	out, e := cmd.CombinedOutput()
@@ -121,7 +121,7 @@ func TestAccountCLIReconnectReplacesOnlyAnExistingNodeSavedXSession(t *testing.T
 	var out bytes.Buffer
 	call := func(args []string, input string) error {
 		out.Reset()
-		return accountsCommand(args, strings.NewReader(input), &out)
+		return fixtureAccountsCommand(args, strings.NewReader(input), &out)
 	}
 	if e := call([]string{"connect", "x_read", "first", "2"}, `{"auth_token":"synthetic-expired-auth","ct0":"synthetic-expired-csrf"}`); e != nil {
 		t.Fatal(e)

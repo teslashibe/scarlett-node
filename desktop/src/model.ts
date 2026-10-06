@@ -3,6 +3,7 @@ export type Account = {
   id: string;
   service: "codex" | "x_read";
   concurrency: number;
+  username?: string;
 };
 export type BrowserProfile = { id: string; browser: "chrome" | "firefox" | "safari"; label: string };
 export type AccountHealth = {
@@ -12,6 +13,7 @@ export type AccountHealth = {
   in_flight?: number;
   rest_until?: string;
   last_error_code?: string;
+  username?: string;
 };
 export type ServiceHealth = {
   kind?: string;
@@ -56,6 +58,8 @@ export const errorMessage = (code: unknown): string =>
     runtime_unavailable: "The node or proof helper is missing from this build",
     accounts_unavailable:
       "This node build does not support account management yet",
+    identity_mismatch: "This login belongs to a different X account. Add it as a new account",
+    duplicate_account: "This X account is already connected under another local name. Use the existing entry, or remove it before adding a new name",
     account_limit: `Remove a Codex account first. Up to ${MAX_CODEX_ACCOUNTS} Codex accounts are supported on this device`,
     cli_unavailable:
       "The bundled Codex runtime is missing or incompatible",
@@ -160,7 +164,14 @@ export const X_SESSION_EXPIRED =
 const X_STATES: Record<string, string> = {
   configured: "Warming up · checking login",
   auth_required: X_SESSION_EXPIRED,
+  identity_unverified: "X identity not verified · waiting for a login check",
+  duplicate_account: "Duplicate X account · shares quota with another entry · remove this local entry",
 };
+export function accountTitle(s: Snapshot, a: Account): string {
+  if (a.service !== "x_read") return `Codex · ${a.id}`;
+  const username = a.username ?? observedHealth(s, a)?.username;
+  return username ? `X · @${username} · ${a.id}` : `X · ${a.id}`;
+}
 export function accountHealth(s: Snapshot, a: Account): string {
   const state = observedHealth(s, a)?.state;
   if (!state) return "Configured · access not verified";
@@ -214,5 +225,5 @@ export function xLoginMessage(result: XLoginStatus): string {
  if (result.status === "updated") return "X account verified and saved on this device";
  if (result.status === "cancelled") return "X login cancelled";
  if (result.status === "pending") return `Enter the verification code${result.destination ? ` sent to ${result.destination}` : ""}. This login expires at ${new Date(result.expires_at || "").toLocaleTimeString()}`;
- return ({restart_login:"This login expired or was restarted. Start a new login",cooldown:`X requested a cooldown${result.retry_after ? ` of ${result.retry_after} seconds` : ""}. Wait before starting another login`,verification_failed:"X could not verify the requested account. Your saved session was kept",account_changed:"The account changed during login. Your saved session was kept",runtime_unavailable:"Browser login is unavailable in this build. Use browser import or cookie paste",login_busy:"Another X login is already running",invalid_input:"Check the local account ID, username and verification code"} as Record<string,string>)[result.code || ""] || "X login could not finish. Your saved session was kept";
+ return ({restart_login:"This login expired or was restarted. Start a new login",cooldown:`X requested a cooldown${result.retry_after ? ` of ${result.retry_after} seconds` : ""}. Wait before starting another login`,verification_failed:"X could not verify the requested account. Your saved session was kept",account_changed:"The account changed during login. Your saved session was kept",duplicate_account:errorMessage("duplicate_account"),identity_mismatch:errorMessage("identity_mismatch"),runtime_unavailable:"Browser login is unavailable in this build. Use browser import or cookie paste",login_busy:"Another X login is already running",invalid_input:"Check the local account ID, username and verification code"} as Record<string,string>)[result.code || ""] || "X login could not finish. Your saved session was kept";
 }

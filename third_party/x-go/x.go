@@ -106,12 +106,10 @@ type Client struct {
 	maxRetries        int
 	retryBase         time.Duration
 	minGap            time.Duration
-	gapMu             sync.Mutex
-	lastReqAt         time.Time
+	pacing            *RequestPacing
+	identityPacing    func(string) (*RequestPacing, error)
 	reqMu             sync.RWMutex // protects queryIDs
 	queryIDsRefreshed bool
-	rlMu              sync.Mutex
-	rlState           RateLimitState
 	viewer            *User
 	txState           transactionState
 	txInitErr         error // non-nil if initTransaction failed; Followers/Search may 404
@@ -183,6 +181,14 @@ func WithMinRequestGap(d time.Duration) Option {
 	return func(c *Client) { c.minGap = d }
 }
 
+// WithIdentityPacing joins a request pacing domain only after the Viewer
+// response authenticated the stable user ID. Credentials, transport and
+// validation remain those of this client. The callback may refuse a new domain
+// when the caller's retained-identity limit has been reached.
+func WithIdentityPacing(f func(string) (*RequestPacing, error)) Option {
+	return func(c *Client) { c.identityPacing = f }
+}
+
 // New creates a Client and validates the session via the Viewer query.
 // Returns ErrInvalidAuth if AuthToken or CT0 is empty.
 func New(cookies Cookies, opts ...Option) (*Client, error) {
@@ -218,6 +224,7 @@ func NewWithContext(ctx context.Context, cookies Cookies, opts ...Option) (*Clie
 		maxRetries: defaultMaxRetries,
 		retryBase:  defaultRetryBase,
 		minGap:     defaultMinGap,
+		pacing:     &RequestPacing{},
 	}
 
 	for _, o := range opts {
@@ -239,10 +246,12 @@ func NewWithContext(ctx context.Context, cookies Cookies, opts ...Option) (*Clie
 // RateLimit returns a snapshot of the most recently observed rate-limit state.
 // Use RateLimitState.IsLimited() to check if the client is currently throttled.
 func (c *Client) RateLimit() RateLimitState {
-	c.rlMu.Lock()
-	defer c.rlMu.Unlock()
-	return c.rlState
+	return c.pacing.RateLimit()
 }
+
+// LastRequestAt returns the request slot reserved by this client's pacing
+// domain. It contains no request or credential data.
+func (c *Client) LastRequestAt() time.Time { return c.pacing.LastRequestAt() }
 
 // TransactionInitErr returns the error from X-Client-Transaction-Id bootstrap,
 // if any. A non-nil value means transaction headers are unavailable; provider

@@ -76,6 +76,9 @@ func TestXLeaseAuthenticationUsesAdmittedCredentialStamp(t *testing.T) {
 					if err := localfs.WriteAtomic(l.config.XSession, raw, true); err != nil {
 						t.Fatal(err)
 					}
+					if managed && want == "configured" {
+						saveVerifiedXFixture(t, p, l.config.XSession, l.xIdentity, "fixture_one")
+					}
 				}
 				if scenario != "replacement-before-health-refresh" {
 					healthKind(t, p, "x_read")
@@ -117,6 +120,7 @@ func TestXLeaseAuthenticationCannotSettleRelocatedManagedAccount(t *testing.T) {
 	}
 	f.Accounts[0].Path = path
 	saveAccountFixture(t, p, f)
+	saveVerifiedXFixture(t, p, path, l.xIdentity, "fixture_one")
 	healthKind(t, p, "x_read")
 	if _, ok := p.acquireAccount("x_read"); ok {
 		t.Fatal("relocated account admitted before old work drained")
@@ -158,6 +162,9 @@ func TestXLeaseReplacementRetainsAccountWideQuota(t *testing.T) {
 				}
 				if err := localfs.WriteAtomic(older.config.XSession, []byte(`{"auth_token":"replacement-synthetic-auth","ct0":"replacement-synthetic-csrf"}`), true); err != nil {
 					t.Fatal(err)
+				}
+				if managed {
+					saveVerifiedXFixture(t, p, older.config.XSession, older.xIdentity, "fixture_one")
 				}
 				healthKind(t, p, "x_read")
 				if !beforeReplacement {

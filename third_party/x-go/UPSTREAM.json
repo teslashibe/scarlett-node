@@ -3,7 +3,7 @@
   "version": "v1.13.0",
   "source_repository": "https://github.com/teslashibe/x-go",
   "source_revision": "fb031a0f6f69b68a7038efdf52d1c4ef22d54f85",
-  "scope": "Unmodified runtime package at source_revision; v1.13.0 is the local replacement label, not a claim that this commit is a tagged release. Commands, MCP and upstream tests are omitted.",
+  "scope": "Original runtime package source hashes at source_revision. Reviewed local changes and additions are recorded separately in PATCHED.json; v1.13.0 is the local replacement label, not a claim that this commit is a tagged release. Commands, MCP and upstream tests are omitted.",
   "refresh": "python3 scripts/refresh-x-go-runtime.py /path/to/x-go <reviewed-commit>",
   "sha256": {
     "actions.go": "ebbb62a66a191fc21bfca4bfc6d103a00043d6b373632d88f70d52f881019ff0",

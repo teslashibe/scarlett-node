@@ -17,6 +17,9 @@ const COORDINATOR: &str = "https://network.scarlett.ai";
 const VERIFIER: &str = "verifier.scarlett.ai:7047";
 const CLI_VERSION: &str = "codex-cli 0.159.2";
 const OUTPUT_LIMIT: usize = 32768;
+// X writes verify the new session and any unknown legacy identities under one
+// 30-second CLI budget. Leave time for private storage and the acknowledgement.
+const X_ACCOUNT_WRITE_TIMEOUT: u64 = 45;
 /// The node's durable keyed-relay halt marker (worker.RelayHaltFile). It exists
 /// from the moment the node catches its verifier misusing an X session until
 /// `scarlett-node relay-resume` removes it.
@@ -105,6 +108,8 @@ pub enum Error {
     RuntimeUnavailable,
     AccountsUnavailable,
     AccountLimit,
+    DuplicateAccount,
+    IdentityMismatch,
     CliUnavailable,
     CommandFailed,
     CommandTimeout,
@@ -163,6 +168,8 @@ fn browser_import_error(raw: &[u8]) -> Error {
         return Error::CommandFailed;
     }
     match failure.code.as_str() {
+        "duplicate_account" => Error::DuplicateAccount,
+        "identity_mismatch" => Error::IdentityMismatch,
         "browser_protected" => Error::BrowserProtected,
         "browser_busy" => Error::BrowserBusy,
         "browser_invalid" => Error::BrowserInvalid,
@@ -196,6 +203,8 @@ pub struct Account {
     pub id: String,
     pub service: String,
     pub concurrency: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
 }
 #[derive(Clone, Serialize, Default)]
 pub struct Snapshot {
@@ -270,6 +279,8 @@ fn x_login_projection(raw: &[u8]) -> Result<XLoginStatus> {
                     | "cooldown"
                     | "verification_failed"
                     | "account_changed"
+                    | "duplicate_account"
+                    | "identity_mismatch"
                     | "runtime_unavailable"
             ))
     {
@@ -523,9 +534,20 @@ fn account_projection(raw: &[u8]) -> Result<Vec<Account>> {
         .map(|v| {
             let a: Account = serde_json::from_value(v).map_err(|_| Error::CommandFailed)?;
             valid_selection(&a.service, &a.id, a.concurrency).map_err(|_| Error::CommandFailed)?;
+            if a.username
+                .as_deref()
+                .is_some_and(|name| a.service != "x_read" || !x_username(name))
+            {
+                return Err(Error::CommandFailed);
+            }
             Ok(a)
         })
         .collect()
+}
+fn x_username(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 15
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 fn observation_projection(raw: &[u8]) -> Result<Value> {
     let v: Value = serde_json::from_slice(raw).map_err(|_| Error::CommandFailed)?;
@@ -569,6 +591,7 @@ fn observation_projection(raw: &[u8]) -> Result<Value> {
                 "in_flight",
                 "last_error_code",
                 "rest_until",
+                "username",
             ][..],
         ),
     ] {
@@ -586,7 +609,11 @@ fn observation_projection(raw: &[u8]) -> Result<Value> {
                             let Some(value) = obj.get(*field) else {
                                 continue;
                             };
-                            if *field == "proof_modes" {
+                            if *field == "username" {
+                                if let Some(name) = value.as_str().filter(|name| x_username(name)) {
+                                    safe.insert((*field).into(), Value::String(name.into()));
+                                }
+                            } else if *field == "proof_modes" {
                                 if let Some(modes) = proof_modes(value) {
                                     safe.insert((*field).into(), modes);
                                 }
@@ -781,7 +808,10 @@ impl Node {
                 .success()
             {
                 if args.first() == Some(&"accounts")
-                    && matches!(args.get(1), Some(&"import-x" | &"reimport-x"))
+                    && matches!(
+                        args.get(1),
+                        Some(&"connect" | &"reconnect" | &"import-x" | &"reimport-x")
+                    )
                 {
                     return Err(browser_import_error(&output));
                 }
@@ -848,7 +878,7 @@ impl Node {
                 &concurrency.to_string(),
             ],
             Some(input),
-            5,
+            X_ACCOUNT_WRITE_TIMEOUT,
         )
         .await?;
         Ok(())
@@ -1000,7 +1030,7 @@ impl Node {
                     &concurrency.to_string(),
                 ],
                 None,
-                45,
+                X_ACCOUNT_WRITE_TIMEOUT,
             )
             .await?;
         updated(&raw)
@@ -1028,8 +1058,12 @@ impl Node {
         self.registered_x(&id).await?;
         let input = serde_json::to_vec(&json!({"auth_token":auth_token,"ct0":ct0}))
             .map_err(|_| Error::InvalidInput)?;
-        self.call(&["accounts", "reconnect", "x_read", &id], Some(input), 5)
-            .await?;
+        self.call(
+            &["accounts", "reconnect", "x_read", &id],
+            Some(input),
+            X_ACCOUNT_WRITE_TIMEOUT,
+        )
+        .await?;
         Ok(())
     }
     pub async fn reimport_x(&self, profile: String, id: String) -> Result<()> {
@@ -1039,7 +1073,11 @@ impl Node {
         }
         self.registered_x(&id).await?;
         let raw = self
-            .call(&["accounts", "reimport-x", &profile, &id], None, 45)
+            .call(
+                &["accounts", "reimport-x", &profile, &id],
+                None,
+                X_ACCOUNT_WRITE_TIMEOUT,
+            )
             .await?;
         updated(&raw)
     }
@@ -1061,10 +1099,46 @@ impl Node {
     pub async fn remove(&self, service: String, id: String) -> Result<()> {
         let _guard = self.mutation.lock().await;
         valid_selection(&service, &id, 1)?;
-        self.accounts().await?;
-        self.call(&["accounts", "remove", &service, &id], None, 5)
-            .await?;
-        Ok(())
+        // Removal is idempotent from the desktop's point of view. An earlier
+        // timed-out command may already have committed the registration change.
+        if !self
+            .accounts()
+            .await?
+            .iter()
+            .any(|a| a.service == service && a.id == id)
+        {
+            return Ok(());
+        }
+        let result = self
+            .call(&["accounts", "remove", &service, &id], None, 5)
+            .await;
+        match result {
+            Ok(raw) => {
+                updated(&raw)?;
+                if self
+                    .accounts()
+                    .await?
+                    .iter()
+                    .any(|a| a.service == service && a.id == id)
+                {
+                    return Err(Error::CommandFailed);
+                }
+                Ok(())
+            }
+            Err(Error::CommandTimeout) => {
+                // Never repeat an ambiguous mutation. Read the registry through
+                // the same bounded command to establish whether it committed.
+                match self.accounts().await {
+                    Ok(accounts)
+                        if !accounts.iter().any(|a| a.service == service && a.id == id) =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(Error::CommandTimeout),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
     pub async fn start(&self) -> Result<()> {
         let _guard = self.mutation.lock().await;
@@ -1573,6 +1647,7 @@ mod tests {
             id: "codex-3".into(),
             service: "codex".into(),
             concurrency: 1,
+            username: None,
         }];
         let (id, home) =
             new_codex_profile(&profiles, &accounts, &helper, CODEX_PROFILE_NAMES).unwrap();
@@ -1634,6 +1709,7 @@ mod tests {
                 id: format!("old-{i}"),
                 service: "codex".into(),
                 concurrency: 1,
+                username: None,
             })
             .collect();
         assert_eq!(
@@ -1647,6 +1723,7 @@ mod tests {
             id: "x-one".into(),
             service: "x_read".into(),
             concurrency: 1,
+            username: None,
         });
         assert_eq!(
             new_codex_profile(&profiles, &mixed, &helper, CODEX_PROFILE_NAMES)
@@ -1742,6 +1819,216 @@ mod tests {
         assert!(!safe.contains("SECRET"));
         let status=observation_projection(br#"{"state":"running","credential":"SECRET","services":[{"type":"x_read","state":"configured","token":"SECRET"}],"accounts":[{"id":"work","service":"codex","path":"SECRET"}]}"#).unwrap();
         assert!(!status.to_string().contains("SECRET"));
+    }
+    #[test]
+    fn account_identity_projection_keeps_only_a_bounded_verified_handle() {
+        let raw = br#"[{"id":"one","service":"x_read","concurrency":1,"username":"known_user","provider_user_id":"SECRET","path":"SECRET"}]"#;
+        let safe = serde_json::to_string(&account_projection(raw).unwrap()).unwrap();
+        assert!(safe.contains("known_user"));
+        assert!(!safe.contains("SECRET"));
+        for username in [
+            "",
+            "abcdefghijklmnop",
+            "@known_user",
+            "user\nname",
+            "user/name",
+        ] {
+            let raw = serde_json::to_vec(
+                &json!([{"id":"one","service":"x_read","concurrency":1,"username":username}]),
+            )
+            .unwrap();
+            assert_eq!(account_projection(&raw).err(), Some(Error::CommandFailed));
+        }
+        let status = observation_projection(br#"{"accounts":[{"id":"one","service":"x_read","state":"duplicate_account","username":"known_user","provider_user_id":"SECRET"},{"id":"two","service":"x_read","username":"private/provider/SECRET"}]}"#).unwrap();
+        assert_eq!(status["accounts"][0]["username"], json!("known_user"));
+        assert_eq!(status["accounts"][0]["state"], json!("duplicate_account"));
+        assert!(status["accounts"][1].get("username").is_none());
+        assert!(!status.to_string().contains("SECRET"));
+        assert_eq!(
+            browser_import_error(br#"{"status":"error","code":"duplicate_account"}"#),
+            Error::DuplicateAccount
+        );
+        assert!(x_login_projection(br#"{"status":"error","code":"duplicate_account"}"#).is_ok());
+        assert_eq!(
+            browser_import_error(br#"{"status":"error","code":"identity_mismatch"}"#),
+            Error::IdentityMismatch
+        );
+        assert!(x_login_projection(br#"{"status":"error","code":"identity_mismatch"}"#).is_ok());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn x_account_writes_allow_verification_and_project_identity_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("node");
+        let script = r##"#!/bin/sh
+case "$1 $2" in
+'accounts list') printf '[{"id":"one","service":"x_read","concurrency":1}]';;
+'accounts connect'|'accounts reconnect')
+  cat >/dev/null
+  if [ -e "$SCARLETT_STATE_DIR/error-code" ]; then
+    printf '{"status":"error","code":"%s"}' "$(cat "$SCARLETT_STATE_DIR/error-code")"
+    exit 1
+  fi
+  /bin/sleep 6
+  printf '{"status":"updated"}';;
+*) exit 1;;
+esac
+"##;
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let node = Node::new(
+            temp.path().join("state"),
+            binary,
+            temp.path().join("helper"),
+        );
+        // Each command deliberately exceeds the previous five-second native
+        // limit, while staying below the bounded verification budget.
+        node.connect_x(
+            "two".into(),
+            1,
+            "synthetic-auth".into(),
+            "synthetic-csrf".into(),
+        )
+        .await
+        .unwrap();
+        node.reconnect_x(
+            "one".into(),
+            "synthetic-auth".into(),
+            "synthetic-csrf".into(),
+        )
+        .await
+        .unwrap();
+        std::fs::write(node.state.join("error-code"), "duplicate_account").unwrap();
+        assert_eq!(
+            node.connect_x(
+                "two".into(),
+                1,
+                "synthetic-auth".into(),
+                "synthetic-csrf".into()
+            )
+            .await,
+            Err(Error::DuplicateAccount)
+        );
+        std::fs::write(node.state.join("error-code"), "identity_mismatch").unwrap();
+        assert_eq!(
+            node.reconnect_x(
+                "one".into(),
+                "synthetic-auth".into(),
+                "synthetic-csrf".into()
+            )
+            .await,
+            Err(Error::IdentityMismatch)
+        );
+    }
+    #[cfg(unix)]
+    fn removal_fixture(temp: &tempfile::TempDir) -> Node {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = temp.path().join("node");
+        let script = r##"#!/bin/sh
+printf '%s\n' "$*" >> "$SCARLETT_STATE_DIR/calls"
+case "$1 $2" in
+'accounts list')
+  if [ -e "$SCARLETT_STATE_DIR/bad-list" ]; then printf 'private-malformed-data';
+  elif [ -e "$SCARLETT_STATE_DIR/removed" ]; then printf '[]';
+  else printf '[{"id":"one","service":"x_read","concurrency":1}]'; fi;;
+'accounts remove')
+  case "$(cat "$SCARLETT_STATE_DIR/mode")" in
+    malformed) touch "$SCARLETT_STATE_DIR/removed"; printf 'private-malformed-data';;
+    retained) printf '{"status":"updated"}';;
+    failed) printf 'private-provider-secret' >&2; exit 1;;
+    timeout_removed) touch "$SCARLETT_STATE_DIR/removed"; exec /bin/sleep 10;;
+    timeout_retained) exec /bin/sleep 10;;
+    bad_readback) touch "$SCARLETT_STATE_DIR/bad-list"; printf '{"status":"updated"}';;
+    *) touch "$SCARLETT_STATE_DIR/removed"; printf '{"status":"updated"}';;
+  esac;;
+'desktop run') cat >/dev/null;;
+'drain ') ;;
+*) exit 1;;
+esac
+"##;
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let helper = temp.path().join("helper");
+        std::fs::write(&helper, "synthetic helper fixture").unwrap();
+        let node = Node::new(temp.path().join("state"), binary, helper);
+        node.prepare().unwrap();
+        std::fs::write(node.state.join("identity.json"), "{}").unwrap();
+        std::fs::write(node.state.join("mode"), "updated").unwrap();
+        node
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn removal_confirms_absence_without_stopping_the_running_x_node() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = removal_fixture(&temp);
+        node.start().await.unwrap();
+        let began = Instant::now();
+        while !std::fs::read_to_string(node.state.join("calls"))
+            .is_ok_and(|c| c.contains("desktop run"))
+        {
+            assert!(began.elapsed() < Duration::from_secs(5));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        std::fs::write(node.state.join("calls"), "").unwrap();
+        node.remove("x_read".into(), "one".into()).await.unwrap();
+        assert!(
+            node.running
+                .lock()
+                .await
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read_to_string(node.state.join("calls")).unwrap(),
+            "accounts list\naccounts remove x_read one\naccounts list\n"
+        );
+        // Repeat removal acknowledges the authoritative absent registry, with
+        // no second mutation even if the previous action was uncertain.
+        node.remove("x_read".into(), "one".into()).await.unwrap();
+        let calls = std::fs::read_to_string(node.state.join("calls")).unwrap();
+        assert_eq!(calls.matches("accounts remove").count(), 1);
+        assert!(
+            !calls
+                .lines()
+                .any(|call| call == "drain" || call == "desktop run")
+        );
+        node.stop().await.unwrap();
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn removal_requires_acknowledgement_and_readback_and_bounds_errors() {
+        for mode in ["malformed", "retained", "failed", "bad_readback"] {
+            let temp = tempfile::tempdir().unwrap();
+            let node = removal_fixture(&temp);
+            std::fs::write(node.state.join("mode"), mode).unwrap();
+            assert_eq!(
+                node.remove("x_read".into(), "one".into()).await,
+                Err(Error::CommandFailed)
+            );
+            let calls = std::fs::read_to_string(node.state.join("calls")).unwrap();
+            assert_eq!(calls.matches("accounts remove").count(), 1);
+        }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn removal_timeout_reads_back_once_and_never_retries_the_mutation() {
+        for (mode, expected) in [
+            ("timeout_removed", Ok(())),
+            ("timeout_retained", Err(Error::CommandTimeout)),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let node = removal_fixture(&temp);
+            std::fs::write(node.state.join("mode"), mode).unwrap();
+            assert_eq!(node.remove("x_read".into(), "one".into()).await, expected);
+            assert_eq!(
+                std::fs::read_to_string(node.state.join("calls")).unwrap(),
+                "accounts list\naccounts remove x_read one\naccounts list\n"
+            );
+        }
     }
     #[test]
     fn projection_keeps_relay_state_and_only_known_proof_modes() {
@@ -1936,47 +2223,52 @@ esac
         );
     }
     #[tokio::test]
-    async fn x_reconnect_replaces_the_real_node_session_for_the_same_id() {
+    async fn x_removal_uses_the_real_node_registry_and_retains_private_credentials() {
         let Some(binary) = test_node_helper() else {
             return;
         };
         let temp = tempfile::tempdir().unwrap();
         let node = Node::new(
             temp.path().join("state"),
-            binary,
+            binary.clone(),
             temp.path().join("prover"),
         );
-        node.connect_x(
-            "one".into(),
-            2,
-            "synthetic-expired-auth".into(),
-            "synthetic-expired-csrf".into(),
-        )
-        .await
-        .unwrap();
-        node.reconnect_x(
-            "one".into(),
-            "synthetic-fresh-auth".into(),
-            "synthetic-fresh-csrf".into(),
-        )
-        .await
-        .unwrap();
-        let accounts = node.accounts().await.unwrap();
-        assert_eq!(accounts.len(), 1);
-        assert_eq!(accounts[0].concurrency, 2);
-        assert_eq!(
-            node.reconnect_x("two".into(), "synthetic-a".into(), "synthetic-b".into())
-                .await,
-            Err(Error::InvalidInput)
-        );
-        let session = std::fs::read_to_string(
-            node.state
-                .join("accounts")
-                .join("x_read-one")
-                .join("session.json"),
-        )
-        .unwrap();
-        assert!(session.contains("synthetic-fresh-auth") && !session.contains("synthetic-expired"));
+        node.prepare().unwrap();
+        let homes = node.state.join("accounts");
+        private_dir_with_helper(&homes, &binary).unwrap();
+        let home = homes.join("x_read-one");
+        private_dir_with_helper(&home, &binary).unwrap();
+        let session = home.join("session.json");
+        let registry = node.state.join("accounts.json");
+        // Reuse the actual helper to create protected private files on both
+        // platforms. Overwriting the synthetic bytes preserves each file ACL.
+        // No authentication command or provider connection is involved.
+        let session_seed = home.join("bearer");
+        let registry_seed = node.state.join("bearer");
+        private_helper(&binary, "bearer", &session_seed).unwrap();
+        private_helper(&binary, "bearer", &registry_seed).unwrap();
+        std::fs::rename(session_seed, &session).unwrap();
+        std::fs::rename(registry_seed, &registry).unwrap();
+        let synthetic_session =
+            br#"{"auth_token":"synthetic-retained-auth","ct0":"synthetic-retained-csrf"}"#;
+        std::fs::write(&session, synthetic_session).unwrap();
+        std::fs::write(
+            &registry,
+            serde_json::to_vec(&json!({"version":1,"accounts":[{"id":"one","service":"x_read","path":session,"concurrency":2}]})).unwrap(),
+        ).unwrap();
+        let before = node.accounts().await.unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].id, "one");
+        assert_eq!(before[0].concurrency, 2);
+        node.remove("x_read".into(), "one".into()).await.unwrap();
+        assert!(node.accounts().await.unwrap().is_empty());
+        assert_eq!(std::fs::read(&session).unwrap(), synthetic_session);
+        // The actual CLI acknowledgement and desktop absence read-back support
+        // an idempotent second action without touching retained credentials.
+        node.remove("x_read".into(), "one".into()).await.unwrap();
+        assert_eq!(std::fs::read(&session).unwrap(), synthetic_session);
+        let stored: Value = serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+        assert_eq!(stored["accounts"], json!([]));
     }
     #[test]
     fn unrecognized_registry_is_not_mocked_ready() {

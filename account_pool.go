@@ -20,12 +20,15 @@ type pooledAccount struct {
 	removed    bool
 	renewing   *renewalAttempt
 	renewAfter time.Time
+	identity   worker.VerifiedXIdentity
+	duplicate  bool
 }
 type accountLease struct {
-	id, kind string
-	config   config.Config
-	account  *pooledAccount
-	xStamp   string
+	id, kind  string
+	config    config.Config
+	account   *pooledAccount
+	xStamp    string
+	xIdentity string
 }
 type accountStatus struct {
 	ID        string    `json:"id"`
@@ -35,6 +38,7 @@ type accountStatus struct {
 	InFlight  int       `json:"in_flight"`
 	LastError string    `json:"last_error_code,omitempty"`
 	RestUntil time.Time `json:"rest_until,omitempty"`
+	Username  string    `json:"username,omitempty"`
 }
 type savedAccountHealth struct {
 	// Older readers ignore this optional marker and conservatively quarantine.
@@ -43,6 +47,7 @@ type savedAccountHealth struct {
 	Error            string    `json:"error,omitempty"`
 	Stamp            string    `json:"stamp,omitempty"`
 	RestUntil        time.Time `json:"rest_until,omitempty"`
+	XIdentity        string    `json:"x_identity,omitempty"`
 }
 
 func validAccountStatuses(status []accountStatus) bool {
@@ -50,7 +55,8 @@ func validAccountStatuses(status []accountStatus) bool {
 		return false
 	}
 	for _, s := range status {
-		if (!validAccountID(s.ID) && s.ID != "legacy") || s.Service != "codex" && s.Service != "x_read" || s.Capacity < 0 || s.Capacity > 32 || s.InFlight < 0 || s.InFlight > 32 || !validHealth(s.State, s.LastError) {
+		localXState := s.Service == "x_read" && (s.State == "identity_unverified" || s.State == "duplicate_account") && s.LastError == "" && s.Capacity == 0
+		if (!validAccountID(s.ID) && s.ID != "legacy") || s.Service != "codex" && s.Service != "x_read" || s.Capacity < 0 || s.Capacity > 32 || s.InFlight < 0 || s.InFlight > 32 || !validHealth(s.State, s.LastError) && !localXState || !validStatusUsername(s.Username) {
 			return false
 		}
 	}
@@ -105,7 +111,7 @@ func (p *servicePool) initAccounts() {
 		return
 	}
 	for key, h := range p.saved {
-		if !validSavedKey(key) || !validHealth(h.State, h.Error) || len(h.Stamp) > 96 || h.RestUntil.After(time.Now().Add(30*24*time.Hour)) {
+		if !validSavedKey(key) || !validHealth(h.State, h.Error) || len(h.Stamp) > 96 || h.RestUntil.After(time.Now().Add(30*24*time.Hour)) || h.XIdentity != "" && !validCooldownIdentity(h.XIdentity) {
 			p.healthError = true
 			return
 		}
@@ -121,6 +127,7 @@ func (p *servicePool) initAccounts() {
 		if h, ok := p.saved[key]; ok {
 			a.entry.state, a.entry.lastError, a.entry.stamp, a.entry.restUntil = h.State, h.Error, h.Stamp, h.RestUntil
 			a.entry.localAuthInvalid = h.LocalAuthInvalid
+			a.entry.xRestIdentity = h.XIdentity
 		}
 	}
 }
@@ -141,7 +148,7 @@ func (p *servicePool) saveHealth() {
 		e := a.entry
 		if e.state == "exhausted" || e.state == "auth_required" || e.state == "unreachable" {
 			local := e.localAuthInvalid && e.state == "auth_required" && e.lastError == "auth_required"
-			p.saved[key] = savedAccountHealth{State: e.state, Error: e.lastError, Stamp: e.stamp, RestUntil: e.restUntil, LocalAuthInvalid: local}
+			p.saved[key] = savedAccountHealth{State: e.state, Error: e.lastError, Stamp: e.stamp, RestUntil: e.restUntil, LocalAuthInvalid: local, XIdentity: e.xRestIdentity}
 		} else {
 			delete(p.saved, key)
 		}
@@ -200,6 +207,7 @@ func (p *servicePool) refreshAccounts(now time.Time) bool {
 			if h, ok := p.saved[key]; ok {
 				a.entry.state, a.entry.lastError, a.entry.stamp, a.entry.restUntil = h.State, h.Error, h.Stamp, h.RestUntil
 				a.entry.localAuthInvalid = h.LocalAuthInvalid
+				a.entry.xRestIdentity = h.XIdentity
 			}
 			p.accounts[key] = a
 		} else if a.spec.Path != spec.Path {
@@ -233,6 +241,7 @@ func (p *servicePool) refreshAccounts(now time.Time) bool {
 			refreshAccount(a, now, helperErr != nil)
 		}
 	}
+	p.refreshXIdentities(now)
 	for kind, s := range p.entries {
 		s.inFlight = 0
 		available := 0
@@ -245,10 +254,15 @@ func (p *servicePool) refreshAccounts(now time.Time) bool {
 			}
 			s.inFlight += a.entry.inFlight
 			held := p.renewalHolds(a)
+			identityUnavailable := kind == "x_read" && (p.xIdentityError || a.identity.ID == "" || a.duplicate)
 			if !a.removed && !held && (a.entry.state == "ready" || a.entry.state == "configured") {
-				available += max(0, a.entry.capacity-a.entry.inFlight)
+				if kind == "x_read" {
+					available += p.xGroupAvailable(a)
+				} else {
+					available += max(0, a.entry.capacity-a.entry.inFlight)
+				}
 			}
-			if a.removed || held {
+			if a.removed || held || identityUnavailable {
 				if held {
 					unreachable = true
 				}
@@ -382,8 +396,18 @@ func (p *servicePool) acquireAccount(kind string) (*accountLease, bool) {
 		s.inFlight++
 		c := p.config
 		c.LocalAccountID = "legacy"
+		if kind == "x_read" {
+			c.ExpectedXStamp = stamp
+			c.ExpectedXIdentity = a.identity.ID
+			if a.identity.ID != "" {
+				if p.xInFlight == nil {
+					p.xInFlight = map[string]int{}
+				}
+				p.xInFlight[a.identity.ID]++
+			}
+		}
 		c.AccountCooldown = p.cooldown(a)
-		return &accountLease{id: "legacy", kind: kind, config: c, account: a, xStamp: stamp}, true
+		return &accountLease{id: "legacy", kind: kind, config: c, account: a, xStamp: stamp, xIdentity: a.identity.ID}, true
 	}
 	keys := []string{}
 	for key, a := range p.accounts {
@@ -405,9 +429,13 @@ func (p *servicePool) acquireAccount(kind string) (*accountLease, bool) {
 		stamp := ""
 		if kind == "x_read" {
 			stamp = worker.XSessionStamp(a.spec.Path)
-			if stamp == "" {
+			if stamp == "" || stamp != a.identity.Stamp || p.xGroupAvailable(a) == 0 {
 				continue
 			}
+			if p.xInFlight == nil {
+				p.xInFlight = map[string]int{}
+			}
+			p.xInFlight[a.identity.ID]++
 		}
 		e.inFlight++
 		s.inFlight++
@@ -419,8 +447,9 @@ func (p *servicePool) acquireAccount(kind string) (*accountLease, bool) {
 			c.CodexHome = a.spec.Path
 		} else {
 			c.XSession = a.spec.Path
+			c.ExpectedXStamp, c.ExpectedXIdentity = stamp, a.identity.ID
 		}
-		return &accountLease{id: a.spec.ID, kind: kind, config: c, account: a, xStamp: stamp}, true
+		return &accountLease{id: a.spec.ID, kind: kind, config: c, account: a, xStamp: stamp, xIdentity: a.identity.ID}, true
 	}
 	return nil, false
 }
@@ -433,6 +462,19 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 	s := l.account.entry
 	if s.inFlight > 0 {
 		s.inFlight--
+	}
+	if l.xIdentity != "" && p.xInFlight[l.xIdentity] > 0 {
+		p.xInFlight[l.xIdentity]--
+		if p.xInFlight[l.xIdentity] == 0 {
+			delete(p.xInFlight, l.xIdentity)
+		}
+	}
+	if l.kind == "x_read" && l.xIdentity != "" && (code == "x_rate_limited" || code == "capacity_unavailable") {
+		p.recordXCooldown(l.xIdentity, time.Now().Add(15*time.Minute), false)
+		p.refresh(time.Now())
+		if l.account.identity.ID != l.xIdentity {
+			return
+		}
 	}
 	if l.kind == "x_read" && code == "auth_required" {
 		// Login can replace credentials while an admitted job finishes. Drain
@@ -545,6 +587,9 @@ func (p *servicePool) settle(a *pooledAccount, code string, validation bool) {
 		if until := time.Now().Add(15 * time.Minute); until.After(s.restUntil) {
 			s.restUntil = until
 		}
+		if a.spec.Service == "x_read" {
+			p.recordXCooldown(a.identity.ID, s.restUntil, false)
+		}
 	case "prover_error", "x_request_failed":
 		s.state = "unreachable"
 		if until := time.Now().Add(capacityRest); until.After(s.restUntil) {
@@ -571,6 +616,20 @@ func (p *servicePool) accountStatus() []accountStatus {
 		state := a.entry.state
 		capacity := a.entry.capacity
 		lastError := a.entry.lastError
+		if a.spec.Service == "x_read" && p.accountMode {
+			capacity = p.xGroupLimit(a)
+			if a.identity.ID == "" {
+				capacity = 0
+			}
+			switch {
+			case p.xIdentityError:
+				state, capacity, lastError = "unreachable", 0, "prover_error"
+			case a.identity.ID == "" && (state == "configured" || state == "ready"):
+				state, capacity, lastError = "identity_unverified", 0, ""
+			case a.duplicate:
+				state, capacity, lastError = "duplicate_account", 0, ""
+			}
+		}
 		if p.accountsError {
 			state, capacity, lastError = "unreachable", 0, "prover_error"
 		}
@@ -581,12 +640,13 @@ func (p *servicePool) accountStatus() []accountStatus {
 			state = "draining"
 			capacity = 0
 		}
-		out = append(out, accountStatus{a.spec.ID, a.spec.Service, state, capacity, a.entry.inFlight, lastError, a.entry.restUntil})
+		out = append(out, accountStatus{ID: a.spec.ID, Service: a.spec.Service, State: state, Capacity: capacity, InFlight: a.entry.inFlight, LastError: lastError, RestUntil: a.entry.restUntil, Username: a.identity.Username})
 	}
 	return out
 }
 
 func (p *servicePool) cooldown(a *pooledAccount) func(time.Duration) {
+	identity := a.identity.ID
 	return func(wait time.Duration) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
@@ -596,12 +656,22 @@ func (p *servicePool) cooldown(a *pooledAccount) func(time.Duration) {
 		// Outside the bounded scheduling window, require operator attention rather
 		// than resuming earlier than an authoritative provider reset.
 		if wait > 30*24*time.Hour {
+			if a.spec.Service == "x_read" && identity != "" {
+				p.recordXCooldown(identity, time.Time{}, true)
+				p.saveHealth()
+				return
+			}
 			a.entry.state, a.entry.lastError = "auth_required", "auth_required"
 			a.entry.localAuthInvalid = false
 			p.saveHealth()
 			return
 		}
 		until := time.Now().Add(wait)
+		if a.spec.Service == "x_read" && identity != "" {
+			p.recordXCooldown(identity, until, false)
+			p.saveHealth()
+			return
+		}
 		if until.After(a.entry.restUntil) {
 			a.entry.restUntil = until
 		}

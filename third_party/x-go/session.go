@@ -107,6 +107,16 @@ func (c *Client) validateSession(ctx context.Context) error {
 		return fmt.Errorf("%w: viewer identity does not match session", ErrRequestFailed)
 	}
 	c.restID = viewerID
+	if c.identityPacing != nil {
+		shared, err := c.identityPacing(viewerID)
+		if err != nil {
+			return fmt.Errorf("%w: account pacing unavailable", ErrRequestFailed)
+		}
+		if shared != nil && shared != c.pacing {
+			shared.merge(c.pacing)
+			c.pacing = shared
+		}
+	}
 
 	// Fetch full profile — the Viewer query only returns partial fields.
 	profileVars := map[string]interface{}{
@@ -131,6 +141,13 @@ func (c *Client) validateSession(ctx context.Context) error {
 	}
 
 	u := toUser(profileData.User.Result)
+	if u.ID == "" {
+		c.viewer = &User{ID: viewerID}
+		return nil
+	}
+	if u.ID != viewerID {
+		return fmt.Errorf("%w: profile identity does not match viewer", ErrRequestFailed)
+	}
 	c.viewer = &u
 	return nil
 }

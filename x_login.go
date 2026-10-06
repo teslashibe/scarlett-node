@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/localfs"
+	"github.com/teslashibe/scarlett-node/internal/worker"
 	"github.com/teslashibe/scarlett-node/internal/xloginruntime"
 	x "github.com/teslashibe/x-go"
 	"golang.org/x/term"
@@ -114,16 +116,17 @@ func (b *lazyXLoginBackend) Cancel(ctx context.Context, o x.BrowserLoginOperatio
 }
 
 type xLoginOperation struct {
-	dir       string
-	backend   xLoginBackend
-	verify    func(context.Context, x.Session, string, string) (string, error)
-	now       func() time.Time
-	request   xLoginMessage // Password/Code are never retained here.
-	operation x.BrowserLoginOperation
-	pending   *x.BrowserLoginChallenge
-	original  *providerAccount
-	prior     []byte
-	lock      *os.File
+	dir            string
+	backend        xLoginBackend
+	verify         func(context.Context, x.Session, string, string) (string, error)
+	verifyImported xSessionVerifier
+	now            func() time.Time
+	request        xLoginMessage // Password/Code are never retained here.
+	operation      x.BrowserLoginOperation
+	pending        *x.BrowserLoginChallenge
+	original       *providerAccount
+	prior          []byte
+	lock           *os.File
 }
 
 func opaqueLoginID() string {
@@ -134,7 +137,9 @@ func opaqueLoginID() string {
 	return hex.EncodeToString(b[:])
 }
 func newXLoginOperation(dir string, backend xLoginBackend) *xLoginOperation {
-	return &xLoginOperation{dir: dir, backend: backend, verify: verifyXLoginSession, now: time.Now}
+	return &xLoginOperation{dir: dir, backend: backend, verify: verifyXLoginSession, verifyImported: func(ctx context.Context, session x.Session) (worker.VerifiedXIdentity, error) {
+		return worker.VerifyXSession(ctx, session)
+	}, now: time.Now}
 }
 func verifyXLoginSession(ctx context.Context, s x.Session, username, priorTwid string) (string, error) {
 	return verifyXLoginWithOptions(ctx, s, username, priorTwid)
@@ -265,7 +270,7 @@ func (o *xLoginOperation) handle(ctx context.Context, m xLoginMessage) xLoginSta
 		}
 	}
 	if err == nil && m.Reconnect {
-		if o.original == nil || o.original.Path != filepath.Join(o.dir, "accounts", "x_read-"+m.ID, "session.json") {
+		if o.original == nil || !ownedXSessionPath(o.dir, m.ID, o.original.Path) {
 			err = errors.New("invalid reconnect")
 		} else {
 			o.prior, err = readLocalFile(o.original.Path, 65536)
@@ -290,13 +295,23 @@ func (o *xLoginOperation) handle(ctx context.Context, m xLoginMessage) xLoginSta
 			return fail("verification_failed")
 		}
 		checkCtx, done := context.WithTimeout(ctx, 30*time.Second)
-		_, check := o.verify(checkCtx, prior, m.Username, prior.Twid)
-		done()
+		viewerID, check := o.verify(checkCtx, prior, m.Username, prior.Twid)
 		if check == nil {
+			identity := worker.VerifiedXIdentity{ID: viewerID, Username: strings.TrimPrefix(strings.TrimSpace(m.Username), "@"), Stamp: xCredentialStamp(o.original.Path)}
+			if err := o.bindSavedIdentity(checkCtx, identity); err != nil {
+				done()
+				o.close()
+				if errors.Is(err, errDuplicateXIdentity) {
+					return fail("duplicate_account")
+				}
+				return fail("account_changed")
+			}
+			done()
 			id := m.ID
 			o.close()
 			return xLoginStatus{Status: "updated", ID: id}
 		}
+		done()
 		if errors.Is(check, x.ErrRateLimited) {
 			o.close()
 			return fail("cooldown")
@@ -377,7 +392,14 @@ func (o *xLoginOperation) finish(ctx context.Context, result *x.BrowserLoginResu
 	if ctx.Err() != nil {
 		return failure("restart_login")
 	}
-	if err := o.commit(ctx, session); err != nil {
+	identity := worker.VerifiedXIdentity{ID: viewerID, Username: strings.TrimPrefix(strings.TrimSpace(o.request.Username), "@")}
+	if err := o.commit(ctx, session, identity); err != nil {
+		if errors.Is(err, errDuplicateXIdentity) {
+			return failure("duplicate_account")
+		}
+		if errors.Is(err, errXIdentityMismatch) {
+			return failure("identity_mismatch")
+		}
 		return failure("account_changed")
 	}
 	id := o.request.ID
@@ -390,43 +412,76 @@ func safeLoginLabel(s string) string {
 	}
 	return s
 }
-func (o *xLoginOperation) commit(ctx context.Context, s x.Session) error {
+
+// Bind an already-valid saved session without repeating browser or Viewer work.
+func (o *xLoginOperation) bindSavedIdentity(ctx context.Context, identity worker.VerifiedXIdentity) error {
+	if o.original == nil || !validXIdentity(identity) {
+		return errXIdentityUnverified
+	}
+	return o.commitIdentity(ctx, nil, identity, true)
+}
+
+func (o *xLoginOperation) commit(ctx context.Context, session x.Session, identity worker.VerifiedXIdentity) error {
+	raw, err := json.Marshal(session)
+	if err != nil {
+		return err
+	}
+	defer clear(raw)
+	stamp := sha256.Sum256(raw)
+	identity.Stamp = hex.EncodeToString(stamp[:])
+	if !validXIdentity(identity) {
+		return errXIdentityUnverified
+	}
+	return o.commitIdentity(ctx, raw, identity, false)
+}
+
+func (o *xLoginOperation) commitIdentity(ctx context.Context, raw []byte, identity worker.VerifiedXIdentity, saved bool) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if err := ctxDeadline(o.now(), o.deadline()); err != nil {
-		return err
+	if !saved {
+		if err := ctxDeadline(o.now(), o.deadline()); err != nil {
+			return err
+		}
 	}
 	path := accountFilePath(o.dir)
-	lock, err := localfs.LockPrivateWait(filepath.Join(filepath.Dir(path), ".accounts.lock"))
+	before, err := loadAccounts(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	exclude := ""
+	if o.original != nil {
+		exclude = o.original.Path
+	}
+	if err := verifyRegisteredXIdentities(ctx, o.dir, before, exclude, o.verifyImported); err != nil {
+		return err
+	}
+	lock, err := lockAccountRegistry(o.dir)
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
-	f, err := loadAccounts(path)
-	if os.IsNotExist(err) {
-		err = nil
-	}
-	if err != nil {
+	registry, err := loadAccounts(path)
+	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	account := providerAccount{o.request.ID, "x_read", filepath.Join(o.dir, "accounts", "x_read-"+o.request.ID, "session.json"), o.request.Concurrency}
+	account := providerAccount{o.request.ID, "x_read", "", o.request.Concurrency}
 	found := false
-	for _, a := range f.Accounts {
-		if a.Service == "x_read" && a.ID == account.ID {
+	for _, current := range registry.Accounts {
+		if current.Service == "x_read" && current.ID == account.ID {
 			found = true
-			if !o.request.Reconnect || o.original == nil || a != *o.original {
+			if !o.request.Reconnect || o.original == nil || current != *o.original {
 				return errors.New("account changed")
 			}
-			account = a
+			account = current
 		}
 	}
 	if o.request.Reconnect {
-		if !found {
+		if !found || !ownedXSessionPath(o.dir, account.ID, account.Path) {
 			return errors.New("account removed")
 		}
 		current, err := readLocalFile(account.Path, 65536)
-		if err != nil || string(current) != string(o.prior) {
+		if err != nil || !bytes.Equal(current, o.prior) {
 			clear(current)
 			return errors.New("session changed")
 		}
@@ -435,37 +490,60 @@ func (o *xLoginOperation) commit(ctx context.Context, s x.Session) error {
 		if found {
 			return errors.New("account added")
 		}
-		f.Accounts = append(f.Accounts, account)
-		if !validAccounts(f) {
+		account.Path, err = newOwnedXSessionPath(o.dir, account.ID)
+		if err != nil {
+			return err
+		}
+	}
+	candidate := registry
+	if !o.request.Reconnect {
+		candidate.Accounts = append(append([]providerAccount(nil), registry.Accounts...), account)
+		if !validAccounts(candidate) {
 			return errors.New("account limit")
 		}
 	}
-	if err := prepareStateDir(filepath.Join(o.dir, "accounts")); err != nil {
-		return err
-	}
-	if err := prepareStateDir(filepath.Dir(account.Path)); err != nil {
-		return err
-	}
-	raw, err := json.Marshal(s)
+	identityLock, err := lockXIdentities(o.dir)
 	if err != nil {
 		return err
 	}
-	defer clear(raw)
+	defer identityLock.Close()
+	identities, err := loadXIdentities(o.dir)
+	if err != nil {
+		return err
+	}
+	previous := identities.Identities[filepath.Clean(account.Path)]
+	if o.request.Reconnect && validXIdentity(previous) && previous.ID != identity.ID {
+		return errXIdentityMismatch
+	}
+	if err := rejectDuplicateXIdentity(registry, identities, account, identity); err != nil {
+		return err
+	}
+	if saved && identity.Stamp != xCredentialStamp(account.Path) {
+		return errXIdentityUnverified
+	}
+	pruneXIdentities(&identities, candidate, account.Path)
+	identities.Identities[filepath.Clean(account.Path)] = identity
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if err := localfs.WriteAtomic(account.Path, raw, o.request.Reconnect); err != nil {
+	if err := writeXIdentities(o.dir, identities); err != nil {
 		return err
 	}
-	if !o.request.Reconnect {
-		registry, _ := json.Marshal(f)
-		if err := writeLocalFile(filepath.Dir(path), filepath.Base(path), registry); err != nil {
-			_ = os.Remove(account.Path)
+	if !saved {
+		if err := localfs.WriteAtomic(account.Path, raw, o.request.Reconnect); err != nil {
 			return err
+		}
+	}
+	if !o.request.Reconnect {
+		body, err := json.Marshal(candidate)
+		if err != nil || writeLocalFile(filepath.Dir(path), filepath.Base(path), body) != nil {
+			_ = os.Remove(account.Path)
+			return errors.New("cannot save account registry")
 		}
 	}
 	return nil
 }
+
 func ctxDeadline(now, deadline time.Time) error {
 	if !now.Before(deadline) {
 		return context.DeadlineExceeded

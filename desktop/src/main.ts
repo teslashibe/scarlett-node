@@ -2,8 +2,10 @@ import { listen } from "@tauri-apps/api/event";
 import "./styles.css";
 import { api } from "./api.ts";
 import { scheduleXLoginExpiry } from "./x-login-expiry.ts";
+import { accountRemovalConfirmation } from "./account-removal.ts";
 import {
   accountHealth,
+  accountTitle,
   canConnectCodex,
   canStart,
   claudeStatusText,
@@ -30,18 +32,31 @@ app.innerHTML = `<header><span class="brand">SCARLETT <small>Node</small></span>
 <section id="relay-banner" class="relay-banner" aria-labelledby="relay-heading" hidden><h2 id="relay-heading">Keyed relay is paused on this node</h2><p id="relay-detail" tabindex="-1"></p><div class="actions"><button id="relay-resume" type="button">Resume relay</button></div></section>
 <section aria-labelledby="runtime-heading"><div class="section-head"><h2 id="runtime-heading">Your node</h2><strong id="status">Checking local runtime</strong></div><p id="runtime-note">Connecting to the installed node</p><div class="actions"><button id="start">Start node</button><button id="pause" class="secondary">Pause</button><button id="resume" class="secondary">Resume</button><button id="stop" class="quiet">Stop</button></div><p id="work" class="muted"></p><p id="x-proofs" class="muted" hidden></p></section>
 <section aria-labelledby="pair-heading"><div class="section-head"><h2 id="pair-heading">Pair with Scarlett</h2><button id="setup" class="quiet">Open setup ↗</button></div><p>Sign in, redeem your invite and bind your wallet in your browser. Then paste the one-time pairing code here</p><form id="pair-form"><label>Pairing code<input id="pair-code" type="password" autocomplete="off" spellcheck="false" maxlength="64" required></label><button type="submit">Pair node</button></form></section>
-<section aria-labelledby="accounts-heading"><div class="section-head"><h2 id="accounts-heading">Connected accounts</h2><span id="account-note" class="muted"></span></div><div id="accounts"></div><div class="account-forms">
+<section aria-labelledby="accounts-heading"><div class="section-head"><h2 id="accounts-heading" tabindex="-1">Connected accounts</h2><span id="account-note" class="muted"></span></div><div id="accounts"></div><div class="account-forms">
 <form id="codex-form"><h3>Connect Codex</h3><p>Sign in with your ChatGPT account in your browser. Scarlett creates a private profile on this device for each account</p><button type="submit">Connect Codex</button><button id="cancel-login" type="button" class="quiet" hidden>Cancel login</button><p id="codex-note" class="muted"></p></form>
 <div class="x-browser-login"><form id="x-login-form"><h3>Sign in to X</h3><p>Sign in through the browser on this device, then enter any verification code here. Passwords and codes are used only for this login</p><label>Local account ID for X login<input id="x-login-id" autocomplete="off" pattern="[a-z0-9_-]{1,32}" maxlength="32" required></label><label>Concurrent jobs<input id="x-login-capacity" type="number" min="1" max="32" value="1" required></label><label class="check"><input id="x-login-reconnect" type="checkbox">Replace the session for an existing local account</label><label>X username<input id="x-login-username" autocomplete="username" maxlength="64" required></label><label>Password<input id="x-login-password" type="password" autocomplete="current-password" maxlength="1024" required></label><button id="x-login-start" type="submit">Sign in to X</button><button id="x-login-cancel" type="button" class="quiet" hidden>Cancel X login</button><p id="x-login-note" role="status" class="muted"></p></form><form id="x-challenge-form" hidden><h3>Verify your X login</h3><label>Verification code<input id="x-login-code" type="password" autocomplete="one-time-code" maxlength="128" required></label><button id="x-login-continue" type="submit">Continue login</button></form></div><form id="x-form"><h3>Connect X</h3><p>Import from a browser profile or paste these two cookies. They stay on this device; the node uses X for read-only work</p><div id="x-reimport" class="reimport" hidden><strong id="x-reimport-title"></strong><p>Choose a browser profile signed in to this X account, or paste its two cookies. The account keeps its ID and job limit.</p><button id="x-reimport-cancel" type="button" class="quiet">Cancel re-import</button></div><label>Local X account ID<input id="x-id" autocomplete="off" pattern="[a-z0-9_-]{1,32}" maxlength="32" placeholder="personal-x" required></label><label>Concurrent jobs<input id="x-capacity" type="number" min="1" max="32" value="1" required></label><label>Browser profile<select id="x-profile" disabled><option value="">Loading browser profiles</option></select></label><label class="check"><input id="x-consent" type="checkbox">Import only X session cookies from this profile</label><button id="x-import" type="button" disabled>Import X account</button><p class="muted">Close the selected browser before importing. The OS may ask for permission; protected stores can use cookie paste</p><label>auth_token<input id="x-token" type="password" autocomplete="off" spellcheck="false" maxlength="64" required></label><label>ct0<input id="x-ct0" type="password" autocomplete="off" spellcheck="false" maxlength="160" required></label><button type="submit">Connect X</button><p id="x-import-note" class="muted"></p></form></div></section>
 <section aria-labelledby="local-api-heading"><h2 id="local-api-heading">Local model API</h2><p>Connect your tools to this device using an OpenAI-compatible API. It uses the Codex accounts connected above. Stop network jobs before starting the local API</p><p id="api-status" class="muted"></p><label>Local port<input id="api-port" type="number" min="1024" max="65535" value="8088"></label><h3>Connect Claude</h3><p>Your browser handles subscription login. Claude keeps this app’s credentials on this device</p><p id="claude-status" class="muted"></p><div class="actions"><button id="claude-connect" type="button">Connect Claude subscription</button><button id="claude-cancel" type="button" class="quiet" hidden>Cancel Claude login</button><button id="claude-disconnect" type="button" class="quiet">Disconnect Claude</button></div><label>Claude billing<select id="claude-mode"><option value="subscription">Claude subscription</option><option value="api_key">Anthropic API key · separate usage billing</option></select></label><label id="claude-key-label" hidden>Anthropic API key<input id="claude-key" type="password" autocomplete="off" spellcheck="false" maxlength="512"></label><p class="muted">Subscription mode uses your connected claude.ai account. API key mode bills Anthropic API usage separately; the key is cleared when the service stops. Stop the local API before changing billing mode</p><div class="actions"><button id="api-start" type="button">Start local API</button><button id="api-stop" type="button" class="quiet">Stop local API</button><button id="api-show-key" type="button" class="quiet">Show local API key</button><button id="api-hide-key" type="button" class="quiet" hidden>Hide key</button></div><label id="api-key-label" hidden>Local API key<input id="api-key" type="password" readonly autocomplete="off" spellcheck="false"></label><p class="muted">Use the address above as your base URL and this private key as the bearer token. Restart the local API after adding Codex accounts</p></section>
 <section aria-labelledby="preferences-heading"><h2 id="preferences-heading">This device</h2><form id="preferences-form"><label class="check"><input id="background" type="checkbox">Keep running when the window closes</label><p class="muted">When off, closing the window drains accepted jobs and quits Scarlett. When on, use the menu bar or tray to reopen or quit</p><label>Saved local API port<input id="saved-api-port" type="number" min="1024" max="65535" required></label><button type="submit">Save device preferences</button></form><label class="check"><input id="autostart" type="checkbox" disabled>Open Scarlett when I log in</label><p class="muted">Opening Scarlett does not start network jobs or the local API. You choose when to start them</p></section>
-<footer><p>Suppliers earn points only. Local status does not confirm a points award</p><p>Choose what happens when the window closes in This device. Quit drains and stops the node</p><button id="settings" class="quiet">Manage node access ↗</button></footer></main>`;
+<footer><p>Suppliers earn points only. Local status does not confirm a points award</p><p>Choose what happens when the window closes in This device. Quit drains and stops the node</p><button id="settings" class="quiet">Manage node access ↗</button></footer></main><dialog id="remove-account-dialog" aria-labelledby="remove-account-heading" aria-describedby="remove-account-detail"><h2 id="remove-account-heading"></h2><p id="remove-account-detail">This account will stop receiving new work when the node picks up the change. Accepted jobs keep their original account and finish. Saved credentials remain on this device.</p><div class="actions"><button id="remove-account-cancel" type="button" class="secondary">Keep account</button><button id="remove-account-confirm" type="button">Remove account</button></div></dialog>`;
 const $ = <T extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as T;
+const restoreAccountFocus = (account: Account) => {
+  const title = document.getElementById(`account-${account.service}-${account.id}`);
+  const remove = title?.closest(".account-row")?.querySelector<HTMLButtonElement>("button[data-remove]");
+  (remove ?? $("accounts-heading")).focus();
+};
+const confirmRemoval = accountRemovalConfirmation({
+  dialog: $<HTMLDialogElement>("remove-account-dialog"),
+  heading: $("remove-account-heading"),
+  cancel: $<HTMLButtonElement>("remove-account-cancel"),
+  confirm: $<HTMLButtonElement>("remove-account-confirm"),
+  restoreFocus: restoreAccountFocus,
+});
 let snapshot: Snapshot | undefined;
 let claudeStatus: ClaudeStatus | undefined;
 let busy = false;
-let polling = false;
+let polling: Promise<void> | undefined;
+let mutationEpoch = 0;
 let claudePolling = false;
 let browserProfilesAvailable = false;
 let preferencesAvailable = false;
@@ -151,7 +166,7 @@ function render(s: Snapshot) {
     const text = document.createElement("div");
     const title = document.createElement("strong");
     title.id = `account-${a.service}-${a.id}`;
-    title.textContent = `${a.service === "codex" ? "Codex" : "X"} · ${a.id}`;
+    title.textContent = accountTitle(s, a);
     const state = document.createElement("p");
     const waiting = a.service === "x_read" && reimported.has(a.id);
     const expired = !waiting && needsXReimport(s, a);
@@ -178,16 +193,17 @@ function render(s: Snapshot) {
     remove.className = "quiet";
     remove.textContent = "Remove";
     remove.disabled = busy;
+    remove.dataset.remove = "";
+    remove.setAttribute("aria-describedby", title.id);
     remove.addEventListener("click", () => {
-      if (
-        confirm(
-          "Stop using this account for new work? Existing attempts keep their original account. Stored credentials are retained until safely removed after drain.",
-        )
-      )
-        void act(
-          () => api.remove(a.service, a.id),
-          "Removal requested. The node applies it on its next scheduling check",
-        );
+      if (busy) return;
+      void confirmRemoval(a).then((confirmed) => {
+        if (confirmed)
+          void act(
+            () => api.remove(a.service, a.id),
+            "Account removed from the saved list. The node stops new work for it when it picks up the change; accepted jobs can finish. Saved credentials remain on this device",
+          ).finally(() => restoreAccountFocus(a));
+      });
     });
     actions.append(remove);
     row.append(text, actions);
@@ -215,17 +231,25 @@ function render(s: Snapshot) {
   $("cancel-login").hidden = !s.login_pending;
   $("codex-note").textContent = codexNote(s);
 }
-async function refresh() {
+async function refresh(afterMutation = false) {
   void refreshClaude();
-  if (polling) return;
-  polling = true;
-  try {
-    render(await api.status());
-  } catch (e) {
-    notice(errorMessage(e), true);
-  } finally {
-    polling = false;
+  if (polling) {
+    if (!afterMutation) return;
+    await polling;
   }
+  const epoch = mutationEpoch;
+  const request = (async () => {
+    try {
+      const status = await api.status();
+      // A poll begun before a mutation must not restore the old registry rows.
+      if (epoch === mutationEpoch) render(status);
+    } catch (e) {
+      if (epoch === mutationEpoch) notice(errorMessage(e), true);
+    }
+  })();
+  polling = request;
+  try { await request; }
+  finally { if (polling === request) polling = undefined; }
 }
 // Claude status verifies the bundled runtime and launches its CLI. Poll it on
 // its own so that cost never delays node status, such as a paired identity.
@@ -246,6 +270,7 @@ async function refreshClaude() {
 async function act(fn: () => Promise<void>, success: string) {
   if (busy) return;
   busy = true;
+  mutationEpoch++;
   if (snapshot) render(snapshot);
   notice("Working…");
   try {
@@ -255,7 +280,7 @@ async function act(fn: () => Promise<void>, success: string) {
     notice(errorMessage(e), true);
   } finally {
     busy = false;
-    await refresh();
+    await refresh(true);
   }
 }
 for (const id of ["setup", "dashboard", "settings"] as const)

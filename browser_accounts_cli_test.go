@@ -55,7 +55,7 @@ INSERT INTO moz_cookies VALUES('.x.com','auth_token','synthetic-import-auth',0,'
 func browserFixtureID(t *testing.T) string {
 	t.Helper()
 	var out bytes.Buffer
-	if err := accountsCommand([]string{"browser-profiles"}, strings.NewReader(""), &out); err != nil {
+	if err := fixtureAccountsCommand([]string{"browser-profiles"}, strings.NewReader(""), &out); err != nil {
 		t.Fatal(err)
 	}
 	var profiles []struct{ ID, Browser, Label string }
@@ -76,7 +76,7 @@ func TestBrowserAccountImportPersistsPrivateSessionWithoutReturningCredentials(t
 	id := browserFixtureID(t)
 	before, _ := os.ReadFile(path)
 	var out bytes.Buffer
-	if err := accountsCommand([]string{"import-x", id, "browser-one", "2"}, nil, &out); err != nil {
+	if err := fixtureAccountsCommand([]string{"import-x", id, "browser-one", "2"}, nil, &out); err != nil {
 		t.Fatal("isolated import failed", err)
 	}
 	if out.String() != "{\"status\":\"updated\"}\n" {
@@ -100,7 +100,7 @@ func TestBrowserAccountImportPersistsPrivateSessionWithoutReturningCredentials(t
 		t.Fatal("source browser database changed")
 	}
 	out.Reset()
-	if err := accountsCommand([]string{"import-x", id, "browser-one", "2"}, nil, &out); err == nil {
+	if err := fixtureAccountsCommand([]string{"import-x", id, "browser-one", "2"}, nil, &out); err == nil {
 		t.Fatal("duplicate import overwrote credentials")
 	}
 }
@@ -115,7 +115,7 @@ func TestBrowserAccountImportBusyFailsWithoutRegisteringAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	err := accountsCommand([]string{"import-x", id, "busy-one", "1"}, nil, &out)
+	err := fixtureAccountsCommand([]string{"import-x", id, "busy-one", "1"}, nil, &out)
 	if err == nil || err.Error() != "browser_busy" || out.String() != "{\"code\":\"browser_busy\",\"status\":\"error\"}\n" {
 		t.Fatal("busy import did not return a fixed failure")
 	}
@@ -157,7 +157,7 @@ func TestBrowserAccountReimportReplacesSessionForTheSameID(t *testing.T) {
 	t.Setenv("SCARLETT_ACCOUNTS_FILE", "")
 	id := browserFixtureID(t)
 	var out bytes.Buffer
-	if err := accountsCommand([]string{"connect", "x_read", "browser-one", "2"}, strings.NewReader(`{"auth_token":"synthetic-expired-auth","ct0":"synthetic-expired-csrf"}`), &out); err != nil {
+	if err := fixtureAccountsCommand([]string{"connect", "x_read", "browser-one", "2"}, strings.NewReader(`{"auth_token":"synthetic-expired-auth","ct0":"synthetic-expired-csrf"}`), &out); err != nil {
 		t.Fatal(err)
 	}
 	session := filepath.Join(dir, "accounts", "x_read-browser-one", "session.json")
@@ -166,7 +166,7 @@ func TestBrowserAccountReimportReplacesSessionForTheSameID(t *testing.T) {
 		t.Fatal(err)
 	}
 	out.Reset()
-	err := accountsCommand([]string{"reimport-x", id, "browser-one"}, nil, &out)
+	err := fixtureAccountsCommand([]string{"reimport-x", id, "browser-one"}, nil, &out)
 	if err == nil || err.Error() != "browser_busy" || out.String() != "{\"code\":\"browser_busy\",\"status\":\"error\"}\n" {
 		t.Fatal("busy re-import did not return a fixed failure", err)
 	}
@@ -178,7 +178,7 @@ func TestBrowserAccountReimportReplacesSessionForTheSameID(t *testing.T) {
 	}
 	before, _ := os.ReadFile(path)
 	out.Reset()
-	if err := accountsCommand([]string{"reimport-x", id, "browser-one"}, nil, &out); err != nil {
+	if err := fixtureAccountsCommand([]string{"reimport-x", id, "browser-one"}, nil, &out); err != nil {
 		t.Fatal("isolated re-import failed", err)
 	}
 	if out.String() != "{\"status\":\"updated\"}\n" {
@@ -196,7 +196,7 @@ func TestBrowserAccountReimportReplacesSessionForTheSameID(t *testing.T) {
 		t.Fatal("source browser database changed")
 	}
 	out.Reset()
-	if err := accountsCommand([]string{"reimport-x", id, "unknown"}, nil, &out); err == nil {
+	if err := fixtureAccountsCommand([]string{"reimport-x", id, "unknown"}, nil, &out); err == nil {
 		t.Fatal("re-import created a new account")
 	}
 }
