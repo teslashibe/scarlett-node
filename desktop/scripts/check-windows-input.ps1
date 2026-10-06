@@ -38,6 +38,13 @@ if ([string][ScarlettAcceptanceWindow]::LastNativeFailure -cne 'None' -or
     throw 'Native input diagnostics retained a previous failure'
 }
 Write-Output 'Native click bounds rejection and diagnostic reset passed; no input injected'
+$awarenessBefore = [ScarlettAcceptanceWindow]::ThreadDpiAwareness()
+$physical = [ScarlettAcceptanceWindow]::PhysicalPointContext([IntPtr]::Zero, [int]::MinValue, [int]::MinValue)
+if ($awarenessBefore -notin @(0, 1, 2) -or -not $physical[0] -or $physical[1] -or $physical[2] -or
+    -not $physical[3] -or [ScarlettAcceptanceWindow]::ThreadDpiAwareness() -ne $awarenessBefore) {
+    throw 'Physical click diagnostics did not reject an absent point and restore caller DPI awareness'
+}
+Write-Output 'Physical click diagnostics rejected the absent point and restored caller DPI awareness; no input injected'
 
 # Evaluate the exact inventory normalization used by installed acceptance.
 # Windows PowerShell 5.1 emits JSON arrays as one pipeline object; PowerShell 7

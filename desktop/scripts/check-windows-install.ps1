@@ -24,11 +24,14 @@ public static class ScarlettAcceptanceWindow {
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
     [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
     [DllImport("user32.dll")] private static extern IntPtr GetThreadDpiAwarenessContext();
+    [DllImport("user32.dll")] private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll")] private static extern int GetAwarenessFromDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll")] private static extern uint GetDpiForWindow(IntPtr window);
     [DllImport("kernel32.dll")] private static extern void SetLastError(uint error);
     [StructLayout(LayoutKind.Sequential)] private struct ScreenPoint { public int x, y; }
     [DllImport("user32.dll")] private static extern IntPtr WindowFromPhysicalPoint(ScreenPoint point);
+    [DllImport("user32.dll")] private static extern IntPtr MonitorFromPoint(ScreenPoint point, uint flags);
+    [DllImport("user32.dll")] private static extern IntPtr MonitorFromWindow(IntPtr window, uint flags);
     public enum NativeFailure { None, DesktopBounds, InputLayout, ModifierPressed, RejectedEvents }
     public static NativeFailure LastNativeFailure { get; private set; }
     public static uint LastInputExpected { get; private set; }
@@ -53,6 +56,20 @@ public static class ScarlettAcceptanceWindow {
         int width = GetSystemMetrics(78), height = GetSystemMetrics(79);
         return width >= 2 && height >= 2 && x >= left && y >= top &&
             (long)x < (long)left + width && (long)y < (long)top + height;
+    }
+    public static bool[] PhysicalPointContext(IntPtr window, int x, int y) {
+        // Failure diagnostics only: compare physical UIA coordinates to real
+        // monitors, then restore the caller's context before returning.
+        bool[] state = new bool[4];
+        IntPtr previous = SetThreadDpiAwarenessContext(new IntPtr(-4));
+        if (previous == IntPtr.Zero) return state;
+        try {
+            ScreenPoint point = new ScreenPoint(); point.x = x; point.y = y;
+            state[0] = true;
+            state[1] = MonitorFromPoint(point, 0) != IntPtr.Zero;
+            state[2] = MonitorFromWindow(window, 0) != IntPtr.Zero;
+        } finally { state[3] = SetThreadDpiAwarenessContext(previous) != IntPtr.Zero; }
+        return state;
     }
     [StructLayout(LayoutKind.Sequential)] private struct KeyboardInput {
         public ushort key, scan; public uint flags, time; public UIntPtr extra;
@@ -705,6 +722,8 @@ function Click-Control([System.Windows.Automation.AutomationElement]$Control) {
             controlOffscreen = $false; controlPassword = $false; controlSameProcess = $false
             scrollSupported = $null -ne $scroll; pointAvailable = $click.pointAvailable; pointFinite = $false
             pointDiagnosticsAvailable = $false; pointInsideControl = $false; pointInDesktop = $false; pointWindowOwned = $false
+            physicalContextAvailable = $false; physicalContextRestored = $false
+            pointOnPhysicalMonitor = $false; windowOnPhysicalMonitor = $false
             foregroundOwned = $false; modifiersReleased = $false; webViewNativeInputFocus = $false
             accessibilityWindowNativeFocus = $false; threadDpiContextKnown = $false; threadDpiUnaware = $false
             threadDpiSystemAware = $false; threadDpiPerMonitorAware = $false; windowDpiKnown = $false
@@ -724,6 +743,11 @@ function Click-Control([System.Windows.Automation.AutomationElement]$Control) {
                 $diagnostic.pointInDesktop = [ScarlettAcceptanceWindow]::PointInDesktop([int]$click.point.X, [int]$click.point.Y)
                 $diagnostic.pointWindowOwned = [ScarlettAcceptanceWindow]::PointOwnedByWindow($handle, [int]$click.point.X, [int]$click.point.Y)
                 $diagnostic.pointDiagnosticsAvailable = $true
+                $physical = [ScarlettAcceptanceWindow]::PhysicalPointContext($handle, [int]$click.point.X, [int]$click.point.Y)
+                $diagnostic.physicalContextAvailable = $physical[0]
+                $diagnostic.pointOnPhysicalMonitor = $physical[1]
+                $diagnostic.windowOnPhysicalMonitor = $physical[2]
+                $diagnostic.physicalContextRestored = $physical[3]
             }
         } catch { }
         try {
