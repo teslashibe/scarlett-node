@@ -4,10 +4,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -200,5 +202,42 @@ func WriteAtomic(path string, raw []byte, replace bool) error {
 	if replace {
 		flags |= windows.MOVEFILE_REPLACE_EXISTING
 	}
-	return windows.MoveFileEx(from, to, flags)
+	return publishPrivateFile(path, from, to, flags)
+}
+
+const privatePublishRetryLimit = 500 * time.Millisecond
+
+func publishPrivateFile(path string, from, to *uint16, flags uint32) error {
+	// Legacy Windows replacement can refuse an existing destination while a
+	// reader holds it open, even with FILE_SHARE_DELETE. Retry only publication:
+	// the same complete, flushed private file and pinned parents stay in place.
+	deadline := time.Now().Add(privatePublishRetryLimit)
+	for {
+		err := windows.MoveFileEx(from, to, flags)
+		if err == nil {
+			return nil
+		}
+		remaining := time.Until(deadline)
+		if (!errors.Is(err, windows.ERROR_ACCESS_DENIED) && !errors.Is(err, windows.ERROR_SHARING_VIOLATION)) || remaining <= 0 {
+			return fmt.Errorf("publish private file: %w", err)
+		}
+		time.Sleep(min(10*time.Millisecond, remaining))
+		if flags&windows.MOVEFILE_REPLACE_EXISTING != 0 {
+			// The owner can change this entry while a reader holds it. Recheck
+			// every replacement attempt; retries must not adopt an unsafe target.
+			f, checkErr := OpenPrivate(path)
+			if checkErr == nil {
+				f.Close()
+			} else if !os.IsNotExist(checkErr) {
+				var pathErr *os.PathError
+				if errors.As(checkErr, &pathErr) {
+					checkErr = pathErr.Err
+				}
+				return fmt.Errorf("revalidate private publication target: %w", checkErr)
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("publish private file: %w", err)
+		}
+	}
 }

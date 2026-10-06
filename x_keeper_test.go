@@ -42,6 +42,13 @@ func (k *keeperX) RoundTrip(r *http.Request) (*http.Response, error) {
 	answer := func(status int, body string) (*http.Response, error) {
 		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}, Request: r}, nil
 	}
+	id, username := "12", "fixture"
+	switch token {
+	case "synthetic-private-auth-one":
+		id, username = "123", "fixture_one"
+	case "synthetic-private-auth-two", "late-auth":
+		id, username = "456", "fixture_two"
+	}
 	switch {
 	case !strings.Contains(r.URL.Path, "/i/api/graphql/"):
 		return answer(404, "")
@@ -50,9 +57,9 @@ func (k *keeperX) RoundTrip(r *http.Request) (*http.Response, error) {
 	case strings.HasSuffix(r.URL.Path, "/Viewer") && k.missing.Load():
 		return answer(404, "")
 	case strings.HasSuffix(r.URL.Path, "/Viewer"):
-		return answer(200, `{"data":{"viewer":{"user_results":{"result":{"rest_id":"12"}}}}}`)
+		return answer(200, `{"data":{"viewer":{"user_results":{"result":{"rest_id":"`+id+`"}}}}}`)
 	}
-	return answer(200, `{"data":{"user":{"result":{"__typename":"User","rest_id":"12","legacy":{"screen_name":"fixture"}}}}}`)
+	return answer(200, `{"data":{"user":{"result":{"__typename":"User","rest_id":"`+id+`","legacy":{"screen_name":"`+username+`"}}}}}`)
 }
 
 func (k *keeperX) requests(token string) int {
@@ -65,6 +72,7 @@ func keeperFixture(t *testing.T, p *servicePool, x http.RoundTripper) *worker.XC
 	t.Helper()
 	clients := worker.NewXClients()
 	clients.Base = x
+	clients.ObserveIdentity(p.xIdentityValidated)
 	clients.Observe(p.xValidated)
 	stop := startXKeeper(context.Background(), p.config, clients, p, 10*time.Millisecond)
 	t.Cleanup(func() { stop(); clients.Stop() })
@@ -250,8 +258,8 @@ func TestXKeeperWarmsLateAccountsAndEvictsRemovedOnes(t *testing.T) {
 	saveAccountFixture(t, m, f)
 	eventually(t, "the removed account to leave the pool", func() bool { return state("two") == "" })
 	time.Sleep(100 * time.Millisecond) // a keeper tick, and any refresh already running
-	gone, live := x.requests("late-auth"), x.requests("synthetic-private-auth")
-	eventually(t, "the kept account to keep refreshing", func() bool { return x.requests("synthetic-private-auth") >= live+4 })
+	gone, live := x.requests("late-auth"), x.requests("synthetic-private-auth-one")
+	eventually(t, "the kept account to keep refreshing", func() bool { return x.requests("synthetic-private-auth-one") >= live+4 })
 	if after := x.requests("late-auth"); after != gone {
 		t.Fatal("removed account is still refreshed against X", gone, after)
 	}
@@ -341,12 +349,20 @@ func TestXValidatedFencesSessionReplacementUnderPoolLock(t *testing.T) {
 			fake.refuse.Store(test.refused)
 			clients.Base = fake
 			accounts := []worker.XAccount{{ID: "legacy", Path: p.config.XSession}}
+			admittedStamp := worker.XSessionStamp(p.config.XSession)
 			if test.cached {
 				clients.Warm(context.Background(), p.config, accounts)
 			}
 			arrived := make(chan struct{})
+			var arriveOnce sync.Once
 			clients.Observe(func(path, stamp, code string) {
-				close(arrived)
+				// Warm may rebuild a replacement immediately after discarding its
+				// old construction. This test isolates the original observation;
+				// fresh observations belong to the newly admitted credentials.
+				if stamp != admittedStamp {
+					return
+				}
+				arriveOnce.Do(func() { close(arrived) })
 				p.xValidated(path, stamp, code)
 			})
 			p.mu.Lock()

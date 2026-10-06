@@ -52,6 +52,10 @@ type Config struct {
 	AccountCooldown  func(time.Duration) // private provider quota observation
 	LocalAccountID   string              // private attempt identity; never sent to the coordinator
 	XSession         string
+	// Accepted X leases pin private credentials and verified provider identity.
+	// These values never enter coordinator reports or local public status.
+	ExpectedXStamp    string
+	ExpectedXIdentity string
 	// XRelay lets this node take X jobs proven by keyed relay, where the
 	// verifier holds the TLS session keys. On by default: relay cuts a node's
 	// upload per read from tens of megabytes to tens of kilobytes, and the

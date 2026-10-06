@@ -1,0 +1,11 @@
+{
+  "upstream_revision": "fb031a0f6f69b68a7038efdf52d1c4ef22d54f85",
+  "scope": "Local Scarlett changes share request pacing only after authenticated Viewer identity and preserve conservative quota state; clients and credential validation remain session-specific. UPSTREAM.json retains the original source hashes.",
+  "sha256": {
+    "client.go": "cf80899deb62cee137c96f4df01969b43aa7d5988cd9e564011129f7806c0a8b",
+    "session.go": "f61634f928d36643543773fba76aa6f73ea7b8fe2d224a489c338713bace8fe2",
+    "x.go": "b9c6f096756a9ce107ee23b7f520b047d39edcd215ca25216c2c0d497b7ff144",
+    "pacing.go": "7a9abb836eaeac58df0c68036a37c295682441751f2aaebfb49c0fd4c010fdd6",
+    "pacing_test.go": "552f982525dea94f753618c5b15342df3c222a40974f6c5a14ad3bf3493b4def"
+  }
+}

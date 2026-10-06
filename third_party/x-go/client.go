@@ -352,14 +352,14 @@ func (c *Client) queryID(name string) string {
 func (c *Client) waitForGap(ctx context.Context) {
 	gap := c.adaptiveGap()
 
-	c.gapMu.Lock()
+	c.pacing.gapMu.Lock()
 	now := time.Now()
-	nextSlot := c.lastReqAt.Add(gap)
+	nextSlot := c.pacing.lastReqAt.Add(gap)
 	if now.After(nextSlot) {
 		nextSlot = now
 	}
-	c.lastReqAt = nextSlot
-	c.gapMu.Unlock()
+	c.pacing.lastReqAt = nextSlot
+	c.pacing.gapMu.Unlock()
 
 	if wait := time.Until(nextSlot); wait > 0 {
 		select {
@@ -372,18 +372,20 @@ func (c *Client) waitForGap(ctx context.Context) {
 		return
 	}
 	// Clear RetryAfter once we've waited past it.
-	c.rlMu.Lock()
-	c.rlState.RetryAfter = 0
-	c.rlMu.Unlock()
+	c.pacing.rlMu.Lock()
+	if !time.Now().Before(c.pacing.rlState.Reset) {
+		c.pacing.rlState.RetryAfter = 0
+	}
+	c.pacing.rlMu.Unlock()
 }
 
 // adaptiveGap returns the delay before the next request based on observed
 // rate-limit state. Spreads requests across the window when quota is low;
 // waits for reset when quota is exhausted.
 func (c *Client) adaptiveGap() time.Duration {
-	c.rlMu.Lock()
-	rs := c.rlState
-	c.rlMu.Unlock()
+	c.pacing.rlMu.Lock()
+	rs := c.pacing.rlState
+	c.pacing.rlMu.Unlock()
 
 	// Quota exhausted — wait for the window to reset.
 	if rs.Remaining == 0 && !rs.Reset.IsZero() {
@@ -408,27 +410,23 @@ func (c *Client) adaptiveGap() time.Duration {
 // the client's tracked state. Call on every HTTP response.
 func (c *Client) updateRateLimit(resp *http.Response) {
 	h := resp.Header
-	c.rlMu.Lock()
-	defer c.rlMu.Unlock()
-	if v := rlHeader(h, "Limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.rlState.Limit = n
-		}
+	var observed RateLimitState
+	var hasLimit, hasRemaining, hasReset bool
+	if n, err := strconv.Atoi(rlHeader(h, "Limit")); err == nil && n >= 0 {
+		observed.Limit, hasLimit = n, true
 	}
-	if v := rlHeader(h, "Remaining"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.rlState.Remaining = n
-		}
+	if n, err := strconv.Atoi(rlHeader(h, "Remaining")); err == nil && n >= 0 {
+		observed.Remaining, hasRemaining = n, true
 	}
-	if v := rlHeader(h, "Reset"); v != "" {
-		if ts, err := strconv.ParseInt(v, 10, 64); err == nil {
-			if ts > 1_000_000_000 {
-				c.rlState.Reset = time.Unix(ts, 0) // Unix epoch (Twitter/X style)
-			} else {
-				c.rlState.Reset = time.Now().Add(time.Duration(ts) * time.Second) // relative (Reddit style)
-			}
+	if ts, err := strconv.ParseInt(rlHeader(h, "Reset"), 10, 64); err == nil && ts >= 0 {
+		if ts > 1_000_000_000 {
+			observed.Reset = time.Unix(ts, 0)
+		} else {
+			observed.Reset = time.Now().Add(time.Duration(ts) * time.Second)
 		}
+		hasReset = true
 	}
+	c.pacing.observe(observed, hasLimit, hasRemaining, hasReset)
 }
 
 // rlHeader returns the trimmed value of a rate-limit header, checking the four
@@ -490,18 +488,18 @@ func (c *Client) checkStatus(resp *http.Response) error {
 
 // recordRateLimit keeps later calls behind the same provider cooldown.
 func (c *Client) recordRateLimit(wait time.Duration) {
-	c.rlMu.Lock()
-	c.rlState.Remaining = 0
-	c.rlState.RetryAfter = wait
-	if c.rlState.Reset.IsZero() || time.Until(c.rlState.Reset) < wait {
-		c.rlState.Reset = time.Now().Add(wait)
+	c.pacing.rlMu.Lock()
+	c.pacing.rlState.Remaining = 0
+	c.pacing.rlState.RetryAfter = wait
+	if c.pacing.rlState.Reset.IsZero() || time.Until(c.pacing.rlState.Reset) < wait {
+		c.pacing.rlState.Reset = time.Now().Add(wait)
 	}
-	c.rlMu.Unlock()
-	c.gapMu.Lock()
-	if earliest := time.Now().Add(wait); c.lastReqAt.Before(earliest) {
-		c.lastReqAt = earliest
+	c.pacing.rlMu.Unlock()
+	c.pacing.gapMu.Lock()
+	if earliest := time.Now().Add(wait); c.pacing.lastReqAt.Before(earliest) {
+		c.pacing.lastReqAt = earliest
 	}
-	c.gapMu.Unlock()
+	c.pacing.gapMu.Unlock()
 }
 
 // classifyRESTErrorBody maps known X REST error payloads to sentinels so

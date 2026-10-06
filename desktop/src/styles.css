@@ -271,3 +271,18 @@ footer p {
   width: auto;
   margin: 0;
 }
+
+dialog {
+  width: min(480px, calc(100% - 40px));
+  padding: 24px;
+  color: #f3efee;
+  background: #13100f;
+  border: 1px solid #49392f;
+  border-radius: 14px;
+}
+dialog::backdrop {
+  background: rgb(0 0 0 / 65%);
+}
+dialog .actions {
+  justify-content: flex-end;
+}

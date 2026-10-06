@@ -11,11 +11,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/teslashibe/scarlett-node/internal/browserx"
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/localfs"
 	"github.com/teslashibe/scarlett-node/internal/worker"
+	x "github.com/teslashibe/x-go"
 	"golang.org/x/term"
 )
 
@@ -104,6 +106,20 @@ func accountFilePath(dir string) string {
 // Account mutations are serialized independently of the running node's attempt
 // lock. No CLI operation cancels or reassigns a provider attempt.
 func accountsCommand(args []string, input io.Reader, output io.Writer) error {
+	return accountsCommandWithVerifier(args, input, output, func(ctx context.Context, session x.Session) (worker.VerifiedXIdentity, error) {
+		return worker.VerifyXSession(ctx, session)
+	})
+}
+
+func lockAccountRegistry(dir string) (*os.File, error) {
+	path := accountFilePath(dir)
+	if !filepath.IsAbs(path) || localfs.CheckOwnedDir(filepath.Dir(path)) != nil {
+		return nil, errors.New("accounts directory must be private and owned")
+	}
+	return localfs.LockPrivateWait(filepath.Join(filepath.Dir(path), ".accounts.lock"))
+}
+
+func accountsCommandWithVerifier(args []string, input io.Reader, output io.Writer, verify xSessionVerifier) error {
 	if len(args) > 1 && args[0] == "login-x" {
 		return xLoginTerminalCommand(args[1:], input, output)
 	}
@@ -122,33 +138,30 @@ func accountsCommand(args []string, input io.Reader, output io.Writer) error {
 	}
 	dir := os.Getenv("SCARLETT_STATE_DIR")
 	if dir == "" {
-		h, e := os.UserHomeDir()
-		if e != nil {
-			return e
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
 		}
-		dir = config.DefaultStateDir(h)
+		dir = config.DefaultStateDir(home)
 	}
 	if !filepath.IsAbs(dir) {
 		return errors.New("state directory must be absolute")
 	}
-	if e := prepareStateDir(dir); e != nil {
-		return e
+	if err := prepareStateDir(dir); err != nil {
+		return err
 	}
 	path := accountFilePath(dir)
-	if !filepath.IsAbs(path) {
-		return errors.New("accounts file must be absolute")
-	}
-	// The CLI only writes into an existing private directory.
-	if e := localfs.CheckDir(filepath.Dir(path)); e != nil {
-		return errors.New("accounts directory must be private")
-	}
-	lock, e := localfs.LockPrivateWait(filepath.Join(filepath.Dir(path), ".accounts.lock"))
-	if e != nil {
+	lock, err := lockAccountRegistry(dir)
+	if err != nil {
 		return errors.New("cannot lock account configuration")
 	}
-	defer lock.Close()
-	f, e := loadAccounts(path)
-	if e != nil && !os.IsNotExist(e) {
+	defer func() {
+		if lock != nil {
+			lock.Close()
+		}
+	}()
+	registry, err := loadAccounts(path)
+	if err != nil && !os.IsNotExist(err) {
 		return errors.New("cannot read private account configuration")
 	}
 	if (args[0] == "reconnect" && len(args) == 3 && args[1] == "x_read") || (args[0] == "reimport-x" && len(args) == 3) {
@@ -156,100 +169,174 @@ func accountsCommand(args []string, input io.Reader, output io.Writer) error {
 		if args[0] == "reimport-x" {
 			profile = args[1]
 		}
-		return replaceXSession(dir, f, args[2], profile, input, output)
+		lock.Close()
+		lock = nil
+		return replaceXSession(dir, registry, args[2], profile, input, output, verify)
 	}
 	if args[0] == "list" && len(args) == 1 {
 		type item struct {
 			ID          string `json:"id"`
 			Service     string `json:"service"`
 			Concurrency int    `json:"concurrency"`
+			Username    string `json:"username,omitempty"`
 		}
 		out := []item{}
-		for _, a := range f.Accounts {
-			out = append(out, item{a.ID, a.Service, a.Concurrency})
+		for _, account := range registry.Accounts {
+			row := item{ID: account.ID, Service: account.Service, Concurrency: account.Concurrency}
+			if account.Service == "x_read" {
+				if identity, err := verifiedXIdentity(dir, account.Path); err == nil {
+					row.Username = identity.Username
+				}
+			}
+			out = append(out, row)
 		}
 		return json.NewEncoder(output).Encode(out)
 	}
 	if args[0] == "remove" && len(args) == 3 {
-		found := false
+		if !validAccountID(args[2]) || args[1] != "codex" && args[1] != "x_read" {
+			return errors.New("invalid account removal")
+		}
 		out := []providerAccount{}
-		for _, a := range f.Accounts {
-			if a.Service == args[1] && a.ID == args[2] {
-				found = true
-			} else {
-				out = append(out, a)
+		for _, account := range registry.Accounts {
+			if account.Service != args[1] || account.ID != args[2] {
+				out = append(out, account)
 			}
 		}
-		if !found {
-			return errors.New("local account not found")
-		}
-		f.Accounts = out
-	} else if (args[0] == "add" && len(args) == 5) || (args[0] == "connect" && len(args) == 4) || (args[0] == "import-x" && len(args) == 4) {
-		n, e := strconv.Atoi(args[len(args)-1])
-		if e != nil {
-			return errors.New("invalid account concurrency")
-		}
-		a := providerAccount{ID: args[2], Service: args[1], Concurrency: n}
-		if args[0] == "import-x" {
-			a.Service = "x_read"
-		}
-		if args[0] == "add" {
-			a.Path = args[3]
-		} else {
-			a.Path = filepath.Join(dir, "accounts", a.Service+"-"+a.ID)
-			if a.Service == "x_read" {
-				a.Path = filepath.Join(a.Path, "session.json")
+		if len(out) != len(registry.Accounts) {
+			registry.Accounts = out
+			raw, err := json.Marshal(registry)
+			if err != nil || writeLocalFile(filepath.Dir(path), filepath.Base(path), raw) != nil {
+				return errors.New("cannot save private account configuration")
 			}
 		}
-		candidate := f
-		candidate.Accounts = append(append([]providerAccount(nil), f.Accounts...), a)
-		if !validAccounts(candidate) {
-			return errors.New("invalid or duplicate account; use codex or x_read, a unique lowercase ID, an absolute path and concurrency 1..32")
-		}
-		if args[0] == "connect" || args[0] == "import-x" {
-			credentialDir := a.Path
-			name := "auth.json"
-			if a.Service == "x_read" {
-				credentialDir = filepath.Dir(a.Path)
-				name = "session.json"
-			}
-			if e := prepareStateDir(filepath.Join(dir, "accounts")); e != nil {
-				return e
-			}
-			if e := prepareStateDir(credentialDir); e != nil {
-				return e
-			}
-			if _, e := os.Lstat(filepath.Join(credentialDir, name)); !os.IsNotExist(e) {
-				return errors.New("refusing to overwrite account credentials")
-			}
-			profile := ""
-			if args[0] == "import-x" {
-				profile = args[1]
-			}
-			raw, e := readCredential(profile, input, output)
-			if e != nil {
-				return e
-			}
-			defer clear(raw)
-			if e := writeLocalFile(credentialDir, name, raw); e != nil {
-				return errors.New("cannot save private account credentials")
-			}
-			if a.Service == "x_read" && !worker.XConfigured(a.Path) {
-				os.Remove(a.Path)
-				return errors.New("invalid X session")
-			}
-		}
-		f = candidate
-	} else {
+		return json.NewEncoder(output).Encode(map[string]string{"status": "updated"})
+	}
+	if !((args[0] == "add" && len(args) == 5) || (args[0] == "connect" && len(args) == 4) || (args[0] == "import-x" && len(args) == 4)) {
 		return errors.New("usage: accounts list | browser-profiles | import-x PROFILE_ID ID CONCURRENCY | reimport-x PROFILE_ID ID | add SERVICE ID ABSOLUTE_PATH CONCURRENCY | connect SERVICE ID CONCURRENCY (credential JSON on protected stdin) | reconnect x_read ID (credential JSON on protected stdin) | remove SERVICE ID")
 	}
-	raw, e := json.Marshal(f)
-	if e != nil {
-		return e
+	n, err := strconv.Atoi(args[len(args)-1])
+	if err != nil {
+		return errors.New("invalid account concurrency")
 	}
-	if e = writeLocalFile(filepath.Dir(path), filepath.Base(path), raw); e != nil {
+	account := providerAccount{ID: args[2], Service: args[1], Concurrency: n}
+	if args[0] == "import-x" {
+		account.Service = "x_read"
+	}
+	if args[0] == "add" {
+		account.Path = args[3]
+	} else {
+		account.Path = filepath.Join(dir, "accounts", account.Service+"-"+account.ID)
+		if account.Service == "x_read" {
+			account.Path = filepath.Join(account.Path, "session.json")
+		}
+	}
+	candidate := registry
+	candidate.Accounts = append(append([]providerAccount(nil), registry.Accounts...), account)
+	if !validAccounts(candidate) {
+		return errors.New("invalid or duplicate account; use codex or x_read, a unique lowercase ID, an absolute path and concurrency 1..32")
+	}
+	// Never keep the registry locked across browser reads, stdin or provider I/O.
+	lock.Close()
+	lock = nil
+	owned := args[0] != "add"
+	committed := false
+	if owned {
+		if account.Service == "x_read" {
+			account.Path, err = newOwnedXSessionPath(dir, account.ID)
+			if err != nil {
+				return errors.New("cannot create private account storage")
+			}
+		} else {
+			account.Path, err = newOwnedAccountDirectory(dir, account.Service, account.ID)
+			if err != nil {
+				return errors.New("cannot create private account storage")
+			}
+		}
+		credentialPath := account.Path
+		if account.Service == "codex" {
+			credentialPath = filepath.Join(account.Path, "auth.json")
+		}
+		if _, err := os.Lstat(credentialPath); !os.IsNotExist(err) {
+			return errors.New("refusing to overwrite account credentials")
+		}
+		profile := ""
+		if args[0] == "import-x" {
+			profile = args[1]
+		}
+		raw, err := readCredential(profile, input, output)
+		if err != nil {
+			return err
+		}
+		defer clear(raw)
+		if err := localfs.WriteAtomic(credentialPath, raw, false); err != nil {
+			return errors.New("cannot save private account credentials")
+		}
+		defer func() {
+			if !committed {
+				_ = os.Remove(credentialPath)
+			}
+		}()
+	}
+	var identity worker.VerifiedXIdentity
+	verificationCtx := context.Background()
+	if account.Service == "x_read" {
+		var cancel context.CancelFunc
+		verificationCtx, cancel = context.WithTimeout(verificationCtx, 30*time.Second)
+		defer cancel()
+		identity, err = verifyXCredential(verificationCtx, account.Path, verify)
+		if err == nil {
+			err = verifyRegisteredXIdentities(verificationCtx, dir, registry, "", verify)
+		}
+		if err != nil {
+			return xAccountError(output, err)
+		}
+	}
+	lock, err = lockAccountRegistry(dir)
+	if err != nil {
+		return errors.New("cannot lock account configuration")
+	}
+	registry, err = loadAccounts(path)
+	if err != nil && !os.IsNotExist(err) {
+		return errors.New("cannot read private account configuration")
+	}
+	candidate = registry
+	candidate.Accounts = append(append([]providerAccount(nil), registry.Accounts...), account)
+	if !validAccounts(candidate) {
+		return errors.New("account registration changed")
+	}
+	if account.Service == "x_read" {
+		if verificationCtx.Err() != nil {
+			return xAccountError(output, verificationCtx.Err())
+		}
+		identityLock, err := lockXIdentities(dir)
+		if err != nil {
+			return xAccountError(output, err)
+		}
+		defer identityLock.Close()
+		if verificationCtx.Err() != nil {
+			return xAccountError(output, verificationCtx.Err())
+		}
+		identities, err := loadXIdentities(dir)
+		if err == nil && worker.XSessionStamp(account.Path) != identity.Stamp {
+			err = errXIdentityUnverified
+		}
+		if err == nil {
+			err = rejectDuplicateXIdentity(registry, identities, account, identity)
+		}
+		if err != nil {
+			return xAccountError(output, err)
+		}
+		pruneXIdentities(&identities, candidate, account.Path)
+		identities.Identities[filepath.Clean(account.Path)] = identity
+		if err := writeXIdentities(dir, identities); err != nil {
+			return xAccountError(output, err)
+		}
+	}
+	raw, err := json.Marshal(candidate)
+	if err != nil || writeLocalFile(filepath.Dir(path), filepath.Base(path), raw) != nil {
 		return errors.New("cannot save private account configuration")
 	}
+	committed = true
 	return json.NewEncoder(output).Encode(map[string]string{"status": "updated"})
 }
 
@@ -291,45 +378,110 @@ func readCredential(profile string, input io.Reader, output io.Writer) ([]byte, 
 	return raw, nil
 }
 
-// replaceXSession is the explicit re-import for an X account whose session X
-// expired or revoked. It keeps the account's local ID, path and concurrency
-// and replaces only the session this node wrote for it; connect and import-x
-// still never overwrite. The new session is validated in a private staging
-// file first, so a failed re-import leaves the previous session untouched. A
-// running node sees the changed file on its next scheduling check and treats
-// the account as configured again; attempts already in flight keep the session
-// they started with.
-func replaceXSession(dir string, f accountFile, id, profile string, input io.Reader, output io.Writer) error {
+// replaceXSession validates outside registry locks. The final commit compares
+// both registration and prior bytes; removal or another reconnect wins safely.
+func replaceXSession(dir string, registry accountFile, id, profile string, input io.Reader, output io.Writer, verify xSessionVerifier) error {
 	var account *providerAccount
-	for i := range f.Accounts {
-		if f.Accounts[i].Service == "x_read" && f.Accounts[i].ID == id {
-			account = &f.Accounts[i]
+	for i := range registry.Accounts {
+		if registry.Accounts[i].Service == "x_read" && registry.Accounts[i].ID == id {
+			copy := registry.Accounts[i]
+			account = &copy
 		}
 	}
 	if account == nil {
 		return errors.New("local account not found")
 	}
-	credentialDir := filepath.Join(dir, "accounts", "x_read-"+id)
-	if filepath.Clean(account.Path) != filepath.Join(credentialDir, "session.json") {
+	if !ownedXSessionPath(dir, id, account.Path) {
 		return errors.New("only an X session this node saved can be re-imported")
 	}
-	if e := localfs.CheckDir(credentialDir); e != nil {
-		return errors.New("account directory must be private")
+	prior, err := readLocalFile(account.Path, 65536)
+	if err != nil {
+		return errors.New("cannot read previous X session")
 	}
-	raw, e := readCredential(profile, input, output)
-	if e != nil {
-		return e
+	defer clear(prior)
+	priorIdentities, identityErr := loadXIdentities(dir)
+	if identityErr != nil {
+		return xAccountError(output, identityErr)
+	}
+	previousIdentity := priorIdentities.Identities[filepath.Clean(account.Path)]
+	raw, err := readCredential(profile, input, output)
+	if err != nil {
+		return err
 	}
 	defer clear(raw)
-	const staging = "session.replace.json"
-	defer os.Remove(filepath.Join(credentialDir, staging))
-	if e := writeLocalFile(credentialDir, staging, raw); e != nil {
+	owner := opaqueLoginID()
+	if owner == "" {
+		return errors.New("cannot create private staging credentials")
+	}
+	staging := filepath.Join(filepath.Dir(account.Path), "session.verify-"+owner+".json")
+	if err := localfs.WriteAtomic(staging, raw, false); err != nil {
 		return errors.New("cannot save private account credentials")
 	}
-	if !worker.XConfigured(filepath.Join(credentialDir, staging)) {
-		return errors.New("invalid X session")
+	defer os.Remove(staging)
+	verificationCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	identity, err := verifyXCredential(verificationCtx, staging, verify)
+	if err == nil && validXIdentity(previousIdentity) && identity.ID != previousIdentity.ID {
+		err = errXIdentityMismatch
 	}
-	if e := writeLocalFile(credentialDir, "session.json", raw); e != nil {
+	if err == nil {
+		err = verifyRegisteredXIdentities(verificationCtx, dir, registry, account.Path, verify)
+	}
+	if err != nil {
+		return xAccountError(output, err)
+	}
+	lock, err := lockAccountRegistry(dir)
+	if err != nil {
+		return errors.New("cannot lock account configuration")
+	}
+	defer lock.Close()
+	current, err := loadAccounts(accountFilePath(dir))
+	if err != nil {
+		return errors.New("cannot read private account configuration")
+	}
+	found := false
+	for _, candidate := range current.Accounts {
+		if candidate.Service == "x_read" && candidate.ID == id && candidate == *account {
+			found = true
+		}
+	}
+	stored, err := readLocalFile(account.Path, 65536)
+	if err != nil || !found || !bytes.Equal(stored, prior) {
+		clear(stored)
+		return errors.New("account or session changed")
+	}
+	clear(stored)
+	identityLock, err := lockXIdentities(dir)
+	if err != nil {
+		return xAccountError(output, err)
+	}
+	defer identityLock.Close()
+	if verificationCtx.Err() != nil {
+		return xAccountError(output, verificationCtx.Err())
+	}
+	identities, err := loadXIdentities(dir)
+	if err == nil {
+		// A warm client may authenticate this registration while the staged
+		// replacement is being checked. Preserve that newly verified user too.
+		latest := identities.Identities[filepath.Clean(account.Path)]
+		if validXIdentity(latest) && latest.ID != identity.ID {
+			err = errXIdentityMismatch
+		}
+	}
+	if err == nil {
+		err = rejectDuplicateXIdentity(current, identities, *account, identity)
+	}
+	if err != nil {
+		return xAccountError(output, err)
+	}
+	pruneXIdentities(&identities, current, account.Path)
+	identities.Identities[filepath.Clean(account.Path)] = identity
+	// Publish the checked binding first. Until the synced credential replacement,
+	// its stamp mismatch makes the old registration temporarily unverified.
+	if err := writeXIdentities(dir, identities); err != nil {
+		return xAccountError(output, err)
+	}
+	if err := localfs.WriteAtomic(account.Path, raw, true); err != nil {
 		return errors.New("cannot save private account credentials")
 	}
 	return json.NewEncoder(output).Encode(map[string]string{"status": "updated"})

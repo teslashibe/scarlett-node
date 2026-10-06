@@ -18,6 +18,7 @@ type serviceEntry struct {
 	restUntil               time.Time
 	helperMissing           bool
 	localAuthInvalid        bool
+	xRestIdentity           string
 }
 type servicePool struct {
 	mu                                      sync.Mutex
@@ -28,6 +29,9 @@ type servicePool struct {
 	saved                                   map[string]savedAccountHealth
 	next                                    map[string]int
 	accountMode, accountsError, healthError bool
+	xCooldowns                              map[string]xIdentityCooldown
+	xInFlight                               map[string]int
+	xIdentityError, xIdentityHealthError    bool
 }
 
 func newServicePool(c config.Config) *servicePool {
@@ -132,6 +136,11 @@ func (p *servicePool) finish(kind, code string) {
 	lease := &accountLease{kind: kind, account: a, config: p.config}
 	if a != nil && kind == "x_read" {
 		lease.xStamp = worker.XSessionStamp(a.spec.Path)
+		lease.xIdentity = a.identity.ID
+		for admitted := range a.xLeases {
+			lease = admitted
+			break
+		}
 	}
 	p.mu.Unlock()
 	if a != nil {

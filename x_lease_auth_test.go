@@ -76,6 +76,9 @@ func TestXLeaseAuthenticationUsesAdmittedCredentialStamp(t *testing.T) {
 					if err := localfs.WriteAtomic(l.config.XSession, raw, true); err != nil {
 						t.Fatal(err)
 					}
+					if managed && want == "configured" {
+						saveVerifiedXFixture(t, p, l.config.XSession, l.xIdentity, "fixture_one")
+					}
 				}
 				if scenario != "replacement-before-health-refresh" {
 					healthKind(t, p, "x_read")
@@ -117,6 +120,7 @@ func TestXLeaseAuthenticationCannotSettleRelocatedManagedAccount(t *testing.T) {
 	}
 	f.Accounts[0].Path = path
 	saveAccountFixture(t, p, f)
+	saveVerifiedXFixture(t, p, path, l.xIdentity, "fixture_one")
 	healthKind(t, p, "x_read")
 	if _, ok := p.acquireAccount("x_read"); ok {
 		t.Fatal("relocated account admitted before old work drained")
@@ -137,6 +141,11 @@ func TestXLeaseReplacementRetainsAccountWideQuota(t *testing.T) {
 			name := map[bool]string{false: "legacy", true: "managed"}[managed] + "/" + map[bool]string{false: "quota-after-replacement", true: "quota-before-replacement"}[beforeReplacement]
 			t.Run(name, func(t *testing.T) {
 				p := xLeasePool(t, managed)
+				if !managed {
+					// Account-wide quota requires authenticated evidence that the
+					// rotated sessions describe the same provider user.
+					p.xIdentityValidated(p.config.XSession, worker.VerifiedXIdentity{ID: "123", Username: "fixture_one", Stamp: worker.XSessionStamp(p.config.XSession)})
+				}
 				older, ok := p.acquireAccount("x_read")
 				if !ok {
 					t.Fatal("old lease unavailable")
@@ -158,6 +167,9 @@ func TestXLeaseReplacementRetainsAccountWideQuota(t *testing.T) {
 				}
 				if err := localfs.WriteAtomic(older.config.XSession, []byte(`{"auth_token":"replacement-synthetic-auth","ct0":"replacement-synthetic-csrf"}`), true); err != nil {
 					t.Fatal(err)
+				}
+				if managed {
+					saveVerifiedXFixture(t, p, older.config.XSession, older.xIdentity, "fixture_one")
 				}
 				healthKind(t, p, "x_read")
 				if !beforeReplacement {

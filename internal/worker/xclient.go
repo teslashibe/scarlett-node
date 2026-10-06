@@ -59,9 +59,12 @@ type XClients struct {
 
 	mu       sync.Mutex
 	accounts map[string]*xAccount
+	// identities retain bounded pacing domains across alias removal and re-add.
+	identities map[string]*xIdentityDomain
 	// observe is told the outcome of each build that asked X to validate a
 	// session; see Observe.
-	observe func(path, stamp, code string)
+	observe         func(path, stamp, code string)
+	observeIdentity func(path string, identity VerifiedXIdentity)
 	// refreshAdmission checks pool availability before an autonomous refresh.
 	refreshAdmission func(path string) bool
 	// minGap overrides x-go's request pacing; zero means xMinGap. Tests only.
@@ -156,8 +159,13 @@ func (c *XClients) Ensure(cfg config.Config, accounts []XAccount) {
 	for started, i := false, 0; i < len(accounts); i++ {
 		stamp, built := c.account(cfg, accounts[i].ID, accounts[i].Path, nil).ensure(!started)
 		started = started || built
-		if stamp != "" && observe != nil {
-			observe(accounts[i].Path, stamp, "")
+		if stamp != "" {
+			if identity, ok := c.VerifiedIdentity(accounts[i].Path); ok {
+				c.reportIdentity(accounts[i].Path, identity)
+			}
+			if observe != nil {
+				observe(accounts[i].Path, stamp, "")
+			}
 		}
 	}
 }
@@ -255,6 +263,9 @@ type xAccount struct {
 	gen     uint64
 	stop    chan struct{}
 	stopped bool
+	// acquiring pins identity domains between job admission and obtaining the
+	// warm client's reference, including concurrent removal from the cache.
+	acquiring int
 	// kick tells the refresher that a client without transaction-ID material
 	// was installed, so it retries the bootstrap soon.
 	kick chan struct{}
@@ -272,11 +283,12 @@ type xAccount struct {
 
 // xWarm is one built client with what it was built from.
 type xWarm struct {
-	client *x.Client
-	stamp  string            // SHA-256 of the session file it was built from
-	ids    map[string]string // query ID overrides it was built with
-	replay *xValidation      // its construction-time validation answers
-	gen    uint64
+	client   *x.Client
+	identity VerifiedXIdentity
+	stamp    string            // SHA-256 of the session file it was built from
+	ids      map[string]string // query ID overrides it was built with
+	replay   *xValidation      // its construction-time validation answers
+	gen      uint64
 	// lastReq is when this client last sent a request, in Unix nanoseconds:
 	// the end of its construction, then each read handed to a proof transport.
 	lastReq atomic.Int64
@@ -303,7 +315,7 @@ func (w *xWarm) pacingWait(minGap time.Duration) (wait, reset time.Duration) {
 	if gap <= minGap {
 		return 0, reset
 	}
-	return max(time.Until(time.Unix(0, w.lastReq.Load()).Add(gap)), 0), reset
+	return max(time.Until(w.client.LastRequestAt().Add(gap)), 0), reset
 }
 
 // exhausted is the time until X's quota window resets when X last reported no
@@ -367,6 +379,10 @@ func (a *xAccount) acquire(ctx context.Context, ids map[string]string, strict bo
 			return nil, errXSession
 		}
 		a.mu.Lock()
+		if a.stopped {
+			a.mu.Unlock()
+			return nil, errXDropped
+		}
 		cur := a.current
 		if cur != nil && cur.stamp != stamp {
 			// The file changed under the client: it would send stale cookies.
@@ -386,6 +402,19 @@ func (a *xAccount) acquire(ctx context.Context, ids map[string]string, strict bo
 		case <-b.done:
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		}
+		// The file can rotate while validation or bootstrap is in progress.
+		// Never return a client for the content seen before that wait.
+		if _, now, err := readXSession(a.path); err != nil {
+			return nil, errXSession
+		} else if now != stamp {
+			continue
+		}
+		a.mu.Lock()
+		stopped := a.stopped
+		a.mu.Unlock()
+		if stopped {
+			return nil, errXDropped
 		}
 		if b.err != nil {
 			if xSwap(b.kind) && inherited < 2 {
@@ -590,7 +619,12 @@ func (a *xAccount) run(b *xBuild, prior *xWarm, ids map[string]string) {
 			a.logf("x client ready for account %s", a.id)
 		}
 	}
+	identityReport := err == nil && !a.stopped
+	a.syncIdentityDomains()
 	a.mu.Unlock()
+	if identityReport {
+		a.clients.reportIdentity(a.path, warm.identity)
+	}
 	observe := a.clients.observer()
 	if !report || observe == nil {
 		return
@@ -622,15 +656,20 @@ func (a *xAccount) construct(ctx context.Context, prior *xWarm, ids map[string]s
 	}
 	defer con.done.Store(true)
 	hc := &http.Client{Transport: a.board, Timeout: a.timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	client, err := session.NewClient(withXConstruction(ctx, con), x.WithHTTPClient(hc), x.WithRetry(1, time.Millisecond), x.WithQueryIDs(ids), x.WithMinRequestGap(a.clients.gap()))
+	client, err := session.NewClient(withXConstruction(ctx, con), x.WithHTTPClient(hc), x.WithRetry(1, time.Millisecond), x.WithQueryIDs(ids), x.WithMinRequestGap(a.clients.gap()), x.WithIdentityPacing(a.pacingFor))
 	if err != nil {
 		return nil, stamp, con.asked.Load(), err
 	}
+	identity, err := verifiedXClient(ctx, client)
+	if err != nil {
+		return nil, stamp, con.asked.Load(), err
+	}
+	identity.Stamp = stamp
 	replay := con.replay
 	if replay == nil {
 		replay = &con.captured
 	}
-	warm := &xWarm{client: client, stamp: stamp, ids: ids, replay: replay}
+	warm := &xWarm{client: client, identity: identity, stamp: stamp, ids: ids, replay: replay}
 	warm.lastReq.Store(time.Now().UnixNano())
 	return warm, stamp, con.asked.Load(), nil
 }
@@ -731,6 +770,9 @@ func (a *xAccount) close() {
 		close(a.stop)
 	}
 	a.current = nil
+	if a.acquiring == 0 {
+		a.detachIdentityDomains()
+	}
 	a.mu.Unlock()
 }
 
