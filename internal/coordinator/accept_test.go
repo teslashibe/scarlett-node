@@ -329,7 +329,9 @@ func TestAcceptRetryStopsBeforeLeaseDeadline(t *testing.T) {
 	if _, err := client.Accept(context.Background(), offer); err == nil {
 		t.Fatal("busy acceptance authorized work")
 	}
-	if calls.Load() != 1 || time.Since(started) > time.Second {
+	// A retry would first wait out the 15-second Retry-After; five seconds
+	// leaves a slow runner's first TLS request room without hiding one.
+	if calls.Load() != 1 || time.Since(started) > 5*time.Second {
 		t.Fatalf("retried into the last 30 seconds: %d requests in %v", calls.Load(), time.Since(started))
 	}
 	// One-second waits fit twice before the margin, not three times.
@@ -357,14 +359,19 @@ func TestAcceptRetryWaitsRetryAfterAndStopsOnCancel(t *testing.T) {
 		t.Fatalf("retry after %v, %d requests", gap, calls.Load())
 	}
 	client, calls, _ = acceptRetryServer(t, offer, []acceptReply{{503, "1", "dispatch_busy"}})
-	client.retryWait = func(time.Duration) time.Duration { return 10 * time.Second }
 	ctx, cancel := context.WithCancel(context.Background())
-	time.AfterFunc(50*time.Millisecond, cancel)
-	started := time.Now()
+	// Cancel only once the retry wait has begun: a fixed timer from the start
+	// could fire before a slow runner finishes the first TLS request.
+	var waiting time.Time
+	client.retryWait = func(time.Duration) time.Duration {
+		waiting = time.Now()
+		time.AfterFunc(50*time.Millisecond, cancel)
+		return 10 * time.Second
+	}
 	if _, err := client.Accept(ctx, offer); err == nil {
 		t.Fatal("cancelled acceptance authorized work")
 	}
-	if calls.Load() != 1 || time.Since(started) > time.Second {
-		t.Fatalf("cancel did not end the retry wait: %d requests in %v", calls.Load(), time.Since(started))
+	if calls.Load() != 1 || waiting.IsZero() || time.Since(waiting) > time.Second {
+		t.Fatalf("cancel did not end the retry wait: %d requests, waited %v", calls.Load(), time.Since(waiting))
 	}
 }
