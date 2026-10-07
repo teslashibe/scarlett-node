@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -113,6 +114,7 @@ func (p *servicePool) initAccounts() {
 		p.healthError = true
 		return
 	}
+	p.healthWritten = raw
 	for key, h := range p.saved {
 		if !validSavedKey(key) || !validHealth(h.State, h.Error) || len(h.Stamp) > 96 || h.RestUntil.After(time.Now().Add(30*24*time.Hour)) || h.XIdentity != "" && !validCooldownIdentity(h.XIdentity) {
 			p.healthError = true
@@ -157,13 +159,76 @@ func (p *servicePool) saveHealth() {
 		}
 	}
 	if len(p.saved) > 64 {
+		// Removed accounts keep entries so a re-added ID resumes its rest. Past
+		// the file's bound, forget those rather than stop every live account.
+		for key := range p.saved {
+			if p.accounts[key] == nil {
+				delete(p.saved, key)
+			}
+		}
+	}
+	if len(p.saved) > 64 {
 		p.healthError = true
 		return
 	}
-	raw, e := json.Marshal(p.saved)
-	if e != nil || writeLocalFile(p.config.StateDir, "account-health.json", raw) != nil {
-		p.healthError = true
+	p.healthDirty = true
+	p.flushLocalState(time.Now())
+}
+
+// stateWriteRetry spaces attempts to save account state after a failed write.
+const stateWriteRetry = 30 * time.Second
+
+func (p *servicePool) writeStateFile(name string, raw []byte) error {
+	if p.writeState != nil {
+		return p.writeState(p.config.StateDir, name, raw)
 	}
+	return writeLocalFile(p.config.StateDir, name, raw)
+}
+
+// flushLocalState saves account health and X identity cooldowns that changed.
+// Memory stays authoritative for this process. A failed atomic write leaves
+// the previous file intact, which is all a restart could read anyway, so it is
+// retried rather than stopping admission. Caller holds p.mu.
+func (p *servicePool) flushLocalState(now time.Time) {
+	if p.config.StateDir == "" || now.Before(p.stateRetryAt) || !p.healthDirty && !p.xCooldownsDirty {
+		return
+	}
+	var err error
+	if p.healthDirty && !p.healthError {
+		raw, e := json.Marshal(p.saved)
+		if e == nil && !bytes.Equal(raw, p.healthWritten) {
+			e = p.writeStateFile("account-health.json", raw)
+		}
+		if err = e; err == nil {
+			p.healthDirty, p.healthWritten = false, raw
+		}
+	}
+	if err == nil && p.xCooldownsDirty && !p.xIdentityHealthError {
+		raw, e := json.Marshal(p.xCooldowns)
+		if e == nil {
+			e = p.writeStateFile("x-cooldowns.json", raw)
+		}
+		if err = e; err == nil {
+			p.xCooldownsDirty = false
+		}
+	}
+	if err != nil {
+		p.stateWriteFailed(now, err)
+		return
+	}
+	p.stateWriteSaved()
+}
+func (p *servicePool) stateWriteSaved() {
+	if p.stateWriteErr != nil {
+		fmt.Fprintln(os.Stderr, "accounts: account state saved again")
+		p.stateWriteErr = nil
+	}
+}
+func (p *servicePool) stateWriteFailed(now time.Time, err error) {
+	if p.stateWriteErr == nil {
+		fmt.Fprintln(os.Stderr, "accounts: cannot save account state, retrying; current state stays in effect:", err)
+	}
+	p.stateWriteErr, p.stateRetryAt = err, now.Add(stateWriteRetry)
 }
 
 // refreshAccounts returns false only while using the legacy single-account
@@ -175,15 +240,38 @@ func (p *servicePool) refreshAccounts(now time.Time) bool {
 		p.blockAccounts()
 		return true
 	}
+	p.flushLocalState(now)
 	f, e := loadAccounts(p.config.AccountsFile)
 	if os.IsNotExist(e) && !p.accountMode && !p.config.AccountsRequired {
+		if p.accountsError {
+			// The account file went away before its mode marker was saved. Undo
+			// blockAccounts on the shared legacy entries and reread credentials.
+			p.accountsError = false
+			for kind, s := range p.entries {
+				if a := p.accounts[kind+":legacy"]; a != nil {
+					s.capacity = a.spec.Concurrency
+				}
+				if s.state == "unreachable" && s.lastError == "prover_error" {
+					s.stamp = ""
+				}
+			}
+		}
 		return false
 	}
 	if !p.accountMode {
-		if p.config.StateDir != "" && writeLocalFile(p.config.StateDir, "accounts-mode", []byte("managed\n")) != nil {
-			p.healthError = true
-			p.blockAccounts()
-			return true
+		// Stay closed until the marker is durable, so a restart cannot fall back
+		// to the legacy account, but retry it rather than stop until restart.
+		if p.config.StateDir != "" {
+			if now.Before(p.stateRetryAt) {
+				p.blockAccounts()
+				return true
+			}
+			if err := p.writeStateFile("accounts-mode", []byte("managed\n")); err != nil {
+				p.stateWriteFailed(now, err)
+				p.blockAccounts()
+				return true
+			}
+			p.stateWriteSaved()
 		}
 		p.accountMode = true
 		for kind, old := range p.entries {
@@ -335,7 +423,6 @@ func refreshAccount(a *pooledAccount, now time.Time, helperMissing bool) {
 	if a.spec.Service == "codex" {
 		configured = configured && codexAdmissionValid(a.spec.Path, codexAdmissionWindow(now))
 	}
-	wasLocalInvalid := s.localAuthInvalid
 	stampChanged := stamp != s.stamp
 	if s.state == "" || stampChanged {
 		s.stamp = stamp
@@ -345,7 +432,7 @@ func refreshAccount(a *pooledAccount, now time.Time, helperMissing bool) {
 		if s.restUntil.IsZero() || !now.Before(s.restUntil) {
 			s.lastError = ""
 			s.state = "configured"
-		} else if s.state == "auth_required" && wasLocalInvalid {
+		} else if s.state == "auth_required" {
 			s.state, s.lastError = "exhausted", "capacity_unavailable"
 		}
 	}

@@ -85,12 +85,8 @@ func (p *servicePool) recordXCooldown(id string, until time.Time, blocked bool) 
 		return
 	}
 	p.xCooldowns[id] = xIdentityCooldown{Until: until, Blocked: blocked}
-	if p.config.StateDir != "" {
-		raw, err := json.Marshal(p.xCooldowns)
-		if err != nil || writeLocalFile(p.config.StateDir, "x-cooldowns.json", raw) != nil {
-			p.xIdentityHealthError = true
-		}
-	}
+	p.xCooldownsDirty = true
+	p.flushLocalState(now)
 	for _, a := range p.accounts {
 		if a.spec.Service == "x_read" && a.identity.ID == id && blocked {
 			a.entry.xRestIdentity = id
