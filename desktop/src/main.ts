@@ -16,6 +16,7 @@ import {
   statusText,
   externalRuntime,
   drainingAccounts,
+  journalNote,
   needsXReimport,
   relayState,
   statusPredates,
@@ -142,7 +143,7 @@ function render(s: Snapshot) {
         ? "The proof helper is missing. New work is disabled"
         : local?.running
           ? "Quit and reopen Scarlett before starting X network jobs"
-          : "Serve X network jobs with the accounts connected to this device";
+          : journalNote(s) || "Serve X network jobs with the accounts connected to this device";
   $("start").toggleAttribute("disabled", busy || !canStart(s));
   const controllable = s.supervised || externalRuntime(s);
   const paused = s.observation?.drain_requested;

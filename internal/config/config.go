@@ -104,21 +104,24 @@ func Load() (Config, error) {
 	default:
 		return c, errors.New("invalid SCARLETT_DIAGNOSTICS")
 	}
-	for name, destination := range map[string]*int{"SCARLETT_JOURNAL_MAX_RECORDS": &c.JournalLimits.MaxRecords, "SCARLETT_JOURNAL_MAX_RECORD_BYTES": &c.JournalLimits.MaxRecordBytes} {
+	// An explicit zero is refused: zero terminal limits mean the defaults.
+	for name, destination := range map[string]*int{"SCARLETT_JOURNAL_MAX_RECORDS": &c.JournalLimits.MaxRecords, "SCARLETT_JOURNAL_MAX_RECORD_BYTES": &c.JournalLimits.MaxRecordBytes, "SCARLETT_JOURNAL_MAX_TERMINAL_RECORDS": &c.JournalLimits.MaxTerminalRecords} {
 		if raw := os.Getenv(name); raw != "" {
 			value, err := strconv.Atoi(raw)
-			if err != nil {
+			if err != nil || value < 1 {
 				return c, errors.New("invalid " + name)
 			}
 			*destination = value
 		}
 	}
-	if raw := os.Getenv("SCARLETT_JOURNAL_MAX_TOTAL_BYTES"); raw != "" {
-		value, err := strconv.ParseInt(raw, 10, 64)
-		if err != nil {
-			return c, errors.New("invalid SCARLETT_JOURNAL_MAX_TOTAL_BYTES")
+	for name, destination := range map[string]*int64{"SCARLETT_JOURNAL_MAX_TOTAL_BYTES": &c.JournalLimits.MaxTotalBytes, "SCARLETT_JOURNAL_MAX_TERMINAL_BYTES": &c.JournalLimits.MaxTerminalBytes} {
+		if raw := os.Getenv(name); raw != "" {
+			value, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || value < 1 {
+				return c, errors.New("invalid " + name)
+			}
+			*destination = value
 		}
-		c.JournalLimits.MaxTotalBytes = value
 	}
 	if err := c.JournalLimits.Validate(); err != nil {
 		return c, err
