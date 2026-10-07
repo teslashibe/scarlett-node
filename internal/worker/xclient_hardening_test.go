@@ -642,9 +642,10 @@ func TestXExhaustedWindowHoldsUntilItsReset(t *testing.T) {
 		t.Fatal(code)
 	}
 	time.Sleep(2 * time.Second) // more than half the window
-	short := c
-	short.InferenceTimeout = 300 * time.Millisecond
-	if code := xRun(short, l, clients, fake, exhausted); code != "x_rate_limited" || proofs.Load() != 1 {
+	short := l
+	short.LeaseDeadline = time.Now().Add(xReportMargin + 300*time.Millisecond)
+	short.SettlementDeadline = short.LeaseDeadline
+	if code := xRun(c, short, clients, fake, exhausted); code != "x_rate_limited" || proofs.Load() != 1 {
 		t.Fatal("job late in an exhausted window returned", code, proofs.Load())
 	}
 	if wait := time.Duration(cooled.Load()); wait <= 300*time.Millisecond || wait > time.Second+100*time.Millisecond {
@@ -681,8 +682,10 @@ func TestXExhaustedQuotaMidSearchKeepsTheClient(t *testing.T) {
 		response.Header.Set("X-Rate-Limit-Reset", "600")
 		return response, nil
 	})
-	c.InferenceTimeout = 500 * time.Millisecond
-	if code := xRun(c, l, clients, fake, proof); code != "x_rate_limited" || proofs.Load() != 1 {
+	short := l
+	short.LeaseDeadline = time.Now().Add(xReportMargin + 500*time.Millisecond)
+	short.SettlementDeadline = short.LeaseDeadline
+	if code := xRun(c, short, clients, fake, proof); code != "x_rate_limited" || proofs.Load() != 1 {
 		t.Fatal("search held back by an exhausted quota returned", code, proofs.Load())
 	}
 	if wait := time.Duration(cooled.Load()); wait < 9*time.Minute || wait > 10*time.Minute {

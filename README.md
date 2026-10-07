@@ -232,7 +232,7 @@ Settings come from the environment, typically via `~/.config/scarlett-node/node.
 | `SCARLETT_X_REFRESH_SECONDS` | How often each warm X client refreshes its transaction-ID material and re-checks its session with X in the background (default 1800) |
 | `SCARLETT_STATE_DIR` | Private directory for identity, journal and account health |
 | `SCARLETT_BID` | Standing assignment bid; lower wins |
-| `SCARLETT_INFERENCE_TIMEOUT_SECONDS` | Per-job provider deadline |
+| `SCARLETT_INFERENCE_TIMEOUT_SECONDS` | Per-job Codex/gateway deadline, and the bound on one X request or client build; an x_read job runs to its lease deadline less 15 s |
 | `SCARLETT_MAX_INPUT_BYTES` | Largest prompt or serialized X request the node accepts |
 | `SCARLETT_MAX_OUTPUT_TOKENS` | Largest Codex completion the node accepts |
 | `SCARLETT_JOURNAL_MAX_RECORDS` | Ceiling on unfinished journal attempts; a full journal refuses new work. Finished receipts do not count |

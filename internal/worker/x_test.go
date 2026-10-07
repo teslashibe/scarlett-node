@@ -537,3 +537,37 @@ func TestTypedXQuotaCarriesOnlyCooldownIntoLocalScheduler(t *testing.T) {
 		t.Fatal("raw error drove account scheduler")
 	}
 }
+
+// A paced multi-page search is bounded by its lease, less the report margin,
+// not by the provider timeout Codex uses: pages that fit in the lease are all
+// read, and a lease that cannot leave the margin spends no X quota.
+func TestXSearchRunsToItsLeaseNotTheInferenceTimeout(t *testing.T) {
+	c, l, plan := xFixture(t, coordinator.XRequest{Operation: "search", Query: "bitcoin", Count: 20, Pages: 3})
+	c.InferenceTimeout = 300 * time.Millisecond
+	var proofs atomic.Int32
+	proof := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		n := proofs.Add(1)
+		time.Sleep(200 * time.Millisecond) // three pages outlast InferenceTimeout; each one fits
+		body := `{"data":{"search_by_raw_query":{"search_timeline":{"timeline":{"instructions":[{"type":"TimelineAddEntries","entries":[{"entryId":"cursor-bottom-1","content":{"entryType":"TimelineTimelineCursor","cursorType":"Bottom","value":"cursor-` + string(rune('0'+n)) + `"}}]}]}}}}}`
+		return xResponse(r, 200, body), nil
+	})
+	clients := NewXClients()
+	clients.log = io.Discard
+	clients.minGap = 5 * time.Millisecond // x-go's 1 s gap would outlast the short build timeout
+	t.Cleanup(clients.Stop)
+	c.LocalAccountID = "fixture-account"
+	run := X{Config: c, Base: &xFakeX{}, Proof: proof, Clients: clients}
+	if code := run.Run(context.Background(), l); code != "" || int(proofs.Load()) != len(plan.Exchanges) {
+		t.Fatal("paced search inside its lease returned", code, proofs.Load())
+	}
+	late := l
+	late.LeaseDeadline = time.Now().Add(xReportMargin - time.Second)
+	late.SettlementDeadline = late.LeaseDeadline
+	if code := run.Run(context.Background(), late); code != "expired" || int(proofs.Load()) != len(plan.Exchanges) {
+		t.Fatal("lease without room for its report returned", code, proofs.Load())
+	}
+	_, deadline, code := validateXLease(c, l)
+	if want := l.LeaseDeadline.Add(-xReportMargin); code != "" || !deadline.Equal(want) {
+		t.Fatal("x_read deadline", deadline, code, "want", want)
+	}
+}

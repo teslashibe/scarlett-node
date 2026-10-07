@@ -442,11 +442,25 @@ func validateXLease(c config.Config, l coordinator.Lease) (xPlan, time.Time, str
 	if l.SettlementDeadline.Before(deadline) {
 		deadline = l.SettlementDeadline
 	}
-	if c.InferenceTimeout < time.Until(deadline) {
-		deadline = now.Add(c.InferenceTimeout)
+	// An x_read job is paced by X's quota, not bounded by a provider
+	// response time: it may use the whole lease except the time its proven
+	// report and the coordinator's verifier read need to land before the
+	// deadline. Work that cannot leave that margin spends no X quota.
+	deadline = deadline.Add(-xReportMargin)
+	if !deadline.After(now) {
+		return plan, time.Time{}, "expired"
 	}
 	return plan, deadline, ""
 }
+
+// xReportMargin is the part of an x_read lease kept for after the last page:
+// the journal writes, the proven report, the coordinator's inline verifier
+// read and, when that read is busy, one tick of its ten-second proof
+// reconciler. It also covers clock skew: ValidOffer refuses an offer whose
+// deadline is more than MaxOfferLifetime plus OfferClockSkew (5 s) past the
+// node's clock, so a node that accepted work lags the coordinator by at most
+// that much.
+const xReportMargin = 15 * time.Second
 
 // Run serves one x_read lease on the account's warm client (see XClients).
 // The lease is validated first, and acquire checks the session file before

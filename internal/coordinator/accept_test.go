@@ -137,7 +137,7 @@ func TestUnboundedOrPrefilledCommunityOfferDoesNotCallCoordinator(t *testing.T) 
 	client := New(server.URL, "synthetic")
 	client.HTTP = server.Client()
 	for _, edit := range []func(*Lease){func(l *Lease) { l.AcceptanceRequired = false }, func(l *Lease) { l.VerifierToken = strings.Repeat("c", 64) }, func(l *Lease) { l.RequestSHA256 = "invalid" }, func(l *Lease) {
-		l.LeaseDeadline = time.Now().Add(121 * time.Second)
+		l.LeaseDeadline = time.Now().Add(MaxOfferLifetime + OfferClockSkew + time.Second)
 		l.SettlementDeadline = l.LeaseDeadline
 	}, func(l *Lease) { l.SettlementDeadline = l.LeaseDeadline.Add(time.Second) }} {
 		changed := offer
@@ -373,5 +373,23 @@ func TestAcceptRetryWaitsRetryAfterAndStopsOnCancel(t *testing.T) {
 	}
 	if calls.Load() != 1 || waiting.IsZero() || time.Since(waiting) > time.Second {
 		t.Fatalf("cancel did not end the retry wait: %d requests, waited %v", calls.Load(), time.Since(waiting))
+	}
+}
+
+// The coordinator stamps a deadline up to MaxOfferLifetime ahead of its own
+// clock and delivers it within milliseconds. A node whose clock runs slightly
+// behind must still accept it; only a deadline beyond the skew margin is unsafe.
+func TestValidOfferToleratesSlowLocalClock(t *testing.T) {
+	now := time.Now()
+	offer := Lease{Version: Version, ServiceType: "x_read", JobID: "synthetic", Attempt: "attempt", Fence: "fence", AcceptanceRequired: true, SignedJobID: strings.Repeat("a", 64), RequestSHA256: strings.Repeat("b", 64)}
+	for _, tc := range []struct {
+		ahead time.Duration
+		ok    bool
+	}{{MaxOfferLifetime, true}, {MaxOfferLifetime + 900*time.Millisecond, true}, {MaxOfferLifetime + OfferClockSkew, true}, {MaxOfferLifetime + OfferClockSkew + time.Second, false}, {0, false}, {-time.Second, false}} {
+		offer.LeaseDeadline = now.Add(tc.ahead)
+		offer.SettlementDeadline = offer.LeaseDeadline
+		if err := ValidOffer(offer, now); (err == nil) != tc.ok {
+			t.Fatalf("deadline %v ahead: err %v, want ok=%v", tc.ahead, err, tc.ok)
+		}
 	}
 }

@@ -51,6 +51,17 @@ func acceptRetryAfter(err error) (time.Duration, bool) {
 	return max(status.RetryAfter, MinRetryAfter), true
 }
 
+// OfferClockSkew is how far this node's clock may run behind the
+// coordinator's before a fresh offer looks longer than MaxOfferLifetime. The
+// coordinator stamps deadlines up to MaxOfferLifetime ahead of its own clock
+// and delivers them within milliseconds, so without a margin a node even a
+// fraction of a second slow refuses most fresh offers (nodes lag by 0.4-0.8 s
+// in production). It loosens only this upper bound: expiry still uses the
+// local clock, and Codex admission checks the offer's own deadline with its
+// own margin. It stays well inside the x_read report margin, so a node this
+// far behind still reports before the coordinator's deadline.
+const OfferClockSkew = 5 * time.Second
+
 func digest(value string) bool {
 	raw, err := hex.DecodeString(value)
 	return err == nil && len(raw) == 32 && hex.EncodeToString(raw) == value
@@ -59,7 +70,7 @@ func digest(value string) bool {
 // ValidOffer applies Accept's local checks to the unchanged offered terms. A
 // failure here means acceptance HTTP is never sent for the offer.
 func ValidOffer(offer Lease, now time.Time) error {
-	if !offer.AcceptanceRequired || offer.Version != Version || offer.VerifierToken != "" || !digest(offer.RequestSHA256) || !digest(offer.SignedJobID) || (offer.ServiceType != "codex" && offer.ServiceType != "x_read") || !offer.LeaseDeadline.After(now) || offer.LeaseDeadline.After(now.Add(MaxOfferLifetime)) || !offer.SettlementDeadline.Equal(offer.LeaseDeadline) {
+	if !offer.AcceptanceRequired || offer.Version != Version || offer.VerifierToken != "" || !digest(offer.RequestSHA256) || !digest(offer.SignedJobID) || (offer.ServiceType != "codex" && offer.ServiceType != "x_read") || !offer.LeaseDeadline.After(now) || offer.LeaseDeadline.After(now.Add(MaxOfferLifetime+OfferClockSkew)) || !offer.SettlementDeadline.Equal(offer.LeaseDeadline) {
 		return errors.New("invalid community offer")
 	}
 	return nil
