@@ -89,7 +89,7 @@ func (p xPlan) relay(c config.Config) (relay, ok bool) {
 		// The operator must have opted in: this mode changes who could read
 		// the session cookie, so a coordinator cannot select it alone. A node
 		// that has caught its verifier misusing the session serves no more
-		// relay until an operator restarts it.
+		// relay until an operator resumes it.
 		return true, c.XRelay && !RelayHalted()
 	}
 	return false, false
@@ -104,7 +104,7 @@ const relayMisuseMarker = "verifier misused this node's X session"
 // per-account one: every account routes through the single operator-run
 // verifier, so a misuse implicates the verifier, not the account. The node
 // keeps serving MPC-TLS and offers no more keyed relay until an operator
-// restarts it and investigates — deliberately sticky, because this is a trust
+// investigates and resumes it — deliberately sticky, because this is a trust
 // break the operator should see, not a transient error to retry past.
 var relayHalt struct {
 	sync.Mutex
@@ -114,7 +114,8 @@ var relayHalt struct {
 	// file, when set, makes the halt durable: it is written on halt and read
 	// at startup, so a restart (the desktop app restarts the node on its own)
 	// cannot quietly re-arm relay. `scarlett-node relay-resume` removes it.
-	file string
+	file     string
+	recorded bool // Absence is a resume only after this halt was saved successfully.
 }
 
 // RelayHaltFile is the marker's name inside the node's state directory.
@@ -135,6 +136,7 @@ func LoadRelayHalt(dir string) error {
 		return err
 	}
 	relayHalt.halted = true
+	relayHalt.recorded = true
 	relayHalt.reason = strings.TrimSpace(string(raw))
 	fmt.Fprintf(os.Stderr, "keyed relay stays halted from an earlier run (%s); run `scarlett-node relay-resume` once the verifier has been checked\n", relayHalt.reason)
 	return nil
@@ -144,26 +146,52 @@ func LoadRelayHalt(dir string) error {
 // prints one alert line. Safe to call repeatedly; only the first halts and alerts.
 func HaltRelay(reason string) {
 	relayHalt.Lock()
+	defer relayHalt.Unlock()
+	// A new failure after the operator removed the earlier marker must publish
+	// a new halt, even if no heartbeat has observed that resume yet.
+	refreshRelayHaltLocked()
 	first := !relayHalt.halted
 	relayHalt.halted, relayHalt.reason, relayHalt.at = true, reason, time.Now()
 	file := relayHalt.file
-	relayHalt.Unlock()
 	if !first {
 		return
 	}
+	relayHalt.recorded = false
 	fmt.Fprintf(os.Stderr, "ALERT keyed relay halted: %s — this node serves no more relay jobs until `scarlett-node relay-resume`; investigate the verifier first\n", reason)
 	if file != "" {
 		// Best effort: the in-memory halt holds for this run regardless.
 		if err := localfs.WriteAtomic(file, []byte(reason+"\n"), true); err != nil {
 			fmt.Fprintln(os.Stderr, "keyed relay halt could not be recorded:", err)
+		} else {
+			relayHalt.recorded = true
 		}
 	}
+}
+
+// refreshRelayHaltLocked observes the operator's relay-resume command without
+// restarting the node. Holding the latch lock through publication and this
+// check prevents a reader seeing the gap before a new marker is written.
+// A failed write, an unreadable marker or a missing state directory keeps the
+// halt: none proves that the operator removed a saved marker.
+func refreshRelayHaltLocked() {
+	if !relayHalt.halted || !relayHalt.recorded || relayHalt.file == "" {
+		return
+	}
+	if _, err := os.Lstat(relayHalt.file); !os.IsNotExist(err) {
+		return
+	}
+	if localfs.CheckDir(filepath.Dir(relayHalt.file)) != nil {
+		return
+	}
+	relayHalt.halted, relayHalt.reason, relayHalt.at, relayHalt.recorded = false, "", time.Time{}, false
+	fmt.Fprintln(os.Stderr, "keyed relay resumed by the operator")
 }
 
 // RelayHaltReason is the recorded reason, or empty when relay is not halted.
 func RelayHaltReason() string {
 	relayHalt.Lock()
 	defer relayHalt.Unlock()
+	refreshRelayHaltLocked()
 	if !relayHalt.halted {
 		return ""
 	}
@@ -175,6 +203,7 @@ func RelayHaltReason() string {
 func RelayHalted() bool {
 	relayHalt.Lock()
 	defer relayHalt.Unlock()
+	refreshRelayHaltLocked()
 	return relayHalt.halted
 }
 
@@ -183,6 +212,7 @@ func RelayHalted() bool {
 func ResetRelayHaltForTests() {
 	relayHalt.Lock()
 	relayHalt.halted, relayHalt.reason, relayHalt.at, relayHalt.file = false, "", time.Time{}, ""
+	relayHalt.recorded = false
 	relayHalt.Unlock()
 }
 

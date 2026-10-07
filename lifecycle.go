@@ -77,8 +77,9 @@ func localCommand(command string, output io.Writer) error {
 			return err
 		}
 	case "relay-resume":
-		// The operator has checked the verifier. A running node picks this
-		// up at its next restart; the status below says whether one is running.
+		// The operator has checked the verifier. A running node observes the
+		// removed marker on its next admission or service-health check; the
+		// returned status may still predate that observation.
 		if err := os.Remove(filepath.Join(dir, worker.RelayHaltFile)); err != nil && !os.IsNotExist(err) {
 			return err
 		}

@@ -444,6 +444,88 @@ func TestCaughtVerifierMisuseHaltsRelayNodeWide(t *testing.T) {
 	}
 }
 
+func TestRelayResumeClearsLiveAdmissionAndNewFailureRelatches(t *testing.T) {
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	dir := filepath.Join(t.TempDir(), "state")
+	if err := localfs.EnsureDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := LoadRelayHalt(dir); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, RelayHaltFile)
+	c := config.Config{XRelay: true}
+	offer := json.RawMessage(`{"proof_mode":"relay","proof_policy":"x-relay-v1"}`)
+	HaltRelay("first synthetic failure")
+	if XOfferServable(c, offer) {
+		t.Fatal("relay admission stayed open after a halt")
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	if !XOfferServable(c, offer) || RelayHaltReason() != "" {
+		t.Fatal("operator removal did not clear live relay admission")
+	}
+	HaltRelay("second synthetic failure")
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	// Another failure wins over an earlier resume, including before any
+	// admission/status getter has observed that resume.
+	HaltRelay("third synthetic failure")
+	if !RelayHalted() || XOfferServable(c, offer) {
+		t.Fatal("an earlier resume cleared a new failure")
+	}
+	raw, err := os.ReadFile(marker)
+	if err != nil || string(raw) != "third synthetic failure\n" {
+		t.Fatalf("new halt was not saved: %q, %v", raw, err)
+	}
+}
+
+func TestRelayHaltRefreshFailsClosed(t *testing.T) {
+	for _, failure := range []string{"write failed", "marker replaced", "state missing"} {
+		t.Run(failure, func(t *testing.T) {
+			ResetRelayHaltForTests()
+			t.Cleanup(ResetRelayHaltForTests)
+			dir := filepath.Join(t.TempDir(), "state")
+			if err := localfs.EnsureDir(dir); err != nil {
+				t.Fatal(err)
+			}
+			if err := LoadRelayHalt(dir); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(dir, RelayHaltFile)
+			if failure == "write failed" {
+				if err := os.Mkdir(marker, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			HaltRelay("synthetic failure")
+			switch failure {
+			case "write failed":
+				if err := os.Remove(marker); err != nil {
+					t.Fatal(err)
+				}
+			case "marker replaced":
+				if err := os.Remove(marker); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(marker, 0700); err != nil {
+					t.Fatal(err)
+				}
+			case "state missing":
+				if err := os.Rename(dir, dir+"-moved"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !RelayHalted() || RelayHaltReason() != "synthetic failure" {
+				t.Fatal("filesystem failure cleared the live relay halt")
+			}
+		})
+	}
+}
+
 func TestTypedXQuotaCarriesOnlyCooldownIntoLocalScheduler(t *testing.T) {
 	observed := time.Duration(0)
 	w := X{Config: config.Config{AccountCooldown: func(wait time.Duration) { observed = wait }}}

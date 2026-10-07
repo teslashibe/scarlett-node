@@ -180,7 +180,9 @@ When X expires or revokes a session, the account shows **X session expired or re
 
 ## Keyed relay halt
 
-When the node catches its verifier misusing an X session it stops serving keyed relay and keeps serving MPC-TLS. The app shows a red **Keyed relay is paused on this node** banner. **Resume relay** asks for confirmation, then runs only the bundled node's `relay-resume`, which removes the saved `relay-halt` marker. It never drains, stops or restarts the supervised node, so warm X clients and accepted work continue. A running node keeps relay paused until it picks the change up; until its status stops reporting `relay_halted`, the banner says the resume is saved. The node section shows what the running node advertises for X: **MPC + relay** or **MPC only**.
+When the node cannot verify a relay request it stops serving keyed relay and keeps serving MPC-TLS. This includes a request mismatch or a connection ending before the verifier opens the request record; the pause alone does not establish misuse. The app shows a red **Keyed relay is paused on this node** banner. **Resume relay** asks for confirmation, then runs only the bundled node's `relay-resume`, which removes the saved `relay-halt` marker. The running node observes that removal during its next admission or service-health check and advertises relay again. It never drains, stops or restarts the supervised node, so warm X clients and accepted work continue. Until its status stops reporting `relay_halted`, the banner says the resume is saved. Filesystem errors or a halt that could not be saved keep relay paused. The node section shows what the running node advertises for X: **MPC + relay** or **MPC only**.
+
+In desktop releases through 0.1.7, removing the marker does not clear the running node's memory latch. After the operator checks the verifier, use **Stop**, **Resume relay**, **Start node**, then **Resume** to clear that existing halt and restore normal admission. Stop lets accepted work finish; saved accounts and credentials remain on the device.
 
 ## Device preferences
 
