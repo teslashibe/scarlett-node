@@ -4,7 +4,7 @@ import { layout, revealControl } from "./layout.ts";
 import { api } from "./api.ts";
 import { scheduleXLoginExpiry } from "./x-login-expiry.ts";
 import { accountRemovalConfirmation } from "./account-removal.ts";
-import { availableXSlots, diagnosticsNote, localCapacity, renderDiagnostics, type Diagnostics } from "./diagnostics.ts";
+import { availableXSlots, diagnosticsNote, localCapacity, renderDiagnostics, xDiagnostics, type Diagnostics } from "./diagnostics.ts";
 import {
   accountHealth,
   accountTitle,
@@ -84,14 +84,15 @@ document.addEventListener("keydown", (event) => {
   }
 }, true);
 function render(s: Snapshot) {
-  const previous = snapshot;
   snapshot = s;
+  const accounts = s.accounts.filter((a) => a.service === "x_read");
+  const draining = drainingAccounts(s).filter((a) => a.service === "x_read");
   setText($("diagnostics-capacity"), localCapacity(s));
-  setText($("metric-accounts"), s.accounts_available ? String(s.accounts.length) : "Unknown");
+  setText($("metric-accounts"), s.accounts_available ? String(accounts.length) : "Unknown");
   setText($("metric-capacity"), String(availableXSlots(s) ?? "Unknown"));
   setText($("metric-jobs"), String(s.observation?.in_flight ?? "Unknown"));
   setText($("metric-pending"), String(s.observation?.unresolved_attempts ?? "Unknown"));
-  $("accounts-empty").hidden = s.accounts.length > 0 || drainingAccounts(s).length > 0;
+  $("accounts-empty").hidden = accounts.length > 0 || draining.length > 0;
   $("x-profile").toggleAttribute("disabled", busy || !browserProfilesAvailable);
   $("x-consent").toggleAttribute("disabled", busy || !browserProfilesAvailable);
   $("x-import").toggleAttribute("disabled", busy || !s.accounts_available || !browserProfilesAvailable || !$<HTMLSelectElement>("x-profile").value || !$<HTMLInputElement>("x-consent").checked);
@@ -139,7 +140,9 @@ function render(s: Snapshot) {
       ? "Account management needs the newer native node release"
       : !s.helper_available
         ? "The proof helper is missing. New work is disabled"
-        : "Serve network jobs with the accounts connected to this device";
+        : local?.running
+          ? "Quit and reopen Scarlett before starting X network jobs"
+          : "Serve X network jobs with the accounts connected to this device";
   $("start").toggleAttribute("disabled", busy || !canStart(s));
   const controllable = s.supervised || externalRuntime(s);
   const paused = s.observation?.drain_requested;
@@ -155,7 +158,6 @@ function render(s: Snapshot) {
   $("stop").toggleAttribute("disabled", busy || !s.supervised);
   $("pair-form").hidden = s.paired;
   $("pair-section").hidden = s.paired;
-  if (s.login_pending && !previous?.login_pending) revealControl($("codex-form"));
   $("pair-form")
     .querySelector("button")!
     .toggleAttribute("disabled", busy || !s.runtime_available);
@@ -169,7 +171,7 @@ function render(s: Snapshot) {
   // Rows are rebuilt off-screen and swapped in only when they changed, so the
   // 3 s poll does not drop keyboard focus or a click that is in progress.
   const rows = document.createElement("div");
-  for (const a of s.accounts) {
+  for (const a of accounts) {
     const row = document.createElement("div");
     row.className = "account-row";
     row.dataset.account = `${a.service}:${a.id}:${a.concurrency}`;
@@ -224,7 +226,7 @@ function render(s: Snapshot) {
     row.append(mark, text, actions);
     rows.append(row);
   }
-  for (const health of drainingAccounts(s)) {
+  for (const health of draining) {
     const row = document.createElement("div");
     row.className = "account-row";
     const text = document.createElement("p");
@@ -235,7 +237,7 @@ function render(s: Snapshot) {
   if (rows.innerHTML !== $("accounts").innerHTML)
     $("accounts").replaceChildren(...rows.childNodes);
   $("account-note").textContent = s.accounts_available
-    ? `${s.accounts.length} local ${s.accounts.length === 1 ? "account" : "accounts"}`
+    ? `${accounts.length} local X ${accounts.length === 1 ? "account" : "accounts"}`
     : "Unavailable in this node build";
   $("codex-form")
     .querySelector("button[type=submit]")!
@@ -247,7 +249,8 @@ function render(s: Snapshot) {
   $("codex-note").textContent = codexNote(s);
 }
 async function refresh(afterMutation = false) {
-  void refreshClaude();
+  // Model connection controls are hidden in the X-only desktop UI.
+  if (!$("local-api-panel").closest<HTMLElement>("section")!.hidden) void refreshClaude();
   void refreshDiagnostics();
   if (polling) {
     if (!afterMutation) return;
@@ -288,7 +291,7 @@ async function refreshClaude() {
 async function refreshDiagnostics() {
   if (diagnosticsPolling) return;
   diagnosticsPolling = true;
-  try { diagnostics = await api.diagnostics(); }
+  try { diagnostics = xDiagnostics(await api.diagnostics()); }
   catch { diagnostics = { available: false }; }
   finally { diagnosticsPolling = false; }
   setText($("diagnostics-note"), diagnosticsNote(diagnostics));

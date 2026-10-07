@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { diagnosticsNote, duration, groupTitle, localCapacity, outcomeCounts, phase, recentAttempts, summaryCells, timelineAxes, type Diagnostics, type DiagnosticsRecord } from "../src/diagnostics.ts";
+import { diagnosticsNote, duration, groupTitle, localCapacity, outcomeCounts, phase, recentAttempts, summaryCells, timelineAxes, xDiagnostics, type Diagnostics, type DiagnosticsRecord } from "../src/diagnostics.ts";
 import type { AccountHealth, Snapshot } from "../src/model.ts";
 
 const record: DiagnosticsRecord = {
@@ -13,6 +13,19 @@ const record: DiagnosticsRecord = {
     {phase:"helper_total",source:"helper",exchange:2,start_ms:0,duration_ms:800,outcome:"success"},
   ],
 };
+test("X-only display excludes model history without modifying retained measurements", () => {
+  const value: Diagnostics = {available: true, snapshot: {version: 1,
+    load_error: "partial", attempts: [record, {...record, operation: "codex"}],
+    summaries: [{...record, samples: 1, newest_at: record.started_at}, {...record, operation: "codex", samples: 1, newest_at: record.started_at}],
+  }};
+  const before = structuredClone(value);
+  const visible = xDiagnostics(value);
+  assert.deepEqual(visible.snapshot?.attempts, [record]);
+  assert.equal(visible.snapshot?.summaries.length, 1);
+  assert.equal(visible.snapshot?.load_error, "partial");
+  assert.deepEqual(value, before);
+  assert.deepEqual(xDiagnostics({available: false}), {available: false});
+});
 test("Go-emitted pacing history keeps readable timelines across legacy and new attempts", () => {
   const snapshot = JSON.parse(readFileSync(new URL("./fixtures/pacing-diagnostics-v1.json", import.meta.url), "utf8")) as NonNullable<Diagnostics["snapshot"]>;
   assert.equal(snapshot.attempts.length, 31);
@@ -67,6 +80,8 @@ test("Current capacity does not count duplicate names as independent X accounts 
   assert.match(localCapacity(base), /Unknown verified X accounts · Unknown available X slots · Unknown jobs/);
   const s:Snapshot={...base,accounts:[{id:"one",service:"x_read",concurrency:1},{id:"two",service:"x_read",concurrency:1}],observation:{state:"running",in_flight:1,services:[{kind:"x_read",state:"ready",capacity:1,in_flight:1}],accounts:[{id:"one",service:"x_read",state:"ready",username:"same_user"},{id:"two",service:"x_read",state:"duplicate_account",username:"same_user"},{id:"old",service:"x_read",state:"draining",username:"removed_user"}]}};
   assert.match(localCapacity(s), /2 saved accounts · 1 verified X account · 0 available X slots · 1 job in flight/);
+  s.accounts.push({id: "model", service: "codex", concurrency: 1});
+  assert.match(localCapacity(s), /^2 saved accounts ·/);
 });
 test("Verified X account counts stay unknown when a countable account has no handle", async (t) => {
   const named: AccountHealth = {id: "named", service: "x_read", state: "ready", username: "same_user"};
