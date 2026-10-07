@@ -91,7 +91,8 @@ def read_json(path, limit=1048576):
 
 
 def app_versions():
-    """The desktop version recorded in tauri.conf.json, package.json, Cargo.toml and both lockfiles."""
+    """The desktop version recorded in tauri.conf.json, package.json, Cargo.toml, both lockfiles and the
+    node's NodeRelease, which it reports to the coordinator."""
     tauri = json.loads((REPOSITORY / 'desktop/src-tauri/tauri.conf.json').read_text())['version']
     package = json.loads((REPOSITORY / 'desktop/package.json').read_text())['version']
     lock = json.loads((REPOSITORY / 'desktop/package-lock.json').read_text())
@@ -99,8 +100,10 @@ def app_versions():
                       (REPOSITORY / 'desktop/src-tauri/Cargo.toml').read_text(), re.MULTILINE)
     locked = re.search(r'^name = "scarlett-node-desktop"\nversion = "([^"]+)"$',
                        (REPOSITORY / 'desktop/src-tauri/Cargo.lock').read_text(), re.MULTILINE)
+    node = re.search(r'^const NodeRelease = "([^"]+)"$',
+                     (REPOSITORY / 'internal/coordinator/release.go').read_text(), re.MULTILINE)
     return {tauri, package, lock.get('version'), lock.get('packages', {}).get('', {}).get('version'),
-            cargo.group(1) if cargo else None, locked.group(1) if locked else None}
+            cargo.group(1) if cargo else None, locked.group(1) if locked else None, node.group(1) if node else None}
 
 
 def check_version(version):

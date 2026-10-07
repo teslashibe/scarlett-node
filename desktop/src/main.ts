@@ -17,6 +17,7 @@ import {
   externalRuntime,
   drainingAccounts,
   journalNote,
+  updateNotice,
   needsXReimport,
   relayState,
   statusPredates,
@@ -128,6 +129,7 @@ function render(s: Snapshot) {
       : "Resume saved. Waiting for the node to confirm relay is available again.",
   );
   $("relay-resume").hidden = relay !== "halted";
+  renderUpdate(s);
   $("relay-resume").toggleAttribute("disabled", busy);
   const proofs = xProofModes(s);
   $("x-proofs").hidden = !proofs;
@@ -314,6 +316,26 @@ async function act(fn: () => Promise<void>, success: string) {
     await refresh(true);
   }
 }
+// "Later" hides an available update until a newer one appears. A required
+// update cannot be dismissed: the node gets no new jobs until it is installed.
+let dismissedUpdate = "";
+function renderUpdate(s: Snapshot) {
+  const update = updateNotice(s);
+  const toast = $("update-toast");
+  toast.hidden = !update || (update.level === "available" && dismissedUpdate === update.latest);
+  if (!update) return;
+  setText($("update-text"), update.text);
+  toast.className = update.level === "required" ? "update-toast danger" : "update-toast";
+  toast.setAttribute("role", update.level === "required" ? "alert" : "status");
+  $("update-dismiss").hidden = update.level === "required";
+}
+$("update-download").addEventListener("click", () => {
+  void act(() => api.open("update"), "Opened the download page in your browser");
+});
+$("update-dismiss").addEventListener("click", () => {
+  dismissedUpdate = snapshot ? (updateNotice(snapshot)?.latest ?? "") : "";
+  $("update-toast").hidden = true;
+});
 for (const id of ["setup", "dashboard", "settings"] as const)
   $(id).addEventListener("click", () => {
     void act(() => api.open(id), "Opened in your browser");

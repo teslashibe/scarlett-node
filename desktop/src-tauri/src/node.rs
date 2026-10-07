@@ -564,6 +564,10 @@ fn observation_projection(raw: &[u8]) -> Result<Value> {
         "drain_requested",
         "relay_halted",
         "journal_full",
+        "release",
+        "latest_release",
+        "update_available",
+        "update_required",
     ] {
         if let Some(value) = source.get(key)
             && (value.is_string() || value.is_boolean() || value.is_number())
@@ -720,6 +724,7 @@ impl Node {
             "setup" => "/setup/",
             "dashboard" => "/dashboard/",
             "settings" => "/settings/",
+            "update" => "/setup/install/#desktop-heading",
             _ => return Err(Error::InvalidInput),
         };
         Ok(format!("{}{path}", self.endpoints.coordinator))
@@ -1948,6 +1953,11 @@ esac
         let status = observation_projection(br#"{"state":"running","journal_full":true,"journal_capacity":{"records":1024,"available_records":0}}"#).unwrap();
         assert_eq!(status["journal_full"], json!(true));
         assert!(status.get("journal_capacity").is_none());
+        // The coordinator's release notice reaches the update toast.
+        let status = observation_projection(br#"{"state":"running","release":"0.1.10","latest_release":"0.1.11","update_available":true,"update_required":false}"#).unwrap();
+        assert_eq!(status["latest_release"], json!("0.1.11"));
+        assert_eq!(status["update_available"], json!(true));
+        assert_eq!(status["update_required"], json!(false));
     }
     #[test]
     fn account_identity_projection_keeps_only_a_bounded_verified_handle() {

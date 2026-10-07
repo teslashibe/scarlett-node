@@ -347,6 +347,8 @@ type Client struct {
 	heartbeatGrace time.Duration
 	// retryWait overrides RetryAfterWait for acceptance retries; tests shorten it.
 	retryWait func(retryAfter time.Duration) time.Duration
+	// release holds the coordinator's last release notice; see Release.
+	release *releaseState
 }
 
 // heartbeatTimeout is the deadline of one heartbeat: the hold the node asked
@@ -377,7 +379,7 @@ func (c *Client) allowEcho(origin *url.URL) bool {
 }
 
 func New(origin, credential string) *Client {
-	return &Client{Origin: origin, Credential: credential, HTTP: &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	return &Client{Origin: origin, Credential: credential, release: &releaseState{}, HTTP: &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 }
 
 // Post sends one report under the client's 10-second timeout. An answer
@@ -413,6 +415,7 @@ func (c *Client) post(ctx context.Context, path string, body any, out any, longP
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set(NodeVersionHeader, NodeRelease)
 	if c.Credential != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Credential)
 	}
@@ -428,6 +431,7 @@ func (c *Client) post(ctx context.Context, path string, body any, out any, longP
 		return 0, nil, errors.New("coordinator unavailable")
 	}
 	defer resp.Body.Close()
+	c.observeRelease(resp.Header)
 	if resp.StatusCode == http.StatusNoContent {
 		return resp.StatusCode, resp.Header, nil
 	}

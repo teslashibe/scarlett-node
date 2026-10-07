@@ -430,7 +430,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	}
 	slots := make(chan struct{}, capacity)
 	var running sync.WaitGroup
-	status := runtimeStatus{Version: coordinator.Version, State: "running", NodeID: nodeID, Services: []coordinator.ServiceHealth{}}
+	status := runtimeStatus{Version: coordinator.Version, State: "running", NodeID: nodeID, Release: coordinator.NodeRelease, Services: []coordinator.ServiceHealth{}}
 	defer func() {
 		status.State = "draining"
 		status.InFlight = len(slots)
@@ -582,6 +582,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			status.UnresolvedAttempts = len(records)
 		}
 		status.RelayHalted = worker.RelayHalted()
+		status.observeRelease(client.Release())
 		if err := saveRuntimeStatus(c.StateDir, status); err != nil {
 			return err
 		}

@@ -106,6 +106,7 @@ export const layout = `
     </section>
   </div>
   <footer><span>Suppliers earn points only · local status does not confirm an award</span><button id="settings" class="quiet header-link">Manage node access ↗</button></footer>
+  <aside id="update-toast" class="update-toast" aria-live="polite" hidden><p id="update-text"></p><div class="actions"><button id="update-download" type="button">Download update ↗</button><button id="update-dismiss" type="button" class="quiet">Later</button></div></aside>
 </main>
 <dialog id="remove-account-dialog" aria-labelledby="remove-account-heading" aria-describedby="remove-account-detail"><h2 id="remove-account-heading"></h2><p id="remove-account-detail">This account will stop receiving new work when the node picks up the change. Accepted jobs keep their original account and finish. Saved credentials remain on this device.</p><div class="actions"><button id="remove-account-cancel" type="button" class="secondary">Keep account</button><button id="remove-account-confirm" type="button">Remove account</button></div></dialog>`;
 

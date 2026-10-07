@@ -10,7 +10,7 @@ export const api = {
   status: () => invoke<Snapshot>("desktop_status"),
   diagnostics: () => invoke<Diagnostics>("desktop_diagnostics"),
   claudeStatus: () => invoke<ClaudeStatus>("claude_status"),
-  open: (destination: "setup" | "dashboard" | "settings") =>
+  open: (destination: "setup" | "dashboard" | "settings" | "update") =>
     invoke<void>("open_network", { destination }),
   pair: (code: string) => invoke<void>("pair_node", { code }),
   control: (action: "start" | "pause" | "resume" | "stop") =>
