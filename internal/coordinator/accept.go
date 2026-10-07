@@ -70,7 +70,7 @@ func digest(value string) bool {
 // ValidOffer applies Accept's local checks to the unchanged offered terms. A
 // failure here means acceptance HTTP is never sent for the offer.
 func ValidOffer(offer Lease, now time.Time) error {
-	if !offer.AcceptanceRequired || offer.Version != Version || offer.VerifierToken != "" || !digest(offer.RequestSHA256) || !digest(offer.SignedJobID) || (offer.ServiceType != "codex" && offer.ServiceType != "x_read") || !offer.LeaseDeadline.After(now) || offer.LeaseDeadline.After(now.Add(MaxOfferLifetime+OfferClockSkew)) || !offer.SettlementDeadline.Equal(offer.LeaseDeadline) {
+	if !offer.AcceptanceRequired || offer.Version != Version || offer.VerifierToken != "" || !digest(offer.RequestSHA256) || !digest(offer.SignedJobID) || (offer.ServiceType != "codex" && offer.ServiceType != "x_read" && offer.ServiceType != "web") || !offer.LeaseDeadline.After(now) || offer.LeaseDeadline.After(now.Add(MaxOfferLifetime+OfferClockSkew)) || !offer.SettlementDeadline.Equal(offer.LeaseDeadline) {
 		return errors.New("invalid community offer")
 	}
 	return nil

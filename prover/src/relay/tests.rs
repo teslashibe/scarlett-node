@@ -16,7 +16,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
-use super::{node, ot::NodeOt, record, tag, verifier, wire};
+use super::{node, ot::NodeOt, record, tag, verifier::{self, Failure}, wire};
 use crate::xpolicy;
 
 pub(crate) const AUTH: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -857,5 +857,276 @@ async fn live_x_accepts_the_jointly_sealed_record() {
             println!("verified {} response bytes in {:?}: {head}", outcome.received.len(), started.elapsed());
         }
         _ => panic!("verifier: {:?}\nsupplier: {:?}", outcome.as_ref().err(), response.as_ref().err()),
+    }
+}
+
+/// What a web origin answers one request with, and whether it then ends the
+/// TLS session with close_notify (`Close`), drops the TCP connection without
+/// one (`Drop`), or waits (`Wait`).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum End {
+    Close,
+    Drop,
+    Wait,
+}
+
+pub(crate) type Respond = Arc<dyn Fn(&[u8]) -> (Vec<u8>, End) + Send + Sync>;
+
+/// A TLS origin for example.com and www.example.com under a private CA,
+/// TLS 1.3 unless `tls12_only`. `seen` holds the last request it decrypted.
+pub(crate) async fn web_origin(respond: Respond, tls12_only: bool) -> Server {
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let leaf_key = KeyPair::generate().unwrap();
+    let leaf = CertificateParams::new(vec!["example.com".to_owned(), "www.example.com".to_owned()]).unwrap().signed_by(&leaf_key, &ca, &ca_key).unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(ca.der().clone()).unwrap();
+    let versions: &[&rustls::SupportedProtocolVersion] = if tls12_only { &[&rustls::version::TLS12] } else { &[&rustls::version::TLS13] };
+    let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_protocol_versions(versions)
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![leaf.der().clone()], PrivatePkcs8KeyDer::from(leaf_key.serialize_der()).into())
+        .unwrap();
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(None));
+    let record = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let (acceptor, respond, record) = (acceptor.clone(), respond.clone(), record.clone());
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(tcp).await else { return };
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tls.read(&mut chunk).await {
+                        Ok(n) if n > 0 => request.extend_from_slice(&chunk[..n]),
+                        _ => return,
+                    }
+                }
+                let (response, end) = respond(&request);
+                *record.lock().unwrap() = Some(request);
+                let _ = tls.write_all(&response).await;
+                let _ = tls.flush().await;
+                match end {
+                    End::Close => {
+                        let _ = tls.shutdown().await;
+                    }
+                    End::Drop => {
+                        let (mut tcp, _) = tls.into_inner();
+                        let _ = tcp.shutdown().await;
+                    }
+                    End::Wait => {
+                        let _ = tls.read(&mut chunk).await;
+                    }
+                }
+            });
+        }
+    });
+    Server { addr, roots, seen }
+}
+
+pub(crate) fn web_headers() -> Vec<crate::webpolicy::Header> {
+    let vectors: serde_json::Value = serde_json::from_str(include_str!("../../../api/web-vectors.json")).unwrap();
+    serde_json::from_value(vectors["default_headers"].clone()).unwrap()
+}
+
+/// One web hop between an honest supplier and verifier: the verifier
+/// authorizes the canonical request for `url` and reports it final.
+async fn web_hop<X>(roots: RootCertStore, node_end: DuplexStream, verifier_end: DuplexStream, to_server: X, url: &str, node_raw: Vec<u8>, node_host: &str, max: usize) -> (Result<node::HopOutcome>, Result<verifier::WebOutcome>)
+where
+    X: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let config = verifier::tls_config(roots).unwrap();
+    let (url, host) = (url.to_owned(), node_host.to_owned());
+    let node = {
+        let url = url.clone();
+        tokio::spawn(async move { node::web_session(node_end, to_server, &node_raw, &host, 0, &url, &crate::diagnostics::Trace::new()).await })
+    };
+    let request = crate::webpolicy::request(&url, &web_headers());
+    let server_name = crate::webpolicy::url_host(&url).to_owned();
+    let outcome = within(verifier::run_web(verifier_end, config, &server_name, &request, max, |outcome| {
+        Ok(serde_json::to_vec(&serde_json::json!({"hop":0,"url":url,"status_code":outcome.response.status,"final":true})).unwrap())
+    }))
+    .await;
+    (within(node).await.unwrap(), outcome)
+}
+
+fn page(response: &'static [u8], end: End) -> Respond {
+    Arc::new(move |_| (response.to_vec(), end))
+}
+
+#[tokio::test]
+async fn a_web_hop_reaches_the_verifier_and_only_its_outcome_reaches_the_supplier() {
+    const PAGE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 13\r\n\r\n<p>secret</p>";
+    let origin = web_origin(page(PAGE, End::Wait), false).await;
+    let to_node = Arc::new(Mutex::new(Vec::new()));
+    let log = to_node.clone();
+    let (node_end, verifier_end) = link(move |from_node, kind, payload| {
+        if !from_node && kind != wire::TO_SERVER {
+            log.lock().unwrap().push((kind, payload.to_vec()));
+        }
+        Verdict::Pass
+    });
+    let url = "https://example.com/a?b=1";
+    let raw = crate::webpolicy::request(url, &web_headers());
+    let tcp = TcpStream::connect(origin.addr).await.unwrap();
+    let (node_result, outcome) = web_hop(origin.roots.clone(), node_end, verifier_end, tcp, url, raw.clone(), "example.com", 1 << 20).await;
+    let outcome = outcome.unwrap();
+    let reported = node_result.unwrap();
+    assert_eq!((reported.hop, reported.url.as_str(), reported.status_code, reported.is_final, reported.next_url), (0, url, 200, true, None));
+    assert_eq!(origin.seen.lock().unwrap().as_deref(), Some(&raw[..]));
+    assert_eq!(outcome.sent, raw);
+    assert_eq!((outcome.response.status, outcome.response.body.as_slice(), outcome.response.received), (200, &b"<p>secret</p>"[..], PAGE.len()));
+    assert_eq!(outcome.tls.alpn.as_deref(), Some("http/1.1"));
+    // The supplier got the record material, the opening, the outcome and DONE: never the page.
+    let frames = to_node.lock().unwrap();
+    let kinds: Vec<u8> = frames.iter().map(|(kind, _)| *kind).collect();
+    assert_eq!(kinds, [wire::MATERIAL, wire::OPENING, wire::OUTCOME, wire::DONE]);
+    assert!(!frames.iter().any(|(_, payload)| payload.windows(6).any(|w| w == b"secret")));
+}
+
+#[tokio::test]
+async fn a_web_supplier_refuses_plaintext_a_missing_or_wrong_outcome_and_another_host() {
+    const PAGE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    for attack in ["plain", "no_outcome", "outcome_hop", "outcome_url", "outcome_early", "two_outcomes", "other_host"] {
+        let origin = web_origin(page(PAGE, End::Wait), false).await;
+        let (node_end, verifier_end) = link(move |from_node, kind, payload| {
+            if from_node {
+                return Verdict::Pass;
+            }
+            let mut changed: serde_json::Value = if kind == wire::OUTCOME { serde_json::from_slice(payload).unwrap() } else { serde_json::Value::Null };
+            match (attack, kind) {
+                ("plain", wire::MATERIAL) => Verdict::Also(vec![(wire::PLAIN, b"ok".to_vec())]),
+                ("no_outcome", wire::OUTCOME) => Verdict::Skip,
+                ("outcome_hop", wire::OUTCOME) => {
+                    changed["hop"] = 1.into();
+                    Verdict::Replace(serde_json::to_vec(&changed).unwrap())
+                }
+                ("outcome_url", wire::OUTCOME) => {
+                    changed["url"] = "https://example.com/other".into();
+                    Verdict::Replace(serde_json::to_vec(&changed).unwrap())
+                }
+                ("outcome_early", wire::MATERIAL) => Verdict::Also(vec![(wire::OUTCOME, br#"{"hop":0,"url":"https://example.com/","status_code":200,"final":true}"#.to_vec())]),
+                ("two_outcomes", wire::OUTCOME) => Verdict::Also(vec![(wire::OUTCOME, payload.to_vec())]),
+                _ => Verdict::Pass,
+            }
+        });
+        let url = "https://example.com/";
+        let host = if attack == "other_host" { "www.example.com" } else { "example.com" };
+        let tcp = TcpStream::connect(origin.addr).await.unwrap();
+        let (node_result, outcome) = web_hop(origin.roots.clone(), node_end, verifier_end, tcp, url, crate::webpolicy::request(url, &web_headers()), host, 1 << 20).await;
+        let error = format!("{:#}", node_result.err().unwrap_or_else(|| panic!("{attack}: supplier accepted")));
+        let expected = match attack {
+            "plain" => "plaintext",
+            "no_outcome" => "without reporting the hop",
+            "outcome_hop" | "outcome_url" => "outcome mismatch",
+            "outcome_early" | "two_outcomes" => "before opening its request record, or twice",
+            _ => "ClientHello for this hop's host",
+        };
+        assert!(error.contains(expected), "{attack}: {error}");
+        // The host never appears in what the supplier reports.
+        assert!(!error.contains("example.com"), "{attack}: {error}");
+        if attack == "other_host" {
+            assert!(outcome.is_err() && origin.seen.lock().unwrap().is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_web_verifier_authorizes_only_the_canonical_request_and_classifies_failures() {
+    let url = "https://example.com/";
+    let honest = crate::webpolicy::request(url, &web_headers());
+    let mut other = honest.clone();
+    other[5] = b'x';
+    let cases: Vec<(&str, Respond, bool, Vec<u8>, usize, Failure)> = vec![
+        ("tampered request", page(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", End::Wait), false, other, 1 << 20, Failure::RequestRejected),
+        ("tls 1.2", page(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", End::Wait), true, honest.clone(), 1 << 20, Failure::TlsFailed),
+        ("too large", page(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n", End::Wait), false, honest.clone(), 80, Failure::ResponseTooLarge),
+        ("bad head", page(b"HTTP/1.1 200 OK\r\nNo colon here\r\n\r\n", End::Wait), false, honest.clone(), 1 << 20, Failure::ResponseInvalid),
+        ("cut short", page(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort", End::Close), false, honest.clone(), 1 << 20, Failure::ServerClosed),
+        ("bare eof", page(b"HTTP/1.1 200 OK\r\n\r\nno length", End::Drop), false, honest.clone(), 1 << 20, Failure::ServerClosed),
+    ];
+    for (case, respond, tls12, raw, max, failure) in cases {
+        let origin = web_origin(respond, tls12).await;
+        let (node_end, verifier_end) = link(|_, _, _| Verdict::Pass);
+        let tcp = TcpStream::connect(origin.addr).await.unwrap();
+        let (node_result, outcome) = web_hop(origin.roots.clone(), node_end, verifier_end, tcp, url, raw, "example.com", max).await;
+        let error = outcome.err().unwrap_or_else(|| panic!("{case}: verifier accepted"));
+        assert_eq!(Failure::of(&error), failure, "{case}: {error:#}");
+        assert!(node_result.is_err(), "{case}");
+        if failure == Failure::RequestRejected || failure == Failure::TlsFailed {
+            assert!(origin.seen.lock().unwrap().is_none(), "{case}: a request reached the origin");
+        }
+        // An honest verifier that fails after sealing still opens the record.
+        assert!(!format!("{:#}", node_result.err().unwrap()).contains(node::MISUSE), "{case}");
+    }
+}
+
+#[tokio::test]
+async fn a_close_delimited_page_completes_on_close_notify_and_keeps_its_encoding() {
+    let origin = web_origin(page(b"HTTP/1.0 200 OK\r\nContent-Encoding: gzip\r\n\r\n\x1f\x8b\x08\x00binary", End::Close), false).await;
+    let (node_end, verifier_end) = link(|_, _, _| Verdict::Pass);
+    let tcp = TcpStream::connect(origin.addr).await.unwrap();
+    let url = "https://www.example.com/";
+    let (node_result, outcome) = web_hop(origin.roots.clone(), node_end, verifier_end, tcp, url, crate::webpolicy::request(url, &web_headers()), "www.example.com", 1 << 20).await;
+    let outcome = outcome.unwrap();
+    assert!(node_result.is_ok());
+    assert_eq!((outcome.response.framing, outcome.response.body.as_slice()), (crate::webpolicy::Framing::Close, &b"\x1f\x8b\x08\x00binary"[..]));
+}
+
+#[tokio::test]
+async fn a_web_session_refuses_hidden_bytes() {
+    // An X-style supplier that would hide bytes gets nothing for a web hop.
+    let origin = web_origin(page(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", End::Wait), false).await;
+    let (node_end, verifier_end) = tokio::io::duplex(1 << 20);
+    let supplier = tokio::spawn(rogue_supplier(origin.addr, node_end, 64, vec![]));
+    let url = "https://example.com/";
+    let request = crate::webpolicy::request(url, &web_headers());
+    let error = within(verifier::run_web(verifier_end, verifier::tls_config(origin.roots.clone()).unwrap(), "example.com", &request, 1 << 20, |_| Ok(Vec::new()))).await.err().unwrap();
+    assert_eq!(Failure::of(&error), Failure::RequestRejected);
+    assert_eq!(within(supplier).await.unwrap(), 0);
+}
+
+/// Not run by default: one real web hop to `SCARLETT_TEST_WEB_URL` (default
+/// https://example.com/) through an in-process supplier and verifier with
+/// the pinned Mozilla roots.
+#[tokio::test]
+#[ignore]
+async fn live_web_hop_is_verified() {
+    let url = std::env::var("SCARLETT_TEST_WEB_URL").unwrap_or_else(|_| "https://example.com/".into());
+    let url = crate::webpolicy::canonical_url(&url).unwrap();
+    let host = crate::webpolicy::url_host(&url).to_owned();
+    let raw = crate::webpolicy::request(&url, &web_headers());
+    let (node_end, verifier_end) = tokio::io::duplex(1 << 20);
+    let config = verifier::tls_config(verifier::mozilla_roots().unwrap()).unwrap();
+    let tcp = TcpStream::connect((host.as_str(), 443)).await.unwrap();
+    let started = std::time::Instant::now();
+    let node = {
+        let (raw, host, url) = (raw.clone(), host.clone(), url.clone());
+        tokio::spawn(async move { node::web_session(node_end, tcp, &raw, &host, 0, &url, &crate::diagnostics::Trace::new()).await })
+    };
+    let outcome = within(verifier::run_web(verifier_end, config, &host, &raw, crate::webpolicy::MAX_RESPONSE, |outcome| {
+        Ok(serde_json::to_vec(&serde_json::json!({"hop":0,"url":url,"status_code":outcome.response.status,"final":true})).unwrap())
+    }))
+    .await;
+    let reported = within(node).await.unwrap();
+    match (&outcome, &reported) {
+        (Ok(outcome), Ok(reported)) => println!(
+            "verified HTTP {} ({}) framing {} body {} bytes, received {} bytes, alpn {:?}, in {:?}",
+            outcome.response.status,
+            reported.status_code,
+            outcome.response.framing.name(),
+            outcome.response.body.len(),
+            outcome.response.received,
+            outcome.tls.alpn,
+            started.elapsed()
+        ),
+        _ => panic!("verifier: {:?}\nsupplier: {:?}", outcome.as_ref().err(), reported.as_ref().err()),
     }
 }

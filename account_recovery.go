@@ -19,7 +19,7 @@ func (p *servicePool) refreshXRecovery() {
 		if record.NoProvider {
 			continue
 		}
-		if record.ProviderService == "codex" {
+		if record.ProviderService == "codex" || record.ProviderService == "web" {
 			continue
 		}
 		if record.ProviderService != "x_read" || record.ProviderAccountID == "" {

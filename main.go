@@ -134,6 +134,10 @@ func restsNode(pooled bool, code string) bool {
 	return code == "capacity_unavailable" && !pooled
 }
 
+// webWorker builds the web worker for one lease; tests replace it to inject a
+// resolver and egress guard.
+var webWorker = func(c config.Config) worker.Web { return worker.Web{Config: c} }
+
 // heartbeatWatchInterval is how often the node rechecks, while the coordinator
 // holds a heartbeat, whether what that heartbeat advertised still holds.
 const heartbeatWatchInterval = time.Second
@@ -438,6 +442,10 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			stopKeeping()
 			worker.DefaultXClients().Stop()
 		}()
+		if c.Enabled("web") {
+			// NAT64 prefixes and local addresses are kept fresh off the job path.
+			go worker.KeepWebEgressFresh(workCtx)
+		}
 	}
 	slots := make(chan struct{}, capacity)
 	var running sync.WaitGroup
@@ -721,7 +729,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 				var err error
 				if !serviceAvailable {
 					code = "service_unavailable"
-					if l.AcceptanceRequired && (l.ServiceType == "codex" || l.ServiceType == "x_read") {
+					if l.AcceptanceRequired && (l.ServiceType == "codex" || l.ServiceType == "x_read" || l.ServiceType == "web") {
 						// No selected valid profile: leave the unaccepted offer to
 						// expire rather than funding it through rejectLease.
 						err = errors.New("provider offer has no locally eligible account")
@@ -780,6 +788,9 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	// Decline a proof mode this node does not serve before accepting funds for it.
 	if l.ServiceType == "x_read" && !worker.XOfferServable(c, l.XPayload) {
 		return "invalid_lease", errors.New("x_read offer asks for a proof mode this node does not serve")
+	}
+	if l.ServiceType == "web" && !worker.WebOfferServable(c, l.WebPayload) {
+		return "invalid_lease", errors.New("web offer asks for a proof mode this node does not serve")
 	}
 	record, err := attemptRecord(l)
 	if err != nil {
@@ -850,6 +861,8 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 			code = "service_unavailable"
 		} else if c.Executor == config.ExecutorServices && l.ServiceType == "x_read" {
 			code = worker.X{Config: c}.Run(ctx, l)
+		} else if c.Executor == config.ExecutorServices && l.ServiceType == "web" {
+			code = webWorker(c).Run(ctx, l)
 		} else {
 			code, detail = worker.Prover{Config: c}.Run(ctx, l)
 		}

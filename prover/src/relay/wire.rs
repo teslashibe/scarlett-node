@@ -28,6 +28,9 @@ pub const DONE: u8 = 23;
 /// The client write key, IV and sequence number of the request record, sent
 /// once the response is complete so the supplier can check what it was made to send.
 pub const OPENING: u8 = 24;
+/// Web sessions only, after OPENING: the hop's status and the URL the
+/// verifier authorizes next. The supplier learns nothing else of the page.
+pub const OUTCOME: u8 = 25;
 
 /// Largest tunnel chunk either side forwards in one frame.
 pub const CHUNK: usize = 32 << 10;
@@ -35,6 +38,8 @@ pub const CHUNK: usize = 32 << 10;
 fn limit(kind: u8) -> Option<usize> {
     Some(match kind {
         HELLO | DONE => 1 << 10,
+        // Two URLs of at most 2048 bytes each, plus the fields around them.
+        OUTCOME => 8 << 10,
         CO_SETUP | KOS_CHI | OPENING => 1 << 8,
         CO_CHOOSE | CO_PAYLOAD | KOS_CHECK => 32 << 10,
         // The KOS matrix is 16 bytes per transfer, plus its padding rows.
@@ -102,6 +107,18 @@ mod tests {
         assert!(recv(&mut b).await.is_err());
         let (mut a, mut b) = tokio::io::duplex(64);
         a.write_all(&[99, 0, 0, 0, 0]).await.unwrap();
+        assert!(recv(&mut b).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn outcome_frames_carry_two_maximal_urls_and_no_more() {
+        let url = format!("https://example.com/{}", "a".repeat(2048 - 20));
+        let outcome = serde_json::to_vec(&serde_json::json!({"hop":4,"url":url,"status_code":308,"final":false,"next_url":url})).unwrap();
+        let (mut a, mut b) = tokio::io::duplex(1 << 20);
+        send(&mut a, OUTCOME, &outcome).await.unwrap();
+        assert_eq!(recv(&mut b).await.unwrap(), (OUTCOME, outcome));
+        assert!(send(&mut a, OUTCOME, &vec![b' '; (8 << 10) + 1]).await.is_err());
+        a.write_all(&[OUTCOME, 0, 0, 0x20, 1]).await.unwrap();
         assert!(recv(&mut b).await.is_err());
     }
 

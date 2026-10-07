@@ -238,7 +238,7 @@ func valid(r Record) bool {
 	if r.ProofTraffic != nil && !r.ProofTraffic.valid(r.Fingerprint) {
 		return false
 	}
-	if r.ProviderAccountID != "" && (!validField(r.ProviderAccountID) || (r.ProviderService != "codex" && r.ProviderService != "x_read")) || r.ProviderAccountID == "" && r.ProviderService != "" || r.NoProvider && r.ProviderAccountID != "" {
+	if r.ProviderAccountID != "" && (!validField(r.ProviderAccountID) || (r.ProviderService != "codex" && r.ProviderService != "x_read" && r.ProviderService != "web")) || r.ProviderAccountID == "" && r.ProviderService != "" || r.NoProvider && r.ProviderAccountID != "" {
 		return false
 	}
 	if !validField(r.JobID) || !validField(r.Attempt) || !validField(r.Fence) || !validHash(r.Fingerprint) || r.Deadline.IsZero() || r.UpdatedAt.IsZero() {

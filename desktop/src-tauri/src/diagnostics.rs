@@ -58,7 +58,11 @@ struct Summary {
     p95_ms: Option<f64>,
     newest_at: String,
 }
-const OPERATIONS: &[&str] = &["search", "profile", "post", "thread", "codex", "other"];
+const OPERATIONS: &[&str] = &[
+    "search", "profile", "post", "thread", "codex", "scrape", "other",
+];
+/// Three X pages, or six web hops (a page with five redirects).
+const MAX_EXCHANGE: u8 = 6;
 const PROOFS: &[&str] = &["relay", "mpc", "none"];
 const OUTCOMES: &[&str] = &[
     "success",
@@ -89,6 +93,11 @@ const OUTCOMES: &[&str] = &[
     "x_request_failed",
     "execution_uncertain",
     "relay_misuse",
+    "web_egress_denied",
+    "web_dns_failed",
+    "web_connect_failed",
+    "web_proxy_failed",
+    "web_fetch_failed",
 ];
 const NODE_PHASES: &[&str] = &[
     "account_acquire",
@@ -197,7 +206,7 @@ impl Record {
             && self.missing_phases.len() <= 64
             && self.missing_phases.iter().all(|p| phase(p))
             && self.spans.iter().all(|s| {
-                s.exchange <= 3
+                s.exchange <= MAX_EXCHANGE
                     && ms(s.start_ms)
                     && ms(s.duration_ms)
                     && ms(s.start_ms + s.duration_ms)
@@ -307,7 +316,7 @@ mod tests {
             span["phase"] = json!(phase);
             assert!(project(&serde_json::to_vec(&value).unwrap()).is_none());
         }
-        for (field, bad) in [("source", json!("helper")), ("exchange", json!(4))] {
+        for (field, bad) in [("source", json!("helper")), ("exchange", json!(7))] {
             let mut value = original.clone();
             let span = value["attempts"][22]["spans"]
                 .as_array_mut()
@@ -388,7 +397,7 @@ mod tests {
             serde_json::to_value(safe).unwrap()["attempts"][0]["truncated"],
             true
         );
-        for bad in [json!(0), json!(4)] {
+        for bad in [json!(0), json!(7)] {
             v = sample();
             v["attempts"][0]["spans"][0]["exchange"] = bad;
             assert!(project(&serde_json::to_vec(&v).unwrap()).is_none());
@@ -401,12 +410,26 @@ mod tests {
         assert!(project(&serde_json::to_vec(&v).unwrap()).is_none());
     }
     #[test]
+    fn web_scrape_records_with_six_hops_stay_available() {
+        let mut v = sample();
+        v["attempts"][0]["operation"] = json!("scrape");
+        v["attempts"][0]["pages"] = json!(1);
+        v["attempts"][0]["spans"][0]["exchange"] = json!(6);
+        v["summaries"][0]["operation"] = json!("scrape");
+        assert!(project(&serde_json::to_vec(&v).unwrap()).is_some());
+    }
+    #[test]
     fn final_failure_vocabulary_keeps_a_valid_snapshot_available() {
         for code in [
             "service_unavailable",
             "x_request_failed",
             "execution_uncertain",
             "relay_misuse",
+            "web_egress_denied",
+            "web_dns_failed",
+            "web_connect_failed",
+            "web_proxy_failed",
+            "web_fetch_failed",
         ] {
             let mut v = sample();
             v["attempts"][0]["outcome"] = json!(code);

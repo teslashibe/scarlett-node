@@ -155,6 +155,8 @@ func (p *servicePool) renewCodexStep(ctx context.Context, now time.Time) <-chan 
 		case record.ProviderService == "codex" && validAccountID(record.ProviderAccountID):
 			blocked[record.ProviderAccountID] = true
 		case record.ProviderService == "x_read" && validAccountID(record.ProviderAccountID):
+		case record.ProviderService == "web" && record.ProviderAccountID == "web":
+			// Web runs no provider credential.
 		default:
 			unknown = true
 		}

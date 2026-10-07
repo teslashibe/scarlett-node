@@ -120,7 +120,7 @@ func localCommand(command string, output io.Writer) error {
 	if err == nil {
 		decoder := json.NewDecoder(bytes.NewReader(raw))
 		decoder.DisallowUnknownFields()
-		if decoder.Decode(&status) != nil || decoder.Decode(new(any)) != io.EOF || status.Version != coordinator.Version || len(status.Services) > 2 || status.InFlight < 0 || status.InFlight > 64 || status.UnresolvedAttempts < 0 || status.UnresolvedAttempts > 1000000 || !validIdentityField(status.NodeID, 128) || (status.State != "running" && status.State != "draining" && status.State != "stopped") {
+		if decoder.Decode(&status) != nil || decoder.Decode(new(any)) != io.EOF || status.Version != coordinator.Version || len(status.Services) > 3 || status.InFlight < 0 || status.InFlight > 96 || status.UnresolvedAttempts < 0 || status.UnresolvedAttempts > 1000000 || !validIdentityField(status.NodeID, 128) || (status.State != "running" && status.State != "draining" && status.State != "stopped") {
 			return errors.New("invalid local status")
 		}
 		if !validAccountStatuses(status.Accounts) {

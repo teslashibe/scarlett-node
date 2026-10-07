@@ -28,7 +28,7 @@ Run `./scarlett-node pair` and enter a one-time coordinator code on stdin. Pairi
 
 For an **unpaid Docker fixture only**, `../scarlett-app/compose.yaml` builds this node twice with `SCARLETT_LOCAL_FIXTURE=1` and `local-fixture` profile. It polls the local app over Docker Desktop host loopback with a per-node seeded credential and standing bid. Each model calls its own isolated gateway container, which read-only mounts just the existing matching account; account credentials are never mounted into the nodes. This fixture is not provider authorization and cannot cap upstream inference usage because the Codex gateway ignores `max_tokens`.
 
-**Independent community services** (`SCARLETT_EXECUTOR=services`): set `SCARLETT_SERVICES=codex`, `x_read` or `codex,x_read`. The node uses proven execution only in this mode. Set `SCARLETT_VERIFIER=host:port` and the local prover binary as above. Codex uses `SCARLETT_CODEX_HOME`; X uses an absolute `SCARLETT_X_SESSION` path to a private 0600 x-go session JSON file. The X session must not contain a proxy override, which would bypass its proof transport. Provider credentials remain on the supplier machine and are sent to the prover through stdin, never as command arguments or coordinator fields. `SCARLETT_CODEX_CONCURRENCY` and `SCARLETT_X_CONCURRENCY` are independent limits from 1 to 32, default 1 each. The legacy shared-concurrency setting does not replace these limits. `SCARLETT_X_REFRESH_SECONDS` (default 1800, 60 to 86400) is how often each warm X client's transaction-ID material is refreshed in the background.
+**Independent community services** (`SCARLETT_EXECUTOR=services`): set `SCARLETT_SERVICES` to one or more of `codex`, `x_read` and `web` (see [Web pages](#web-pages)). The node uses proven execution only in this mode. Set `SCARLETT_VERIFIER=host:port` and the local prover binary as above. Codex uses `SCARLETT_CODEX_HOME`; X uses an absolute `SCARLETT_X_SESSION` path to a private 0600 x-go session JSON file. The X session must not contain a proxy override, which would bypass its proof transport. Provider credentials remain on the supplier machine and are sent to the prover through stdin, never as command arguments or coordinator fields. `SCARLETT_CODEX_CONCURRENCY` and `SCARLETT_X_CONCURRENCY` are independent limits from 1 to 32, default 1 each. The legacy shared-concurrency setting does not replace these limits. `SCARLETT_X_REFRESH_SECONDS` (default 1800, 60 to 86400) is how often each warm X client's transaction-ID material is refreshed in the background.
 
 Services-mode heartbeats report both services independently. A usable credential file initially means `configured`, rather than authenticated readiness. Local proof submission can change it to node-reported `ready`; the coordinator must still verify the proof independently. For `x_read` the node does not wait for a job: an account is `configured` while its warm client is being built and becomes `ready` when that build has validated the session against X, `auth_required` when X refused it, `exhausted` when X rate-limited the build and `unreachable` when X could not be reached or answered the validation with not-found (a rotated query ID, not a refusal), with the same rests a failed job earns. A validated build only promotes `configured` to `ready`; it never clears an authentication failure or ends a rest. An account that goes back to `configured` while its validated client is still installed (a rest ended, or the session file was rewritten with the same content) is reported `ready` again by the next 15-second check, without a request to X. An outcome for a session file that was replaced while X answered is discarded. `configured` accounts stay leasable. X quota/authentication errors suppress X without disabling Codex, and vice versa. Capacity includes separate in-flight counts. Quota/transport cooldowns last 30 seconds; an authentication failure waits for a changed local credential file. No numeric provider quota is guessed. Unknown or unavailable services receive a nonrewardable failure, without a provider call.
 
@@ -251,10 +251,109 @@ no paid demand itself.
 
 Services-mode heartbeats include each enabled service's local `max_input_bytes`.
 For Codex this counts prompt UTF-8 bytes; for X it counts the serialized
-`x_request`, as the worker does. Codex also reports its configured
-`max_output_tokens` and the accepted base-model catalog. X reports neither.
-Disabled services advertise no limits. These reports describe local validation,
-not verified provider access, successful work or payment evidence.
+`x_request`, and for web the serialized `web_request`, as the workers do. Codex
+also reports its configured `max_output_tokens` and the accepted base-model
+catalog. X and web report neither. An enabled web entry also reports `egress`
+(`direct` or `proxy`). Disabled services report `not_added` and no limits. These
+reports describe local validation, not verified provider access, successful
+work or payment evidence. A heartbeat lists at most three services and a total
+capacity of at most 96 (32 each).
+
+## Web pages
+
+`SCARLETT_SERVICES` may include `web` (alone or with `codex` and `x_read`). Web
+needs no account and no credential path. `SCARLETT_WEB_CONCURRENCY` (1–32,
+default 4) bounds simultaneous pages; the web entry reports it as capacity.
+
+**Lease.** A web lease carries `web_request` (`{"operation":"scrape","url":…}`)
+and `web_payload`, the exact verifier `web.fetch` payload (`api/node-v1.openapi.yaml`,
+fixtures `lease-web-offer.json` and `lease-web.json`). Before acceptance the node
+refuses an offer whose payload is not `proof_mode` `relay` with `proof_policy`
+`web-relay-v1`, or while keyed relay is halted. After acceptance it checks that
+`input_sha256` is the SHA-256 of Go's encoding of `web_request` (at most
+`SCARLETT_MAX_INPUT_BYTES`), that the payload has unique keys, integer numbers,
+exactly its seven fields, a URL equal to `web_request.url`, 0–5 redirects,
+1–10485760 response bytes and at most the three allowlisted headers in order,
+and that the lease carries no Codex or X fields; otherwise it reports
+`invalid_lease`. Well-formed terms whose URL is not canonical (including an IP
+literal, a reserved name or an X host) are reported `web_egress_denied` without
+any lookup. The job runs until the lease deadline less a 10 s report margin.
+
+**Canonical URLs.** The strict rules are shared with the app and the verifier
+through `api/web-vectors.json`: absolute `https`, lowercase ASCII host with at
+least two labels and a letter in the last, port 443 only, no userinfo, no IP
+literal (bracketed, an all-digit last label or one starting with `0x`), no
+reserved name (`localhost`, `local`, `internal`, `home.arpa`, `lan`,
+`localdomain`, `onion`, `invalid`, `test` or a subdomain), no `x.com` or
+`twitter.com` host, fragment dropped, path and query percent-encoded and dot
+segments removed, at most 2048 bytes. A URL is canonical when these rules leave
+it unchanged.
+
+**Hops.** Each hop is one `scarlett-prover relay-web` run under the job's single
+verifier token, at most `max_redirects + 1` of them. For each hop the node:
+
+1. re-checks the hop URL is canonical;
+2. resolves the host with the system resolver (5 s);
+3. checks every returned address with the egress guard, refusing the hop if any
+   is denied;
+4. picks the first IPv4 address, else the first IPv6 address;
+5. runs the helper with stdin `{verifier, verifier_ca_file?, plaintext_fixture?,
+   token, hop, url, ip, port: 443, proxy?, payload, timeout_ms}`, where
+   `timeout_ms` is the smaller of 30 s and the time left. stdout is capped at
+   64 KiB and stderr at 16 KiB;
+6. reads the one-line summary: `status` `proof_sent`, the same `hop`, a
+   `status_code`, and either `final: true` or a canonical `next_url` for a
+   301, 302, 303, 307 or 308 that the verifier authorized.
+
+The helper never receives page plaintext; the summary carries counters and the
+next URL only. Each hop is one proof-traffic sample (up to six per attempt) and
+one diagnostics exchange (operation `scrape`, proof mode `relay`). No URL, host,
+address, proxy or page content is logged or kept in diagnostics.
+
+**Outcomes.** Failures of the first hop are reported with these codes; once the
+first hop was verified, any later failure other than verifier misuse is
+reported `proven`, because the verifier already holds the verified hops.
+
+| Code | First hop |
+| --- | --- |
+| `web_egress_denied` | The URL failed node validation, or the host resolved to a denied address |
+| `web_dns_failed` | No address within 5 s |
+| `web_connect_failed` | The helper could not open TCP to the checked address (`SCARLETT_WEB_ERROR=connect_failed`); no verifier session was spent |
+| `web_proxy_failed` | The egress proxy was unreachable, refused authentication or did not answer 200 (`SCARLETT_WEB_ERROR=proxy_failed`) |
+| `web_fetch_failed` | The relay session failed after the token was presented, or the helper's summary was invalid |
+| `relay_misuse` | The helper caught the verifier misusing the session; keyed relay halts node-wide, for X and web alike, until `scarlett-node relay-resume` |
+| `expired` | The lease deadline passed first |
+| `prover_error` | The helper could not run |
+
+**Readiness.** The web entry is `configured` when enabled with the helper
+present and `ready` after a proven job. It is `unreachable` with
+`last_error_code` `prover_error` while the helper is missing, `relay_misuse`
+while relay is halted and `web_proxy_failed` for 60 s after the egress proxy
+failed. Failures on the target's side (`web_dns_failed`, `web_egress_denied`,
+`web_connect_failed`, `web_fetch_failed`) never change it. Account files, their
+errors and account mode never apply to web, so a desktop node with
+`SCARLETT_DESKTOP_WEB=1` can start with no accounts.
+
+**Egress guard.** IPv4-mapped IPv6 is judged as its IPv4 address. Denied IPv4:
+0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12,
+192.0.0.0/24, 192.0.2.0/24, 192.31.196.0/24, 192.52.193.0/24, 192.88.99.0/24,
+192.168.0.0/16, 192.175.48.0/24, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24,
+224.0.0.0/4 and 240.0.0.0/4. IPv6 must be in 2000::/3 and outside 2001::/23,
+2001:db8::/32, 2002::/16 and 3fff::/20. NAT64 prefixes are discovered from the
+AAAA answers for `ipv4only.arpa` (RFC 7050) at start and every 10 minutes; an
+address inside one is judged by the IPv4 address it embeds. Without discovery
+64:ff9b::/96 is denied like any address outside 2000::/3. Every address on a
+local interface (refreshed each minute) is denied, and scoped addresses never
+pass. Only port 443 is dialled. The node's own public address behind NAT
+(hairpin) is not detected.
+
+**Proxy egress.** `SCARLETT_WEB_EGRESS_PROXY=http://[user:pass@]host:port`
+(services executor only; port required, no path, query or fragment) makes the
+helper send `CONNECT <checked-ip>:443` to the proxy, with
+`Proxy-Authorization: Basic …` when credentials are given, and require a `200`.
+DNS is still resolved and checked on the node. The proxy must be a
+non-intercepting tunnel. The value is never logged, printed in errors or
+status, or sent to the coordinator; the heartbeat reports only `egress: proxy`.
 
 The coordinator must reject incompatible new assignments and check limits again
 before funded acceptance. Legacy heartbeats can still report health, but cannot

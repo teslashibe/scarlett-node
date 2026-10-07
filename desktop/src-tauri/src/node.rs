@@ -223,6 +223,9 @@ pub struct Snapshot {
     /// `relay_halted`, this tells a pending resume (marker gone, node not yet
     /// caught up) from a halt nobody has resumed.
     pub relay_halt_marker: bool,
+    /// The node also serves web pages (SCARLETT_DESKTOP_WEB=1), which need no
+    /// provider account, so it may start with none.
+    pub web_enabled: bool,
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
@@ -311,6 +314,9 @@ pub struct Node {
     x_concurrency: std::sync::atomic::AtomicU8,
     x_login_resources: PathBuf,
     x_login_browser: Option<PathBuf>,
+    /// Serve web pages as well. Set only from the trusted desktop process
+    /// environment (SCARLETT_DESKTOP_WEB=1); there is no preference for it yet.
+    web: bool,
 }
 
 pub fn valid_id(id: &str) -> bool {
@@ -585,6 +591,7 @@ fn observation_projection(raw: &[u8]) -> Result<Value> {
                 "in_flight",
                 "last_error_code",
                 "proof_modes",
+                "egress",
             ][..],
         ),
         (
@@ -681,6 +688,7 @@ impl Node {
             ),
             x_login_resources: PathBuf::new(),
             x_login_browser: None,
+            web: false,
         }
     }
     pub fn with_provider_runtime(mut self, resource_root: &Path) -> Self {
@@ -694,6 +702,7 @@ impl Node {
     }
     pub fn from_environment(state: PathBuf, binary: PathBuf, helper: PathBuf) -> Result<Self> {
         let mut node = Self::new(state, binary, helper);
+        node.web = std::env::var_os("SCARLETT_DESKTOP_WEB").is_some_and(|v| v == "1");
         let browser = std::env::var_os("SCARLETT_X_LOGIN_BROWSER").map(PathBuf::from);
         node.x_login_browser = browser_override(browser.as_deref())?;
         let coordinator = std::env::var("SCARLETT_DESKTOP_LOCAL_COORDINATOR").ok();
@@ -765,7 +774,14 @@ impl Node {
             .env("SCARLETT_COORDINATOR", &self.endpoints.coordinator)
             .env("SCARLETT_VERIFIER", &self.endpoints.verifier)
             .env("SCARLETT_EXECUTOR", "services")
-            .env("SCARLETT_SERVICES", "codex,x_read")
+            .env(
+                "SCARLETT_SERVICES",
+                if self.web {
+                    "codex,x_read,web"
+                } else {
+                    "codex,x_read"
+                },
+            )
             .env(
                 "SCARLETT_X_CONCURRENCY",
                 self.x_concurrency.load(Ordering::SeqCst).to_string(),
@@ -787,6 +803,9 @@ impl Node {
             .kill_on_drop(true);
         #[cfg(windows)]
         cmd.creation_flags(0x08000000);
+        if self.web {
+            cmd.env("SCARLETT_WEB_CONCURRENCY", "4");
+        }
         if let Some(root) = managed_codex_root(&self.state) {
             cmd.env("SCARLETT_CODEX_MANAGED_ROOT", root);
         }
@@ -1201,7 +1220,8 @@ impl Node {
         if !regular(&self.helper) {
             return Err(Error::RuntimeUnavailable);
         }
-        if self.accounts().await?.is_empty() {
+        // Web serves pages without any provider account.
+        if self.accounts().await?.is_empty() && !self.web {
             return Err(Error::AccountsUnavailable);
         }
         let mut cmd = self.command(&["desktop", "run"])?;
@@ -1461,6 +1481,7 @@ impl Node {
             s.observation = observation_projection(&raw).ok();
         }
         s.relay_halt_marker = self.relay_halt_marker();
+        s.web_enabled = self.web;
         let mut run = self.running.lock().await;
         if let Some(p) = run.as_mut() {
             s.supervised = p.try_wait().ok().flatten().is_none();
@@ -2638,6 +2659,66 @@ esac
             assert_eq!(node.set_x_concurrency(invalid), Err(Error::InvalidInput));
         }
         assert_env("4");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn launcher_adds_web_only_when_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("node");
+        std::fs::write(&binary, "synthetic node").unwrap();
+        let mut node = Node::new(
+            temp.path().join("state"),
+            binary,
+            temp.path().join("helper"),
+        );
+        let env = |node: &Node| -> std::collections::HashMap<String, Option<String>> {
+            node.command(&["desktop", "run"])
+                .unwrap()
+                .as_std()
+                .get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect()
+        };
+        let plain = env(&node);
+        assert_eq!(plain["SCARLETT_SERVICES"].as_deref(), Some("codex,x_read"));
+        assert!(!plain.contains_key("SCARLETT_WEB_CONCURRENCY"));
+        node.web = true;
+        let web = env(&node);
+        assert_eq!(
+            web["SCARLETT_SERVICES"].as_deref(),
+            Some("codex,x_read,web")
+        );
+        assert_eq!(web["SCARLETT_WEB_CONCURRENCY"].as_deref(), Some("4"));
+        assert!(!web.contains_key("SCARLETT_WEB_EGRESS_PROXY"));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn web_node_starts_without_accounts() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("node");
+        let helper = temp.path().join("helper");
+        std::fs::write(&binary, "#!/bin/sh\ncase \"$1 $2\" in\n'accounts list') printf '[]';;\n'desktop run') cat >/dev/null;;\n'drain ') exit 0;;\n'status ') printf '{\"state\":\"running\",\"services\":[{\"kind\":\"web\",\"state\":\"configured\",\"capacity\":4,\"egress\":\"direct\",\"max_input_bytes\":32768}]}';;\n*) exit 1;;\nesac\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&helper, "synthetic helper fixture").unwrap();
+        let mut node = Node::new(temp.path().join("state"), binary, helper);
+        node.prepare().unwrap();
+        std::fs::write(node.state.join("identity.json"), "{}").unwrap();
+        assert_eq!(node.start().await, Err(Error::AccountsUnavailable));
+        node.web = true;
+        node.start().await.unwrap();
+        let snapshot = node.snapshot().await;
+        assert!(snapshot.web_enabled && snapshot.supervised);
+        let service = &snapshot.observation.unwrap()["services"][0];
+        assert_eq!(service["kind"], "web");
+        assert_eq!(service["egress"], "direct");
+        assert!(service.get("max_input_bytes").is_none());
+        node.stop().await.unwrap();
     }
     #[cfg(unix)]
     #[tokio::test]

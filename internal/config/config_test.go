@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -294,5 +295,77 @@ func TestManagedCodexRootIsExplicitServicesOptIn(t *testing.T) {
 	c.Executor = ExecutorCodex
 	if c.Validate() == nil {
 		t.Fatal("managed renewal allowed outside services pool")
+	}
+}
+
+func TestWebServiceConfiguration(t *testing.T) {
+	t.Setenv("SCARLETT_COORDINATOR", "https://example.org")
+	t.Setenv("SCARLETT_PROFILE", "synthetic")
+	t.Setenv("SCARLETT_EXECUTOR", ExecutorServices)
+	t.Setenv("SCARLETT_VERIFIER", "127.0.0.1:7047")
+	t.Setenv("SCARLETT_PROVER", "scarlett-prover")
+	t.Setenv("SCARLETT_X_SESSION", filepath.Join(t.TempDir(), "synthetic-x.json"))
+	// Web alone needs no credential path at all.
+	t.Setenv("SCARLETT_SERVICES", "web")
+	c, err := Load()
+	if err != nil || !c.Enabled("web") || c.Enabled("x_read") || c.WebConcurrency != 4 || c.WebEgressProxy != nil || c.WebEgress() != "direct" {
+		t.Fatal("web-only node", err, c.WebConcurrency)
+	}
+	for services, ok := range map[string]bool{"codex,x_read,web": true, "x_read,web": true, "web,web": false, "web,browser": false, "codex,x_read,web,web": false, "": false} {
+		t.Setenv("SCARLETT_SERVICES", services)
+		if _, err := Load(); (err == nil) != ok {
+			t.Errorf("SCARLETT_SERVICES=%q: %v", services, err)
+		}
+	}
+	t.Setenv("SCARLETT_SERVICES", "web")
+	for value, want := range map[string]int{"1": 1, "32": 32, "0": 0, "33": 0, "four": 0} {
+		t.Setenv("SCARLETT_WEB_CONCURRENCY", value)
+		c, err := Load()
+		if want == 0 {
+			if err == nil {
+				t.Errorf("SCARLETT_WEB_CONCURRENCY=%q accepted", value)
+			}
+			continue
+		}
+		if err != nil || c.WebConcurrency != want {
+			t.Errorf("SCARLETT_WEB_CONCURRENCY=%q: %v %d", value, err, c.WebConcurrency)
+		}
+	}
+	os.Unsetenv("SCARLETT_WEB_CONCURRENCY")
+	for _, tc := range []struct {
+		raw, host, auth string
+		port            int
+	}{
+		{"http://proxy.example:8080", "proxy.example", "", 8080},
+		{"http://proxy.example:8080/", "proxy.example", "", 8080},
+		{"http://127.0.0.1:3128", "127.0.0.1", "", 3128},
+		{"http://[::1]:3128", "::1", "", 3128},
+		{"http://user:p%40ss@proxy.example:8080", "proxy.example", "Basic dXNlcjpwQHNz", 8080},
+		{"http://user@proxy.example:8080", "proxy.example", "Basic dXNlcjo=", 8080},
+	} {
+		t.Setenv("SCARLETT_WEB_EGRESS_PROXY", tc.raw)
+		c, err := Load()
+		if err != nil || c.WebEgressProxy == nil || c.WebEgressProxy.Host != tc.host || c.WebEgressProxy.Port != tc.port || c.WebEgressProxy.Authorization != tc.auth || c.WebEgress() != "proxy" {
+			t.Errorf("%q: %v %+v", tc.raw, err, c.WebEgressProxy)
+		}
+	}
+	for _, bad := range []string{"https://proxy.example:8080", "socks5://proxy.example:1080", "http://proxy.example", "http://proxy.example:0", "http://proxy.example:65536", "http://proxy.example:80a", "http://proxy.example:8080/path", "http://proxy.example:8080?x=1", "http://proxy.example:8080#f", "http://:secret@proxy.example:8080", "proxy.example:8080", "http://pro_xy.example:8080", "http://user:secret@:8080"} {
+		t.Setenv("SCARLETT_WEB_EGRESS_PROXY", bad)
+		_, err := Load()
+		if err == nil {
+			t.Errorf("%q accepted", bad)
+			continue
+		}
+		if strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "proxy.example") {
+			t.Errorf("error repeats the value: %v", err)
+		}
+	}
+	// The proxy belongs to the services executor only.
+	t.Setenv("SCARLETT_WEB_EGRESS_PROXY", "http://proxy.example:8080")
+	t.Setenv("SCARLETT_EXECUTOR", ExecutorGateway)
+	t.Setenv("SCARLETT_GATEWAY", "http://127.0.0.1:8080")
+	os.Unsetenv("SCARLETT_SERVICES")
+	if _, err := Load(); err == nil {
+		t.Fatal("egress proxy accepted outside services mode")
 	}
 }

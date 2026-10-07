@@ -23,6 +23,8 @@ export type ServiceHealth = {
   last_error_code?: string;
   // Absent means MPC-TLS only, as for every node before the field existed.
   proof_modes?: string[];
+  // web only: "direct" or "proxy" (a local CONNECT proxy).
+  egress?: string;
 };
 export type ClaudeStatus = { available: boolean; connected: boolean; pending: boolean; error?: string | null };
 export type Snapshot = {
@@ -38,6 +40,8 @@ export type Snapshot = {
   accounts: Account[];
   // The node's saved keyed-relay halt is still on disk.
   relay_halt_marker?: boolean;
+  // The node also serves web pages, which need no provider account.
+  web_enabled?: boolean;
   observation?: {
     state?: string;
     updated_at?: string;
@@ -103,7 +107,7 @@ export function canStart(s: Snapshot): boolean {
     s.helper_available &&
     s.accounts_available &&
     s.paired &&
-    s.accounts.length > 0 &&
+    (s.accounts.length > 0 || s.web_enabled === true) &&
     !s.supervised &&
     !s.local_api?.running &&
     !externalRuntime(s)

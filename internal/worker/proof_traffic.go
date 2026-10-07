@@ -25,14 +25,22 @@ func WithProofObserver(ctx context.Context, observer ProofObserver) context.Cont
 }
 
 // ProofSampleLimit uses the current production policy, never experimental batch
-// settings. x-go WithRetry(1) means one total attempt for each pinned exchange.
+// settings. x-go WithRetry(1) means one total attempt for each pinned exchange;
+// a web page runs one relay session per hop, its redirects plus one.
 func ProofSampleLimit(c config.Config, l coordinator.Lease) int {
-	if l.ServiceType == "x_read" {
+	switch l.ServiceType {
+	case "x_read":
 		plan, _, code := validateXLease(c, l)
 		if code != "" {
 			return 0
 		}
 		return plan.MaxAttempts
+	case "web":
+		plan, _, code := validateWebLease(c, l)
+		if code != "" {
+			return 0
+		}
+		return plan.MaxRedirects + 1
 	}
 	return 1
 }

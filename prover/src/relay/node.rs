@@ -1,15 +1,25 @@
-//! Supplier side of a relay session: `scarlett-prover relay-x`.
+//! Supplier side of a relay session: `scarlett-prover relay-x` and
+//! `scarlett-prover relay-web`.
 //!
 //! The supplier opens the TCP connection to X, so X sees its address, and
 //! carries the verifier's TLS session over it. It holds no session key. Its
 //! only cryptographic act is to place its cookie and CSRF values into the one
 //! request record the verifier sealed and finish that record's tag.
+//!
+//! A web hop is the same session to the address the node checked, with
+//! nothing hidden: the supplier sends the canonical request for the hop,
+//! still checks the opened record against it, and learns only the hop's
+//! status and next URL, never the page.
 
-use std::{ops::Range, time::Instant};
+use std::{
+    net::IpAddr,
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
@@ -23,8 +33,10 @@ use super::{
     wire::{self, CHUNK},
 };
 use crate::{
+    dial,
     diagnostics::{Outcome, Phase, Run, Snapshot, Trace},
     policy::find,
+    webpolicy,
     xpolicy::{self, HOST},
     xprove::{MAX_RECV, Request},
 };
@@ -43,6 +55,8 @@ struct Handshake {
     hellos: usize,
     change_cipher_spec: bool,
     finished: bool,
+    /// Keep the host out of errors, which the node may log.
+    quiet: bool,
 }
 
 impl Handshake {
@@ -57,6 +71,9 @@ impl Handshake {
                 // A ClientHello, or its repeat after a HelloRetryRequest.
                 record::HANDSHAKE if self.hellos < 2 && !self.finished => {
                     if client_hello_name(&record[5..]) != Some(host.as_bytes()) {
+                        if self.quiet {
+                            bail!("verifier's handshake is not a ClientHello for this hop's host");
+                        }
                         bail!("verifier's handshake is not a ClientHello for {host}");
                     }
                     self.hellos += 1;
@@ -167,6 +184,147 @@ async fn run_observed(request: Request, trace: &Trace) -> Result<Summary> {
     })
 }
 
+/// Input of `scarlett-prover relay-web`: one hop of a web job, to the
+/// address the node resolved and checked.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebRequest {
+    pub verifier: String,
+    pub verifier_ca_file: Option<String>,
+    #[serde(default)]
+    pub plaintext_fixture: bool,
+    pub token: String,
+    pub hop: u32,
+    pub url: String,
+    pub ip: String,
+    pub port: u16,
+    pub proxy: Option<dial::Proxy>,
+    pub payload: serde_json::Value,
+    pub timeout_ms: u64,
+}
+
+#[derive(Serialize)]
+pub struct WebSummary {
+    /// Untrusted operational TCP payload counters, never billing or proof evidence.
+    #[serde(flatten)]
+    pub verifier_transport: crate::control::TrafficSnapshot,
+    pub status: &'static str,
+    pub hop: u32,
+    /// The hop URL the verifier reported, already checked against the input.
+    pub url: String,
+    pub status_code: u16,
+    #[serde(rename = "final")]
+    pub is_final: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_url: Option<String>,
+    /// TCP payload bytes to and from the target (TLS records, or the tunnel).
+    pub target_sent_bytes: u64,
+    pub target_received_bytes: u64,
+    pub duration_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Snapshot>,
+}
+
+/// A failed hop: `class` is what the node maps to a failure code
+/// (`connect_failed`, `proxy_failed` or `fetch_failed`).
+pub struct WebError {
+    pub class: &'static str,
+    pub error: anyhow::Error,
+}
+
+impl WebError {
+    fn fetch(error: anyhow::Error) -> Self {
+        Self { class: "fetch_failed", error }
+    }
+}
+
+pub async fn run_web(input: &[u8]) -> Result<WebSummary, WebError> {
+    let diagnostics = Run::new();
+    let mut summary = run_web_observed(input, &diagnostics.trace()).await?;
+    summary.diagnostics = Some(diagnostics.success());
+    Ok(summary)
+}
+
+/// Defense in depth only: the node's egress check is the authority on
+/// which addresses a job may reach.
+fn public_address(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_loopback() || v4.is_unspecified() || v4.is_multicast() || v4.is_link_local() || v4.is_private() || v4.is_broadcast() || a == 0 || (a == 100 && b & 0xc0 == 64))
+        }
+        IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || v6.is_unicast_link_local() || v6.is_unique_local()),
+    }
+}
+
+/// Checks a hop request before any connection. Errors name the rule, never
+/// the URL or address.
+fn validate_hop(request: &WebRequest) -> Result<(webpolicy::Job, IpAddr, Duration)> {
+    if request.token.len() != 64 || !request.token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("verifier token must be 64 hex characters");
+    }
+    let job = webpolicy::validate_job(&request.payload)?;
+    if webpolicy::canonical_url(&request.url).ok().as_deref() != Some(request.url.as_str()) {
+        bail!("hop URL must be a canonical public https URL");
+    }
+    if request.hop as usize > job.max_redirects || (request.hop == 0 && request.url != job.url) {
+        bail!("hop does not belong to this job");
+    }
+    let ip: IpAddr = request.ip.parse().ok().context("target must be an IP address literal")?;
+    if !public_address(ip) {
+        bail!("target address is not public");
+    }
+    if request.port != 443 {
+        bail!("target port must be 443");
+    }
+    if !(1000..=webpolicy::HOP_LIMIT.as_millis() as u64).contains(&request.timeout_ms) {
+        bail!("timeout_ms must be 1000-30000");
+    }
+    Ok((job, ip, Duration::from_millis(request.timeout_ms)))
+}
+
+async fn run_web_observed(input: &[u8], trace: &Trace) -> Result<WebSummary, WebError> {
+    let request: WebRequest = serde_json::from_slice(input).context("invalid relay-web input").map_err(WebError::fetch)?;
+    let (job, ip, timeout) = validate_hop(&request).map_err(WebError::fetch)?;
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + timeout;
+    let raw = webpolicy::request(&request.url, &job.headers);
+    let host = webpolicy::url_host(&request.url);
+    // Reach the target first: presenting the token spends one of the job's sessions.
+    let dial_class = if request.proxy.is_some() { "proxy_failed" } else { "connect_failed" };
+    let server = match tokio::time::timeout_at(deadline, trace.measure(Phase::XTcpConnect, dial::target(ip, request.port, request.proxy.as_ref()))).await {
+        Ok(Ok(server)) => server,
+        Ok(Err(dial::Error::Connect(error))) => return Err(WebError { class: "connect_failed", error }),
+        Ok(Err(dial::Error::Proxy(error))) => return Err(WebError { class: "proxy_failed", error }),
+        Err(_) => return Err(WebError { class: dial_class, error: anyhow::anyhow!("target connection timed out") }),
+    };
+    let (server, target) = crate::control::metered(server);
+    let session = async {
+        let (mut socket, traffic) = crate::control::connect_observed(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture, Some(trace)).await?;
+        socket.write_all(format!("{}\n", request.token).as_bytes()).await?;
+        let outcome = trace.measure(Phase::RelaySession, web_session(socket, server, &raw, host, request.hop, &request.url, trace)).await?;
+        anyhow::Ok((outcome, traffic))
+    };
+    let (outcome, traffic) = match tokio::time::timeout_at(deadline, session).await {
+        Ok(result) => result.map_err(WebError::fetch)?,
+        Err(_) => return Err(WebError::fetch(anyhow::anyhow!("relay session timed out"))),
+    };
+    let (target_sent_bytes, target_received_bytes) = target.bytes();
+    Ok(WebSummary {
+        verifier_transport: traffic.snapshot(),
+        status: "proof_sent",
+        hop: outcome.hop,
+        url: outcome.url,
+        status_code: outcome.status_code,
+        is_final: outcome.is_final,
+        next_url: outcome.next_url,
+        target_sent_bytes,
+        target_received_bytes,
+        duration_ms: started.elapsed().as_millis(),
+        diagnostics: None,
+    })
+}
+
 /// The hidden ranges of a request and the bytes in them.
 fn secrets(raw: &[u8]) -> Result<(Vec<Range<usize>>, Vec<u8>)> {
     let head_end = find(raw, b"\r\n\r\n").context("request has no header terminator")?;
@@ -198,12 +356,53 @@ where
     V: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     X: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    exchange(verifier, server, raw, host, Mode::X, trace).await.map(|(response, _)| response)
+}
+
+/// Runs one web hop over an established verifier socket and a connection to
+/// the target, and returns what the verifier reported for it. `raw` is the
+/// canonical request for `url`, hop number `hop`.
+pub(crate) async fn web_session<V, X>(verifier: V, server: X, raw: &[u8], host: &str, hop: u32, url: &str, trace: &Trace) -> Result<HopOutcome>
+where
+    V: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    X: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (_, outcome) = exchange(verifier, server, raw, host, Mode::Web { hop, url }, trace).await?;
+    outcome.context("verifier finished without reporting the hop")
+}
+
+#[derive(Clone, Copy)]
+enum Mode<'a> {
+    X,
+    Web { hop: u32, url: &'a str },
+}
+
+/// What the verifier reports about a web hop once the supplier has checked
+/// the opened request record.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HopOutcome {
+    pub hop: u32,
+    pub url: String,
+    pub status_code: u16,
+    #[serde(rename = "final")]
+    pub is_final: bool,
+    pub next_url: Option<String>,
+}
+
+async fn exchange<V, X>(verifier: V, server: X, raw: &[u8], host: &str, mode: Mode<'_>, trace: &Trace) -> Result<(Vec<u8>, Option<HopOutcome>)>
+where
+    V: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    X: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let web = matches!(mode, Mode::Web { .. });
     // These begin together. Authorization is the locally observed wait until
     // MATERIAL confirms readiness; it also includes any remaining TLS/OT work.
     let mut authorization = Some(trace.span(Phase::RelayAuthorization));
     let mut tls_ready = Some(trace.span(Phase::XTlsReady));
     let mut ot_ready = Some(trace.span(Phase::OtReady));
-    let (hidden, secret) = secrets(raw)?;
+    // A web request is public: nothing in it is hidden from the verifier.
+    let (hidden, secret) = if web { (Vec::new(), Vec::new()) } else { secrets(raw)? };
     let bits = tag::hidden_bits(raw.len(), &hidden)?;
     let mut public = raw.to_vec();
     hidden.iter().for_each(|range| public[range.clone()].fill(0));
@@ -252,12 +451,13 @@ where
         received = Some(Vec::new());
     }
 
-    let mut handshake = Handshake::default();
+    let mut handshake = Handshake { quiet: web, ..Handshake::default() };
     let mut record_sent = false;
     let mut sealed: Option<Vec<u8>> = None;
     let mut checked = false;
     let mut response = Vec::new();
     let mut response_last_byte = None;
+    let mut outcome: Option<HopOutcome> = None;
     while let Some(event) = inbox.recv().await {
         match event {
             Event::Failed(e) => {
@@ -269,6 +469,11 @@ where
             // Once the response is whole the verifier stops reading, so a late
             // write to it may fail while its result is still on the way here.
             Event::Server(bytes) => {
+                // The supplier never sees a web page, only when its records start to arrive.
+                if web && record_sent && !bytes.is_empty() && response_last_byte.is_none() {
+                    trace.milestone(Phase::ResponseFirstByte);
+                    response_last_byte = Some(Instant::now());
+                }
                 let sent = wire::send(&mut to_verifier, wire::FROM_SERVER, &bytes).await;
                 if !record_sent {
                     sent?;
@@ -324,6 +529,9 @@ where
                 sealed = Some(record);
             }
             Event::Frame(wire::PLAIN, payload) => {
+                if web {
+                    bail!("verifier sent page plaintext in a web session");
+                }
                 if !record_sent || response.len() + payload.len() > MAX_RECV {
                     bail!("verifier returned an unexpected or oversized response");
                 }
@@ -338,12 +546,28 @@ where
             Event::Frame(wire::OPENING, payload) => {
                 // Check framing once, after the verifier stopped returning data,
                 // to avoid a new repeated full-body scan for small PLAIN frames.
-                if xpolicy::response_complete(&response) && let Some(at) = response_last_byte.take() {
+                if !web && xpolicy::response_complete(&response) && let Some(at) = response_last_byte.take() {
                     trace.milestone_at(Phase::ResponseComplete, at);
                 }
                 let record = sealed.take().context("verifier opened a record that was not sent")?;
                 trace.measure_sync(Phase::OpeningCheck, || opened_as(&payload, &record, raw))?;
                 checked = true;
+            }
+            Event::Frame(wire::OUTCOME, payload) if web => {
+                let Mode::Web { hop, url } = mode else { unreachable!("web mode") };
+                if !checked || outcome.is_some() {
+                    bail!("verifier reported a hop before opening its request record, or twice");
+                }
+                let reported: HopOutcome = serde_json::from_slice(&payload).context("invalid hop outcome")?;
+                if reported.hop != hop || reported.url != url {
+                    bail!("outcome mismatch");
+                }
+                let next_ok = reported.next_url.as_deref().is_none_or(|next| webpolicy::canonical_url(next).ok().as_deref() == Some(next));
+                if !(100..=999).contains(&reported.status_code) || reported.is_final != reported.next_url.is_none() || !next_ok {
+                    bail!("verifier reported an invalid hop outcome");
+                }
+                trace.milestone(Phase::ResponseComplete);
+                outcome = Some(reported);
             }
             Event::Frame(wire::DONE, _) => {
                 if !record_sent {
@@ -353,7 +577,10 @@ where
                 if !checked {
                     bail!("{MISUSE}: it did not open the request record");
                 }
-                return Ok(response);
+                if web && outcome.is_none() {
+                    bail!("verifier finished without reporting the hop");
+                }
+                return Ok((response, outcome));
             }
             Event::Frame(kind, _) => bail!("unexpected relay frame {kind}"),
         }
@@ -516,6 +743,81 @@ mod tests {
         wrong[0] ^= 1;
         assert!(opened_as(&wrong, &record, &raw).is_err());
         assert!(opened_as(&opening[..35], &record, &raw).is_err());
+    }
+
+    fn web_input() -> serde_json::Value {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!("../../../api/web-vectors.json")).unwrap();
+        serde_json::json!({
+            "verifier": "127.0.0.1:1", "plaintext_fixture": true, "token": "ab".repeat(32), "hop": 0,
+            "url": "https://example.com/", "ip": "93.184.215.14", "port": 443,
+            "payload": {"type":"web.fetch","proof_mode":"relay","proof_policy":"web-relay-v1","url":"https://example.com/","max_redirects":5,"max_response_bytes":10485760,"headers":vectors["default_headers"]},
+            "timeout_ms": 1000
+        })
+    }
+
+    async fn web_class(input: &serde_json::Value) -> (&'static str, String) {
+        match run_web(&serde_json::to_vec(input).unwrap()).await {
+            Ok(_) => panic!("hop succeeded"),
+            Err(failure) => (failure.class, format!("{:#}", failure.error)),
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_web_input_is_checked_before_any_connection() {
+        let cases: Vec<(&str, Box<dyn Fn(&mut serde_json::Value)>)> = vec![
+            ("hostname", Box::new(|v| v["ip"] = "example.com".into())),
+            ("ip with port", Box::new(|v| v["ip"] = "93.184.215.14:443".into())),
+            ("loopback", Box::new(|v| v["ip"] = "127.0.0.1".into())),
+            ("private", Box::new(|v| v["ip"] = "192.168.1.10".into())),
+            ("cgnat", Box::new(|v| v["ip"] = "100.64.0.1".into())),
+            ("link-local", Box::new(|v| v["ip"] = "169.254.169.254".into())),
+            ("unspecified", Box::new(|v| v["ip"] = "0.0.0.0".into())),
+            ("mapped loopback", Box::new(|v| v["ip"] = "::ffff:127.0.0.1".into())),
+            ("v6 loopback", Box::new(|v| v["ip"] = "::1".into())),
+            ("ula", Box::new(|v| v["ip"] = "fd00::1".into())),
+            ("v6 link-local", Box::new(|v| v["ip"] = "fe80::1".into())),
+            ("multicast", Box::new(|v| v["ip"] = "ff02::1".into())),
+            ("port", Box::new(|v| v["port"] = 8443.into())),
+            ("non-canonical url", Box::new(|v| v["url"] = "https://Example.com/".into())),
+            ("x url", Box::new(|v| v["url"] = "https://x.com/".into())),
+            ("hop 0 elsewhere", Box::new(|v| v["url"] = "https://www.example.com/".into())),
+            ("hop beyond redirects", Box::new(|v| v["hop"] = 6.into())),
+            ("payload", Box::new(|v| v["payload"]["max_redirects"] = 9.into())),
+            ("timeout", Box::new(|v| v["timeout_ms"] = 30001.into())),
+            ("short timeout", Box::new(|v| v["timeout_ms"] = 999.into())),
+            ("token", Box::new(|v| v["token"] = "short".into())),
+            ("unknown field", Box::new(|v| v["extra"] = true.into())),
+            ("proxy field", Box::new(|v| v["proxy"] = serde_json::json!({"host":"127.0.0.1","port":1,"url":"x"}))),
+        ];
+        for (name, mutate) in cases {
+            let mut input = web_input();
+            mutate(&mut input);
+            let (class, error) = web_class(&input).await;
+            assert_eq!(class, "fetch_failed", "{name}: {error}");
+            for private in ["example.com", "93.184.215.14", "192.168", "127.0.0.1"] {
+                assert!(!error.contains(private), "{name}: {error}");
+            }
+        }
+        // A later hop may fetch any canonical URL the verifier authorized.
+        let mut later = web_input();
+        later["hop"] = 1.into();
+        later["url"] = "https://www.example.com/".into();
+        later["proxy"] = serde_json::json!({"host":"127.0.0.1","port":1});
+        assert_eq!(web_class(&later).await.0, "proxy_failed");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_proxy_or_target_is_not_a_verifier_session() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
+        let mut input = web_input();
+        input["proxy"] = serde_json::json!({"host":"127.0.0.1","port":closed,"authorization":"Basic c2VjcmV0"});
+        let (class, error) = web_class(&input).await;
+        assert_eq!(class, "proxy_failed");
+        assert!(!error.contains("c2VjcmV0") && !error.contains("127.0.0.1"), "{error}");
+        // A documentation address goes nowhere: the dial fails or times out.
+        let mut input = web_input();
+        input["ip"] = "192.0.2.1".into();
+        assert_eq!(web_class(&input).await.0, "connect_failed");
     }
 
     #[test]

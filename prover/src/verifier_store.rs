@@ -48,6 +48,11 @@ fn unresolved(record: &Record) -> bool {
     if record.expires_ms <= now { return false; }
      matches!(record.status["status"].as_str(), Some("pending" | "running"))
         || record.status["status"] == "x_read" && record.status["complete"] != true && record.status["remaining_attempts"].as_u64().unwrap_or(0) > 0
+        // A web job that can still run a hop may yet store a full page.
+        || record.status["status"] == "web_read"
+            && record.status["complete"] != true
+            && record.status["rejections"].as_array().is_some_and(Vec::is_empty)
+            && record.status["remaining_sessions"].as_u64().unwrap_or(0) > 0
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -342,6 +347,32 @@ mod tests {
         store.save(&second).unwrap();
         assert!(store.capacity().can_register);
         store.save(&third).unwrap();
+    }
+    #[test]
+    fn web_receipts_reserve_space_only_while_a_hop_can_still_run() {
+        let dir = Temp::new();
+        let limits = Limits { max_records: 8, max_record_bytes: 1 << 20, max_total_bytes: 4 << 20 };
+        let (mut store, _) = Store::open_with_limits(&dir.0, limits).unwrap();
+        let mut r = record();
+        r.payload = serde_json::json!({"type":"web.fetch"});
+        let web = |remaining: u64, complete: bool, rejections: serde_json::Value| serde_json::json!({"status":"web_read","remaining_sessions":remaining,"complete":complete,"next_url":null,"hops":[],"rejections":rejections});
+        for (status, reserved) in [
+            (web(6, false, serde_json::json!([])), true),
+            (web(0, false, serde_json::json!([])), false),
+            (web(3, true, serde_json::json!([])), false),
+            (web(5, false, serde_json::json!(["tls_failed"])), false),
+        ] {
+            r.status = status;
+            assert_eq!(unresolved(&r), reserved, "{}", r.status);
+            store.save(&r).unwrap();
+            assert_eq!(store.capacity().reserved_bytes == limits.max_record_bytes, reserved);
+        }
+        // Expiry releases the reservation whatever the status says.
+        r.status = web(6, false, serde_json::json!([]));
+        r.expires_ms = 1;
+        assert!(!unresolved(&r));
+        r.in_flight = 1;
+        assert!(unresolved(&r));
     }
     #[test]
     fn invalid_capacity_limits_fail_closed() {

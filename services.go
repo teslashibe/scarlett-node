@@ -39,24 +39,32 @@ type servicePool struct {
 	xRecovery                               func() ([]attempts.Record, error)
 	xRecoveryIdentities                     map[string]bool
 	xRecoveryUnknown                        bool
+	// web is the account-free web service's slot holder. Its entry is
+	// entries["web"], which only the web paths below ever change.
+	web *pooledAccount
 }
 
 func newServicePool(c config.Config) *servicePool {
-	p := &servicePool{next: map[string]int{}, config: c, entries: map[string]*serviceEntry{"codex": {capacity: c.CodexConcurrency}, "x_read": {capacity: c.XConcurrency}}}
+	p := &servicePool{next: map[string]int{}, config: c, entries: map[string]*serviceEntry{"codex": {capacity: c.CodexConcurrency}, "x_read": {capacity: c.XConcurrency}, "web": {capacity: c.WebConcurrency}}}
 	if c.XAccountConcurrency > 0 {
 		p.entries["x_read"].capacity = min(c.XConcurrency, c.XAccountConcurrency)
 	}
 	for _, kind := range c.Services {
 		p.entries[kind].enabled = true
 	}
+	p.web = &pooledAccount{spec: providerAccount{"web", "web", "", c.WebConcurrency}, entry: p.entries["web"]}
 	return p
 }
 func (p *servicePool) refresh(now time.Time) {
+	p.refreshWeb(now)
 	if p.refreshAccounts(now) {
 		return
 	}
 	_, helperError := exec.LookPath(p.config.Prover)
 	for kind, s := range p.entries {
+		if kind == "web" {
+			continue
+		}
 		if !s.enabled {
 			s.state = "not_added"
 			continue
@@ -80,7 +88,7 @@ func (p *servicePool) health() []coordinator.ServiceHealth {
 	now := time.Now()
 	p.refresh(now)
 	out := []coordinator.ServiceHealth{}
-	for _, kind := range []string{"codex", "x_read"} {
+	for _, kind := range []string{"codex", "x_read", "web"} {
 		s := p.entries[kind]
 		capacity := 0
 		if s.enabled {
@@ -135,6 +143,9 @@ func (p *servicePool) health() []coordinator.ServiceHealth {
 			if kind == "codex" {
 				h.MaxOutputTokens = p.config.MaxOutputTokens
 				h.Models = config.AvailableModelsAt(time.Now())
+			}
+			if kind == "web" {
+				h.Egress = p.config.WebEgress()
 			}
 			// Only an opted-in node says so, and a node that has not opted
 			// in sends exactly the heartbeat it sent before the field existed.
@@ -195,6 +206,10 @@ func (p *servicePool) xRefreshAllowed(path string) bool {
 
 func (p *servicePool) acquire(kind string) bool { _, ok := p.acquireAccount(kind); return ok }
 func (p *servicePool) finish(kind, code string) {
+	if kind == "web" {
+		p.finishAccount(&accountLease{id: "web", kind: "web", config: p.config, account: p.web}, code)
+		return
+	}
 	p.mu.Lock()
 	p.initAccounts()
 	a := p.accounts[kind+":legacy"]
@@ -217,10 +232,63 @@ func (p *servicePool) finish(kind, code string) {
 // configuration, never the advertised capacity that refresh and renewal adjust.
 func (p *servicePool) capacity() int {
 	total := 0
-	for kind, ceiling := range map[string]int{"codex": p.config.CodexConcurrency, "x_read": p.config.XConcurrency} {
+	for kind, ceiling := range map[string]int{"codex": p.config.CodexConcurrency, "x_read": p.config.XConcurrency, "web": p.config.WebConcurrency} {
 		if p.config.Enabled(kind) {
 			total += ceiling
 		}
 	}
 	return total
+}
+
+// webProxyRest is how long the web service reports unreachable after its
+// egress proxy failed, before it is offered work again.
+const webProxyRest = 60 * time.Second
+
+// refreshWeb derives the web state. Web has no accounts: it is configured
+// once enabled with the proof helper present, and only the helper, a relay
+// halt or a failed egress proxy make it unreachable. Caller holds p.mu.
+func (p *servicePool) refreshWeb(now time.Time) {
+	s := p.entries["web"]
+	if !s.enabled {
+		s.state, s.lastError = "not_added", ""
+		return
+	}
+	_, helperErr := exec.LookPath(p.config.Prover)
+	switch {
+	case helperErr != nil:
+		s.state, s.lastError = "unreachable", "prover_error"
+	case worker.RelayHalted():
+		// Web is keyed relay only, through the one verifier that misbehaved.
+		s.state, s.lastError = "unreachable", "relay_misuse"
+	case now.Before(s.restUntil):
+		s.state, s.lastError = "unreachable", "web_proxy_failed"
+	case s.state != "ready":
+		s.state, s.lastError, s.restUntil = "configured", "", time.Time{}
+	}
+}
+
+// acquireWebLocked takes a web slot. Account files, their health and their
+// errors never apply: a web-only node may have no accounts at all.
+func (p *servicePool) acquireWebLocked() (*accountLease, bool) {
+	s := p.entries["web"]
+	if !s.enabled || s.state != "configured" && s.state != "ready" || s.inFlight >= s.capacity {
+		return nil, false
+	}
+	s.inFlight++
+	c := p.config
+	c.LocalAccountID = "web"
+	return &accountLease{id: "web", kind: "web", config: c, account: p.web}, true
+}
+
+// settleWeb applies one finished web job. Only the node's own egress proxy
+// failing rests the service; a target that fails, refuses or does not resolve
+// says nothing about this node. Caller holds p.mu.
+func (p *servicePool) settleWeb(code string) {
+	s := p.entries["web"]
+	switch code {
+	case "":
+		s.state, s.lastError = "ready", ""
+	case "web_proxy_failed":
+		s.state, s.lastError, s.restUntil = "unreachable", code, time.Now().Add(webProxyRest)
+	}
 }

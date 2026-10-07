@@ -51,6 +51,10 @@ type Lease struct {
 	VerifierToken string          `json:"verifier_token,omitempty"`
 	XRequest      *XRequest       `json:"x_request,omitempty"`
 	XPayload      json.RawMessage `json:"x_payload,omitempty"`
+	// Set for web jobs: the canonical page to fetch and the exact verifier
+	// web.fetch payload that binds it.
+	WebRequest *WebRequest     `json:"web_request,omitempty"`
+	WebPayload json.RawMessage `json:"web_payload,omitempty"`
 	// Community offers grant no provider permission before funded acceptance.
 	AcceptanceRequired bool   `json:"acceptance_required,omitempty"`
 	RequestSHA256      string `json:"request_sha256,omitempty"`
@@ -65,6 +69,13 @@ type XRequest struct {
 	PostID    string `json:"post_id,omitempty"`
 	Count     int    `json:"count,omitempty"`
 	Pages     int    `json:"pages,omitempty"`
+}
+
+// WebRequest is one public https page. The URL is canonical (api/web-vectors.json);
+// redirects are followed only as the verifier authorizes them.
+type WebRequest struct {
+	Operation string `json:"operation"`
+	URL       string `json:"url"`
 }
 
 // ActiveLease is an already acquired coordinator lease occupying local work.
@@ -108,6 +119,9 @@ type ServiceHealth struct {
 	// Proof modes this node serves for the kind beyond the default. Absent
 	// means MPC-TLS only, which is what every node before this field serves.
 	ProofModes []string `json:"proof_modes,omitempty"`
+	// Egress is how an enabled web service reaches targets: "direct" or
+	// "proxy" (a local HTTP CONNECT proxy). Node-reported, not verified.
+	Egress string `json:"egress,omitempty"`
 }
 
 // Per-operation lanes overlap and must never be added together. Admission

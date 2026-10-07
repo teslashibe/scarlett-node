@@ -189,8 +189,8 @@ paths:
       parameters: [{$ref: '#/components/parameters/JobID'}]
       summary: Report that a proof was sent to the assigned verifier
       description: >-
-        The node does not submit the answer. The coordinator reads Codex model/output/usage or X fulfilment/response copies
-        from the assigned verifier after this call. A supplier copy of the output is not accepted. X bootstrap authentication reads are unproven and do not count as paid exchanges. An empty first search page may fulfil one pinned exchange; missing cursors cannot fulfil later requested pages.
+        The node does not submit the answer. The coordinator reads Codex model/output/usage, X fulfilment/response copies
+        or web hops from the assigned verifier after this call. A supplier copy of the output is not accepted. X bootstrap authentication reads are unproven and do not count as paid exchanges. An empty first search page may fulfil one pinned exchange; missing cursors cannot fulfil later requested pages.
       requestBody:
         required: true
         content:
@@ -284,7 +284,7 @@ components:
     Heartbeat:
       type: object
       required: [version, node_id, profile, state, wait_seconds]
-      description: Legacy nodes share catalog capacity. Services-mode nodes report independently enabled Codex/X capacities and states; all health is node-reported, not verifier acceptance or payment evidence.
+      description: Legacy nodes share catalog capacity. Services-mode nodes report independently enabled Codex, X and web capacities and states; all health is node-reported, not verifier acceptance or payment evidence.
       properties:
         version: {type: string, enum: [node-v1]}
         node_id: {type: string}
@@ -292,19 +292,19 @@ components:
         state: {type: string, enum: [available, exhausted], description: exhausted means the node's gateway recently had no capacity; the coordinator offers it no lease until it reports available again.}
         wait_seconds: {type: integer, minimum: 0, maximum: 20, description: "How long the coordinator may hold this heartbeat open while it has nothing to offer. The node sends 20; the coordinator clamps the value to [0, 20] and answers early the moment an offer exists. Zero asks for an immediate answer."}
         bid: {type: integer, minimum: 0, maximum: 1000000000, description: Standing assignment bid. Lower wins, then least assigned work, then node_id. Missing is treated as 100. Not an on-chain quote.}
-        capacity: {type: integer, minimum: 0, maximum: 64, description: "Legacy typed reports use the exact sum of service capacities. Enriched readiness reports use the shared physical ceiling: the sum of configured_capacity where present and ordinary capacity otherwise. Generic runnable capacity may be zero while an exact operation is runnable. Legacy untyped reports require positive capacity; omitted legacy capacity defaults to 1. Physical capacity alone never grants operation readiness."}
+        capacity: {type: integer, minimum: 0, maximum: 96, description: "Legacy typed reports use the exact sum of service capacities. Enriched readiness reports use the shared physical ceiling: the sum of configured_capacity where present and ordinary capacity otherwise. Generic runnable capacity may be zero while an exact operation is runnable. Legacy untyped reports require positive capacity; omitted legacy capacity defaults to 1. Physical capacity alone never grants operation readiness."}
         services:
           type: array
-          maxItems: 2
-          description: Each kind is unique; disabled kinds have zero capacity and in-flight count
+          maxItems: 3
+          description: Each kind (codex, x_read, web) is unique; disabled kinds report not_added with zero capacity and in-flight count
           items: {$ref: '#/components/schemas/ServiceHealth'}
     ServiceHealth:
       type: object
       additionalProperties: false
       required: [kind, state, capacity, in_flight]
       properties:
-        kind: {type: string, enum: [codex, x_read]}
-        state: {type: string, enum: [not_added, configured, ready, exhausted, auth_required, unreachable], description: "configured means a local credential file is usable (for x_read: the account's warm client is still being built, or a rest just ended and the next 15-second check has not yet confirmed the installed client); ready means local execution reported proof sent, not verifier acceptance, or for x_read that a client build validated the session against X; an x_read build that X refuses, rate-limits or cannot reach reports auth_required, exhausted or unreachable without waiting for a job"}
+        kind: {type: string, enum: [codex, x_read, web]}
+        state: {type: string, enum: [not_added, configured, ready, exhausted, auth_required, unreachable], description: "configured means a local credential file is usable (for x_read: the account's warm client is still being built, or a rest just ended and the next 15-second check has not yet confirmed the installed client); ready means local execution reported proof sent, not verifier acceptance, or for x_read that a client build validated the session against X; an x_read build that X refuses, rate-limits or cannot reach reports auth_required, exhausted or unreachable without waiting for a job. web has no accounts: configured means enabled with the proof helper present, ready means the last web job ended proven, and unreachable carries last_error_code relay_misuse (keyed relay halted), prover_error (helper missing) or web_proxy_failed (a 60-second rest after the egress proxy failed). Target-side web failures never change the web state."}
         capacity: {type: integer, minimum: 0, maximum: 32}
         in_flight: {type: integer, minimum: 0, maximum: 32}
         configured_capacity: {type: integer, minimum: 0, maximum: 32, description: "Optional physical service ceiling including retained in-flight work and distinct usable authenticated account lanes, at least capacity. Never provider quota or global independence across nodes."}
@@ -332,7 +332,7 @@ components:
               runnable_capacity: {type: integer, minimum: 0, maximum: 32}
               next_ready_at: {type: string, format: date-time, description: "Optional bounded UTC eligibility hint; elapsed time alone does not authorize an offer."}
         last_error_code: {type: string, description: Bounded failure code only, never raw provider errors or credentials}
-        max_input_bytes: {type: integer, minimum: 1, maximum: 65536, description: Local Codex prompt UTF-8 bytes or serialized x_request UTF-8 bytes; omitted by legacy nodes}
+        max_input_bytes: {type: integer, minimum: 1, maximum: 65536, description: Local Codex prompt UTF-8 bytes, serialized x_request UTF-8 bytes or serialized web_request UTF-8 bytes; omitted by legacy nodes and disabled kinds}
         max_output_tokens: {type: integer, minimum: 1, maximum: 8192, description: Codex local output reservation limit; absent for X}
         models:
           type: array
@@ -361,6 +361,10 @@ components:
             job to a node that does not list relay, and should omit proof_mode on mpc jobs so
             nodes that predate the field still accept them.
           items: {type: string, enum: [mpc, relay]}
+        egress:
+          type: string
+          enum: [direct, proxy]
+          description: "web only; required for an enabled web entry. proxy means the node dials targets through a local HTTP CONNECT proxy (SCARLETT_WEB_EGRESS_PROXY). Node-reported, not verified."
     ActiveLease:
       type: object
       additionalProperties: false
@@ -397,9 +401,12 @@ components:
       type: object
       description: >-
         Job ID and signed_job_id are issued/committed server-side before lease; client does not
-        cryptographically verify signed_job_id yet. codex_payload and verifier_token are set only
-        for proven Codex jobs. The node proves that request to the locally configured verifier;
-        the coordinator reads the answer from the verifier, not from this node.
+        cryptographically verify signed_job_id yet. codex_payload, x_payload and web_payload carry the
+        exact verifier request of a Codex, x_read or web job; verifier_token arrives only in the funded
+        acceptance reply. The node proves that request to the locally configured verifier; the
+        coordinator reads the answer from the verifier, not from this node. A web lease fetches one
+        public https page: the node resolves the host itself, refuses private and reserved addresses,
+        and opens the connection from its own address while the verifier is the TLS client.
       required: [version, job_id, signed_job_id, profile, input_sha256, attempt, fence, lease_deadline, settlement_deadline]
       oneOf:
         - required: [model_id, prompt, max_input_tokens, max_output_tokens]
@@ -415,13 +422,20 @@ components:
             prompt: {type: string, maxLength: 0}
             max_input_tokens: {type: integer, maximum: 0}
             max_output_tokens: {type: integer, maximum: 0}
+        - required: [service_type, web_request, web_payload]
+          properties:
+            service_type: {type: string, enum: [web]}
+            model_id: {type: string, maxLength: 0}
+            prompt: {type: string, maxLength: 0}
+            max_input_tokens: {type: integer, maximum: 0}
+            max_output_tokens: {type: integer, maximum: 0}
       properties:
         version: {type: string, enum: [node-v1]}
         acceptance_required: {type: boolean, description: Required true for community provider work; token-free offers need funded acceptance before execution}
         request_sha256: {type: string, pattern: '^[0-9a-f]{64}$', description: Canonical exact verifier request digest}
         job_id: {type: string}
         signed_job_id: {type: string, description: Legacy commitment field; community offers bind the immutable reviewed terms digest, not an on-chain signature.}
-        service_type: {type: string, enum: [codex, x_read], description: Required in services mode; omitted by legacy Codex leases}
+        service_type: {type: string, enum: [codex, x_read, web], description: Required in services mode; omitted by legacy Codex leases}
         profile: {type: string}
         model_id: {type: string, description: 'A catalog base model or its gateway alias with a reasoning effort (-low, -medium, -high, -xhigh, -max) and/or the fast tier (-fast, -fast-<effort>). Proven Codex leases must name a base model.'}
         prompt: {type: string}
@@ -441,6 +455,8 @@ components:
           description: Single-use token for the verifier configured in SCARLETT_VERIFIER. Not a login secret.
         x_request: {$ref: '#/components/schemas/XRequest'}
         x_payload: {$ref: '#/components/schemas/XPayload'}
+        web_request: {$ref: '#/components/schemas/WebRequest'}
+        web_payload: {$ref: '#/components/schemas/WebPayload'}
     XRequest:
       type: object
       additionalProperties: false
@@ -489,6 +505,44 @@ components:
               features: {type: object}
               field_toggles: {type: object}
               cursor_from: {type: integer, minimum: 0, maximum: 1}
+    WebRequest:
+      type: object
+      additionalProperties: false
+      required: [operation, url]
+      description: >-
+        One public https page. url is canonical per api/web-vectors.json (lowercase host, port 443
+        only, no userinfo, IP literal, fragment, reserved name or x.com/twitter.com host).
+        input_sha256 is the SHA-256 of this object serialized by Go encoding/json.
+      properties:
+        operation: {type: string, enum: [scrape]}
+        url: {type: string, maxLength: 2048, pattern: '^https://'}
+    WebPayload:
+      type: object
+      additionalProperties: false
+      required: [type, proof_mode, proof_policy, url, max_redirects, max_response_bytes, headers]
+      description: >-
+        Exact verifier web.fetch policy with unique JSON keys and integer numbers. The verifier is
+        the TLS client through the node's connection; each redirect hop is a new session under the
+        same token, authorized only for the canonical https Location of the previous verified 3xx.
+        The node never receives page plaintext. Unknown fields are refused.
+      properties:
+        type: {type: string, enum: [web.fetch]}
+        proof_mode: {type: string, enum: [relay]}
+        proof_policy: {type: string, enum: [web-relay-v1]}
+        url: {type: string, maxLength: 2048, pattern: '^https://', description: Equal to web_request.url}
+        max_redirects: {type: integer, minimum: 0, maximum: 5}
+        max_response_bytes: {type: integer, minimum: 1, maximum: 10485760}
+        headers:
+          type: array
+          maxItems: 3
+          description: Allowlisted request headers, each at most once, in the order user-agent, accept, accept-language
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, value]
+            properties:
+              name: {type: string, enum: [user-agent, accept, accept-language]}
+              value: {type: string, minLength: 1, maxLength: 512}
     Result:
       type: object
       description: >-
@@ -541,4 +595,4 @@ components:
         version: {type: string, enum: [node-v1]}
         attempt: {type: string}
         fence: {type: string}
-        code: {type: string, enum: [invalid_lease, expired, gateway_error, capacity_unavailable, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds, prover_error, execution_uncertain, auth_required, service_unavailable, x_rate_limited, x_incomplete, x_request_failed, relay_misuse], description: relay_misuse means the node caught its verifier sealing something other than the node's own request in a keyed-relay session, or closing the session without opening the record; the node then stops serving relay until its operator clears the halt. execution_uncertain means a provider call might have occurred before interruption and must not automatically requeue paid work. Transport failure alone does not prove a call never ran; capacity_unavailable must not authorize an ambiguous provider retry.}
+        code: {type: string, enum: [invalid_lease, expired, gateway_error, capacity_unavailable, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds, prover_error, execution_uncertain, auth_required, service_unavailable, x_rate_limited, x_incomplete, x_request_failed, relay_misuse, web_egress_denied, web_dns_failed, web_connect_failed, web_proxy_failed, web_fetch_failed], description: relay_misuse means the node caught its verifier sealing something other than the node's own request in a keyed-relay session, or closing the session without opening the record; the node then stops serving relay until its operator clears the halt. execution_uncertain means a provider call might have occurred before interruption and must not automatically requeue paid work. Transport failure alone does not prove a call never ran; capacity_unavailable must not authorize an ambiguous provider retry. Web codes describe the first hop only (a later hop failing after a verified first hop is reported proven); web_egress_denied means the page host resolved to a private, reserved or local address, or its URL failed node validation; web_dns_failed means the host did not resolve within 5 seconds; web_connect_failed means the node could not open TCP to the checked address, before any verifier session; web_proxy_failed means the local CONNECT proxy was unreachable, refused authentication or did not answer 200; web_fetch_failed means the verified session failed after the token was presented (TLS, framing, size or a verifier refusal).}

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"github.com/teslashibe/scarlett-node/internal/attempts"
 	"net"
@@ -74,10 +75,17 @@ type Config struct {
 	// Optional per-authenticated-X-account ceiling; zero uses the account
 	// registry limit. Desktop pins this to one while allowing distinct accounts.
 	XAccountConcurrency int
-	LocalFixture        bool
-	InferenceTimeout    time.Duration
-	MaxInputBytes       int
-	MaxOutputTokens     int
+	// WebConcurrency is how many web pages this node fetches at once
+	// (SCARLETT_WEB_CONCURRENCY, 1-32, default 4). Web needs no accounts.
+	WebConcurrency int
+	// WebEgressProxy, when set, is the local HTTP CONNECT proxy every web
+	// target is dialled through (SCARLETT_WEB_EGRESS_PROXY), such as a
+	// residential proxy in front of a cloud server. It never leaves this node.
+	WebEgressProxy   *WebProxy
+	LocalFixture     bool
+	InferenceTimeout time.Duration
+	MaxInputBytes    int
+	MaxOutputTokens  int
 }
 
 var (
@@ -182,8 +190,15 @@ func Load() (Config, error) {
 			c.AccountsFile = filepath.Join(c.StateDir, "accounts.json")
 		}
 		c.Services = strings.Split(os.Getenv("SCARLETT_SERVICES"), ",")
-		c.CodexConcurrency, c.XConcurrency, c.XAccountConcurrency = 1, 1, 32
-		for name, destination := range map[string]*int{"SCARLETT_CODEX_CONCURRENCY": &c.CodexConcurrency, "SCARLETT_X_CONCURRENCY": &c.XConcurrency, "SCARLETT_X_ACCOUNT_CONCURRENCY": &c.XAccountConcurrency} {
+		c.CodexConcurrency, c.XConcurrency, c.XAccountConcurrency, c.WebConcurrency = 1, 1, 32, 4
+		if raw := os.Getenv("SCARLETT_WEB_EGRESS_PROXY"); raw != "" {
+			proxy, err := ParseWebProxy(raw)
+			if err != nil {
+				return c, err
+			}
+			c.WebEgressProxy = proxy
+		}
+		for name, destination := range map[string]*int{"SCARLETT_CODEX_CONCURRENCY": &c.CodexConcurrency, "SCARLETT_X_CONCURRENCY": &c.XConcurrency, "SCARLETT_X_ACCOUNT_CONCURRENCY": &c.XAccountConcurrency, "SCARLETT_WEB_CONCURRENCY": &c.WebConcurrency} {
 			if value := os.Getenv(name); value != "" {
 				n, e := strconv.Atoi(value)
 				if e != nil || n < 1 || n > 32 {
@@ -194,6 +209,8 @@ func Load() (Config, error) {
 		}
 	} else if os.Getenv("SCARLETT_SERVICES") != "" {
 		return c, errors.New("SCARLETT_SERVICES requires services executor")
+	} else if os.Getenv("SCARLETT_WEB_EGRESS_PROXY") != "" {
+		return c, errors.New("SCARLETT_WEB_EGRESS_PROXY requires services executor")
 	}
 	if s := os.Getenv("SCARLETT_INFERENCE_TIMEOUT_SECONDS"); s != "" {
 		v, e := strconv.Atoi(s)
@@ -300,15 +317,21 @@ func (c Config) Validate() error {
 		if c.XPacingMode != "" && c.XPacingMode != "conservative" && c.XPacingMode != "quota_budget" {
 			return errors.New("invalid SCARLETT_X_PACING_MODE")
 		}
-		if c.LocalFixture || len(c.Services) < 1 || len(c.Services) > 2 || c.CodexConcurrency < 1 || c.CodexConcurrency > 32 || c.XConcurrency < 1 || c.XConcurrency > 32 || c.XAccountConcurrency < 0 || c.XAccountConcurrency > 32 {
+		if c.LocalFixture || len(c.Services) < 1 || len(c.Services) > 3 || c.CodexConcurrency < 1 || c.CodexConcurrency > 32 || c.XConcurrency < 1 || c.XConcurrency > 32 || c.XAccountConcurrency < 0 || c.XAccountConcurrency > 32 || c.WebConcurrency < 0 || c.WebConcurrency > 32 {
 			return errors.New("invalid independent service configuration")
 		}
 		seen := map[string]bool{}
 		for _, kind := range c.Services {
-			if (kind != "codex" && kind != "x_read") || seen[kind] {
-				return errors.New("SCARLETT_SERVICES must select codex, x_read or both")
+			if (kind != "codex" && kind != "x_read" && kind != "web") || seen[kind] {
+				return errors.New("SCARLETT_SERVICES must select one or more of codex, x_read and web")
 			}
 			seen[kind] = true
+		}
+		if seen["web"] && c.WebConcurrency < 1 {
+			return errors.New("invalid independent service configuration")
+		}
+		if c.WebEgressProxy != nil && !c.WebEgressProxy.valid() {
+			return errors.New("invalid SCARLETT_WEB_EGRESS_PROXY")
 		}
 		if c.AccountsRequired && c.AccountsFile == "" || !filepath.IsAbs(c.AccountsFile) && c.AccountsFile != "" {
 			return errors.New("accounts file must be absolute")
@@ -360,6 +383,72 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// WebProxy is a local HTTP CONNECT proxy for web egress. Only
+// non-intercepting CONNECT tunnels work: TLS runs end to end between the
+// target and the verifier, so the proxy sees only ciphertext.
+type WebProxy struct {
+	Host string
+	Port int
+	// Authorization is the exact Proxy-Authorization value, or empty.
+	Authorization string
+}
+
+// String and GoString keep the proxy and its credentials out of any log line
+// or formatted error that prints a configuration.
+func (WebProxy) String() string   { return "web egress proxy" }
+func (WebProxy) GoString() string { return "config.WebProxy{}" }
+
+// ParseWebProxy reads SCARLETT_WEB_EGRESS_PROXY: http://[user:pass@]host:port,
+// with the port required and no path, query or fragment. Errors never repeat
+// the value, which may hold credentials.
+func ParseWebProxy(raw string) (*WebProxy, error) {
+	invalid := errors.New("invalid SCARLETT_WEB_EGRESS_PROXY; use http://[user:pass@]host:port")
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "http" || u.Opaque != "" || u.Host == "" || u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawFragment != "" {
+		return nil, invalid
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil || strconv.Itoa(port) != u.Port() {
+		return nil, invalid
+	}
+	p := &WebProxy{Host: u.Hostname(), Port: port}
+	if u.User != nil {
+		password, _ := u.User.Password()
+		if u.User.Username() == "" {
+			return nil, invalid
+		}
+		p.Authorization = "Basic " + base64.StdEncoding.EncodeToString([]byte(u.User.Username()+":"+password))
+	}
+	if !p.valid() {
+		return nil, invalid
+	}
+	return p, nil
+}
+
+func (p WebProxy) valid() bool {
+	if p.Port < 1 || p.Port > 65535 || p.Host == "" || len(p.Host) > 253 || len(p.Authorization) > 4096 || strings.ContainsAny(p.Authorization, "\r\n\x00") {
+		return false
+	}
+	if ip := net.ParseIP(p.Host); ip != nil {
+		return true
+	}
+	for _, r := range p.Host {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+// WebEgress is how this node reaches web targets: "proxy" through
+// WebEgressProxy, otherwise "direct". It is reported, never verified.
+func (c Config) WebEgress() string {
+	if c.WebEgressProxy != nil {
+		return "proxy"
+	}
+	return "direct"
 }
 
 func (c Config) Enabled(kind string) bool {

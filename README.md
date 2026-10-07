@@ -157,7 +157,7 @@ cargo build --release --manifest-path prover/Cargo.toml
 
 ## Services
 
-Set `SCARLETT_EXECUTOR=services` and choose `SCARLETT_SERVICES=codex`, `x_read` or `codex,x_read`. This is the only mode that uses proven execution for both providers.
+Set `SCARLETT_EXECUTOR=services` and choose one or more of `codex`, `x_read` and `web` in `SCARLETT_SERVICES` (for example `codex,x_read,web`). This is the only mode that uses proven execution for every service.
 
 ### Codex
 
@@ -188,6 +188,18 @@ The coordinator constructs the request; buyers cannot supply URLs, query IDs, fe
 | Reads allowed | Typed jobs use the four catalog reads; the transport allows 14 | Only the four catalog reads; the verifier refuses others |
 | Default | Always served | On; `SCARLETT_X_RELAY=0` turns it off |
 
+### Web pages
+
+A `web` job fetches one public `https` page from the node's own connection, so the site sees the node's IP (a home connection, or a residential proxy in front of a server). It needs no account. The verifier is the TLS client through the node's TCP connection (`scarlett-prover relay-web`, keyed relay with nothing hidden), so the node never sees the page and cannot alter it; buyers receive a Scarlett-signed attestation of what the verifier received. It is not a zero-knowledge proof.
+
+- One `GET` per job, with fixed browser-like headers. Redirects are followed up to five times, each hop a new relay session that the verifier authorizes only for the `https` `Location` of the previous verified redirect.
+- TLS 1.3 with AES-128-GCM and HTTP/1.1 only. Sites that offer only TLS 1.2 fail. No JavaScript runs.
+- Before every hop the node resolves the host itself and refuses the hop if any address is loopback, private, link-local, CGNAT, multicast, reserved, documentation, ULA, 6to4, Teredo, an IPv4-mapped or NAT64 address that carries one of those, or an address on one of the node's own interfaces. The helper then dials exactly the checked address, so a second DNS answer cannot redirect it. `x.com`, `twitter.com` and reserved names such as `.local` are refused before any lookup.
+- `SCARLETT_WEB_CONCURRENCY` (1–32, default 4) bounds simultaneous pages. `SCARLETT_WEB_EGRESS_PROXY=http://[user:pass@]host:port` sends every web connection through a local HTTP `CONNECT` proxy, such as a residential proxy for a cloud server. The proxy must tunnel without intercepting (TLS runs end to end with the verifier). Its address and credentials never leave the node; the heartbeat says only `egress: proxy`.
+- A caught verifier misuse latches the same node-wide relay halt as for X. Web has no MPC fallback, so it stops until `scarlett-node relay-resume`.
+
+Known residual: a site that resolves to the node's own public IP behind NAT (hairpin) is not detected.
+
 Other executors exist for fixtures and earlier modes (`gateway`, `codex`, `codex-tlsn`); they are documented in the [reference](docs/REFERENCE.md).
 
 **Warm X clients.** The node keeps one x-go client per X account, built at start and kept across jobs, so a job on a warm account does only its proven reads: x-go's two session-validation reads and two transaction-ID bootstrap fetches, which used to run unproven before every job (about 12 s around a 2 s proof), happen once per account. Each job's pinned exchanges and verifier token travel in its own request context, never in the shared client, and an X API request without a job behind it is refused. `x_read` reports `ready` once a client has validated the session against X, `configured` while one is still being built (or, for up to 15 seconds, after a rest ended or the session file was rewritten), and `auth_required`, `exhausted` or `unreachable` when the build failed, so a job is not needed to find out. The client is replaced in the background when the session file changes or X refuses the session, and a background refresh (`SCARLETT_X_REFRESH_SECONDS`, default 30 minutes) renews its transaction-ID material and asks X once whether the session still holds, without touching the jobs in flight. A check every 15 seconds builds a client for any account that has none (a new account, a new session file, a build that failed earlier) and drops the clients of removed accounts; a job builds a client itself only as a last resort. Details in the [reference](docs/REFERENCE.md).
@@ -217,7 +229,7 @@ Settings come from the environment, typically via `~/.config/scarlett-node/node.
 | `SCARLETT_COORDINATOR` | HTTPS origin of the coordinator the node polls |
 | `SCARLETT_PROFILE` | Profile name sent when pairing and heartbeating |
 | `SCARLETT_EXECUTOR` | Execution mode; `services` for proven community work |
-| `SCARLETT_SERVICES` | Which services to serve: `codex`, `x_read` or both |
+| `SCARLETT_SERVICES` | Which services to serve: one or more of `codex`, `x_read` and `web` |
 | `SCARLETT_VERIFIER` | `host:port` of the operator-run TLSNotary verifier |
 | `SCARLETT_VERIFIER_CA_FILE` | Absolute PEM path for a private verifier CA; control connection only |
 | `SCARLETT_COORDINATOR_CA_FILE` | Absolute PEM path adding roots for the coordinator transport only |
@@ -229,6 +241,8 @@ Settings come from the environment, typically via `~/.config/scarlett-node/node.
 | `SCARLETT_CODEX_CONCURRENCY` | Total simultaneous Codex jobs across accounts |
 | `SCARLETT_X_CONCURRENCY` | Total simultaneous X jobs across accounts |
 | `SCARLETT_X_ACCOUNT_CONCURRENCY` | Optional ceiling per authenticated X account, 1–32; CLI default 32 retains the registry limit, desktop sets 1 |
+| `SCARLETT_WEB_CONCURRENCY` | Simultaneous web pages, 1–32 (default 4) |
+| `SCARLETT_WEB_EGRESS_PROXY` | Optional local HTTP `CONNECT` proxy for web targets, `http://[user:pass@]host:port`; never logged or reported |
 | `SCARLETT_X_REFRESH_SECONDS` | How often each warm X client refreshes its transaction-ID material and re-checks its session with X in the background (default 1800) |
 | `SCARLETT_STATE_DIR` | Private directory for identity, journal and account health |
 | `SCARLETT_BID` | Standing assignment bid; lower wins |
