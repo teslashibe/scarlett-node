@@ -192,7 +192,7 @@ In desktop releases through 0.1.7, removing the marker does not clear the runnin
 
 ## Device preferences
 
-Device settings saves the local API port, window-close choice and maximum simultaneous X jobs in the private app directory. New installations default to port 8088 and drain/quit when the window closes. Operators can explicitly choose to keep running in the menu bar or tray. Open Scarlett in the native menu (Cmd/Ctrl-1), the tray, macOS Finder/Dock reopen and Windows duplicate launch restore the existing window without starting a second runtime. Saved ports apply on the next local API start; updating a preference does not interrupt accepted jobs or start a service. Corrupt/private-storage failures are reported rather than silently resetting preferences.
+Device settings saves the window-close choice and maximum simultaneous X jobs in the private app directory, preserving the hidden saved local API port. New installations default to port 8088 and drain/quit when the window closes. Operators can explicitly choose to keep running in the menu bar or tray. Open Scarlett in the native menu (Cmd/Ctrl-1), the tray, macOS Finder/Dock reopen and Windows duplicate launch restore the existing window without starting a second runtime. Saved ports apply on the next local API start; updating a preference does not interrupt accepted jobs or start a service. Corrupt/private-storage failures are reported rather than silently resetting preferences.
 
 Open Scarlett when I log in is a separate OS setting, disabled until the operator opts in. The native Tauri autostart manager queries the actual OS registration and uses a macOS LaunchAgent or Windows user startup registration. It registers only the installed app, without credentials or provider arguments. Opening at login still requires the operator to start the node or local API. The renderer receives no direct autostart-plugin permissions; fixed local-window commands own this setting. A failed setting change is reported and the UI rereads OS state. Moving an app after enabling login launch requires disabling/re-enabling it at its new installed location.
 
@@ -200,7 +200,7 @@ Go preference persistence tests use disposable private directories, including re
 
 ## Installed Windows validation
 
-The native complete-bundle workflow installs its testing NSIS package into a clean disposable runner directory, checks the installed component hashes and versions, then clears the development PATH before launching the installed desktop. Windows UI Automation invokes the real Start and Stop controls. Authenticated and unauthenticated model requests check the private bearer; a forced desktop exit and Ctrl-Q check API cleanup and recovery. All profiles are new, no provider accounts are connected and no inference or X requests run. Evidence records only outcomes, never credentials. The script refuses to run outside a disposable Windows CI runner or against existing app-owned state.
+The native complete-bundle workflow installs its testing NSIS package into a clean disposable runner directory, checks the installed component hashes and versions, then clears the development PATH before launching the installed desktop. Windows UI Automation checks visible X controls and the absence of model controls, then exercises device preferences, idle close/reopen, forced exit/relaunch and native Quit. The installed complete-bundle check separately verifies loopback model API readiness and private bearer enforcement; the prepared-bundle Rust test verifies native API supervision. All profiles are new, no provider accounts are connected and no inference or X requests run. Evidence records only outcomes, never credentials. The script refuses to run outside a disposable Windows CI runner or against existing app-owned state.
 
 Passing this check establishes the tested installer and UI lifecycle. It does not establish signature trust, remote provider login or verified paid network execution; those remain release requirements.
 
@@ -209,8 +209,9 @@ the same runtime source. In its disposable profile it retains two synthetic X
 accounts, a synthetic node identity, an uncertain journal record, preferences
 and the private local API bearer across installation of the next version and
 reinstallation of the original version. Each replaced app must reopen without
-starting work, retain the durable bytes, start its protected API and drain on
-Quit. Evidence is recorded only after these assertions pass. This tests the
+starting work, retain the durable bytes including X preferences, show only X
+controls and exit on Quit. Each installed payload separately passes the protected
+model API check. Evidence is recorded only after these assertions pass. This tests the
 installation lifecycle for that version pair; signed installers, historical
 schema compatibility and the Mac upgrade/downgrade UI remain separate checks.
 
