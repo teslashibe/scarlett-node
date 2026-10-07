@@ -283,7 +283,20 @@ func TestByteReservationStopsAdmissionAndKeepsRecovery(t *testing.T) {
 }
 
 func TestJournalLimitsFailClosed(t *testing.T) {
-	for _, limits := range []Limits{{}, {1, 1, 1}, {1000001, maxRecordBytes, 256 << 20}, {1, maxRecordBytes, maxRecordBytes - 1}} {
+	base := Limits{MaxRecords: 1, MaxRecordBytes: maxRecordBytes, MaxTotalBytes: maxRecordBytes}
+	invalid := []Limits{{}, {MaxRecords: 1, MaxRecordBytes: 1, MaxTotalBytes: 1}, {MaxRecords: 1000001, MaxRecordBytes: maxRecordBytes, MaxTotalBytes: 256 << 20}, {MaxRecords: 1, MaxRecordBytes: maxRecordBytes, MaxTotalBytes: maxRecordBytes - 1}}
+	for _, change := range []func(*Limits){
+		func(l *Limits) { l.MaxTerminalRecords = -1 },
+		func(l *Limits) { l.MaxTerminalRecords = 1000001 },
+		func(l *Limits) { l.MaxTerminalBytes = -1 },
+		func(l *Limits) { l.MaxTerminalBytes = maxRecordBytes - 1 },
+		func(l *Limits) { l.MaxTerminalBytes = 16<<30 + 1 },
+	} {
+		limits := base
+		change(&limits)
+		invalid = append(invalid, limits)
+	}
+	for _, limits := range invalid {
 		if _, err := OpenWithLimits(filepath.Join(t.TempDir(), "attempts"), limits); err == nil {
 			t.Fatal("invalid limits accepted", limits)
 		}
@@ -293,7 +306,7 @@ func TestJournalLimitsFailClosed(t *testing.T) {
 func BenchmarkJournalSyntheticCommit(b *testing.B) {
 	// Includes JSON serialization, private atomic writes and file/directory
 	// fsync on this machine. It does not measure proof or provider throughput.
-	j, err := OpenWithLimits(filepath.Join(b.TempDir(), "attempts"), Limits{1000000, maxRecordBytes, 16 << 30})
+	j, err := OpenWithLimits(filepath.Join(b.TempDir(), "attempts"), Limits{MaxRecords: 1000000, MaxRecordBytes: maxRecordBytes, MaxTotalBytes: 16 << 30})
 	if err != nil {
 		b.Fatal(err)
 	}

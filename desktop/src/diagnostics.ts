@@ -1,4 +1,4 @@
-import type { Snapshot } from "./model.ts";
+import { journalNote, type Snapshot } from "./model.ts";
 
 export type DiagnosticsOperation = "search" | "profile" | "post" | "thread" | "codex" | "other";
 export type DiagnosticsProof = "relay" | "mpc" | "none";
@@ -88,7 +88,8 @@ export function localCapacity(s: Snapshot): string {
   const next = s.observation?.accounts?.filter((a) => a.service === "x_read").map((a) => Date.parse(a.rest_until ?? "")).filter((at) => Number.isFinite(at) && at > Date.now());
   const capacity = availableXSlots(s) ?? "Unknown";
   const count = (n: number | "Unknown", singular: string) => `${n} ${singular}${n === 1 ? "" : "s"}`;
-  return `${count(s.accounts.filter((a) => a.service === "x_read").length, "saved account")} · ${count(verifiedCount ?? "Unknown", "verified X account")} · ${count(capacity, "available X slot")} · ${count(s.observation?.in_flight ?? "Unknown", "job")} in flight${next?.length ? ` · earliest cooldown end ${clockTime(new Date(Math.min(...next)).toISOString())}` : ""}${s.observation?.updated_at ? ` · status ${clockTime(s.observation.updated_at)}` : ""}`;
+  const journal = journalNote(s);
+  return `${count(s.accounts.filter((a) => a.service === "x_read").length, "saved account")} · ${count(verifiedCount ?? "Unknown", "verified X account")} · ${count(capacity, "available X slot")} · ${count(s.observation?.in_flight ?? "Unknown", "job")} in flight${journal ? ` · ${journal}` : ""}${next?.length ? ` · earliest cooldown end ${clockTime(new Date(Math.min(...next)).toISOString())}` : ""}${s.observation?.updated_at ? ` · status ${clockTime(s.observation.updated_at)}` : ""}`;
 }
 
 // Helper times start inside each helper process. They are never placed on the

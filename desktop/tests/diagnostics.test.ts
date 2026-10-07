@@ -82,6 +82,10 @@ test("Current capacity does not count duplicate names as independent X accounts 
   assert.match(localCapacity(s), /2 saved accounts · 1 verified X account · 0 available X slots · 1 job in flight/);
   s.accounts.push({id: "model", service: "codex", concurrency: 1});
   assert.match(localCapacity(s), /^2 saved accounts ·/);
+  assert.doesNotMatch(localCapacity(s), /Receipt journal/);
+  // Exhausted only because the journal is full: the line says why no slot is free.
+  const full: Snapshot = {...s, observation: {...s.observation, in_flight: 0, journal_full: true, services: [{kind: "x_read", state: "exhausted", capacity: 1, in_flight: 0}]}};
+  assert.match(localCapacity(full), /0 available X slots · 0 jobs in flight · Receipt journal full · waiting for receipts to clear/);
 });
 test("Verified X account counts stay unknown when a countable account has no handle", async (t) => {
   const named: AccountHealth = {id: "named", service: "x_read", state: "ready", username: "same_user"};
