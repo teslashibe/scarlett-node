@@ -264,10 +264,13 @@ where
     outcome?;
     wire::send(&mut writer, wire::DONE, b"{\"status\":\"complete\"}").await?;
     // The supplier may still be forwarding X's close. Dropping the socket
-    // with those frames unread can reset it and lose the result on its way
-    // out, so close our half and let the supplier finish, briefly.
+    // with those frames unread can reset it, and a reset discards OPENING and
+    // DONE if the supplier has not read them yet: it then has to treat the
+    // sealed record as misuse and halts relay. So close our half and wait for
+    // the supplier to close its own, which it does once it has checked the
+    // opening, for up to CLOSE_DRAIN.
     let _ = writer.shutdown().await;
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let _ = tokio::time::timeout(CLOSE_DRAIN, async {
         let mut sink = [0u8; 4096];
         while matches!(reader.read(&mut sink).await, Ok(n) if n > 0) {}
     })
@@ -275,6 +278,12 @@ where
     let (sent, hidden) = sent.expect("loop ends only after a request was sent");
     Ok(Outcome { sent, hidden, received })
 }
+
+/// How long a finished session waits for the supplier to close after DONE.
+/// An honest supplier closes within milliseconds of reading DONE; two seconds
+/// was not always enough on a busy home connection (one false relay halt in
+/// about 1,300 production sessions on 2026-10-07).
+const CLOSE_DRAIN: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Forwards whatever the handshake wants to write. Nothing is written
 /// through the TLS library after the handshake.
