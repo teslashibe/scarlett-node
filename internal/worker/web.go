@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/netip"
+	"slices"
 	"strings"
 	"time"
 
@@ -21,15 +22,29 @@ import (
 // against the egress guard and has the helper open the connection to the
 // checked address only. Resolver and Egress replace the system resolver and
 // the node-wide guard in tests.
+//
+// A browser job (web_request.mode "browser") first renders the page in the
+// node's hidden browser (Browser), uploads that copy to the coordinator
+// (Upload) and re-fetches the page through the same verified relay, sending
+// the browser's User-Agent and only its anti-bot clearance cookies.
 type Web struct {
 	Config   config.Config
 	Resolver func(ctx context.Context, host string) ([]netip.Addr, error)
 	Egress   *WebEgress
+	// Browser is the browser tier; nil when this node has none.
+	Browser BrowserTier
+	// Upload sends a browser result's gzip body before report; nil never stores one.
+	Upload func(ctx context.Context, jobID string, gzipBody []byte, report time.Time) error
 }
 
-// webRelayPolicy is the only web proof policy this node knows: keyed relay
-// with no hidden bits, so the verifier holds every session key.
-const webRelayPolicy = "web-relay-v1"
+// The web proof policies: keyed relay with no hidden bits, so the verifier
+// holds every session key. web-browser-v1 adds two node-supplied request
+// headers, the browser's pinned User-Agent and its clearance cookies, which
+// the verifier checks against the same pins and allowlist.
+const (
+	webRelayPolicy   = "web-relay-v1"
+	webBrowserPolicy = "web-browser-v1"
+)
 
 const (
 	maxWebRedirects     = 5
@@ -49,6 +64,16 @@ const (
 // only order they may appear.
 var webHeaderOrder = []string{"user-agent", "accept", "accept-language"}
 
+// webBrowserHeaders are the only headers a web-browser-v1 payload carries,
+// exactly and in this order; the User-Agent is the node's.
+var webBrowserHeaders = []webHeader{
+	{"accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+	{"accept-language", "en-US,en;q=0.9"},
+}
+
+// webNodeHeaderNames is the exact node_headers list of web-browser-v1.
+var webNodeHeaderNames = []string{"user-agent", "cookie"}
+
 type webHeader struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
@@ -61,22 +86,38 @@ type webPlan struct {
 	MaxRedirects     int         `json:"max_redirects"`
 	MaxResponseBytes int         `json:"max_response_bytes"`
 	Headers          []webHeader `json:"headers"`
+	NodeHeaders      []string    `json:"node_headers,omitempty"`
 	// raw is the exact lease payload, handed to the helper unchanged.
 	raw json.RawMessage
 }
 
-// WebOfferServable reports whether this node could serve a web offer's proof
-// mode, from the payload the offer carries. A halted relay serves no web: web
-// has no MPC mode to fall back to.
-func WebOfferServable(c config.Config, payload json.RawMessage) bool {
+// WebOfferServable reports whether this node could serve a web offer: its
+// proof mode and policy, and for a browser offer a ready browser tier. A
+// halted relay serves no web: web has no MPC mode to fall back to, and a
+// browser job's re-fetch is relay too. A servable browser offer, or a relay
+// offer carrying the pre-warm hint while the browser is ready, starts the
+// browser in the background while the node accepts. The service pool has
+// already reserved the browser slot; this checks only readiness.
+func WebOfferServable(c config.Config, l coordinator.Lease, browser BrowserTier) bool {
 	var plan struct {
 		ProofMode   string `json:"proof_mode"`
 		ProofPolicy string `json:"proof_policy"`
 	}
-	if len(payload) == 0 || len(payload) > maxWebPayloadBytes || json.Unmarshal(payload, &plan) != nil {
+	if len(l.WebPayload) == 0 || len(l.WebPayload) > maxWebPayloadBytes || json.Unmarshal(l.WebPayload, &plan) != nil || l.WebRequest == nil || plan.ProofMode != "relay" || RelayHalted() {
 		return false
 	}
-	return plan.ProofMode == "relay" && plan.ProofPolicy == webRelayPolicy && !RelayHalted()
+	ready := c.WebBrowser && browser != nil && browser.Status().Ready
+	switch {
+	case l.WebRequest.Mode == "" && plan.ProofPolicy == webRelayPolicy:
+		if l.WebPrewarmBrowser && ready {
+			go browser.Prewarm()
+		}
+		return true
+	case l.WebRequest.Mode == "browser" && plan.ProofPolicy == webBrowserPolicy && !l.WebPrewarmBrowser && ready:
+		go browser.Prewarm()
+		return true
+	}
+	return false
 }
 
 // decodeWebPlan applies the verifier's web.fetch rules to the exact payload:
@@ -89,7 +130,10 @@ func decodeWebPlan(raw []byte) (webPlan, bool) {
 	}
 	value, err := uniqueJSON(raw)
 	fields, ok := value.(map[string]any)
-	if err != nil || !ok || len(fields) != 7 {
+	if err != nil || !ok || len(fields) != 7 && len(fields) != 8 {
+		return plan, false
+	}
+	if _, present := fields["node_headers"]; present != (len(fields) == 8) {
 		return plan, false
 	}
 	if _, ok := fields["headers"].([]any); !ok {
@@ -105,7 +149,21 @@ func decodeWebPlan(raw []byte) (webPlan, bool) {
 			return plan, false
 		}
 	}
-	if plan.Type != "web.fetch" || plan.ProofMode != "relay" || plan.ProofPolicy != webRelayPolicy || plan.MaxRedirects < 0 || plan.MaxRedirects > maxWebRedirects || plan.MaxResponseBytes < 1 || plan.MaxResponseBytes > maxWebResponseBytes || len(plan.Headers) > len(webHeaderOrder) {
+	if plan.Type != "web.fetch" || plan.ProofMode != "relay" || plan.MaxRedirects < 0 || plan.MaxRedirects > maxWebRedirects || plan.MaxResponseBytes < 1 || plan.MaxResponseBytes > maxWebResponseBytes || len(plan.Headers) > len(webHeaderOrder) {
+		return plan, false
+	}
+	switch plan.ProofPolicy {
+	case webRelayPolicy:
+		if len(fields) != 7 {
+			return plan, false
+		}
+	case webBrowserPolicy:
+		// Exactly the two default headers, the node's two headers, and the
+		// app's fixed limits.
+		if len(fields) != 8 || !slices.Equal(plan.Headers, webBrowserHeaders) || !slices.Equal(plan.NodeHeaders, webNodeHeaderNames) || plan.MaxRedirects != maxWebRedirects || plan.MaxResponseBytes != maxWebResponseBytes {
+			return plan, false
+		}
+	default:
 		return plan, false
 	}
 	next := 0
@@ -158,6 +216,12 @@ func validateWebLease(c config.Config, l coordinator.Lease) (webPlan, time.Time,
 	if !ok || plan.URL != l.WebRequest.URL || RelayHalted() {
 		return plan, time.Time{}, "invalid_lease"
 	}
+	// Mode, policy, browser options and node headers go together, and the
+	// pre-warm hint belongs to relay jobs only.
+	browser := l.WebRequest.Mode == "browser"
+	if l.WebRequest.Mode != "" && !browser || browser != (plan.ProofPolicy == webBrowserPolicy) || browser != (l.WebRequest.Browser != nil) || browser && l.WebPrewarmBrowser || browser && !validWebBrowser(*l.WebRequest.Browser) {
+		return plan, time.Time{}, "invalid_lease"
+	}
 	// Well-formed terms for a page this node will not fetch: the buyer learns
 	// the URL is not allowed rather than that the node failed.
 	if !webURLAllowed(plan.URL) {
@@ -178,9 +242,23 @@ func validateWebLease(c config.Config, l coordinator.Lease) (webPlan, time.Time,
 	return plan, deadline, ""
 }
 
+// validWebBrowser applies the browser option bounds of contract §1.
+func validWebBrowser(b coordinator.WebBrowser) bool {
+	if b.Wait != "load" && b.Wait != "networkidle" || b.WaitMS < 0 || b.WaitMS > 15000 || b.TimeoutMS < 5000 || b.TimeoutMS > 45000 || len(b.WaitSelector) > 256 {
+		return false
+	}
+	for i := 0; i < len(b.WaitSelector); i++ {
+		if b.WaitSelector[i] < 0x20 || b.WaitSelector[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
 // Run fetches the lease's page, following redirects only as the verifier
 // authorizes them, and returns "" once at least the first hop was proven.
 // The verifier holds every verified hop; the coordinator reads them there.
+// A browser job is run by runBrowser.
 func (w Web) Run(ctx context.Context, l coordinator.Lease) string {
 	plan, deadline, code := validateWebLease(w.Config, l)
 	if code != "" {
@@ -188,37 +266,59 @@ func (w Web) Run(ctx context.Context, l coordinator.Lease) string {
 	}
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	egress := w.Egress
-	if egress == nil {
-		egress = defaultWebEgress
+	if l.WebRequest.Mode == "browser" {
+		return w.runBrowser(ctx, l, plan, deadline)
 	}
-	resolve := w.Resolver
-	if resolve == nil {
-		resolve = func(ctx context.Context, host string) ([]netip.Addr, error) {
+	code, _ = w.relay(ctx, plan, l.VerifierToken, nil)
+	return code
+}
+
+func (w Web) egress() *WebEgress {
+	if w.Egress == nil {
+		return defaultWebEgress
+	}
+	return w.Egress
+}
+
+func (w Web) resolver() func(context.Context, string) ([]netip.Addr, error) {
+	if w.Resolver == nil {
+		return func(ctx context.Context, host string) ([]netip.Addr, error) {
 			return netResolver.LookupNetIP(ctx, "ip", host)
 		}
 	}
+	return w.Resolver
+}
+
+// relay runs the hop loop and returns the job's code and how many hops the
+// verifier holds. One verified hop already makes the job: a later hop failing
+// for any reason but relay misuse still reports proven. nodeHeaders, set for
+// browser jobs, gives each hop's node-supplied User-Agent and Cookie.
+func (w Web) relay(ctx context.Context, plan webPlan, token string, nodeHeaders func(hopURL string) *webNodeHeaders) (string, int) {
+	resolve, egress := w.resolver(), w.egress()
 	target := plan.URL
 	for hop := 0; hop <= plan.MaxRedirects; hop++ {
 		hopCtx := withXExchange(ctx, hop+1)
 		end := diagnostics.Start(hopCtx, "page_wall", hop+1)
-		outcome := w.hop(hopCtx, plan, l.VerifierToken, hop, target, resolve, egress)
+		var headers *webNodeHeaders
+		if nodeHeaders != nil {
+			headers = nodeHeaders(target)
+		}
+		outcome := w.hop(hopCtx, plan, token, hop, target, resolve, egress, headers)
 		end(webDiagnosticOutcome(hopCtx, outcome.code))
 		if outcome.code != "" {
-			// One verified hop already makes the job: the verifier keeps it.
 			if hop > 0 && outcome.code != "relay_misuse" {
-				return ""
+				return "", hop
 			}
-			return outcome.code
+			return outcome.code, hop
 		}
 		if outcome.final {
-			return ""
+			return "", hop + 1
 		}
 		target = outcome.next
 	}
 	// The verifier marks the last allowed hop final; a helper that says
 	// otherwise is not trusted for anything more.
-	return ""
+	return "", plan.MaxRedirects + 1
 }
 
 func webDiagnosticOutcome(ctx context.Context, code string) string {
@@ -240,7 +340,7 @@ type webHopOutcome struct {
 // hop runs one relay session for target, the job URL or the previous hop's
 // verified redirect. Its failure codes describe this hop; Run decides what a
 // failure after a verified hop means for the job.
-func (w Web) hop(ctx context.Context, plan webPlan, token string, hop int, target string, resolve func(context.Context, string) ([]netip.Addr, error), egress *WebEgress) webHopOutcome {
+func (w Web) hop(ctx context.Context, plan webPlan, token string, hop int, target string, resolve func(context.Context, string) ([]netip.Addr, error), egress *WebEgress, headers *webNodeHeaders) webHopOutcome {
 	if ctx.Err() != nil {
 		return webHopOutcome{code: "expired"}
 	}
@@ -261,7 +361,7 @@ func (w Web) hop(ctx context.Context, plan webPlan, token string, hop int, targe
 	if !ok {
 		return webHopOutcome{code: "web_egress_denied"}
 	}
-	return w.prove(ctx, plan, token, hop, canonical, addr)
+	return w.prove(ctx, plan, token, hop, canonical, addr, headers)
 }
 
 var errWebSummary = errors.New("unexpected relay-web summary")

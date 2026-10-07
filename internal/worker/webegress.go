@@ -103,6 +103,10 @@ func NewWebEgressWith(nat64 []netip.Prefix, local []netip.Addr) *WebEgress {
 
 var defaultWebEgress = NewWebEgress()
 
+// DefaultWebEgress is the node-wide guard every web hop uses; the browser
+// tier's egress proxy checks its connections against the same one.
+func DefaultWebEgress() *WebEgress { return defaultWebEgress }
+
 // KeepWebEgressFresh refreshes the node-wide guard now and then on its own
 // schedule until ctx ends, so a hop never waits on NAT64 discovery.
 func KeepWebEgressFresh(ctx context.Context) {

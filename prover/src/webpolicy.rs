@@ -1,4 +1,5 @@
-//! Policy for proven web fetches (`web.fetch`, policy `web-relay-v1`).
+//! Policy for proven web fetches (`web.fetch`, policies `web-relay-v1` and
+//! `web-browser-v1`).
 //!
 //! A web job names one public https URL. The verifier is the TLS client for
 //! each hop through the supplier's connection, as for keyed X reads, but a
@@ -7,6 +8,16 @@
 //! request bytes `request` builds for the hop URL, and a later hop only for
 //! the canonical `Location` of the previous verified redirect.
 //!
+//! A `web-browser-v1` job is the proven re-fetch of a page the node's
+//! browser rendered. Its request also carries two headers the node chooses
+//! per hop, in public bytes the verifier sees: the browser's User-Agent,
+//! which must be one of the pinned strings `user_agent` builds, and
+//! optionally the anti-bot clearance cookies the browser earned, whose names
+//! must all be on the clearance allowlist. Hidden bytes are never used for
+//! them, because the verifier cannot check hidden content. The receipt keeps
+//! the User-Agent, the cookie names and a hash of the cookie value, never
+//! the value.
+//!
 //! The URL rules here are the "strict" rules every implementation shares
 //! (`api/web-vectors.json`). The response is framed incrementally and kept
 //! still content-encoded; decoding and rendering happen in the app.
@@ -14,11 +25,12 @@
 use std::{fmt, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub const WEB_POLICY: &str = "web-relay-v1";
+pub const BROWSER_POLICY: &str = "web-browser-v1";
 pub const PAYLOAD_TYPE: &str = "web.fetch";
 pub const MAX_REDIRECTS: usize = 5;
 pub const MAX_URL: usize = 2048;
@@ -33,6 +45,27 @@ pub const HOP_LIMIT: Duration = Duration::from_secs(30);
 /// Payload header names in the only order they may appear, and their wire spelling.
 const HEADERS: [(&str, &str); 3] = [("user-agent", "User-Agent"), ("accept", "Accept"), ("accept-language", "Accept-Language")];
 const MAX_HEADER_VALUE: usize = 512;
+/// The only payload headers of a `web-browser-v1` job, in this order.
+const BROWSER_HEADERS: [(&str, &str); 2] = [("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"), ("accept-language", "en-US,en;q=0.9")];
+/// The headers a `web-browser-v1` job lets the node choose per hop.
+const NODE_HEADERS: [&str; 2] = ["user-agent", "cookie"];
+/// The Chrome majors whose User-Agent the verifier accepts. A Chrome for
+/// Testing pin bump changes these with the node's and the app's.
+pub const MIN_BROWSER_MAJOR: u32 = 155;
+pub const MAX_BROWSER_MAJOR: u32 = 155;
+/// The node platforms a browser User-Agent may name, and what it says for each.
+const UA_PLATFORMS: [(&str, &str); 3] = [("darwin", "Macintosh; Intel Mac OS X 10_15_7"), ("windows", "Windows NT 10.0; Win64; x64"), ("linux", "X11; Linux x86_64")];
+const UA_PREFIX: &str = "Mozilla/5.0 (";
+const UA_ENGINE: &str = ") AppleWebKit/537.36 (KHTML, like Gecko) Chrome/";
+const UA_SUFFIX: &str = ".0.0.0 Safari/537.36";
+/// Bytes of a node-supplied Cookie value, and its pairs.
+pub const MAX_COOKIE: usize = 4096;
+pub const MAX_COOKIE_PAIRS: usize = 50;
+const MAX_COOKIE_NAME: usize = 256;
+/// Anti-bot clearance cookies a re-fetch may carry: these names exactly...
+const CLEARANCE_COOKIES: [&str; 11] = ["cf_clearance", "__cf_bm", "_cfuvid", "datadome", "_abck", "bm_sz", "ak_bmsc", "bm_sv", "pxcts", "reese84", "aws-waf-token"];
+/// ...and these prefixes, each followed by at least one more byte.
+const CLEARANCE_PREFIXES: [&str; 4] = ["_px", "incap_ses_", "visid_incap_", "nlbi_"];
 const X_HOSTS: [&str; 2] = ["x.com", "twitter.com"];
 const RESERVED: [&str; 9] = ["localhost", "local", "internal", "home.arpa", "lan", "localdomain", "onion", "invalid", "test"];
 /// Statuses whose `Location` the verifier follows.
@@ -290,6 +323,25 @@ pub struct Header {
     pub value: String,
 }
 
+/// How a web job's hops are authorized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Policy {
+    /// `web-relay-v1`: exactly the request the payload's headers make.
+    Relay,
+    /// `web-browser-v1`: the payload's headers plus the node's pinned
+    /// User-Agent and, optionally, its clearance cookies.
+    Browser,
+}
+
+impl Policy {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Relay => WEB_POLICY,
+            Self::Browser => BROWSER_POLICY,
+        }
+    }
+}
+
 /// A validated web job.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Job {
@@ -297,6 +349,32 @@ pub struct Job {
     pub max_redirects: usize,
     pub max_response_bytes: usize,
     pub headers: Vec<Header>,
+    pub policy: Policy,
+}
+
+impl Job {
+    /// The request bytes for one hop: the node's headers are required
+    /// under `web-browser-v1` and refused otherwise.
+    pub fn hop_request(&self, url: &str, node: Option<&NodeHeaders>) -> Result<Vec<u8>> {
+        match (self.policy, node) {
+            (Policy::Relay, None) => Ok(request(url, &self.headers)),
+            (Policy::Browser, Some(node)) => {
+                node.check()?;
+                let raw = request_with_node(url, &self.headers, &node.user_agent, node.cookie.as_deref());
+                if raw.len() > crate::relay::MAX_REQUEST {
+                    bail!("hop request exceeds {} bytes", crate::relay::MAX_REQUEST);
+                }
+                Ok(raw)
+            }
+            (Policy::Relay, Some(_)) => bail!("node headers are only for {BROWSER_POLICY} jobs"),
+            (Policy::Browser, None) => bail!("{BROWSER_POLICY} jobs need the node's headers"),
+        }
+    }
+}
+
+/// Deserializes a field that may be absent but never `null`.
+pub(crate) fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(deserializer: D) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -310,20 +388,37 @@ struct Payload {
     max_redirects: u64,
     max_response_bytes: u64,
     headers: Vec<Header>,
+    #[serde(default, deserialize_with = "present")]
+    node_headers: Option<Vec<String>>,
 }
 
 /// Validates a `web.fetch` payload as the coordinator registers it and the
 /// node receives it: every field present, nothing else, integers only.
 pub fn validate_job(payload: &Value) -> Result<Job> {
     let p = Payload::deserialize(payload).context("invalid web job")?;
-    if p.kind != PAYLOAD_TYPE || p.proof_mode != "relay" || p.proof_policy != WEB_POLICY {
-        bail!("web jobs must be {PAYLOAD_TYPE} under relay proof policy {WEB_POLICY}");
-    }
+    let policy = [Policy::Relay, Policy::Browser].into_iter().find(|policy| policy.name() == p.proof_policy);
+    let (Some(policy), PAYLOAD_TYPE, "relay") = (policy, p.kind.as_str(), p.proof_mode.as_str()) else {
+        bail!("web jobs must be {PAYLOAD_TYPE} under relay proof policy {WEB_POLICY} or {BROWSER_POLICY}");
+    };
     if canonical_url(&p.url).ok().as_deref() != Some(p.url.as_str()) {
         bail!("web job URL must be a canonical public https URL");
     }
     if p.max_redirects > MAX_REDIRECTS as u64 || !(1..=MAX_RESPONSE as u64).contains(&p.max_response_bytes) {
         bail!("web job limits are out of range");
+    }
+    if policy == Policy::Browser {
+        let headers: Vec<(&str, &str)> = p.headers.iter().map(|h| (h.name.as_str(), h.value.as_str())).collect();
+        if headers != BROWSER_HEADERS {
+            bail!("{BROWSER_POLICY} job headers must be exactly the default accept and accept-language, in that order");
+        }
+        if p.node_headers.as_deref().is_none_or(|names| names != NODE_HEADERS) {
+            bail!("{BROWSER_POLICY} jobs must name node_headers user-agent and cookie, in that order");
+        }
+        if p.max_redirects != MAX_REDIRECTS as u64 || p.max_response_bytes != MAX_RESPONSE as u64 {
+            bail!("{BROWSER_POLICY} jobs must use the default limits");
+        }
+    } else if p.node_headers.is_some() {
+        bail!("{WEB_POLICY} jobs take no node_headers");
     }
     if p.headers.len() > HEADERS.len() {
         bail!("web job has too many headers");
@@ -339,22 +434,194 @@ pub fn validate_job(payload: &Value) -> Result<Job> {
             bail!("web job header value is not allowed");
         }
     }
-    Ok(Job { url: p.url, max_redirects: p.max_redirects as usize, max_response_bytes: p.max_response_bytes as usize, headers: p.headers })
+    Ok(Job { url: p.url, max_redirects: p.max_redirects as usize, max_response_bytes: p.max_response_bytes as usize, headers: p.headers, policy })
 }
+
+/// The request line and Host header for a hop.
+fn request_head(url: &str) -> String {
+    let host = url_host(url);
+    let rest = &url["https://".len() + host.len()..];
+    let target = if rest.is_empty() { "/" } else { rest };
+    format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n")
+}
+
+/// The payload's header lines, in wire spelling.
+fn header_lines(headers: &[Header]) -> String {
+    headers
+        .iter()
+        .map(|header| {
+            let name = HEADERS.iter().find(|(lower, _)| *lower == header.name).map_or(header.name.as_str(), |(_, wire)| wire);
+            format!("{name}: {}\r\n", header.value)
+        })
+        .collect()
+}
+
+const REQUEST_TAIL: &str = "Accept-Encoding: gzip, deflate, br\r\nConnection: close\r\n\r\n";
 
 /// The exact request bytes for one hop. Both sides build them with this
 /// function, and the verifier authorizes nothing else.
 pub fn request(url: &str, headers: &[Header]) -> Vec<u8> {
-    let host = url_host(url);
-    let rest = &url["https://".len() + host.len()..];
-    let target = if rest.is_empty() { "/" } else { rest };
-    let mut out = format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n");
-    for header in headers {
-        let name = HEADERS.iter().find(|(lower, _)| *lower == header.name).map_or(header.name.as_str(), |(_, wire)| wire);
-        out.push_str(&format!("{name}: {}\r\n", header.value));
+    format!("{}{}{REQUEST_TAIL}", request_head(url), header_lines(headers)).into_bytes()
+}
+
+/// The exact request bytes for one hop of a `web-browser-v1` job: the
+/// node's User-Agent right after Host, and its Cookie, when it sends one,
+/// between the payload headers and Accept-Encoding.
+pub fn request_with_node(url: &str, headers: &[Header], user_agent: &str, cookie: Option<&str>) -> Vec<u8> {
+    let cookie = cookie.map(|c| format!("Cookie: {c}\r\n")).unwrap_or_default();
+    format!("{}User-Agent: {user_agent}\r\n{}{cookie}{REQUEST_TAIL}", request_head(url), header_lines(headers)).into_bytes()
+}
+
+/// The User-Agent the node's browser and its re-fetch send on `platform`
+/// (`darwin`, `windows` or `linux`) for a Chrome `major`.
+pub fn user_agent(platform: &str, major: u32) -> Option<String> {
+    let (_, os) = UA_PLATFORMS.iter().find(|(name, _)| *name == platform)?;
+    Some(format!("{UA_PREFIX}{os}{UA_ENGINE}{major}{UA_SUFFIX}"))
+}
+
+/// The Chrome major of a string `user_agent` builds for some platform,
+/// whatever the major.
+fn user_agent_major(value: &str) -> Option<u32> {
+    let rest = value.strip_prefix(UA_PREFIX)?;
+    UA_PLATFORMS.iter().find_map(|(_, os)| {
+        let digits = rest.strip_prefix(os)?.strip_prefix(UA_ENGINE)?.strip_suffix(UA_SUFFIX)?;
+        let canonical = (1..=4).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit()) && !digits.starts_with('0');
+        canonical.then(|| digits.parse().ok()).flatten()
+    })
+}
+
+/// Whether the verifier accepts `value` as a node's User-Agent now: exactly
+/// `user_agent` for a supported platform and a pinned major.
+pub fn pinned_user_agent(value: &str) -> bool {
+    UA_PLATFORMS.iter().any(|(platform, _)| (MIN_BROWSER_MAJOR..=MAX_BROWSER_MAJOR).any(|major| user_agent(platform, major).as_deref() == Some(value)))
+}
+
+fn tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
+fn cookie_octet(b: u8) -> bool {
+    matches!(b, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e)
+}
+
+/// A cookie name: 1-256 RFC 9110 token characters.
+pub fn cookie_name(name: &str) -> bool {
+    (1..=MAX_COOKIE_NAME).contains(&name.len()) && name.bytes().all(tchar)
+}
+
+/// Whether `cookie` is a Cookie header value the node may send:
+/// `name=value` pairs joined by `"; "`, 1-50 of them in 1-4096 bytes, each
+/// value bare or double-quoted cookie-octets. Names may repeat.
+pub fn valid_cookie(cookie: &str) -> bool {
+    let pair = |pair: &str| {
+        pair.split_once('=').is_some_and(|(name, value)| {
+            let bare = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(value);
+            cookie_name(name) && bare.bytes().all(cookie_octet)
+        })
+    };
+    (1..=MAX_COOKIE).contains(&cookie.len()) && cookie.split("; ").count() <= MAX_COOKIE_PAIRS && cookie.split("; ").all(pair)
+}
+
+/// Whether `name` is an anti-bot clearance cookie a re-fetch may carry.
+/// Case matters; a prefix alone is not a name.
+pub fn clearance_cookie(name: &str) -> bool {
+    CLEARANCE_COOKIES.contains(&name) || CLEARANCE_PREFIXES.iter().any(|prefix| name.len() > prefix.len() && name.starts_with(prefix))
+}
+
+/// The names of a valid cookie's pairs, in header order.
+pub fn cookie_names(cookie: &str) -> Vec<&str> {
+    cookie.split("; ").map(|pair| pair.split_once('=').map_or(pair, |(name, _)| name)).collect()
+}
+
+/// Whether a receipt's cookie names could have come from an allowed Cookie
+/// header: at most 50 allowlisted names that fit in one. The shortest such
+/// header is the names with empty values, `a=; b=`.
+pub fn allowed_cookie_names(names: &[String]) -> bool {
+    names.len() <= MAX_COOKIE_PAIRS && names.iter().all(|name| cookie_name(name) && clearance_cookie(name)) && names.join("=; ").len() < MAX_COOKIE
+}
+
+/// Whether `value` has the shape of a browser User-Agent for any major. A
+/// receipt keeps the one its hop was authorized with, which may predate a
+/// pin bump.
+pub fn browser_user_agent(value: &str) -> bool {
+    user_agent_major(value).is_some()
+}
+
+/// The headers a node chose for one hop of a `web-browser-v1` job. They are
+/// public request bytes, but the cookie is the node's: it is never printed.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeHeaders {
+    pub user_agent: String,
+    #[serde(default, deserialize_with = "present")]
+    pub cookie: Option<String>,
+}
+
+impl fmt::Debug for NodeHeaders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NodeHeaders").field("user_agent", &self.user_agent).field("cookie_names", &self.cookie.as_deref().map(cookie_names)).finish()
     }
-    out.push_str("Accept-Encoding: gzip, deflate, br\r\nConnection: close\r\n\r\n");
-    out.into_bytes()
+}
+
+impl NodeHeaders {
+    /// Refuses anything but a pinned User-Agent and a well-formed Cookie of
+    /// clearance cookies only. Errors never quote either value.
+    pub fn check(&self) -> Result<()> {
+        if !pinned_user_agent(&self.user_agent) {
+            bail!("node user agent is not a pinned browser user agent");
+        }
+        if let Some(cookie) = &self.cookie {
+            if !valid_cookie(cookie) {
+                bail!("node cookie is not a valid Cookie header value");
+            }
+            if !cookie_names(cookie).into_iter().all(clearance_cookie) {
+                bail!("node cookie carries a name outside the clearance allowlist");
+            }
+        }
+        Ok(())
+    }
+
+    /// The cookie names in header order: empty without a cookie.
+    pub fn cookie_names(&self) -> Vec<String> {
+        self.cookie.as_deref().map(cookie_names).unwrap_or_default().into_iter().map(str::to_owned).collect()
+    }
+
+    /// SHA-256 of the cookie value bytes, in hex, when there is one.
+    pub fn cookie_sha256(&self) -> Option<String> {
+        self.cookie.as_deref().map(|cookie| Sha256::digest(cookie.as_bytes()).iter().map(|b| format!("{b:02x}")).collect())
+    }
+}
+
+/// Authorizes the public request bytes of one hop of `job` at `url`, with
+/// nothing hidden. A `web-relay-v1` hop must be exactly `request`. A
+/// `web-browser-v1` hop must have the node's User-Agent as its third line
+/// and may have one Cookie line right before Accept-Encoding; both must
+/// pass `NodeHeaders::check`, and then the bytes must be exactly
+/// `request_with_node` for them. Returns the node's headers for a browser hop.
+pub fn authorize(job: &Job, url: &str, public: &[u8]) -> Result<Option<NodeHeaders>> {
+    let node = match job.policy {
+        Policy::Relay => None,
+        Policy::Browser => {
+            let line = |rest: &[u8]| -> Result<(String, usize)> {
+                let end = find(rest, b"\r\n").context("request line is not terminated")?;
+                Ok((String::from_utf8(rest[..end].to_vec()).context("request header is not UTF-8")?, end + 2))
+            };
+            let rest = public.strip_prefix(format!("{}User-Agent: ", request_head(url)).as_bytes()).context("request must name the hop and then the node's User-Agent")?;
+            let (user_agent, used) = line(rest)?;
+            let rest = rest[used..].strip_prefix(header_lines(&job.headers).as_bytes()).context("request headers are not the job's")?;
+            let cookie = match rest.strip_prefix(b"Cookie: ") {
+                Some(rest) => Some(line(rest)?.0),
+                None => None,
+            };
+            let node = NodeHeaders { user_agent, cookie };
+            node.check()?;
+            Some(node)
+        }
+    };
+    if public != job.hop_request(url, node.as_ref())? {
+        bail!("request is not the hop's canonical request");
+    }
+    Ok(node)
 }
 
 /// How a response's body ended.
@@ -704,13 +971,305 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Browser-policy values from the contract (B.2, B.3), shared by the tests.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::{request, request_with_node};
+    use serde_json::{Value, json};
+
+    pub const DARWIN_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36";
+    pub const WINDOWS_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36";
+    pub const LINUX_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36";
+    pub const CLEARANCE: &str = "cf_clearance=abc.DEF-123_456; __cf_bm=x1y2";
+    pub const CLEARANCE_SHA256: &str = "22c210c1e1510c5c642a8782afa10ebc1eee8d8bb91a7d1dedcec522a446aca7";
+
+    /// The B.2 `web_payload` for `url`.
+    pub fn browser_payload(url: &str) -> Value {
+        json!({"type":"web.fetch","proof_mode":"relay","proof_policy":"web-browser-v1","url":url,"max_redirects":5,"max_response_bytes":10485760,
+            "headers":[{"name":"accept","value":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},{"name":"accept-language","value":"en-US,en;q=0.9"}],
+            "node_headers":["user-agent","cookie"]})
+    }
+
+    /// The contract's `browser_authorize` refusals, plus neighbours.
+    pub(crate) fn browser_refusals() -> Vec<(String, Vec<u8>)> {
+        let url = "https://example.com/";
+        let headers = crate::webpolicy::validate_job(&browser_payload(url)).unwrap().headers;
+        let canonical = String::from_utf8(request_with_node(url, &headers, DARWIN_UA, Some(CLEARANCE))).unwrap();
+        let cookie_line = format!("Cookie: {CLEARANCE}\r\n");
+        let without = canonical.replace(&cookie_line, "");
+        vec![
+            ("cookie before accept", without.replacen("Accept: ", &format!("{cookie_line}Accept: "), 1).into_bytes()),
+            ("missing user agent", request(url, &headers)),
+            ("two cookie lines", canonical.replacen(&cookie_line, &format!("{cookie_line}{cookie_line}"), 1).into_bytes()),
+            ("header inside the user agent", request_with_node(url, &headers, &DARWIN_UA.replacen(") ", ")\r\nX-Injected: 1\r\n", 1), None)),
+            ("header after the user agent", request_with_node(url, &headers, &format!("{DARWIN_UA}\r\nX-Injected: 1"), None)),
+            ("lowercase cookie", canonical.replace("Cookie: ", "cookie: ").into_bytes()),
+            ("non-pinned user agent", request_with_node(url, &headers, &DARWIN_UA.replace("Chrome/155", "Chrome/154"), None)),
+            ("session cookie", request_with_node(url, &headers, DARWIN_UA, Some("session=x"))),
+            ("session among clearance", request_with_node(url, &headers, DARWIN_UA, Some("cf_clearance=a; session=x"))),
+            ("cookie grammar", request_with_node(url, &headers, DARWIN_UA, Some("cf_clearance=a;__cf_bm=b"))),
+            ("empty cookie", request_with_node(url, &headers, DARWIN_UA, Some(""))),
+            ("lowercase user agent", without.replace("User-Agent: ", "user-agent: ").into_bytes()),
+            ("user agent twice", without.replacen("Accept: ", &format!("User-Agent: {DARWIN_UA}\r\nAccept: "), 1).into_bytes()),
+            ("cookie after accept-encoding", without.replace("Connection: close", &format!("{cookie_line}Connection: close")).into_bytes()),
+            ("other header", without.replace("Accept-Encoding", "X-Other: 1\r\nAccept-Encoding").into_bytes()),
+            ("padded user agent", request_with_node(url, &headers, &format!(" {DARWIN_UA}"), None)),
+            ("other host", request_with_node("https://www.example.com/", &headers, DARWIN_UA, None)),
+        ]
+        .into_iter()
+        .map(|(case, raw)| (case.to_owned(), raw))
+        .chain(shared_refusals())
+        .collect()
+    }
+
+    /// The `browser_authorize` refusals every implementation shares
+    /// (`api/web-vectors.json`), all for `https://example.com/`.
+    pub(crate) fn shared_refusals() -> Vec<(String, Vec<u8>)> {
+        let vectors: Value = serde_json::from_str(include_str!("../../api/web-vectors.json")).unwrap();
+        vectors["browser_authorize"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                assert_eq!((v["url"].as_str(), v["refused"].as_str()), (Some("https://example.com/"), Some("request_rejected")), "{v}");
+                (v["case"].as_str().unwrap().to_owned(), v["request"].as_str().unwrap().as_bytes().to_vec())
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        fixtures::{CLEARANCE, CLEARANCE_SHA256, DARWIN_UA, LINUX_UA, WINDOWS_UA, browser_payload, browser_refusals, shared_refusals},
+        *,
+    };
     use serde_json::json;
 
     fn vectors() -> Value {
         serde_json::from_str(include_str!("../../api/web-vectors.json")).unwrap()
+    }
+
+    fn browser_job() -> Job {
+        validate_job(&browser_payload("https://example.com/")).unwrap()
+    }
+
+    fn node(user_agent: &str, cookie: Option<&str>) -> NodeHeaders {
+        NodeHeaders { user_agent: user_agent.into(), cookie: cookie.map(Into::into) }
+    }
+
+    #[test]
+    fn browser_request_bytes_match_the_contract() {
+        let job = browser_job();
+        let plain = request_with_node("https://example.com/", &job.headers, DARWIN_UA, None);
+        let expected = format!(
+            "GET / HTTP/1.1\r\nHost: example.com\r\nUser-Agent: {DARWIN_UA}\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\nAccept-Language: en-US,en;q=0.9\r\nAccept-Encoding: gzip, deflate, br\r\nConnection: close\r\n\r\n"
+        );
+        assert_eq!(plain, expected.as_bytes());
+        assert_eq!(format!("{:x}", Sha256::digest(&plain)), "633dcef6749617f2c417104a95c41141971690764338087f7013b2255065c288");
+        let with_cookie = request_with_node("https://example.com/", &job.headers, DARWIN_UA, Some(CLEARANCE));
+        let expected = expected.replace("Accept-Encoding", &format!("Cookie: {CLEARANCE}\r\nAccept-Encoding"));
+        assert_eq!(with_cookie, expected.as_bytes());
+        assert_eq!(format!("{:x}", Sha256::digest(&with_cookie)), "c60f3dee15090ef6bd9b9b70695ed3f89884ae089850179e92a9be061e9160cb");
+        assert_eq!(node(DARWIN_UA, Some(CLEARANCE)).cookie_sha256().as_deref(), Some(CLEARANCE_SHA256));
+        assert_eq!(node(DARWIN_UA, None).cookie_sha256(), None);
+        // The job builds the same bytes, and only with the node's headers.
+        assert_eq!(job.hop_request("https://example.com/", Some(&node(DARWIN_UA, Some(CLEARANCE)))).unwrap(), with_cookie);
+        assert!(job.hop_request("https://example.com/", None).is_err());
+        assert!(job.hop_request("https://example.com/", Some(&node(DARWIN_UA, Some("session=x")))).is_err());
+        let relay = validate_job(&payload()).unwrap();
+        assert!(relay.hop_request("https://example.com/", Some(&node(DARWIN_UA, None))).is_err());
+        assert_eq!(relay.hop_request("https://example.com/", None).unwrap(), request("https://example.com/", &relay.headers));
+    }
+
+    #[test]
+    fn cookie_grammar_vectors() {
+        let fifty = (0..50).map(|i| format!("_px{i}=v")).collect::<Vec<_>>().join("; ");
+        let fits = format!("a={}", "b".repeat(MAX_COOKIE - 2));
+        for valid in ["a=b", "a=", "q=\"x\"", "q=\"\"", CLEARANCE, "a=b; a=c", "a=x=y", fifty.as_str(), fits.as_str()] {
+            assert!(valid_cookie(valid), "{valid} refused");
+        }
+        let fifty_one = format!("{fifty}; a=b");
+        let long = format!("a={}", "b".repeat(4097));
+        for invalid in ["a=b;c=d", "=b", "a b=c", "a=b c", "a=b,c", "a=b; ", "a=\u{7f}", "", "a", "a=\"x", "a=x\"", "a=\"", "a=b;  c=d", " a=b", "a=b\\c", "a=é", "a=b\r\nX: y", long.as_str(), fifty_one.as_str()] {
+            assert!(!valid_cookie(invalid), "{invalid:?} accepted");
+        }
+        assert!(!valid_cookie(&format!("{}=v", "a".repeat(257))) && valid_cookie(&format!("{}=v", "a".repeat(256))));
+        assert_eq!(cookie_names(CLEARANCE), ["cf_clearance", "__cf_bm"]);
+        assert_eq!(cookie_names("a=b; a=c=d"), ["a", "a"]);
+    }
+
+    #[test]
+    fn clearance_cookie_name_vectors() {
+        for allowed in [
+            "cf_clearance", "__cf_bm", "_cfuvid", "datadome", "_abck", "bm_sz", "ak_bmsc", "bm_sv", "pxcts", "reese84", "aws-waf-token", "_px3", "_pxhd", "incap_ses_123_456", "visid_incap_789", "nlbi_1",
+        ] {
+            assert!(clearance_cookie(allowed), "{allowed} refused");
+        }
+        for refused in ["session", "sid", "CF_CLEARANCE", "cf_clearance2", "_px", "incap_ses_", "__Secure-session", "visid_incap_", "nlbi_", "", "xcf_clearance"] {
+            assert!(!clearance_cookie(refused), "{refused} accepted");
+        }
+        // Grammar and names are separate checks; a receipt's list needs both and must fit one header.
+        let names = |list: &[&str]| list.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert!(allowed_cookie_names(&names(&["cf_clearance", "__cf_bm"])) && allowed_cookie_names(&[]));
+        assert!(!allowed_cookie_names(&names(&["cf_clearance", "session"])));
+        assert!(!allowed_cookie_names(&names(&["_px a"])));
+        assert!(!allowed_cookie_names(&vec!["_px1".to_string(); 51]));
+        assert!(allowed_cookie_names(&vec![format!("_px{}", "a".repeat(253)); 13]) && !allowed_cookie_names(&vec![format!("_px{}", "a".repeat(253)); 16]));
+    }
+
+    #[test]
+    fn user_agent_vectors() {
+        assert_eq!(user_agent("darwin", 155).as_deref(), Some(DARWIN_UA));
+        assert_eq!(user_agent("windows", 155).as_deref(), Some(WINDOWS_UA));
+        assert_eq!(user_agent("linux", 155).as_deref(), Some(LINUX_UA));
+        assert_eq!(user_agent("android", 155), None);
+        for allowed in [DARWIN_UA, WINDOWS_UA, LINUX_UA] {
+            assert!(pinned_user_agent(allowed) && browser_user_agent(allowed), "{allowed}");
+        }
+        let refused = [
+            DARWIN_UA.replace("Chrome/155", "Chrome/154"),
+            DARWIN_UA.replace("Chrome/155", "Chrome/156"),
+            "Googlebot/2.1 (+http://www.google.com/bot.html)".into(),
+            format!("{DARWIN_UA} "),
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Mobile Safari/537.36".into(),
+            DARWIN_UA.replace("Chrome/155.0.0.0", "Chrome/155.0.8059.39"),
+            DARWIN_UA.replace("Chrome/155", "Chrome/0155"),
+            DARWIN_UA.replace("Chrome/155", "HeadlessChrome/155"),
+            String::new(),
+        ];
+        for value in &refused {
+            assert!(!pinned_user_agent(value), "{value} accepted");
+        }
+        // A receipt may keep a UA from before a pin bump; it must still have the browser's shape.
+        assert!(browser_user_agent(&refused[0]) && browser_user_agent(&refused[1]));
+        assert!(refused[2..].iter().all(|value| !browser_user_agent(value)));
+    }
+
+    #[test]
+    fn browser_authorize_accepts_exactly_the_canonical_forms() {
+        let job = browser_job();
+        let url = "https://example.com/";
+        for ua in [DARWIN_UA, WINDOWS_UA, LINUX_UA] {
+            for cookie in [None, Some(CLEARANCE), Some("datadome=Ab~9_-.z"), Some("_pxhd=\"q\"; _px3=1; _px3=2")] {
+                let raw = request_with_node(url, &job.headers, ua, cookie);
+                assert_eq!(authorize(&job, url, &raw).unwrap(), Some(node(ua, cookie)), "{ua} {cookie:?}");
+            }
+        }
+        // A later hop is authorized for its own URL only.
+        let next = "https://www.example.com/next?q=1";
+        let raw = request_with_node(next, &job.headers, DARWIN_UA, Some(CLEARANCE));
+        assert!(authorize(&job, next, &raw).is_ok() && authorize(&job, url, &raw).is_err());
+        // A relay job still takes exactly its request, and no node header.
+        let relay = validate_job(&payload()).unwrap();
+        assert_eq!(authorize(&relay, url, &request(url, &relay.headers)).unwrap(), None);
+        let mut relay_with_cookie = request(url, &relay.headers);
+        let at = find(&relay_with_cookie, b"Accept-Encoding").unwrap();
+        relay_with_cookie.splice(at..at, format!("Cookie: {CLEARANCE}\r\n").into_bytes());
+        assert!(authorize(&relay, url, &relay_with_cookie).is_err());
+    }
+
+    /// The browser vectors every implementation shares (`api/web-vectors.json`).
+    #[test]
+    fn shared_browser_vectors() {
+        let vectors = vectors();
+        assert_eq!(vectors["version"], 2);
+        let defaults: Vec<Header> = serde_json::from_value(vectors["browser_default_headers"].clone()).unwrap();
+        assert_eq!(defaults, browser_job().headers);
+        let requests = vectors["browser_requests"].as_array().unwrap();
+        assert!(requests.iter().any(|v| v.get("cookie").is_some()) && requests.iter().any(|v| v.get("cookie").is_none()));
+        for v in requests {
+            let (url, ua, cookie) = (v["url"].as_str().unwrap(), v["user_agent"].as_str().unwrap(), v["cookie"].as_str());
+            let headers: Vec<Header> = serde_json::from_value(v["headers"].clone()).unwrap();
+            let bytes = request_with_node(url, &headers, ua, cookie);
+            assert_eq!(bytes, v["bytes"].as_str().unwrap().as_bytes());
+            assert_eq!(format!("{:x}", Sha256::digest(&bytes)), v["sha256"].as_str().unwrap());
+            assert_eq!(node(ua, cookie).cookie_sha256().as_deref(), v["cookie_sha256"].as_str());
+            // These are exactly what the verifier authorizes.
+            let job = validate_job(&browser_payload(url)).unwrap();
+            assert_eq!(authorize(&job, url, &bytes).unwrap(), Some(node(ua, cookie)));
+        }
+        for valid in vectors["cookies"]["valid"].as_array().unwrap() {
+            assert!(valid_cookie(valid.as_str().unwrap()), "{valid} refused");
+        }
+        for invalid in vectors["cookies"]["invalid"].as_array().unwrap() {
+            assert!(!valid_cookie(invalid.as_str().unwrap()), "{invalid} accepted");
+        }
+        for allowed in vectors["cookie_names"]["allowed"].as_array().unwrap() {
+            assert!(clearance_cookie(allowed.as_str().unwrap()), "{allowed} refused");
+        }
+        for refused in vectors["cookie_names"]["refused"].as_array().unwrap() {
+            assert!(!clearance_cookie(refused.as_str().unwrap()), "{refused} accepted");
+        }
+        for allowed in vectors["user_agents"]["allowed"].as_array().unwrap() {
+            assert!(pinned_user_agent(allowed.as_str().unwrap()), "{allowed} refused");
+        }
+        for refused in vectors["user_agents"]["refused"].as_array().unwrap() {
+            assert!(!pinned_user_agent(refused.as_str().unwrap()), "{refused} accepted");
+        }
+        assert!(shared_refusals().len() >= 7);
+    }
+
+    #[test]
+    fn browser_authorize_refuses_every_other_form() {
+        let job = browser_job();
+        for (case, raw) in browser_refusals() {
+            let error = authorize(&job, "https://example.com/", &raw).expect_err(&case);
+            // Refusals never quote what the node sent.
+            let text = format!("{error:#}");
+            assert!(!text.contains("abc.DEF") && !text.contains("session=") && !text.contains("Mozilla"), "{case}: {text}");
+        }
+    }
+
+    #[test]
+    fn validates_the_browser_payload_and_rejects_every_mutation() {
+        let job = browser_job();
+        assert_eq!((job.policy, job.max_redirects, job.max_response_bytes, job.headers.len()), (Policy::Browser, 5, 10 << 20, 2));
+        assert_eq!((Policy::Browser.name(), Policy::Relay.name()), ("web-browser-v1", "web-relay-v1"));
+        assert_eq!(validate_job(&payload()).unwrap().policy, Policy::Relay);
+        // The coordinator registers it as these exact bytes (B.2's request_sha256).
+        assert_eq!(format!("{:x}", Sha256::digest(serde_json::to_vec(&browser_payload("https://example.com/")).unwrap())), "f24ba0094ed03be33c287a26997889217a0e6aebf62ca0b278f34dbecf0a175e");
+        let mutations: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+            ("user agent header", Box::new(|p| p["headers"].as_array_mut().unwrap().insert(0, json!({"name":"user-agent","value":DARWIN_UA})))),
+            ("header order", Box::new(|p| p["headers"].as_array_mut().unwrap().swap(0, 1))),
+            ("missing header", Box::new(|p| drop(p["headers"].as_array_mut().unwrap().pop()))),
+            ("other accept", Box::new(|p| p["headers"][0]["value"] = "*/*".into())),
+            ("cookie header", Box::new(|p| p["headers"].as_array_mut().unwrap().push(json!({"name":"cookie","value":"a=b"})))),
+            ("no node headers", Box::new(|p| drop(p.as_object_mut().unwrap().remove("node_headers")))),
+            ("null node headers", Box::new(|p| p["node_headers"] = Value::Null)),
+            ("node header order", Box::new(|p| p["node_headers"] = json!(["cookie","user-agent"]))),
+            ("node headers missing cookie", Box::new(|p| p["node_headers"] = json!(["user-agent"]))),
+            ("node headers extra", Box::new(|p| p["node_headers"] = json!(["user-agent","cookie","accept"]))),
+            ("node header case", Box::new(|p| p["node_headers"] = json!(["User-Agent","cookie"]))),
+            ("fewer redirects", Box::new(|p| p["max_redirects"] = 4.into())),
+            ("smaller pages", Box::new(|p| p["max_response_bytes"] = (1 << 20).into())),
+            ("other policy", Box::new(|p| p["proof_policy"] = "web-browser-v2".into())),
+            ("mpc", Box::new(|p| p["proof_mode"] = "mpc".into())),
+            ("unknown field", Box::new(|p| p["mode"] = "browser".into())),
+        ];
+        for (name, mutate) in mutations {
+            let mut p = browser_payload("https://example.com/");
+            mutate(&mut p);
+            assert!(validate_job(&p).is_err(), "{name} accepted");
+        }
+        // A relay job takes no node headers at all, not even null or empty.
+        for node_headers in [json!(["user-agent","cookie"]), json!([]), Value::Null] {
+            let mut p = payload();
+            p["node_headers"] = node_headers.clone();
+            assert!(validate_job(&p).is_err(), "relay with {node_headers}");
+        }
+    }
+
+    #[test]
+    fn node_headers_deserialize_strictly_and_never_print_the_cookie() {
+        let parse = |v: Value| serde_json::from_value::<NodeHeaders>(v);
+        assert_eq!(parse(json!({"user_agent":DARWIN_UA})).unwrap(), node(DARWIN_UA, None));
+        assert_eq!(parse(json!({"user_agent":DARWIN_UA,"cookie":CLEARANCE})).unwrap(), node(DARWIN_UA, Some(CLEARANCE)));
+        for bad in [json!({"user_agent":DARWIN_UA,"cookie":null}), json!({"cookie":CLEARANCE}), json!({"user_agent":DARWIN_UA,"other":1}), json!({"user_agent":null})] {
+            assert!(parse(bad.clone()).is_err(), "{bad}");
+        }
+        let debug = format!("{:?}", node(DARWIN_UA, Some(CLEARANCE)));
+        assert!(debug.contains("cf_clearance") && !debug.contains("abc.DEF") && !debug.contains("x1y2"), "{debug}");
     }
 
     #[test]

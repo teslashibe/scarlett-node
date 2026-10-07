@@ -19,8 +19,12 @@ func beginLeaseDiagnostics(store *diagnostics.Store, l coordinator.Lease) *diagn
 		meta.Operation = "codex"
 	}
 	if l.ServiceType == "web" {
-		// Hops are exchanges; the page is one unit of work.
+		// Hops are exchanges; the page is one unit of work. A browser job's
+		// browser phase and upload are exchange 0, its re-fetch hops 1-6.
 		meta.Operation, meta.Pages, meta.ProofMode = "scrape", 1, "relay"
+		if l.WebRequest != nil && l.WebRequest.Mode == "browser" {
+			meta.ProofMode = "browser"
+		}
 	}
 	if l.ServiceType == "x_read" && l.XRequest != nil {
 		switch l.XRequest.Operation {

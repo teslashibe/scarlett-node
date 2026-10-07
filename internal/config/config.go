@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -81,7 +82,18 @@ type Config struct {
 	// WebEgressProxy, when set, is the local HTTP CONNECT proxy every web
 	// target is dialled through (SCARLETT_WEB_EGRESS_PROXY), such as a
 	// residential proxy in front of a cloud server. It never leaves this node.
-	WebEgressProxy   *WebProxy
+	WebEgressProxy *WebProxy
+	// WebBrowser turns on the browser tier for web jobs in browser mode
+	// (SCARLETT_WEB_BROWSER on|off). It is on by default with web on macOS
+	// and Linux and off by default on Windows in this release.
+	WebBrowser bool
+	// WebBrowserConcurrency is how many pages the browser renders at once
+	// (SCARLETT_WEB_BROWSER_CONCURRENCY, 1-4). Zero means automatic: 1 below
+	// 16 GiB of physical memory, else 2. It never exceeds WebConcurrency.
+	WebBrowserConcurrency int
+	// WebBrowserIdle is how long an idle browser helper stays up
+	// (SCARLETT_WEB_BROWSER_IDLE_SECONDS, 30-3600, default 120).
+	WebBrowserIdle   time.Duration
 	LocalFixture     bool
 	InferenceTimeout time.Duration
 	MaxInputBytes    int
@@ -207,10 +219,15 @@ func Load() (Config, error) {
 				*destination = n
 			}
 		}
+		if err := c.loadWebBrowser(runtime.GOOS); err != nil {
+			return c, err
+		}
 	} else if os.Getenv("SCARLETT_SERVICES") != "" {
 		return c, errors.New("SCARLETT_SERVICES requires services executor")
 	} else if os.Getenv("SCARLETT_WEB_EGRESS_PROXY") != "" {
 		return c, errors.New("SCARLETT_WEB_EGRESS_PROXY requires services executor")
+	} else if os.Getenv("SCARLETT_WEB_BROWSER") != "" || os.Getenv("SCARLETT_WEB_BROWSER_CONCURRENCY") != "" || os.Getenv("SCARLETT_WEB_BROWSER_IDLE_SECONDS") != "" {
+		return c, errors.New("SCARLETT_WEB_BROWSER settings require services executor")
 	}
 	if s := os.Getenv("SCARLETT_INFERENCE_TIMEOUT_SECONDS"); s != "" {
 		v, e := strconv.Atoi(s)
@@ -333,6 +350,9 @@ func (c Config) Validate() error {
 		if c.WebEgressProxy != nil && !c.WebEgressProxy.valid() {
 			return errors.New("invalid SCARLETT_WEB_EGRESS_PROXY")
 		}
+		if c.WebBrowserConcurrency < 0 || c.WebBrowserConcurrency > 4 || c.WebBrowser && c.WebBrowserConcurrency > c.WebConcurrency || c.WebBrowserIdle != 0 && (c.WebBrowserIdle < 30*time.Second || c.WebBrowserIdle > time.Hour) {
+			return errors.New("invalid web browser configuration")
+		}
 		if c.AccountsRequired && c.AccountsFile == "" || !filepath.IsAbs(c.AccountsFile) && c.AccountsFile != "" {
 			return errors.New("accounts file must be absolute")
 		}
@@ -381,6 +401,43 @@ func (c Config) Validate() error {
 		if host != "localhost" && (ip == nil || !ip.IsLoopback()) && !(c.LocalFixture && fixtureHost[host]) {
 			return errors.New("HTTP gateway must be loopback or explicit local Docker fixture")
 		}
+	}
+	return nil
+}
+
+// WebBrowserDefault is whether the browser tier is on when web is enabled and
+// SCARLETT_WEB_BROWSER is unset: on for macOS and Linux, and off for Windows
+// until its live test and clean-machine pass are recorded.
+func WebBrowserDefault(goos string) bool { return goos != "windows" }
+
+// loadWebBrowser reads the browser tier settings for goos. The tier needs web:
+// without it the tier is off whatever SCARLETT_WEB_BROWSER says.
+func (c *Config) loadWebBrowser(goos string) error {
+	c.WebBrowser = WebBrowserDefault(goos)
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SCARLETT_WEB_BROWSER"))) {
+	case "":
+	case "on", "1", "true":
+		c.WebBrowser = true
+	case "off", "0", "false":
+		c.WebBrowser = false
+	default:
+		return errors.New("invalid SCARLETT_WEB_BROWSER; use on or off")
+	}
+	c.WebBrowser = c.WebBrowser && c.Enabled("web")
+	if value := os.Getenv("SCARLETT_WEB_BROWSER_CONCURRENCY"); value != "" {
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 1 || n > 4 {
+			return errors.New("invalid SCARLETT_WEB_BROWSER_CONCURRENCY; use 1-4")
+		}
+		c.WebBrowserConcurrency = n
+	}
+	c.WebBrowserIdle = 120 * time.Second
+	if value := os.Getenv("SCARLETT_WEB_BROWSER_IDLE_SECONDS"); value != "" {
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 30 || n > 3600 {
+			return errors.New("invalid SCARLETT_WEB_BROWSER_IDLE_SECONDS; use 30-3600")
+		}
+		c.WebBrowserIdle = time.Duration(n) * time.Second
 	}
 	return nil
 }

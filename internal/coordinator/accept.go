@@ -73,6 +73,10 @@ func ValidOffer(offer Lease, now time.Time) error {
 	if !offer.AcceptanceRequired || offer.Version != Version || offer.VerifierToken != "" || !digest(offer.RequestSHA256) || !digest(offer.SignedJobID) || (offer.ServiceType != "codex" && offer.ServiceType != "x_read" && offer.ServiceType != "web") || !offer.LeaseDeadline.After(now) || offer.LeaseDeadline.After(now.Add(MaxOfferLifetime+OfferClockSkew)) || !offer.SettlementDeadline.Equal(offer.LeaseDeadline) {
 		return errors.New("invalid community offer")
 	}
+	// The pre-warm hint belongs to relay web offers only.
+	if offer.WebPrewarmBrowser && (offer.ServiceType != "web" || offer.WebRequest == nil || offer.WebRequest.Mode != "") {
+		return errors.New("invalid community offer")
+	}
 	return nil
 }
 
@@ -140,6 +144,10 @@ func (c *Client) Accept(ctx context.Context, offer Lease) (Lease, error) {
 	}
 	token := reply.Lease.VerifierToken
 	reply.Lease.VerifierToken = ""
+	// The pre-warm hint is advice decided at offer time, not part of the
+	// terms, so it is left out of the comparison and the offer's value kept.
+	prewarm := offer.WebPrewarmBrowser
+	offer.WebPrewarmBrowser, reply.Lease.WebPrewarmBrowser = false, false
 	want, err := json.Marshal(offer)
 	if err != nil {
 		return Lease{}, err
@@ -149,5 +157,6 @@ func (c *Client) Accept(ctx context.Context, offer Lease) (Lease, error) {
 		return Lease{}, errors.New("accepted terms differ from offered work")
 	}
 	reply.Lease.VerifierToken = token
+	reply.Lease.WebPrewarmBrowser = prewarm
 	return reply.Lease, nil
 }

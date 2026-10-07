@@ -257,7 +257,7 @@ func TestValidateWebLease(t *testing.T) {
 		t.Fatal("lease inside the report margin ran", code)
 	}
 	HaltRelay("test")
-	if _, _, code := validateWebLease(c, l); code != "invalid_lease" || WebOfferServable(c, l.WebPayload) {
+	if _, _, code := validateWebLease(c, l); code != "invalid_lease" || WebOfferServable(c, l, nil) {
 		t.Fatal("halted relay still serves web")
 	}
 }
@@ -267,11 +267,13 @@ func TestWebOfferServable(t *testing.T) {
 	t.Cleanup(ResetRelayHaltForTests)
 	c := webConfig()
 	l := webFixtureLease(t)
-	if !WebOfferServable(c, l.WebPayload) {
+	if !WebOfferServable(c, l, nil) {
 		t.Fatal("fixture offer refused")
 	}
-	for _, payload := range []string{"", "{", `{"proof_mode":"mpc","proof_policy":"web-relay-v1"}`, `{"proof_mode":"relay","proof_policy":"x-relay-v1"}`, `{"proof_mode":"relay"}`} {
-		if WebOfferServable(c, json.RawMessage(payload)) {
+	for _, payload := range []string{"", "{", `{"proof_mode":"mpc","proof_policy":"web-relay-v1"}`, `{"proof_mode":"relay","proof_policy":"x-relay-v1"}`, `{"proof_mode":"relay"}`, `{"proof_mode":"relay","proof_policy":"web-browser-v1"}`} {
+		m := l
+		m.WebPayload = json.RawMessage(payload)
+		if WebOfferServable(c, m, nil) {
 			t.Fatalf("payload %q servable", payload)
 		}
 	}
@@ -443,7 +445,7 @@ func TestWebRunHops(t *testing.T) {
 	})
 	t.Run("non-canonical hop", func(t *testing.T) {
 		r := &fakeResolver{answers: publicAnswers}
-		out := Web{Config: c, Resolver: r.resolve, Egress: staticEgress()}.hop(context.Background(), webPlan{}, "", 0, "https://Example.com/", r.resolve, staticEgress())
+		out := Web{Config: c, Resolver: r.resolve, Egress: staticEgress()}.hop(context.Background(), webPlan{}, "", 0, "https://Example.com/", r.resolve, staticEgress(), nil)
 		if out.code != "web_egress_denied" || len(r.asked) != 0 {
 			t.Fatal("non-canonical hop URL resolved", out.code)
 		}
@@ -459,7 +461,7 @@ func TestWebRunMisuseHaltsRelay(t *testing.T) {
 			if run.code != "relay_misuse" || !RelayHalted() {
 				t.Fatal("misuse not latched", run.code)
 			}
-			if WebOfferServable(webConfig(), webFixtureLease(t).WebPayload) {
+			if WebOfferServable(webConfig(), webFixtureLease(t), nil) {
 				t.Fatal("halted node still offers web")
 			}
 		})

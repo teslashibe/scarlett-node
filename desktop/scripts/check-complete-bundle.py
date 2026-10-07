@@ -37,6 +37,21 @@ for item in metadata['sidecars']:
     assert file.stat().st_size == item['bytes']
     assert hashlib.sha256(file.read_bytes()).hexdigest() == item['sha256']
 
+# The web browser runtime: extraction with every hash checked, the helper's
+# self-check (imports and the exact browser option set) and the Playwright
+# driver on the bundled x-login Node, in a disposable state directory. The
+# browser itself is never downloaded here.
+web_platform = {'aarch64-apple-darwin': 'darwin-arm64', 'x86_64-apple-darwin': 'darwin-amd64', 'x86_64-pc-windows-msvc': 'windows-amd64'}[metadata['target']]
+assert (runtime / ('web-runtime-' + web_platform + '.tar.gz')).is_file() and (runtime / 'web-runtime.json').is_file(), 'Web runtime must accompany the node'
+assert json.loads((runtime / 'web-runtime.json').read_text())['platform'] == web_platform
+with tempfile.TemporaryDirectory(prefix='scarlett-web-runtime-check-') as temporary:
+    env = {k: os.environ[k] for k in ('SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR', 'PATH') if k in os.environ}
+    # A missing state directory is created private by the node itself.
+    env.update(HOME=temporary, USERPROFILE=temporary, SCARLETT_STATE_DIR=str(Path(temporary) / 'state'))
+    out = subprocess.check_output([str(binaries / ('scarlett-node' + suffix)), 'web-runtime', 'check', '--resources', str(runtime)],
+        cwd=temporary, env=env, timeout=120, text=True, stdin=subprocess.DEVNULL)
+    assert json.loads(out) == {'webRuntime': 'passed'}, 'Bundled web runtime check failed'
+
 if os.name == 'nt':
     for name in ('scarlett-node', 'scarlett-prover', 'open-agent-api', 'scarlett-node-desktop'):
         file = binaries / (name + suffix)
@@ -99,4 +114,4 @@ with tempfile.TemporaryDirectory(prefix='scarlett-bundle-smoke-') as temporary:
             process.kill()
             process.wait(timeout=5)
             raise AssertionError('Bundled model API did not stop')
-print(json.dumps({'bundleIntegrity': 'passed', 'nativeProviderVersions': 'passed', 'loopbackReadiness': 'passed', 'bearerRequired': 'passed', 'modelAliasCount': model_count, 'providerJobs': 0, 'accountProfiles': 'disposable only'}))
+print(json.dumps({'bundleIntegrity': 'passed', 'webRuntime': 'passed', 'nativeProviderVersions': 'passed', 'loopbackReadiness': 'passed', 'bearerRequired': 'passed', 'modelAliasCount': model_count, 'providerJobs': 0, 'accountProfiles': 'disposable only'}))

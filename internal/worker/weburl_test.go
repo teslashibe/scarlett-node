@@ -28,7 +28,7 @@ func TestCanonicalWebURLSharedVectors(t *testing.T) {
 			Next string `json:"next"`
 		} `json:"redirects"`
 	}
-	if err := json.Unmarshal(raw, &vectors); err != nil || vectors.Version != 1 || len(vectors.Strict) == 0 {
+	if err := json.Unmarshal(raw, &vectors); err != nil || vectors.Version != 2 || len(vectors.Strict) == 0 {
 		t.Fatal("vectors unreadable", err)
 	}
 	for _, v := range vectors.Strict {

@@ -33,7 +33,22 @@ type webHopInput struct {
 	Proxy            *webProxyInput  `json:"proxy,omitempty"`
 	Payload          json.RawMessage `json:"payload"`
 	TimeoutMS        int64           `json:"timeout_ms"`
+	// NodeHeaders is present exactly for web-browser-v1 jobs.
+	NodeHeaders *webNodeHeaders `json:"node_headers,omitempty"`
 }
+
+// webNodeHeaders are the request header values a browser job's re-fetch hop
+// supplies: the browser's pinned User-Agent and, when any clearance cookie
+// matches the hop, a Cookie value. They go to the helper's stdin only.
+type webNodeHeaders struct {
+	UserAgent string `json:"user_agent"`
+	Cookie    string `json:"cookie,omitempty"`
+}
+
+// String and GoString keep the cookie out of any formatted output.
+func (webNodeHeaders) String() string   { return "web node headers [redacted]" }
+func (webNodeHeaders) GoString() string { return "worker.webNodeHeaders{}" }
+
 type webProxyInput struct {
 	Host          string `json:"host"`
 	Port          int    `json:"port"`
@@ -52,7 +67,7 @@ const (
 )
 
 // prove runs one relay session to addr and reads its summary.
-func (w Web) prove(ctx context.Context, plan webPlan, token string, hop int, url string, addr netip.Addr) webHopOutcome {
+func (w Web) prove(ctx context.Context, plan webPlan, token string, hop int, url string, addr netip.Addr, headers *webNodeHeaders) webHopOutcome {
 	c := w.Config
 	deadline, ok := ctx.Deadline()
 	budget := min(webHopLimit, time.Until(deadline))
@@ -61,7 +76,7 @@ func (w Web) prove(ctx context.Context, plan webPlan, token string, hop int, url
 	}
 	exchange := hop + 1
 	endEncode := diagnostics.Start(ctx, "request_encode", exchange)
-	in := webHopInput{Verifier: c.Verifier, VerifierCA: c.VerifierCA, PlaintextFixture: c.VerifierPlaintextFixture, Token: token, Hop: hop, URL: url, IP: addr.String(), Port: 443, Payload: plan.raw, TimeoutMS: budget.Milliseconds()}
+	in := webHopInput{Verifier: c.Verifier, VerifierCA: c.VerifierCA, PlaintextFixture: c.VerifierPlaintextFixture, Token: token, Hop: hop, URL: url, IP: addr.String(), Port: 443, Payload: plan.raw, TimeoutMS: budget.Milliseconds(), NodeHeaders: headers}
 	if p := c.WebEgressProxy; p != nil {
 		in.Proxy = &webProxyInput{Host: p.Host, Port: p.Port, Authorization: p.Authorization}
 	}

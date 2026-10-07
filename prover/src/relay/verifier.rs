@@ -255,8 +255,9 @@ where
     Ok(Outcome { sent: sealed.sent, hidden: sealed.hidden, received: received.0 })
 }
 
-/// Runs one web hop for `server_name`. The verifier authorizes exactly
-/// `request`, with nothing hidden, and frames the response within
+/// Runs one web hop for `server_name`. The verifier authorizes only a
+/// request with nothing hidden that `authorize` accepts (see
+/// `webpolicy::authorize`), and frames the response within
 /// `max_response_bytes`. Once the supplier has the record opening,
 /// `conclude` records the hop and returns the OUTCOME frame, which is sent
 /// only after it returns: the supplier cannot start the next hop before
@@ -265,7 +266,7 @@ pub async fn run_web<S>(
     socket: S,
     config: Arc<ClientConfig>,
     server_name: &str,
-    request: &[u8],
+    authorize: impl Fn(&[u8]) -> Result<()>,
     max_response_bytes: usize,
     conclude: impl FnOnce(&WebOutcome) -> Result<Vec<u8>>,
 ) -> Result<WebOutcome>
@@ -273,11 +274,10 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let authorize = |public: &[u8], hidden: &[Range<usize>]| {
-        if hidden.is_empty() && public == request {
-            Ok(())
-        } else {
-            Err(anyhow::Error::new(Failure::RequestRejected).context("request is not the hop's canonical request"))
+        if !hidden.is_empty() {
+            return Err(anyhow::Error::new(Failure::RequestRejected).context("a web request hides nothing"));
         }
+        authorize(public).map_err(|e| e.context(Failure::RequestRejected))
     };
     let mut response = WebReader(Framer::new(max_response_bytes));
     let mut verified = None;

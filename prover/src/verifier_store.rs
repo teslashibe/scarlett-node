@@ -31,10 +31,11 @@ pub fn retention_ms(payload: &Value) -> u64 {
 }
 
 /// The most a web receipt can hold: the final body and every hop's head in
-/// base64, two URLs per hop and the fixed fields around them.
+/// base64, two URLs per hop, a browser hop's User-Agent and cookie names
+/// (which fit in one Cookie header), and the fixed fields around them.
 pub fn web_receipt_bound(max_response_bytes: usize, max_redirects: usize) -> u64 {
     let base64 = |n: usize| 4 * n.div_ceil(3);
-    let per_hop = base64(crate::webpolicy::MAX_HEAD) + 2 * crate::webpolicy::MAX_URL + 2048;
+    let per_hop = base64(crate::webpolicy::MAX_HEAD) + 2 * crate::webpolicy::MAX_URL + crate::webpolicy::MAX_COOKIE + 3 * crate::webpolicy::MAX_COOKIE_PAIRS + 2048 + 1024;
     (base64(max_response_bytes) + (max_redirects + 1) * per_hop + (64 << 10)) as u64
 }
 

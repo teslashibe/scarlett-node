@@ -25,6 +25,15 @@ export type ServiceHealth = {
   proof_modes?: string[];
   // web only: "direct" or "proxy" (a local CONNECT proxy).
   egress?: string;
+  // web only: the hidden browser tier inside web capacity.
+  browser?: BrowserHealth;
+};
+export type BrowserHealth = {
+  state?: string; // "ready" or "unavailable"
+  reason?: string; // set when unavailable, for example "browser_downloading"
+  capacity?: number;
+  in_flight?: number;
+  version?: string; // Chrome for Testing version, when ready
 };
 export type ClaudeStatus = { available: boolean; connected: boolean; pending: boolean; error?: string | null };
 export type Snapshot = {

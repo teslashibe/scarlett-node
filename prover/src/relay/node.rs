@@ -9,7 +9,9 @@
 //! A web hop is the same session to the address the node checked, with
 //! nothing hidden: the supplier sends the canonical request for the hop,
 //! still checks the opened record against it, and learns only the hop's
-//! status and next URL, never the page.
+//! status and next URL, never the page. A `web-browser-v1` hop's request
+//! also carries the node's User-Agent and clearance cookies, which the node
+//! passes in `node_headers` and the verifier sees.
 
 use std::{
     net::IpAddr,
@@ -200,6 +202,10 @@ pub struct WebRequest {
     pub port: u16,
     pub proxy: Option<dial::Proxy>,
     pub payload: serde_json::Value,
+    /// Required for a `web-browser-v1` job and refused otherwise; `null` is
+    /// refused too. Its values are never printed.
+    #[serde(default, deserialize_with = "webpolicy::present")]
+    pub node_headers: Option<webpolicy::NodeHeaders>,
     pub timeout_ms: u64,
 }
 
@@ -257,9 +263,10 @@ fn public_address(ip: IpAddr) -> bool {
     }
 }
 
-/// Checks a hop request before any connection. Errors name the rule, never
-/// the URL or address.
-fn validate_hop(request: &WebRequest) -> Result<(webpolicy::Job, IpAddr, Duration)> {
+/// Checks a hop request before any connection and returns the hop's
+/// request bytes, the target and the timeout. Errors name the rule,
+/// never the URL, address or a node header value.
+fn validate_hop(request: &WebRequest) -> Result<(Vec<u8>, IpAddr, Duration)> {
     if request.token.len() != 64 || !request.token.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("verifier token must be 64 hex characters");
     }
@@ -270,6 +277,7 @@ fn validate_hop(request: &WebRequest) -> Result<(webpolicy::Job, IpAddr, Duratio
     if request.hop as usize > job.max_redirects || (request.hop == 0 && request.url != job.url) {
         bail!("hop does not belong to this job");
     }
+    let raw = job.hop_request(&request.url, request.node_headers.as_ref())?;
     let ip: IpAddr = request.ip.parse().ok().context("target must be an IP address literal")?;
     if !public_address(ip) {
         bail!("target address is not public");
@@ -280,15 +288,14 @@ fn validate_hop(request: &WebRequest) -> Result<(webpolicy::Job, IpAddr, Duratio
     if !(1000..=webpolicy::HOP_LIMIT.as_millis() as u64).contains(&request.timeout_ms) {
         bail!("timeout_ms must be 1000-30000");
     }
-    Ok((job, ip, Duration::from_millis(request.timeout_ms)))
+    Ok((raw, ip, Duration::from_millis(request.timeout_ms)))
 }
 
 async fn run_web_observed(input: &[u8], trace: &Trace) -> Result<WebSummary, WebError> {
     let request: WebRequest = serde_json::from_slice(input).context("invalid relay-web input").map_err(WebError::fetch)?;
-    let (job, ip, timeout) = validate_hop(&request).map_err(WebError::fetch)?;
+    let (raw, ip, timeout) = validate_hop(&request).map_err(WebError::fetch)?;
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + timeout;
-    let raw = webpolicy::request(&request.url, &job.headers);
     let host = webpolicy::url_host(&request.url);
     // Reach the target first: presenting the token spends one of the job's sessions.
     let dial_class = if request.proxy.is_some() { "proxy_failed" } else { "connect_failed" };
@@ -804,6 +811,51 @@ mod tests {
         later["url"] = "https://www.example.com/".into();
         later["proxy"] = serde_json::json!({"host":"127.0.0.1","port":1});
         assert_eq!(web_class(&later).await.0, "proxy_failed");
+    }
+
+    #[tokio::test]
+    async fn relay_web_node_headers_follow_the_job_policy_and_are_never_echoed() {
+        use crate::webpolicy::fixtures::{CLEARANCE, DARWIN_UA, browser_payload};
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
+        let browser = || {
+            let mut input = web_input();
+            input["payload"] = browser_payload("https://example.com/");
+            input["node_headers"] = serde_json::json!({"user_agent": DARWIN_UA, "cookie": CLEARANCE});
+            // A valid hop goes on to dial, which fails on a closed proxy.
+            input["proxy"] = serde_json::json!({"host":"127.0.0.1","port":closed});
+            input
+        };
+        assert_eq!(web_class(&browser()).await.0, "proxy_failed");
+        let mut no_cookie = browser();
+        no_cookie["node_headers"].as_object_mut().unwrap().remove("cookie");
+        assert_eq!(web_class(&no_cookie).await.0, "proxy_failed");
+        let cases: Vec<(&str, Box<dyn Fn(&mut serde_json::Value)>)> = vec![
+            ("missing", Box::new(|v| drop(v.as_object_mut().unwrap().remove("node_headers")))),
+            ("null", Box::new(|v| v["node_headers"] = serde_json::Value::Null)),
+            ("null cookie", Box::new(|v| v["node_headers"]["cookie"] = serde_json::Value::Null)),
+            ("empty cookie", Box::new(|v| v["node_headers"]["cookie"] = "".into())),
+            ("unknown field", Box::new(|v| v["node_headers"]["accept"] = "*/*".into())),
+            ("no user agent", Box::new(|v| drop(v["node_headers"].as_object_mut().unwrap().remove("user_agent")))),
+            ("unpinned user agent", Box::new(|v| v["node_headers"]["user_agent"] = DARWIN_UA.replace("Chrome/155", "Chrome/154").into())),
+            ("injected user agent", Box::new(|v| v["node_headers"]["user_agent"] = format!("{DARWIN_UA}\r\nX-Injected: 1").into())),
+            ("session cookie", Box::new(|v| v["node_headers"]["cookie"] = "cf_clearance=abc.DEF-123_456; session=s3cr3t".into())),
+            ("cookie grammar", Box::new(|v| v["node_headers"]["cookie"] = "cf_clearance=abc.DEF-123_456;__cf_bm=x1y2".into())),
+            ("cookie line break", Box::new(|v| v["node_headers"]["cookie"] = "cf_clearance=abc.DEF-123_456\r\nX: y".into())),
+            ("relay job", Box::new(|v| v["payload"] = web_input()["payload"].clone())),
+        ];
+        for (name, mutate) in cases {
+            let mut input = browser();
+            mutate(&mut input);
+            let (class, error) = web_class(&input).await;
+            assert_eq!(class, "fetch_failed", "{name}: {error}");
+            for private in ["abc.DEF", "x1y2", "s3cr3t", "example.com"] {
+                assert!(!error.contains(private), "{name}: {error}");
+            }
+        }
+        // A relay job takes no node headers.
+        let mut relay = web_input();
+        relay["node_headers"] = serde_json::json!({"user_agent": DARWIN_UA});
+        assert_eq!(web_class(&relay).await.0, "fetch_failed");
     }
 
     #[tokio::test]

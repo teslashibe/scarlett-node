@@ -7,6 +7,8 @@
 //! `scarlett-prover relay-web` reads one web hop (see relay/node.rs), sends
 //! it over a relay session to the address the node checked, and prints the
 //! hop's summary; on failure it prints `SCARLETT_WEB_ERROR=<class>` on stderr.
+//! A `web-browser-v1` hop's input also carries `node_headers` (the browser's
+//! User-Agent and clearance cookies), whose values are never printed.
 //! `scarlett-prover verifier` runs the validator service (see verifier.rs).
 //! `scarlett-prover fake-openai <addr> <ca-out>` is for impersonation tests.
 

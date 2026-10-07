@@ -11,7 +11,9 @@
 //! session per redirect hop under one token, run one at a time. Hop 0 fetches
 //! the job URL and each later hop only the canonical `Location` of the hop
 //! before it. Every verified hop is committed before the supplier learns it,
-//! and one failed session ends the job (see webpolicy.rs).
+//! and one failed session ends the job (see webpolicy.rs). A `web-browser-v1`
+//! hop also records the node's User-Agent, its cookie names and a hash of
+//! its Cookie value, never the value.
 //!
 //! Environment: SCARLETT_VERIFIER_KEY (required, 32+ chars),
 //! SCARLETT_VERIFIER_LISTEN (default 0.0.0.0:7047), SCARLETT_VERIFIER_API
@@ -139,6 +141,17 @@ struct WebHop {
     leaf_cert_sha256: String,
     started_at_ms: u64,
     duration_ms: u64,
+    /// `web-browser-v1` jobs only, and then always: the User-Agent the node sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node_user_agent: Option<String>,
+    /// `web-browser-v1` jobs only, and then always: the names of the
+    /// clearance cookies the node sent, in header order, empty without a Cookie line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node_cookie_names: Option<Vec<String>>,
+    /// SHA-256 of the Cookie value the node sent, when it sent one. The
+    /// value itself is never kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node_cookie_sha256: Option<String>,
 }
 
 /// The reasons a web hop can be rejected for.
@@ -291,6 +304,18 @@ fn valid_web_hop(job: &webpolicy::Job, hop: &WebHop) -> Result<()> {
         None => true,
         Some(body) => STANDARD.decode(body).is_ok_and(|body| body.len() == hop.body_bytes && verifier_store::hash(&body) == hop.body_sha256),
     };
+    // A browser job's hops say what the node sent, and only those; never a cookie value.
+    let node_ok = match job.policy {
+        webpolicy::Policy::Relay => hop.node_user_agent.is_none() && hop.node_cookie_names.is_none() && hop.node_cookie_sha256.is_none(),
+        webpolicy::Policy::Browser => {
+            hop.node_user_agent.as_deref().is_some_and(webpolicy::browser_user_agent)
+                && hop.node_cookie_names.as_deref().is_some_and(|names| webpolicy::allowed_cookie_names(names) && names.is_empty() == hop.node_cookie_sha256.is_none())
+                && hop.node_cookie_sha256.as_deref().is_none_or(hex)
+        }
+    };
+    if !node_ok {
+        bail!("invalid web receipt node headers");
+    }
     if !canonical(&hop.url)
         || hop.server_name != webpolicy::url_host(&hop.url)
         || !(200..=999).contains(&hop.status_code)
@@ -987,6 +1012,7 @@ mod web_tests {
             node,
             tests::{End, Respond, Server, web_headers, web_origin},
         },
+        webpolicy::fixtures::{CLEARANCE, CLEARANCE_SHA256, DARWIN_UA, browser_payload},
     };
     use serde_json::json;
     use sha2::{Digest, Sha256};
@@ -1377,7 +1403,7 @@ mod web_tests {
         // Expired web receipts stay ten minutes, then leave, in a purge or on restart.
         {
             let mut sessions = s.1.lock().unwrap();
-            let mut age = |sessions: &mut Sessions, attempt: &str, age: u64| {
+            let age = |sessions: &mut Sessions, attempt: &str, age: u64| {
                 let key = job_key("synthetic", attempt);
                 sessions.by_job.get_mut(&key).unwrap().expires_ms = now_ms() - age;
                 sessions.commit(&key).unwrap();
@@ -1421,6 +1447,9 @@ mod web_tests {
             leaf_cert_sha256: hex(&Sha256::digest(b"l")),
             started_at_ms: 1,
             duration_ms: 1,
+            node_user_agent: None,
+            node_cookie_names: None,
+            node_cookie_sha256: None,
         }
     }
 
@@ -1498,6 +1527,207 @@ mod web_tests {
         assert!(validate_receipt(&kind, &ended(refused), 0).is_err());
         assert!(validate_receipt(&kind, &good(), 1).is_err());
         assert!(validate_receipt(&Kind::Codex, &good(), 0).is_err());
+    }
+
+    fn browser_hop(index: usize, url: &str, status: u16, location: Option<&str>, body: Option<&[u8]>, cookie: Option<&str>) -> WebHop {
+        let node = webpolicy::NodeHeaders { user_agent: DARWIN_UA.into(), cookie: cookie.map(Into::into) };
+        WebHop { node_user_agent: Some(node.user_agent.clone()), node_cookie_names: Some(node.cookie_names()), node_cookie_sha256: node.cookie_sha256(), ..valid_hop(index, url, status, location, body) }
+    }
+
+    #[test]
+    fn browser_receipt_node_fields_follow_the_policy() {
+        let (browser, _) = kind(&browser_payload("https://example.com/"), true).unwrap();
+        let (relay, _) = kind(&payload("https://example.com/", 5, 10 << 20), true).unwrap();
+        let receipt = |hops: Vec<WebHop>| Status::WebRead { remaining_sessions: 6 - hops.len(), complete: true, next_url: None, hops, rejections: vec![] };
+        let two = || vec![browser_hop(0, "https://example.com/", 302, Some("https://www.example.com/"), None, Some(CLEARANCE)), browser_hop(1, "https://www.example.com/", 200, None, Some(b"page"), None)];
+        assert!(validate_receipt(&browser, &receipt(two()), 0).is_ok());
+        // The same hops without the node fields are a relay receipt, and only that.
+        let plain = || vec![valid_hop(0, "https://example.com/", 302, Some("https://www.example.com/"), None), valid_hop(1, "https://www.example.com/", 200, None, Some(b"page"))];
+        assert!(validate_receipt(&relay, &receipt(plain()), 0).is_ok());
+        assert!(validate_receipt(&browser, &receipt(plain()), 0).is_err());
+        assert!(validate_receipt(&relay, &receipt(two()), 0).is_err());
+        // A UA from before a pin bump still restores; anything else does not.
+        let mut older = two();
+        older[0].node_user_agent = Some(DARWIN_UA.replace("Chrome/155", "Chrome/154"));
+        assert!(validate_receipt(&browser, &receipt(older), 0).is_ok());
+        let mutations: Vec<(&str, Box<dyn Fn(&mut Vec<WebHop>)>)> = vec![
+            ("no user agent", Box::new(|h| h[0].node_user_agent = None)),
+            ("other user agent", Box::new(|h| h[0].node_user_agent = Some("Googlebot/2.1".into()))),
+            ("no names", Box::new(|h| h[1].node_cookie_names = None)),
+            ("session name", Box::new(|h| h[0].node_cookie_names = Some(vec!["cf_clearance".into(), "session".into()]))),
+            ("names without a hash", Box::new(|h| h[0].node_cookie_sha256 = None)),
+            ("hash without names", Box::new(|h| h[1].node_cookie_sha256 = Some(CLEARANCE_SHA256.into()))),
+            ("hash not hex", Box::new(|h| h[0].node_cookie_sha256 = Some("Z".repeat(64)))),
+            ("too many names", Box::new(|h| h[0].node_cookie_names = Some(vec!["_px1".into(); 51]))),
+            ("relay hop in a browser job", Box::new(|h| h[1] = valid_hop(1, "https://www.example.com/", 200, None, Some(b"page")))),
+        ];
+        for (name, mutate) in mutations {
+            let mut hops = two();
+            mutate(&mut hops);
+            assert!(validate_receipt(&browser, &receipt(hops), 0).is_err(), "{name} accepted");
+        }
+        let mut relay_with_ua = plain();
+        relay_with_ua[1].node_user_agent = Some(DARWIN_UA.into());
+        assert!(validate_receipt(&relay, &receipt(relay_with_ua), 0).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_browser_hop_records_what_the_node_sent_and_never_the_cookie_value() {
+        let url = "https://example.com/";
+        let job = webpolicy::validate_job(&browser_payload(url)).unwrap();
+        for cookie in [Some(CLEARANCE), None] {
+            let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+            let dir = Temp::new();
+            let s = shared(origin.roots.clone(), Some(&dir.0));
+            let token = register(&s, browser_payload(url)).await;
+            let raw = webpolicy::request_with_node(url, &job.headers, DARWIN_UA, cookie);
+            let (reported, verifier) = hop(&s, &origin, &token, 0, url, Some(raw.clone())).await;
+            verifier.unwrap();
+            assert!(reported.unwrap().is_final);
+            // The origin got the node's headers, on the wire the verifier sealed.
+            assert_eq!(origin.seen.lock().unwrap().as_deref(), Some(&raw[..]));
+            let view = view(&s).await;
+            assert_eq!(view["request_sha256"], "f24ba0094ed03be33c287a26997889217a0e6aebf62ca0b278f34dbecf0a175e");
+            assert_eq!((view["complete"].as_bool(), view["rejections"].clone()), (Some(true), json!([])));
+            let h = &view["hops"][0];
+            assert_eq!((h["node_user_agent"].as_str(), h["sent_bytes"].as_u64()), (Some(DARWIN_UA), Some(raw.len() as u64)));
+            match cookie {
+                Some(_) => {
+                    assert_eq!((h["node_cookie_names"].clone(), h["node_cookie_sha256"].as_str()), (json!(["cf_clearance", "__cf_bm"]), Some(CLEARANCE_SHA256)));
+                    assert_eq!(h.as_object().unwrap().len(), 24);
+                }
+                None => {
+                    assert_eq!((h["node_cookie_names"].clone(), h.get("node_cookie_sha256")), (json!([]), None));
+                    assert_eq!(h.as_object().unwrap().len(), 23);
+                }
+            }
+            // The cookie value is in no receipt byte: not the view, not the store.
+            let mut receipts = vec![view.to_string().into_bytes()];
+            for entry in fs::read_dir(&dir.0).unwrap() {
+                receipts.push(fs::read(entry.unwrap().path()).unwrap());
+            }
+            assert!(receipts.len() > 1);
+            for bytes in &receipts {
+                for value in ["abc.DEF-123_456", "x1y2", "Cookie"] {
+                    assert!(!bytes.windows(value.len()).any(|w| w == value.as_bytes()), "{value} stored");
+                }
+            }
+            // The receipt restores with its node fields.
+            drop(s);
+            let s = shared(origin.roots.clone(), Some(&dir.0));
+            assert_eq!(super::web_tests::view(&s).await["hops"][0]["node_user_agent"], DARWIN_UA);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_browser_hop_outside_the_policy_is_rejected_before_it_reaches_the_origin() {
+        let url = "https://example.com/";
+        let job = webpolicy::validate_job(&browser_payload(url)).unwrap();
+        let cases = [
+            ("session cookie", webpolicy::request_with_node(url, &job.headers, DARWIN_UA, Some("cf_clearance=a; session=x"))),
+            ("relay request", webpolicy::request(url, &job.headers)),
+            ("unpinned user agent", webpolicy::request_with_node(url, &job.headers, &DARWIN_UA.replace("Chrome/155", "Chrome/156"), None)),
+        ];
+        for (case, raw) in cases {
+            let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+            let s = shared(origin.roots.clone(), None);
+            let token = register(&s, browser_payload(url)).await;
+            let (reported, _) = hop(&s, &origin, &token, 0, url, Some(raw)).await;
+            assert!(reported.is_err(), "{case}");
+            assert!(origin.seen.lock().unwrap().is_none(), "{case}");
+            let view = view(&s).await;
+            assert_eq!((view["rejections"].clone(), view["hops"].as_array().unwrap().len()), (json!(["request_rejected"]), 0), "{case}");
+            assert_eq!(tokens(&s), 0, "{case}");
+        }
+        // A relay job refuses the browser form just the same.
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        let s = shared(origin.roots.clone(), None);
+        let token = register(&s, payload(url, 5, 10 << 20)).await;
+        let mut raw = webpolicy::request(url, &web_headers());
+        let at = raw.windows(15).position(|w| w == b"Accept-Encoding").unwrap();
+        raw.splice(at..at, format!("Cookie: {CLEARANCE}\r\n").into_bytes());
+        assert!(hop(&s, &origin, &token, 0, url, Some(raw)).await.0.is_err());
+        assert_eq!(view(&s).await["rejections"], json!(["request_rejected"]));
+    }
+
+    /// The whole `relay-web` path for a browser job's re-fetch: two hops
+    /// through a CONNECT proxy, each with the node's User-Agent and the
+    /// clearance cookies for its host.
+    #[tokio::test]
+    async fn relay_web_carries_clearance_cookies_over_two_hops() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let respond: Respond = Arc::new(move |request: &[u8]| {
+            log.lock().unwrap().push(request.to_vec());
+            if request.starts_with(b"GET / ") {
+                (b"HTTP/1.1 302 Found\r\nLocation: https://www.example.com/next\r\nContent-Length: 0\r\n\r\n".to_vec(), End::Wait)
+            } else {
+                (PAGE.to_vec(), End::Wait)
+            }
+        });
+        let origin = web_origin(respond, false).await;
+        let first = "https://example.com/";
+        let next = "https://www.example.com/next";
+        let s = shared(origin.roots.clone(), None);
+        let token = register(&s, browser_payload(first)).await;
+        let verifier = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let verifier_addr = verifier.local_addr().unwrap();
+        let shared_verifier = s.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = verifier.accept().await {
+                tokio::spawn(handle(shared_verifier.clone(), Box::new(socket)));
+            }
+        });
+        // The proxy tunnels every CONNECT to the local origin.
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        let origin_addr = origin.addr;
+        tokio::spawn(async move {
+            while let Ok((mut client, _)) = proxy.accept().await {
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") && client.read(&mut byte).await.unwrap() == 1 {
+                        head.push(byte[0]);
+                    }
+                    let mut upstream = TcpStream::connect(origin_addr).await.unwrap();
+                    client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                });
+            }
+        });
+        let other = "cf_clearance=www.Zz9";
+        let input = |hop: u32, url: &str, cookie: &str| {
+            json!({
+                "verifier": verifier_addr.to_string(), "plaintext_fixture": true, "token": token, "hop": hop,
+                "url": url, "ip": "93.184.215.14", "port": 443, "proxy": {"host": "127.0.0.1", "port": proxy_port},
+                "payload": browser_payload(first), "node_headers": {"user_agent": DARWIN_UA, "cookie": cookie}, "timeout_ms": 20000
+            })
+        };
+        let mut summaries = Vec::new();
+        for (hop, url, cookie) in [(0, first, CLEARANCE), (1, next, other)] {
+            match node::run_web(&serde_json::to_vec(&input(hop, url, cookie)).unwrap()).await {
+                Ok(summary) => summaries.push(serde_json::to_value(summary).unwrap()),
+                Err(failure) => panic!("hop {hop}: {}: {:#}", failure.class, failure.error),
+            }
+        }
+        assert_eq!((summaries[0]["status_code"].as_u64(), summaries[0]["final"].as_bool(), summaries[0]["next_url"].as_str()), (Some(302), Some(false), Some(next)));
+        assert_eq!((summaries[1]["status_code"].as_u64(), summaries[1]["final"].as_bool(), summaries[1]["url"].as_str()), (Some(200), Some(true), Some(next)));
+        for summary in &summaries {
+            let text = summary.to_string();
+            assert!(!text.contains("abc.DEF") && !text.contains("x1y2") && !text.contains("Zz9") && !text.contains("hello"), "{text}");
+        }
+        // The origin saw each hop's own cookies, in the bytes the verifier authorized.
+        let headers = webpolicy::validate_job(&browser_payload(first)).unwrap().headers;
+        let expected = vec![webpolicy::request_with_node(first, &headers, DARWIN_UA, Some(CLEARANCE)), webpolicy::request_with_node(next, &headers, DARWIN_UA, Some(other))];
+        assert_eq!(*seen.lock().unwrap(), expected);
+        let view = view(&s).await;
+        assert_eq!((view["complete"].as_bool(), view["remaining_sessions"].as_u64()), (Some(true), Some(4)));
+        let hops = view["hops"].as_array().unwrap();
+        assert_eq!((hops[0]["node_cookie_names"].clone(), hops[0]["node_cookie_sha256"].as_str()), (json!(["cf_clearance", "__cf_bm"]), Some(CLEARANCE_SHA256)));
+        assert_eq!((hops[1]["node_cookie_names"].clone(), hops[1]["node_cookie_sha256"].as_str()), (json!(["cf_clearance"]), Some(verifier_store::hash(other.as_bytes()).as_str())));
+        assert!(hops.iter().all(|h| h["node_user_agent"] == DARWIN_UA));
+        assert!(!view.to_string().contains("Zz9") && !view.to_string().contains("abc.DEF"));
     }
 
     /// The whole `relay-web` input path: stdin JSON, a CONNECT proxy to the
@@ -1981,12 +2211,14 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
         }
         Job::Web(web, index, url) => {
             let host = webpolicy::url_host(&url).to_owned();
-            let request = webpolicy::request(&url, &web.headers);
+            let authorize = |public: &[u8]| webpolicy::authorize(&web, &url, public).map(drop);
             let started_at_ms = now_ms();
             let concluded = AtomicBool::new(false);
             // Runs once the supplier holds the record opening: the hop is
             // durable before the supplier learns the next URL.
             let conclude = |outcome: &WebOutcome| -> Result<Vec<u8>> {
+                // What the node chose for this hop, from the bytes just authorized.
+                let node = webpolicy::authorize(&web, &url, &outcome.sent)?;
                 let response = &outcome.response;
                 let (location, location_refused) = match response.location() {
                     Some(location) if webpolicy::REDIRECTS.contains(&response.status) => match location.and_then(|l| webpolicy::resolve_location(&url, l)) {
@@ -2018,6 +2250,9 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
                     leaf_cert_sha256: hex(&outcome.tls.leaf_cert_sha256),
                     started_at_ms,
                     duration_ms: started.elapsed().as_millis() as u64,
+                    node_user_agent: node.as_ref().map(|n| n.user_agent.clone()),
+                    node_cookie_names: node.as_ref().map(webpolicy::NodeHeaders::cookie_names),
+                    node_cookie_sha256: node.as_ref().and_then(webpolicy::NodeHeaders::cookie_sha256),
                 };
                 let next_url = (!is_final).then_some(location).flatten();
                 let frame = serde_json::to_vec(&HopOutcome { hop: index, url: &url, status_code: response.status, is_final, next_url: next_url.as_deref() })?;
@@ -2041,7 +2276,7 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
                 println!("verifier: job {job_id} proved web hop {index} (HTTP {})", response.status);
                 Ok(frame)
             };
-            let hop = crate::relay::verifier::run_web(socket, config.relay_tls.clone(), &host, &request, web.max_response_bytes, conclude);
+            let hop = crate::relay::verifier::run_web(socket, config.relay_tls.clone(), &host, authorize, web.max_response_bytes, conclude);
             let result = tokio::time::timeout(limit.min(webpolicy::HOP_LIMIT), hop).await;
             if concluded.load(Ordering::SeqCst) {
                 return Ok(());

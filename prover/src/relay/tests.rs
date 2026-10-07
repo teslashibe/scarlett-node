@@ -931,6 +931,11 @@ pub(crate) async fn web_origin(respond: Respond, tls12_only: bool) -> Server {
     Server { addr, roots, seen }
 }
 
+/// An authorization for exactly `request`, as a `web-relay-v1` hop has.
+fn exactly(request: &[u8]) -> impl Fn(&[u8]) -> Result<()> + '_ {
+    move |public| if public == request { Ok(()) } else { anyhow::bail!("request is not the hop's canonical request") }
+}
+
 pub(crate) fn web_headers() -> Vec<crate::webpolicy::Header> {
     let vectors: serde_json::Value = serde_json::from_str(include_str!("../../../api/web-vectors.json")).unwrap();
     serde_json::from_value(vectors["default_headers"].clone()).unwrap()
@@ -950,7 +955,7 @@ where
     };
     let request = crate::webpolicy::request(&url, &web_headers());
     let server_name = crate::webpolicy::url_host(&url).to_owned();
-    let outcome = within(verifier::run_web(verifier_end, config, &server_name, &request, max, |outcome| {
+    let outcome = within(verifier::run_web(verifier_end, config, &server_name, exactly(&request), max, |outcome| {
         Ok(serde_json::to_vec(&serde_json::json!({"hop":0,"url":url,"status_code":outcome.response.status,"final":true})).unwrap())
     }))
     .await;
@@ -1088,9 +1093,57 @@ async fn a_web_session_refuses_hidden_bytes() {
     let supplier = tokio::spawn(rogue_supplier(origin.addr, node_end, 64, vec![]));
     let url = "https://example.com/";
     let request = crate::webpolicy::request(url, &web_headers());
-    let error = within(verifier::run_web(verifier_end, verifier::tls_config(origin.roots.clone()).unwrap(), "example.com", &request, 1 << 20, |_| Ok(Vec::new()))).await.err().unwrap();
+    let error = within(verifier::run_web(verifier_end, verifier::tls_config(origin.roots.clone()).unwrap(), "example.com", exactly(&request), 1 << 20, |_| Ok(Vec::new()))).await.err().unwrap();
     assert_eq!(Failure::of(&error), Failure::RequestRejected);
     assert_eq!(within(supplier).await.unwrap(), 0);
+}
+
+/// One hop of a `web-browser-v1` job for `https://example.com/`: the
+/// supplier sends `node_raw` and the verifier authorizes it under the job.
+async fn browser_hop(origin: &Server, node_raw: Vec<u8>) -> (Result<node::HopOutcome>, Result<verifier::WebOutcome>) {
+    use crate::webpolicy::{self, fixtures::browser_payload};
+    let url = "https://example.com/";
+    let job = webpolicy::validate_job(&browser_payload(url)).unwrap();
+    let (node_end, verifier_end) = link(|_, _, _| Verdict::Pass);
+    let tcp = TcpStream::connect(origin.addr).await.unwrap();
+    let node = tokio::spawn(async move { node::web_session(node_end, tcp, &node_raw, "example.com", 0, url, &crate::diagnostics::Trace::new()).await });
+    let config = verifier::tls_config(origin.roots.clone()).unwrap();
+    let outcome = within(verifier::run_web(verifier_end, config, "example.com", |public| webpolicy::authorize(&job, url, public).map(drop), 1 << 20, |outcome| {
+        Ok(serde_json::to_vec(&serde_json::json!({"hop":0,"url":url,"status_code":outcome.response.status,"final":true})).unwrap())
+    }))
+    .await;
+    (within(node).await.unwrap(), outcome)
+}
+
+#[tokio::test]
+async fn a_browser_hop_seals_the_nodes_user_agent_and_clearance_cookies() {
+    use crate::webpolicy::{
+        self,
+        fixtures::{CLEARANCE, DARWIN_UA, LINUX_UA, browser_payload},
+    };
+    let headers = webpolicy::validate_job(&browser_payload("https://example.com/")).unwrap().headers;
+    for (ua, cookie) in [(DARWIN_UA, Some(CLEARANCE)), (LINUX_UA, None)] {
+        let origin = web_origin(page(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", End::Wait), false).await;
+        let raw = webpolicy::request_with_node("https://example.com/", &headers, ua, cookie);
+        let (node_result, outcome) = browser_hop(&origin, raw.clone()).await;
+        let outcome = outcome.unwrap();
+        assert!(node_result.unwrap().is_final);
+        assert_eq!(outcome.sent, raw);
+        assert_eq!(origin.seen.lock().unwrap().as_deref(), Some(&raw[..]));
+    }
+}
+
+#[tokio::test]
+async fn a_browser_verifier_refuses_every_other_form_before_the_origin_sees_it() {
+    for (case, raw) in crate::webpolicy::fixtures::browser_refusals() {
+        let origin = web_origin(page(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", End::Wait), false).await;
+        let (node_result, outcome) = browser_hop(&origin, raw).await;
+        let error = outcome.err().unwrap_or_else(|| panic!("{case}: verifier accepted"));
+        assert_eq!(Failure::of(&error), Failure::RequestRejected, "{case}: {error:#}");
+        assert!(origin.seen.lock().unwrap().is_none(), "{case}: a request reached the origin");
+        let node_error = format!("{:#}", node_result.err().unwrap_or_else(|| panic!("{case}: supplier reported a hop")));
+        assert!(!node_error.contains(node::MISUSE), "{case}: {node_error}");
+    }
 }
 
 /// Not run by default: one real web hop to `SCARLETT_TEST_WEB_URL` (default
@@ -1111,7 +1164,7 @@ async fn live_web_hop_is_verified() {
         let (raw, host, url) = (raw.clone(), host.clone(), url.clone());
         tokio::spawn(async move { node::web_session(node_end, tcp, &raw, &host, 0, &url, &crate::diagnostics::Trace::new()).await })
     };
-    let outcome = within(verifier::run_web(verifier_end, config, &host, &raw, crate::webpolicy::MAX_RESPONSE, |outcome| {
+    let outcome = within(verifier::run_web(verifier_end, config, &host, exactly(&raw), crate::webpolicy::MAX_RESPONSE, |outcome| {
         Ok(serde_json::to_vec(&serde_json::json!({"hop":0,"url":url,"status_code":outcome.response.status,"final":true})).unwrap())
     }))
     .await;

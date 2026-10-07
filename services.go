@@ -42,6 +42,11 @@ type servicePool struct {
 	// web is the account-free web service's slot holder. Its entry is
 	// entries["web"], which only the web paths below ever change.
 	web *pooledAccount
+	// browser is web's browser tier, nil when the node has none.
+	// browserInFlight counts web leases in browser mode; each is also one of
+	// web's in-flight leases, so browser capacity sits inside web capacity.
+	browser         worker.BrowserTier
+	browserInFlight int
 }
 
 func newServicePool(c config.Config) *servicePool {
@@ -146,6 +151,8 @@ func (p *servicePool) health() []coordinator.ServiceHealth {
 			}
 			if kind == "web" {
 				h.Egress = p.config.WebEgress()
+				browser := p.browserHealthLocked(capacity)
+				h.Browser = &browser
 			}
 			// Only an opted-in node says so, and a node that has not opted
 			// in sends exactly the heartbeat it sent before the field existed.
@@ -267,17 +274,64 @@ func (p *servicePool) refreshWeb(now time.Time) {
 	}
 }
 
-// acquireWebLocked takes a web slot. Account files, their health and their
-// errors never apply: a web-only node may have no accounts at all.
-func (p *servicePool) acquireWebLocked() (*accountLease, bool) {
+// acquireWebLocked takes a web slot, and for a browser-mode lease a browser
+// slot too, which needs the browser tier ready. Account files, their health
+// and their errors never apply: a web-only node may have no accounts at all.
+func (p *servicePool) acquireWebLocked(browser bool) (*accountLease, bool) {
 	s := p.entries["web"]
 	if !s.enabled || s.state != "configured" && s.state != "ready" || s.inFlight >= s.capacity {
 		return nil, false
 	}
+	if browser {
+		if h := p.browserHealthLocked(s.capacity); h.State != "ready" || p.browserInFlight >= h.Capacity {
+			return nil, false
+		}
+		p.browserInFlight++
+	}
 	s.inFlight++
 	c := p.config
 	c.LocalAccountID = "web"
-	return &accountLease{id: "web", kind: "web", config: c, account: p.web}, true
+	return &accountLease{id: "web", kind: "web", config: c, account: p.web, browser: browser}, true
+}
+
+// browserReasons is the closed set of reasons an unavailable browser tier
+// reports. A runtime reason outside it (such as a helper's launch_failed
+// marker, which counts toward helper_failed) is reported as helper_failed.
+var browserReasons = map[string]bool{
+	"disabled": true, "web_unavailable": true, "memory_low": true, "disk_low": true, "runtime_missing": true, "runtime_invalid": true,
+	"browser_downloading": true, "browser_download_failed": true, "browser_invalid": true, "deps_missing": true, "sandbox_unavailable": true, "helper_failed": true,
+}
+
+// browserHealthLocked is the browser entry inside web, whose advertised
+// capacity is webCapacity: off by configuration, unavailable while web itself
+// is not offerable (relay halted, helper missing, proxy rest), else what the
+// tier reports, with capacity at most web's and in-flight at most capacity.
+// Caller holds p.mu with web refreshed.
+func (p *servicePool) browserHealthLocked(webCapacity int) coordinator.BrowserHealth {
+	s := p.entries["web"]
+	unavailable := func(reason string) coordinator.BrowserHealth {
+		return coordinator.BrowserHealth{State: "unavailable", Reason: reason}
+	}
+	switch {
+	case !p.config.WebBrowser:
+		return unavailable("disabled")
+	case s.state != "configured" && s.state != "ready":
+		return unavailable("web_unavailable")
+	case p.browser == nil:
+		return unavailable("runtime_missing")
+	}
+	status := p.browser.Status()
+	if !status.Ready {
+		if !browserReasons[status.Reason] || status.Reason == "disabled" || status.Reason == "web_unavailable" {
+			return unavailable("helper_failed")
+		}
+		return unavailable(status.Reason)
+	}
+	capacity := min(status.Capacity, 4, webCapacity)
+	if capacity < 1 || status.Version == "" || len(status.Version) > 64 {
+		return unavailable("helper_failed")
+	}
+	return coordinator.BrowserHealth{State: "ready", Capacity: capacity, InFlight: min(p.browserInFlight, capacity), Version: status.Version}
 }
 
 // settleWeb applies one finished web job. Only the node's own egress proxy

@@ -63,7 +63,7 @@ const OPERATIONS: &[&str] = &[
 ];
 /// Three X pages, or six web hops (a page with five redirects).
 const MAX_EXCHANGE: u8 = 6;
-const PROOFS: &[&str] = &["relay", "mpc", "none"];
+const PROOFS: &[&str] = &["relay", "mpc", "browser", "none"];
 const OUTCOMES: &[&str] = &[
     "success",
     "running",
@@ -98,6 +98,8 @@ const OUTCOMES: &[&str] = &[
     "web_connect_failed",
     "web_proxy_failed",
     "web_fetch_failed",
+    "web_browser_unavailable",
+    "web_browser_failed",
 ];
 const NODE_PHASES: &[&str] = &[
     "account_acquire",
@@ -128,6 +130,8 @@ const NODE_PHASES: &[&str] = &[
     "journal_terminal",
     "report_prepare",
     "report_http",
+    "browser_fetch",
+    "browser_upload",
 ];
 const HELPER_PHASES: &[&str] = &[
     "helper_total",
@@ -419,6 +423,25 @@ mod tests {
         assert!(project(&serde_json::to_vec(&v).unwrap()).is_some());
     }
     #[test]
+    fn web_browser_records_stay_available() {
+        let mut v = sample();
+        v["attempts"][0]["operation"] = json!("scrape");
+        v["attempts"][0]["proof_mode"] = json!("browser");
+        v["summaries"][0]["operation"] = json!("scrape");
+        v["summaries"][0]["proof_mode"] = json!("browser");
+        assert!(project(&serde_json::to_vec(&v).unwrap()).is_some());
+        for phase in ["browser_fetch", "browser_upload"] {
+            let mut node = v.clone();
+            node["attempts"][0]["spans"][0] = json!({"phase":phase,"source":"node","exchange":0,"start_ms":0,"duration_ms":500,"outcome":"web_browser_failed"});
+            assert!(
+                project(&serde_json::to_vec(&node).unwrap()).is_some(),
+                "{phase}"
+            );
+        }
+        v["attempts"][0]["proof_mode"] = json!("chrome");
+        assert!(project(&serde_json::to_vec(&v).unwrap()).is_none());
+    }
+    #[test]
     fn final_failure_vocabulary_keeps_a_valid_snapshot_available() {
         for code in [
             "service_unavailable",
@@ -430,6 +453,8 @@ mod tests {
             "web_connect_failed",
             "web_proxy_failed",
             "web_fetch_failed",
+            "web_browser_unavailable",
+            "web_browser_failed",
         ] {
             let mut v = sample();
             v["attempts"][0]["outcome"] = json!(code);

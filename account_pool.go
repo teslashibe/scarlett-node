@@ -32,6 +32,8 @@ type accountLease struct {
 	xStamp     string
 	xIdentity  string
 	quotaUntil time.Time
+	// browser marks a web lease that holds a browser slot too.
+	browser bool
 }
 type accountStatus struct {
 	ID        string    `json:"id"`
@@ -396,7 +398,8 @@ func (p *servicePool) acquireAccount(kind string, operation ...string) (*account
 	now := time.Now()
 	p.refresh(now)
 	if kind == "web" {
-		return p.acquireWebLocked()
+		// A browser-mode web lease asks for operation "browser".
+		return p.acquireWebLocked(len(operation) == 1 && operation[0] == "browser")
 	}
 	s := p.entries[kind]
 	if s == nil || !s.enabled || p.healthError || p.accountsError {
@@ -531,6 +534,9 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 		s.inFlight--
 	}
 	if l.kind == "web" {
+		if l.browser && p.browserInFlight > 0 {
+			p.browserInFlight--
+		}
 		p.settleWeb(code)
 		return
 	}

@@ -1,0 +1,45 @@
+{
+  "version": "155.0.8059.39",
+  "platforms": {
+    "darwin-arm64": {
+      "url": "https://storage.googleapis.com/chrome-for-testing-public/155.0.8059.39/mac-arm64/chrome-mac-arm64.zip",
+      "sha256": "529a71bd61aaa2ef266a4d4bd300ae9572ba6a3468a8d55c3023ffeffb5b6b4e",
+      "bytes": 192634606,
+      "executable": "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+      "inventory_sha256": "ca06c327434306d92edd9489d90dfb9f23fca0929e75724bb84830333723047a",
+      "unpacked_bytes": 378822653,
+      "files": 344,
+      "links": 5
+    },
+    "darwin-amd64": {
+      "url": "https://storage.googleapis.com/chrome-for-testing-public/155.0.8059.39/mac-x64/chrome-mac-x64.zip",
+      "sha256": "9e4da7961d4a426078f02e89ecfa569a7926ada2dc88aa53c0bd9ed0d46c3bb7",
+      "bytes": 203101743,
+      "executable": "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+      "inventory_sha256": "3f9ddf17f3713e64f5fb025a0daf42257a1197d0c1d1518804db87e2341d30df",
+      "unpacked_bytes": 389808141,
+      "files": 344,
+      "links": 5
+    },
+    "windows-amd64": {
+      "url": "https://storage.googleapis.com/chrome-for-testing-public/155.0.8059.39/win64/chrome-win64.zip",
+      "sha256": "59ab2a6e99bde9c0bc180414988394f9f5355a0d3764c704151ee8ecea235c7e",
+      "bytes": 207197429,
+      "executable": "chrome-win64/chrome.exe",
+      "inventory_sha256": "1765dd612a0f0db980afd927eb78bd5a0923b0b33b40ba99ed17390d20480ee7",
+      "unpacked_bytes": 457901144,
+      "files": 305,
+      "links": 0
+    },
+    "linux-amd64": {
+      "url": "https://storage.googleapis.com/chrome-for-testing-public/155.0.8059.39/linux64/chrome-linux64.zip",
+      "sha256": "55672d1f392fd3e7b7a08621b6e804e6bcb39d40cf155504abb74b3a021ea8ea",
+      "bytes": 198195769,
+      "executable": "chrome-linux64/chrome",
+      "inventory_sha256": "4afcb3f6ac7b03c10d73d641b79846651d4e2323477bca0f57a9f928d25a1bdb",
+      "unpacked_bytes": 416502722,
+      "files": 301,
+      "links": 0
+    }
+  }
+}
