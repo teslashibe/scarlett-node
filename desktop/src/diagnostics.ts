@@ -66,16 +66,19 @@ export function outcomeCounts(records: DiagnosticsRecord[]): {outcome: string; c
   for (const record of records) counts.set(record.outcome, (counts.get(record.outcome) ?? 0) + 1);
   return [...counts].sort(([a], [b]) => a.localeCompare(b)).map(([outcome, count]) => ({outcome, count}));
 }
-export function localCapacity(s: Snapshot): string {
+export function availableXSlots(s: Snapshot): number | undefined {
   const x = s.observation?.services?.find((v) => v.kind === "x_read");
-  const verified = s.observation?.accounts?.filter((a) => a.service === "x_read" && a.state !== "duplicate_account" && a.state !== "identity_unverified" && a.state !== "draining");
-  const verifiedCount = verified?.every((a) => a.username) ? new Set(verified.map((a) => a.username!.toLowerCase())).size : undefined;
-  const next = s.observation?.accounts?.map((a) => Date.parse(a.rest_until ?? "")).filter((at) => Number.isFinite(at) && at > Date.now());
-  const capacity = x?.capacity === undefined || x.in_flight === undefined || x.state === undefined || s.observation?.state === undefined
-    ? "Unknown"
+  return x?.capacity === undefined || x.in_flight === undefined || x.state === undefined || s.observation?.state === undefined
+    ? undefined
     : s.observation.state !== "running" || s.observation.drain_requested || (x.state !== "configured" && x.state !== "ready")
       ? 0
       : Math.max(0, x.capacity - x.in_flight);
+}
+export function localCapacity(s: Snapshot): string {
+  const verified = s.observation?.accounts?.filter((a) => a.service === "x_read" && a.state !== "duplicate_account" && a.state !== "identity_unverified" && a.state !== "draining");
+  const verifiedCount = verified?.every((a) => a.username) ? new Set(verified.map((a) => a.username!.toLowerCase())).size : undefined;
+  const next = s.observation?.accounts?.map((a) => Date.parse(a.rest_until ?? "")).filter((at) => Number.isFinite(at) && at > Date.now());
+  const capacity = availableXSlots(s) ?? "Unknown";
   const count = (n: number | "Unknown", singular: string) => `${n} ${singular}${n === 1 ? "" : "s"}`;
   return `${count(s.accounts.length, "saved account")} · ${count(verifiedCount ?? "Unknown", "verified X account")} · ${count(capacity, "available X slot")} · ${count(s.observation?.in_flight ?? "Unknown", "job")} in flight${next?.length ? ` · earliest cooldown end ${clockTime(new Date(Math.min(...next)).toISOString())}` : ""}${s.observation?.updated_at ? ` · status ${clockTime(s.observation.updated_at)}` : ""}`;
 }

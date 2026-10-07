@@ -90,7 +90,7 @@ if ($resolvers.Count -ne 0) { throw 'Keyboard probe must not depend on browser d
 $probe = $probes[0].Extent.Text
 $name = [regex]::Match($probe, '\$name = ''([^'']+)''').Groups[1].Value
 $nextName = [regex]::Match($probe, '\$nextName = ''([^'']+)''').Groups[1].Value
-$main = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../src/main.ts') -Raw
+$main = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../src/layout.ts') -Raw
 $form = [regex]::Match($main, '<form id="x-login-form">([\s\S]*?)</form>').Groups[1].Value
 if ($form -ceq '') { throw 'Installed keyboard probe form is missing' }
 $source = [regex]::Match($form, '<label>([^<]+)<input id="x-login-id"([^>]*)>')

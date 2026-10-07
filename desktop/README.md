@@ -21,6 +21,12 @@ cargo clippy --locked --all-targets -- -D warnings
 
 Then run `npm run tauri build -- --bundles app` from `desktop` on Mac. The sidecar preparation script copies only explicitly supplied native binaries, records their target names and makes no provider calls. Review source/digest provenance before preparing release binaries. Generated assets, downloaded dependencies and binaries are ignored; both dependency lockfiles are tracked. The production bundle uses the copies next to the app executable, never a renderer-provided path or a node discovered on PATH.
 
+## UI preview
+
+Run `npm run dev` from `desktop`, then open `http://127.0.0.1:1420/tests/preview.html`. This development page renders the desktop UI with synthetic accounts and intercepts every native command. It does not read installed node state or contact providers, and it is excluded from the production bundle.
+
+Use `?scenario=ready`, `unpaired`, `relay-halted`, `auth-required`, `pending-login` or `running-local-api` to check the main states. Controls update only the fixture. Check the default 960 × 760 window and the minimum 640 × 560 window, including keyboard expansion, account re-import and login verification.
+
 ## Native dependency contract
 
 - Coordinator: `https://network.scarlett.ai`; verifier: `verifier.scarlett.ai:7047`, with normal public TLS verification. These public defaults were supplied by the release owner. There is no plaintext test transport or browser networking bridge.
@@ -186,7 +192,7 @@ In desktop releases through 0.1.7, removing the marker does not clear the runnin
 
 ## Device preferences
 
-The This device section saves only a versioned local API port and a window-close choice in the private app directory. New installations default to port 8088 and drain/quit when the window closes. Operators can explicitly choose to keep running in the menu bar or tray. Open Scarlett in the native menu (Cmd/Ctrl-1), the tray, macOS Finder/Dock reopen and Windows duplicate launch restore the existing window without starting a second runtime. Saved ports apply on the next local API start; updating a preference does not interrupt accepted jobs or start a service. Corrupt/private-storage failures are reported rather than silently resetting preferences.
+Device settings saves the local API port, window-close choice and maximum simultaneous X jobs in the private app directory. New installations default to port 8088 and drain/quit when the window closes. Operators can explicitly choose to keep running in the menu bar or tray. Open Scarlett in the native menu (Cmd/Ctrl-1), the tray, macOS Finder/Dock reopen and Windows duplicate launch restore the existing window without starting a second runtime. Saved ports apply on the next local API start; updating a preference does not interrupt accepted jobs or start a service. Corrupt/private-storage failures are reported rather than silently resetting preferences.
 
 Open Scarlett when I log in is a separate OS setting, disabled until the operator opts in. The native Tauri autostart manager queries the actual OS registration and uses a macOS LaunchAgent or Windows user startup registration. It registers only the installed app, without credentials or provider arguments. Opening at login still requires the operator to start the node or local API. The renderer receives no direct autostart-plugin permissions; fixed local-window commands own this setting. A failed setting change is reported and the UI rereads OS state. Moving an app after enabling login launch requires disabling/re-enabling it at its new installed location.
 

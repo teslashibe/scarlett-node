@@ -4,7 +4,8 @@ import { readFileSync } from "node:fs";
 
 const main = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
 const acceptance = readFileSync(new URL("../scripts/check-windows-install.ps1", import.meta.url), "utf8");
-const form = main.match(/<form id="x-form">([\s\S]*?)<\/form>/)?.[1];
+const layout = readFileSync(new URL("../src/layout.ts", import.meta.url), "utf8");
+const form = layout.match(/<form id="x-form">([\s\S]*?)<\/form>/)?.[1];
 assert.ok(form, "X import form must be present");
 
 test("Native X account input acknowledgments follow the visible import form tab order", () => {
