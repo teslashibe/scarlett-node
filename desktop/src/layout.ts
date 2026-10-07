@@ -23,7 +23,7 @@ export const layout = `
   </section>
   <section id="relay-banner" class="relay-banner" aria-labelledby="relay-heading" hidden><div><h2 id="relay-heading">Keyed relay is paused on this node</h2><p id="relay-detail" tabindex="-1"></p></div><button id="relay-resume" type="button">Resume relay</button></section>
   <div class="metrics" aria-label="Local node activity">
-    <div class="metric"><span class="metric-label">Saved accounts</span><strong id="metric-accounts">—</strong><span class="metric-note">On this device</span></div>
+    <div class="metric"><span class="metric-label">Saved X accounts</span><strong id="metric-accounts">—</strong><span class="metric-note">On this device</span></div>
     <div class="metric"><span class="metric-label">Available X slots</span><strong id="metric-capacity">—</strong><span class="metric-note">Ready for new work</span></div>
     <div class="metric"><span class="metric-label">Jobs in flight</span><strong id="metric-jobs">—</strong><span class="metric-note">Currently running</span></div>
     <div class="metric"><span class="metric-label">Awaiting reconciliation</span><strong id="metric-pending">—</strong><span class="metric-note">Pending confirmation</span></div>
@@ -34,9 +34,9 @@ export const layout = `
     <form id="pair-form" class="inline-form"><label>Pairing code<input id="pair-code" type="password" autocomplete="off" spellcheck="false" maxlength="64" required></label><button type="submit">Pair node</button></form>
   </section>
   <section class="panel accounts-panel" aria-labelledby="accounts-heading">
-    <div class="section-head"><div><h2 id="accounts-heading" tabindex="-1">Connected accounts</h2><p class="section-description">Credentials stay on this device</p></div><span id="account-note" class="muted"></span></div>
+    <div class="section-head"><div><h2 id="accounts-heading" tabindex="-1">Connected X accounts</h2><p class="section-description">Credentials stay on this device</p></div><span id="account-note" class="muted"></span></div>
     <div id="accounts"></div>
-    <p id="accounts-empty" class="empty-state" hidden>Connect an account to start serving work</p>
+    <p id="accounts-empty" class="empty-state" hidden>Connect an X account to start serving work</p>
     <details id="connect-accounts" class="connect-details">
       <summary aria-label="Add account">Add account</summary>
       <div class="account-forms">
@@ -54,7 +54,7 @@ export const layout = `
             <form id="x-challenge-form" hidden><h3>Verify your X login</h3><label>Verification code<input id="x-login-code" type="password" autocomplete="one-time-code" maxlength="128" required></label><button id="x-login-continue" type="submit">Continue login</button></form>
           </div>
         </details>
-        <details id="codex-panel" class="connection">
+        <details id="codex-panel" class="connection" hidden>
           <summary aria-label="Connect Codex"><span class="provider-mark" aria-hidden="true">C</span><span>Connect Codex<span class="method-note">Sign in with your ChatGPT account</span></span></summary>
           <form id="codex-form" class="connection-body"><p>Scarlett creates a private profile on this device for each account</p><div class="actions"><button type="submit">Connect Codex</button><button id="cancel-login" type="button" class="quiet" hidden>Cancel login</button></div><p id="codex-note" class="muted"></p></form>
         </details>
@@ -76,7 +76,7 @@ export const layout = `
     </details>
   </section>
   <div class="settings-stack">
-    <section aria-labelledby="local-api-heading">
+    <section aria-labelledby="local-api-heading" hidden>
       <details id="local-api-panel" class="panel disclosure">
         <summary aria-label="Local model API"><span><h2 id="local-api-heading">Local model API</h2><span class="section-description">Use Codex and Claude from your tools</span></span><span id="api-summary" class="summary-state">Checking</span></summary>
         <div class="disclosure-body">
@@ -93,8 +93,8 @@ export const layout = `
       <details id="preferences-panel" class="panel disclosure">
         <summary aria-label="Device settings"><span><h2 id="preferences-heading">Device settings</h2><span class="section-description">Job limits and startup preferences</span></span></summary>
         <div class="disclosure-body">
-          <form id="preferences-form"><div class="form-grid"><label>Maximum simultaneous X jobs<input id="x-concurrency" type="number" min="1" max="8" value="2" required></label><label>Saved local API port<input id="saved-api-port" type="number" min="1024" max="65535" required></label></div><p class="muted">Each verified X account runs one job at a time. The total is limited by ready accounts and this setting. Changes apply after you stop and start the node; accepted jobs finish before it stops</p><label class="check"><input id="background" type="checkbox">Keep running when the window closes</label><p class="muted">When off, closing the window drains accepted jobs and quits Scarlett. When on, use the menu bar or tray to reopen or quit</p><button type="submit">Save device preferences</button></form>
-          <div class="subsection"><label class="check"><input id="autostart" type="checkbox" disabled>Open Scarlett when I log in</label><p class="muted">Opening Scarlett does not start network jobs or the local API. You choose when to start them</p></div>
+          <form id="preferences-form"><div class="form-grid"><label>Maximum simultaneous X jobs<input id="x-concurrency" type="number" min="1" max="8" value="2" required></label><label hidden>Saved local API port<input id="saved-api-port" type="number" min="1024" max="65535" required></label></div><p class="muted">Each verified X account runs one job at a time. The total is limited by ready accounts and this setting. Changes apply after you stop and start the node; accepted jobs finish before it stops</p><label class="check"><input id="background" type="checkbox">Keep running when the window closes</label><p class="muted">When off, closing the window drains accepted jobs and quits Scarlett. When on, use the menu bar or tray to reopen or quit</p><button type="submit">Save device preferences</button></form>
+          <div class="subsection"><label class="check"><input id="autostart" type="checkbox" disabled>Open Scarlett when I log in</label><p class="muted">Opening Scarlett does not start network jobs. You choose when to start them</p></div>
         </div>
       </details>
     </section>

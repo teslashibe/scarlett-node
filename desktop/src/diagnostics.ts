@@ -19,6 +19,14 @@ export type Diagnostics = {
   available: boolean;
   snapshot?: { version: 1; updated_at?: string; load_error?: string; attempts: DiagnosticsRecord[]; summaries: DiagnosticsSummary[] };
 };
+// Display X history without changing the native snapshot or retained records.
+export function xDiagnostics(value: Diagnostics): Diagnostics {
+  if (!value.snapshot) return value;
+  return {...value, snapshot: {...value.snapshot,
+    attempts: value.snapshot.attempts.filter((r) => r.operation !== "codex"),
+    summaries: value.snapshot.summaries.filter((r) => r.operation !== "codex"),
+  }};
+}
 export const duration = (ms: number | undefined): string =>
   ms === undefined || !Number.isFinite(ms) || ms < 0 ? "Unknown" : ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`;
 export const clockTime = (value?: string): string => {
@@ -77,10 +85,10 @@ export function availableXSlots(s: Snapshot): number | undefined {
 export function localCapacity(s: Snapshot): string {
   const verified = s.observation?.accounts?.filter((a) => a.service === "x_read" && a.state !== "duplicate_account" && a.state !== "identity_unverified" && a.state !== "draining");
   const verifiedCount = verified?.every((a) => a.username) ? new Set(verified.map((a) => a.username!.toLowerCase())).size : undefined;
-  const next = s.observation?.accounts?.map((a) => Date.parse(a.rest_until ?? "")).filter((at) => Number.isFinite(at) && at > Date.now());
+  const next = s.observation?.accounts?.filter((a) => a.service === "x_read").map((a) => Date.parse(a.rest_until ?? "")).filter((at) => Number.isFinite(at) && at > Date.now());
   const capacity = availableXSlots(s) ?? "Unknown";
   const count = (n: number | "Unknown", singular: string) => `${n} ${singular}${n === 1 ? "" : "s"}`;
-  return `${count(s.accounts.length, "saved account")} · ${count(verifiedCount ?? "Unknown", "verified X account")} · ${count(capacity, "available X slot")} · ${count(s.observation?.in_flight ?? "Unknown", "job")} in flight${next?.length ? ` · earliest cooldown end ${clockTime(new Date(Math.min(...next)).toISOString())}` : ""}${s.observation?.updated_at ? ` · status ${clockTime(s.observation.updated_at)}` : ""}`;
+  return `${count(s.accounts.filter((a) => a.service === "x_read").length, "saved account")} · ${count(verifiedCount ?? "Unknown", "verified X account")} · ${count(capacity, "available X slot")} · ${count(s.observation?.in_flight ?? "Unknown", "job")} in flight${next?.length ? ` · earliest cooldown end ${clockTime(new Date(Math.min(...next)).toISOString())}` : ""}${s.observation?.updated_at ? ` · status ${clockTime(s.observation.updated_at)}` : ""}`;
 }
 
 // Helper times start inside each helper process. They are never placed on the

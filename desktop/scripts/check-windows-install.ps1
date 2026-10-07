@@ -338,6 +338,27 @@ function Open-Disclosure([string]$Name) {
         return $pattern.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Expanded
     } 10 "UI disclosure did not open: $Name"
 }
+function Check-XOnlyUI {
+    # Expand the supported sections before checking the accessibility tree.
+    # The shipped model controls must remain absent even beside open X forms.
+    Open-Disclosure 'Add account'
+    Open-Disclosure 'Sign in to X'
+    Open-Disclosure 'Device settings'
+    foreach ($name in @('Connect Codex', 'Connect Claude', 'Connect Claude subscription',
+        'Cancel Claude login', 'Disconnect Claude', 'Start local API', 'Stop local API')) {
+        if ($null -ne (Find-Button $name)) { throw 'Installed X-only UI exposed a model control' }
+    }
+    foreach ($name in @('Connect Codex', 'Local model API')) {
+        if ($null -ne (Find-Disclosure $name)) { throw 'Installed X-only UI exposed a model disclosure' }
+    }
+    if ($null -ne (Find-Input 'Saved local API port')) { throw 'Installed X-only UI exposed the model API port' }
+    Wait-Check {
+        $login = Find-Button 'Sign in to X'
+        $save = Find-Button 'Save device preferences'
+        return $null -ne $login -and $login.Current.IsEnabled -and
+            $null -ne $save -and $save.Current.IsEnabled
+    } 30 'Installed desktop X and preference controls did not become available'
+}
 function Wait-AppWindow {
     Wait-Check {
         $condition = [System.Windows.Automation.AndCondition]::new(
@@ -356,16 +377,7 @@ function Wait-AppWindow {
         $control = Find-Disclosure 'Add account'
         return $null -ne $control -and $control.Current.IsEnabled
     } 30 'Installed desktop account controls did not become available'
-    Open-Disclosure 'Local model API'
-    Wait-Check {
-        $start = Find-Button 'Start local API'
-        $stop = Find-Button 'Stop local API'
-        # A background reopen retains its running API, so Start is disabled.
-        # Either enabled lifecycle control proves the renderer is ready; each
-        # subsequent operation still waits for its specific control/state.
-        return ($null -ne $start -and $start.Current.IsEnabled) -or
-            ($null -ne $stop -and $stop.Current.IsEnabled)
-    } 30 'Installed desktop API controls did not become available'
+    Check-XOnlyUI
 }
 function Start-App {
     $script:application = Start-Process -FilePath $script:executable -WorkingDirectory $script:install -PassThru
@@ -416,13 +428,12 @@ function Focus-QuitShortcut {
     Wait-Check {
         return [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $handle
     } 10 'Installed desktop did not acquire foreground input for Quit'
-    # API readiness precedes the renderer's status refresh; wait for its actual
-    # control readiness rather than treating a temporarily busy UI as failure.
+    # Wait for the visible Quit control after probing native text input.
     Wait-Check {
-        $control = Find-Button 'Stop local API'
+        $control = Find-Button 'Quit Scarlett'
         return $null -ne $control -and $control.Current.IsEnabled
     } 20 'Quit focus control did not become available'
-    $target = Find-Button 'Stop local API'
+    $target = Find-Button 'Quit Scarlett'
     $scroll = $null
     if ($target.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) {
         $scroll.ScrollIntoView()
@@ -459,7 +470,7 @@ function Check-QuitShortcut([string]$Failure) {
                 $shutdownError = $true
             }
         }
-        $target = Find-Button 'Stop local API'
+        $target = Find-Button 'Quit Scarlett'
         $focusMatches = $null -ne $target -and $target.Current.HasKeyboardFocus
         $application.Refresh()
         $foregroundMatches = [ScarlettAcceptanceWindow]::GetForegroundWindow() -eq $application.MainWindowHandle
@@ -468,7 +479,7 @@ function Check-QuitShortcut([string]$Failure) {
     } catch { }
     $diagnostic = @{
         shortcutExited = $false; shutdownErrorVisible = $shutdownError
-        stopControlKeyboardFocus = $focusMatches; foregroundOwnedWindow = $foregroundMatches
+        quitControlKeyboardFocus = $focusMatches; foregroundOwnedWindow = $foregroundMatches
         webViewNativeInputFocus = $nativeInput; accessibilityWindowNativeFocus = $nativeAccessibilityFocus
         apiStatusBeforeButton = (Api-Status '/health'); quitButtonInvoked = $false
         quitButtonExited = $false; realProviderJobs = 0
@@ -600,15 +611,14 @@ function Set-Checkbox([string]$Name, [bool]$Enabled) {
     $pattern.Toggle()
     Wait-Check { Checkbox-Is $Name $Enabled } 15 "Checkbox did not update: $Name"
 }
-function Saved-Preferences([int]$Port, [bool]$Background) {
-    $path = Join-Path $state 'preferences.json'
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+function Read-SavedJSON([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
     $stream = $null
     $reader = $null
     try {
         # Observe one complete file without blocking the helper's atomic rename.
         $sharing = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
-        $stream = [System.IO.FileStream]::new($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $sharing)
+        $stream = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $sharing)
         $reader = [System.IO.StreamReader]::new($stream)
         $saved = $reader.ReadToEnd() | ConvertFrom-Json
     } catch {
@@ -620,13 +630,22 @@ function Saved-Preferences([int]$Port, [bool]$Background) {
         # HRESULT_FROM_WIN32 for sharing/lock violations (32/33) alone defers
         # observation; the bounded wait still requires exact persisted values.
         if ($failure -is [System.IO.IOException] -and
-            $failure.HResult -in @(-2147024864, -2147024863)) { return $false }
+            $failure.HResult -in @(-2147024864, -2147024863)) { return $null }
         throw
     } finally {
         try { if ($null -ne $reader) { $reader.Dispose() } }
         finally { if ($null -ne $stream) { $stream.Dispose() } }
     }
-    return $saved.schema -eq 1 -and $saved.local_api_port -eq $Port -and $saved.background -eq $Background
+    return $saved
+}
+function Saved-Preferences([int]$Port, [bool]$Background) {
+    $saved = Read-SavedJSON (Join-Path $state 'preferences.json')
+    return $null -ne $saved -and $saved.schema -eq 1 -and
+        $saved.local_api_port -eq $Port -and $saved.background -eq $Background
+}
+function Saved-XConcurrency([int]$Limit) {
+    $saved = Read-SavedJSON (Join-Path $state 'throughput-preferences-v1.json')
+    return $null -ne $saved -and $saved.schema -eq 1 -and $saved.x_concurrency -eq $Limit
 }
 function Close-Window {
     $pattern = $null
@@ -659,36 +678,39 @@ function Registered-Command {
 }
 function Check-Preferences {
     if ($null -ne (Registered-Command)) { throw 'Clean runner already has a Scarlett login registration' }
+    # Seed one legacy preference privately. Saving visible X settings must
+    # preserve its nondefault port while the model API controls are hidden.
+    Write-SyntheticPrivateJSON (Join-Path $state 'preferences.json') @{
+        schema = 1; local_api_port = 18088; background = $false
+    }
+    $script:apiPort = 18088
     Start-App
     Open-Disclosure 'Device settings'
     Check-DefaultCheckbox 'Keep running when the window closes' 'Background mode was not opt-in'
     Check-DefaultCheckbox 'Open Scarlett when I log in' 'Start at login was not opt-in'
-    Set-Number 'Saved local API port' 18088
+    Set-Number 'Maximum simultaneous X jobs' 3
     Click-Button 'Save device preferences'
     Wait-PreferenceSave 18088 $false
-    $script:apiPort = 18088
+    Wait-Check { Saved-XConcurrency 3 } 15 'Visible X job limit was not saved privately'
     if ((Api-Status '/health') -ne 0) { throw 'Preferences test port is already occupied' }
-    Click-Button 'Start local API'
-    Wait-Check { (Api-Status '/health') -eq 200 } 30 'Saved port did not start the local API'
     Close-Window
     if (-not $application.WaitForExit(135000)) { throw 'Default window close did not quit' }
-    Wait-Check { (Api-Status '/health') -eq 0 } 30 'Default window close left the API running'
-    Write-Output 'Installed preferences: default close drained and saved port passed'
+    if ((Api-Status '/health') -ne 0) { throw 'Default window close started the hidden API' }
+    Write-Output 'Installed preferences: default close, saved X limit and retained legacy port passed'
 
     Start-App
     Open-Disclosure 'Device settings'
     if ((Api-Status '/health') -ne 0) { throw 'Opening the app automatically started the API' }
+    if (-not (Saved-Preferences 18088 $false) -or -not (Saved-XConcurrency 3)) { throw 'Reopening lost saved device preferences' }
     # Enabling the actual OS registration must quote the installed path with
     # spaces and include no provider/node/API arguments.
     Set-Checkbox 'Open Scarlett when I log in' $true
     $script:ownsLoginRegistration = $true
     $expectedCommand = '"' + $executable + '"'
     Wait-Check { (Registered-Command) -ceq $expectedCommand } 15 'Windows login command was not one quoted app executable'
-    Click-Button 'Start local API'
-    Wait-Check { (Api-Status '/health') -eq 200 } 30 'Saved API port did not survive reopening'
     Focus-QuitShortcut
     Check-QuitShortcut 'Preferences app Quit did not exit'
-    Wait-Check { (Api-Status '/health') -eq 0 } 30 'Preferences Quit left API running'
+    if ((Api-Status '/health') -ne 0) { throw 'Preferences Quit started the hidden API' }
     Start-App
     Open-Disclosure 'Device settings'
     if (-not (Checkbox-Is 'Open Scarlett when I log in' $true)) { throw 'Native login registration did not survive app reopening' }
@@ -701,28 +723,28 @@ function Check-Preferences {
     Set-Checkbox 'Keep running when the window closes' $true
     Click-Button 'Save device preferences'
     Wait-PreferenceSave 18088 $true
-    Click-Button 'Start local API'
-    Wait-Check { (Api-Status '/health') -eq 200 } 30 'Background test API did not start'
+    if (-not (Saved-XConcurrency 3)) { throw 'Background save changed the X job limit' }
     $originalProcess = $application.Id
     Close-Window
     Start-Sleep -Seconds 3
     $application.Refresh()
-    if ($application.HasExited -or (Api-Status '/health') -ne 200) { throw 'Background close stopped the app or API' }
+    if ($application.HasExited -or (Api-Status '/health') -ne 0) { throw 'Background close stopped the app or started the hidden API' }
     $reopen = Start-Process -FilePath $executable -WorkingDirectory $install -PassThru
     if (-not $reopen.WaitForExit(15000)) { $reopen.Kill(); throw 'Single-instance reopening launched a second desktop' }
     Wait-AppWindow
     Open-Disclosure 'Device settings'
-    if ($application.Id -ne $originalProcess -or (Api-Status '/health') -ne 200) { throw 'Reopening did not retain the same background app and API' }
+    if ($application.Id -ne $originalProcess -or (Api-Status '/health') -ne 0) { throw 'Reopening did not retain the same idle background app' }
     Set-Checkbox 'Keep running when the window closes' $false
     Click-Button 'Save device preferences'
     Wait-PreferenceSave 18088 $false
     Close-Window
     if (-not $application.WaitForExit(135000)) { throw 'Restored default close did not exit' }
-    Wait-Check { (Api-Status '/health') -eq 0 } 30 'Restored default close left API running'
+    if ((Api-Status '/health') -ne 0) { throw 'Restored default close started the hidden API' }
     @{
-        savedPort = 'passed'; defaultCloseDrain = 'passed'; backgroundClose = 'passed'
+        retainedLegacyAPIPort = 'passed'; savedXJobLimit = 'passed'; idleDefaultClose = 'passed'; idleBackgroundClose = 'passed'
         singleInstanceReopen = 'passed'; quotedLoginCommand = 'passed'; nativeLoginRegistration = 'passed'
         loginReadBack = 'passed'; loginDisable = 'passed'; actualOSLogin = 'not tested'
+        modelControlsHidden = 'passed'; acceptedJobDrain = 'not exercised by this UI acceptance'
         realProviderJobs = 0; backgroundRestored = $false; loginRestored = $false
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-preferences-ui.json')
 }
@@ -1240,7 +1262,7 @@ function Write-SyntheticPrivateJSON([string]$Path, $Value) {
     Remove-Item -LiteralPath $staging -Recurse
 }
 function Durable-Hashes {
-    $files = @('identity.json', 'accounts.json', 'preferences.json', 'local-api/bearer') | ForEach-Object {
+    $files = @('identity.json', 'accounts.json', 'preferences.json', 'throughput-preferences-v1.json', 'local-api/bearer') | ForEach-Object {
         Get-Item -LiteralPath (Join-Path $script:importState $_)
     }
     $files += @(Get-ChildItem -LiteralPath (Join-Path $script:importState 'accounts') -Recurse -File)
@@ -1561,6 +1583,20 @@ function Check-InstallationRoundTrip {
             deadline = [DateTime]::UtcNow.AddHours(2).ToString('o'); updated_at = [DateTime]::UtcNow.ToString('o')
             state = 'started'; provider_account_id = 'browser-firefox'; provider_service = 'x_read'
         }
+        if (-not (Test-Path -LiteralPath (Join-Path $script:importState 'preferences.json'))) {
+            Write-SyntheticPrivateJSON (Join-Path $script:importState 'preferences.json') @{
+                schema = 1; local_api_port = 18088; background = $false
+            }
+        }
+        # Retain a private legacy API bearer across replacements without
+        # exposing model controls or starting an operator-like model service.
+        $legacyAPI = Join-Path $script:importState 'local-api'
+        $privateOutput = & (Join-Path $install 'scarlett-node.exe') desktop private-dir $legacyAPI | Out-String
+        $privateOutput = $null
+        if ($LASTEXITCODE -ne 0) { throw 'Could not prepare private legacy API state' }
+        $privateOutput = & (Join-Path $install 'scarlett-node.exe') desktop bearer (Join-Path $legacyAPI 'bearer') | Out-String
+        $privateOutput = $null
+        if ($LASTEXITCODE -ne 0) { throw 'Could not prepare the retained private API bearer' }
         Start-App
         $version = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($executable).ProductVersion
         if ($version -notin @($fixture.baselineVersion, ($fixture.baselineVersion + '.0'))) { throw 'Baseline executable has the wrong product version' }
@@ -1571,14 +1607,13 @@ function Check-InstallationRoundTrip {
             throw $failure
         }
         Open-Disclosure 'Device settings'
-        Set-Number 'Saved local API port' 18088
+        Set-Number 'Maximum simultaneous X jobs' 4
         Click-Button 'Save device preferences'
-        Wait-Check { Saved-Preferences 18088 $false } 15 'Baseline app did not retain its test port'
-        Click-Button 'Start local API'
-        Wait-Check { (Api-Status '/health') -eq 200 } 30 'Baseline private API did not start'
+        Wait-PreferenceSave 18088 $false
+        Wait-Check { Saved-XConcurrency 4 } 15 'Baseline app did not retain its X job limit'
         Click-Button 'Quit Scarlett'
         if (-not $application.WaitForExit(135000)) { throw 'Baseline app did not drain before installation' }
-        Wait-Check { (Api-Status '/health') -eq 0 } 30 'Baseline app left API running before installation'
+        if ((Api-Status '/health') -ne 0) { throw 'Baseline app started the hidden API before installation' }
         $before = Durable-Hashes
         foreach ($candidate in @(@{ path = $UpgradeInstaller; version = $fixture.upgradeVersion; direction = 'upgrade' },
                                   @{ path = $Installer; version = $fixture.baselineVersion; direction = 'downgrade' })) {
@@ -1602,24 +1637,21 @@ function Check-InstallationRoundTrip {
                 throw $failure
             }
             Wait-Check { UI-Contains 'browser-firefox' } 15 'Installed app lost the connected X account'
-            if ((Api-Status '/health') -ne 0 -or -not (Saved-Preferences 18088 $false)) { throw 'Opening replaced app started API or lost saved preferences' }
-            Click-Button 'Start local API'
-            Wait-Check { (Api-Status '/health') -eq 200 } 30 'Replaced app could not start the retained local API'
-            $key = [System.IO.File]::ReadAllText((Join-Path $script:importState 'local-api/bearer'))
-            if ((Api-Status '/v1/models' $key) -ne 200) { throw 'Replaced app refused its retained private API bearer' }
-            $key = $null
+            if ((Api-Status '/health') -ne 0 -or -not (Saved-Preferences 18088 $false) -or
+                -not (Saved-XConcurrency 4)) { throw 'Opening replaced app started API or lost saved preferences' }
             Click-Button 'Quit Scarlett'
             if (-not $application.WaitForExit(135000)) { throw 'Replaced app did not drain and quit' }
-            Wait-Check { (Api-Status '/health') -eq 0 } 30 'Replaced app left local API running'
+            if ((Api-Status '/health') -ne 0) { throw 'Replaced app started the hidden API' }
             $after = Durable-Hashes
             if ($after.Count -ne $before.Count) { throw 'Replaced app changed durable file inventory' }
             foreach ($path in $before.Keys) { if ($after[$path] -cne $before[$path]) { throw 'Replaced app changed private durable state' } }
-            Write-Output "Installed round trip: $($candidate.direction) retained private state and protected API"
+            Write-Output "Installed round trip: $($candidate.direction) retained private state and X-only UI"
         }
         @{
             baselineVersion = $fixture.baselineVersion; upgradeVersion = $fixture.upgradeVersion
             upgrade = 'passed'; downgrade = 'passed'; privateIdentity = 'passed'; XAccounts = 'passed'
-            uncertainJournalBytes = 'passed'; preferences = 'passed'; APIBearer = 'passed'; protectedAPI = 'passed'
+            uncertainJournalBytes = 'passed'; preferences = 'passed'; XJobLimit = 'passed'; retainedAPIBearer = 'passed'
+            protectedBundledAPI = 'check-complete-bundle.py passed'; modelControlsHidden = 'passed'
             sameRuntimeSource = $true; signedInstaller = $false; historicalSchemaCompatibility = 'not tested'
             realProviderJobs = 0
         } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-installation-round-trip.json')
@@ -1665,38 +1697,26 @@ $script:ownsLoginRegistration = $false
 $key = $null
 try {
     Start-App
-    Click-Button 'Start local API'
-    Wait-Check { (Api-Status '/health') -eq 200 } 30 'Installed UI did not start the local API'
-    if ((Api-Status '/v1/models') -ne 401) { throw 'Installed API allowed unauthenticated model access' }
-    $keyPath = Join-Path $state 'local-api/bearer'
-    $key = [System.IO.File]::ReadAllText($keyPath)
-    if ($key -notmatch '^[0-9a-f]{64}$' -or (Api-Status '/v1/models' $key) -ne 200) {
-        throw 'Installed API bearer validation failed'
-    }
-    Write-Output 'Installed acceptance: Start and bearer protection passed'
-    $key = $null
-    Click-Button 'Stop local API'
-    Wait-Check { (Api-Status '/health') -eq 0 } 30 'Installed UI Stop left the API running'
-    Wait-Check { (Find-Button 'Start local API').Current.IsEnabled } 10 'Start did not recover after Stop'
-    Click-Button 'Start local API'
-    Wait-Check { (Api-Status '/health') -eq 200 } 30 'Installed UI restart did not become ready'
-    Write-Output 'Installed acceptance: Stop and immediate restart passed'
-    # Kill only the exact desktop process launched above; EOF must stop its API
+    if ((Api-Status '/health') -ne 0) { throw 'Installed X-only UI started the hidden model API' }
+    Write-Output 'Installed acceptance: X controls available and model controls hidden'
+    # Kill only the exact idle desktop process launched above. Native API
+    # supervision remains a separate prepared-bundle Rust acceptance test.
     $application.Kill()
     if (-not $application.WaitForExit(10000)) { throw 'Owned desktop did not exit' }
-    Wait-Check { (Api-Status '/health') -eq 0 } 30 'API survived unexpected desktop exit'
+    if ((Api-Status '/health') -ne 0) { throw 'Unexpected desktop exit started the hidden API' }
     Start-App
-    Click-Button 'Start local API'
-    Wait-Check { (Api-Status '/health') -eq 200 } 30 'Desktop recovery did not start the API'
-    Write-Output 'Installed acceptance: unexpected exit and recovery passed'
+    if ((Api-Status '/health') -ne 0) { throw 'Desktop recovery automatically started the hidden API' }
+    Write-Output 'Installed acceptance: unexpected desktop exit and X-only relaunch passed'
     Focus-QuitShortcut
     Check-QuitShortcut 'Installed desktop Quit did not exit'
-    Wait-Check { (Api-Status '/health') -eq 0 } 30 'Installed desktop Quit left the API running'
+    if ((Api-Status '/health') -ne 0) { throw 'Installed desktop Quit started the hidden API' }
     New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
     @{
         installedNSIS = 'passed'; completePayload = 'passed'; nativeWindow = 'passed'
-        uiStartStop = 'passed'; bearerProtection = 'passed'; developerPathCleared = $true
-        unexpectedDesktopExit = 'passed'; uiQuit = 'passed'; quitInputFocus = 'verified'; realProviderJobs = 0
+        XControlsAvailable = 'passed'; modelControlsHidden = 'passed'; automaticAPIStartAbsent = 'passed'
+        protectedBundledAPI = 'check-complete-bundle.py passed'; nativeAPISupervision = 'separate Rust acceptance'
+        developerPathCleared = $true; idleUnexpectedDesktopExitAndRelaunch = 'passed'
+        uiQuit = 'passed'; quitInputFocus = 'verified'; realProviderJobs = 0
         signedInstaller = 'separate signature acceptance required'; remoteAccountLoginTested = $false
     } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $EvidenceDirectory 'windows-installed-ui.json')
     if ($Preferences) { Check-Preferences }
