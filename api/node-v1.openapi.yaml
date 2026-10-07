@@ -40,6 +40,11 @@ paths:
         job for this node is funded, or with a null lease at the deadline. The node heartbeats
         again immediately after any answer; the hold is its only idle wait. A node must bound
         the request by wait_seconds plus a transport grace, never by a short fixed timeout.
+        After a failed heartbeat the node backs off exponentially from one second, doubling to
+        a 15-second cap with equal jitter, and resets after any 200. A Retry-After on a 429 or
+        503, or on a 200 with a null lease, makes it wait at least that long (clamped to 1–60
+        seconds) plus jitter. A rejected heartbeat (400 or 413) is logged and backed off; the
+        node never resends it in a reduced shape.
       requestBody:
         required: true
         content:
@@ -47,7 +52,12 @@ paths:
             schema: {$ref: '#/components/schemas/Heartbeat'}
       responses:
         '200':
-          description: Lease or null; no implicit acceptance
+          description: >-
+            Lease or null; no implicit acceptance. A coordinator that is shutting down answers a
+            held heartbeat at once with a null lease and a jittered Retry-After of one to five
+            seconds.
+          headers:
+            Retry-After: {$ref: '#/components/headers/RetryAfter'}
           content:
             application/json:
               schema:
@@ -59,6 +69,31 @@ paths:
                   lease:
                     nullable: true
                     allOf: [{$ref: '#/components/schemas/Lease'}]
+        '400':
+          description: Invalid heartbeat
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {description: Invalid or revoked node credential}
+        '413':
+          description: Heartbeat body larger than 32 KiB (heartbeat_too_large)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429':
+          description: Too many node requests (rate_limited)
+          headers:
+            Retry-After: {$ref: '#/components/headers/RetryAfter'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '503':
+          description: Network temporarily unavailable (network_unavailable)
+          headers:
+            Retry-After: {$ref: '#/components/headers/RetryAfter'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
   /api/node/v1/challenge/echo:
     post:
       security: [{nodeBearer: []}]
@@ -92,6 +127,11 @@ paths:
         ownership, revocation and exclusive deadline before committing acceptance. Registration may
         be repeated with identical bindings after uncertainty; provider execution may not be replayed.
         A lost acceptance reply leaves provider work unstarted and requires attempt reconciliation.
+        Acceptance of the exact attempt and fence is idempotent, so on a 503 dispatch_busy or
+        network_unavailable the node repeats the same request inside the same acceptance, at
+        most three times, each after the Retry-After (clamped to 1–60 seconds, one second when
+        absent) plus jitter, and never later than 30 seconds before the lease deadline. It never
+        repeats a 401, 404, 409 or 429.
       requestBody:
         required: true
         content:
@@ -113,8 +153,23 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/LeaseAcceptance'}
         '401': {description: Invalid or revoked node credential}
+        '404': {description: Attempt unavailable to this node}
         '409': {description: Funding, ownership, terms, fence or deadline conflict}
-        '503': {description: Verifier unavailable or bounded registration capacity busy}
+        '429':
+          description: Too many node requests (rate_limited)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '503':
+          description: >-
+            Verifier unavailable (dispatch_unavailable), bounded registration capacity busy
+            (dispatch_busy, with Retry-After) or a transient coordinator failure
+            (network_unavailable)
+          headers:
+            Retry-After: {$ref: '#/components/headers/RetryAfter'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
   /api/node/v1/jobs/{job_id}/result:
     post:
       security: [{nodeBearer: []}]
@@ -200,7 +255,24 @@ components:
       in: path
       required: true
       schema: {type: string, maxLength: 128}
+  headers:
+    RetryAfter:
+      description: >-
+        Seconds to wait before calling again, or an HTTP date. The node clamps it to [1, 60]
+        seconds and adds up to half of it again as jitter, so nodes told the same wait do not
+        return together.
+      schema: {type: string}
   schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: {type: string, description: "Stable machine code, such as rate_limited, heartbeat_too_large, dispatch_busy or network_unavailable"}
+            message: {type: string, description: Human-readable text; nodes must not parse it}
     PairReply:
       type: object
       required: [version, node_id, supplier_pubkey, credential]
