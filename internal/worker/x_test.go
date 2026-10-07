@@ -447,7 +447,7 @@ func TestCaughtVerifierMisuseHaltsRelayNodeWide(t *testing.T) {
 func TestRelayResumeClearsLiveAdmissionAndNewFailureRelatches(t *testing.T) {
 	ResetRelayHaltForTests()
 	t.Cleanup(ResetRelayHaltForTests)
-	dir := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "state")
 	if err := localfs.EnsureDir(dir); err != nil {
 		t.Fatal(err)
 	}
