@@ -1,0 +1,25 @@
+{
+  "version": "node-v1",
+  "description": "Release version headers on every /api/node/v1 request and response. Additive: no request or response body changes. The node sends its release version; while the coordinator enforces a release policy it answers with the latest published release and the minimum release still offered new jobs (the release before latest), and tells a node older than the minimum that it must update. Such a node still authenticates, heartbeats and finishes work it holds, but gets lease null until it updates. A node that sends no version is treated as legacy_node_version.",
+  "legacy_node_version": "0.1.9",
+  "headers": {
+    "node_version": "Scarlett-Node-Version",
+    "latest_version": "Scarlett-Node-Latest-Version",
+    "minimum_version": "Scarlett-Node-Minimum-Version",
+    "update_required": "Scarlett-Node-Update-Required"
+  },
+  "exchanges": [
+    {
+      "request_headers": {"Scarlett-Node-Version": "0.1.10"},
+      "response_headers": {"Scarlett-Node-Latest-Version": "0.1.10", "Scarlett-Node-Minimum-Version": "0.1.9"}
+    },
+    {
+      "request_headers": {"Scarlett-Node-Version": "0.1.9"},
+      "response_headers": {"Scarlett-Node-Latest-Version": "0.1.10", "Scarlett-Node-Minimum-Version": "0.1.9"}
+    },
+    {
+      "request_headers": {"Scarlett-Node-Version": "0.1.8"},
+      "response_headers": {"Scarlett-Node-Latest-Version": "0.1.10", "Scarlett-Node-Minimum-Version": "0.1.9", "Scarlett-Node-Update-Required": "true"}
+    }
+  ]
+}

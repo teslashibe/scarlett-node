@@ -212,3 +212,54 @@ func TestRelayResumeUpdatesLiveHeartbeatWithoutInterruptingWork(t *testing.T) {
 		t.Fatalf("resuming relay changed drain state or kept relay halted: drained %v, %v", drained, err)
 	}
 }
+
+// Local status carries this build's release and the coordinator's last
+// release notice, so the desktop app can show its update toast.
+func TestStatusReportsReleaseNotice(t *testing.T) {
+	dir := privateTestDir(t)
+	t.Setenv("SCARLETT_STATE_DIR", dir)
+	read := func() runtimeStatus {
+		t.Helper()
+		var output bytes.Buffer
+		if e := localCommand("status", &output); e != nil {
+			t.Fatal(e)
+		}
+		var got runtimeStatus
+		if e := json.Unmarshal(output.Bytes(), &got); e != nil {
+			t.Fatal(e)
+		}
+		return got
+	}
+	if got := read(); got.Release != coordinator.NodeRelease || got.LatestRelease != "" || got.UpdateAvailable || got.UpdateRequired {
+		t.Fatalf("offline status %+v", got)
+	}
+	s := runtimeStatus{Version: coordinator.Version, State: "running", NodeID: "synthetic-node", Release: coordinator.NodeRelease, Services: []coordinator.ServiceHealth{}}
+	s.observeRelease(coordinator.ReleaseNotice{}, false)
+	if s.LatestRelease != "" {
+		t.Fatal("notice recorded before the coordinator sent one")
+	}
+	s.observeRelease(coordinator.ReleaseNotice{Latest: "99.0.0", Minimum: "98.0.0", Required: true}, true)
+	if e := saveRuntimeStatus(dir, s); e != nil {
+		t.Fatal(e)
+	}
+	if got := read(); got.LatestRelease != "99.0.0" || !got.UpdateAvailable || !got.UpdateRequired {
+		t.Fatalf("status lost the notice: %+v", got)
+	}
+	// Once this build is the latest release, nothing is due.
+	s.observeRelease(coordinator.ReleaseNotice{Latest: coordinator.NodeRelease}, true)
+	if e := saveRuntimeStatus(dir, s); e != nil {
+		t.Fatal(e)
+	}
+	if got := read(); got.UpdateAvailable || got.UpdateRequired {
+		t.Fatalf("current build told to update: %+v", got)
+	}
+	// A status file naming an invalid release is refused.
+	s.LatestRelease = "<script>"
+	if e := saveRuntimeStatus(dir, s); e != nil {
+		t.Fatal(e)
+	}
+	var output bytes.Buffer
+	if e := localCommand("status", &output); e == nil {
+		t.Fatal("invalid release accepted")
+	}
+}

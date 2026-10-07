@@ -131,6 +131,10 @@ input.locked { color: var(--faint); border-color: var(--border); }
 .relay-banner.danger { border-color: #71372f; background: #1d1210; }
 .relay-banner.danger h2 { color: #ffc4ba; }
 .relay-banner.danger p { color: #dcb5ad; }
+.update-toast { position: fixed; right: 20px; bottom: 20px; z-index: 20; max-width: 420px; display: flex; flex-direction: column; gap: 12px; padding: 16px 18px; border: 1px solid #665126; background: #19150f; border-radius: 10px; box-shadow: 0 10px 30px rgba(0, 0, 0, .45); }
+.update-toast p { color: #f3dec1; font-size: 13px; line-height: 1.45; }
+.update-toast.danger { border-color: #71372f; background: #1d1210; }
+.update-toast.danger p { color: #ffc4ba; }
 .reimport { padding: 12px 14px; margin: 0 0 16px; border: 1px solid #665126; background: #211b10; border-radius: 8px; }
 .reimport strong { font-size: 13px; color: #f3dec1; }
 .reimport p { margin: 6px 0 10px; color: #c9bba3; font-size: 12px; }
@@ -156,6 +160,7 @@ dialog .actions { justify-content: flex-end; }
   .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 560px) {
+  .update-toast { left: 16px; right: 16px; bottom: 16px; max-width: none; }
   .header-inner { padding: 12px 18px; flex-wrap: wrap; }
   main { padding: 24px 18px; gap: 16px; }
   .header-inner .actions { margin-left: auto; }

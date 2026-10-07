@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -38,6 +39,30 @@ type runtimeStatus struct {
 	// JournalFull is set while the attempt journal alone stops new work:
 	// unfinished attempts, or receipts too recent to prune, fill it.
 	JournalFull bool `json:"journal_full,omitempty"`
+	// Release is this build's release version. LatestRelease is the newest
+	// release the coordinator last reported; UpdateAvailable is set when it is
+	// newer than Release, and UpdateRequired while the coordinator offers this
+	// release no new jobs.
+	Release         string `json:"release"`
+	LatestRelease   string `json:"latest_release,omitempty"`
+	UpdateAvailable bool   `json:"update_available,omitempty"`
+	UpdateRequired  bool   `json:"update_required,omitempty"`
+}
+
+// observeRelease copies the coordinator's last release notice into status and
+// logs when this build first needs or stops needing an update.
+func (s *runtimeStatus) observeRelease(notice coordinator.ReleaseNotice, ok bool) {
+	if !ok {
+		return
+	}
+	if notice.Required && !s.UpdateRequired {
+		fmt.Fprintf(os.Stderr, "release: update required; the coordinator offers %s no new jobs (latest %s)\n", coordinator.NodeRelease, notice.Latest)
+	} else if notice.UpdateAvailable() && !notice.Required && notice.Latest != s.LatestRelease {
+		fmt.Fprintf(os.Stderr, "release: Scarlett Node %s is available (running %s)\n", notice.Latest, coordinator.NodeRelease)
+	}
+	s.LatestRelease = notice.Latest
+	s.UpdateAvailable = notice.UpdateAvailable()
+	s.UpdateRequired = notice.Required
 }
 
 // statusFresh is how old status.json may be before a running node reads as
@@ -90,7 +115,7 @@ func localCommand(command string, output io.Writer) error {
 			return err
 		}
 	}
-	status := runtimeStatus{Version: coordinator.Version, State: "offline", Services: []coordinator.ServiceHealth{}}
+	status := runtimeStatus{Version: coordinator.Version, State: "offline", Release: coordinator.NodeRelease, Services: []coordinator.ServiceHealth{}}
 	raw, err := readLocalFile(filepath.Join(dir, "status.json"), 16384)
 	if err == nil {
 		decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -101,6 +126,13 @@ func localCommand(command string, output io.Writer) error {
 		if !validAccountStatuses(status.Accounts) {
 			return errors.New("invalid local account status")
 		}
+		if (status.LatestRelease != "" && !coordinator.ValidVersion(status.LatestRelease)) || (status.UpdateAvailable || status.UpdateRequired) && status.LatestRelease == "" {
+			return errors.New("invalid local release status")
+		}
+		// The status file may come from an earlier build; this build's
+		// release is what the desktop app runs.
+		status.Release = coordinator.NodeRelease
+		status.UpdateAvailable = status.LatestRelease != "" && coordinator.CompareVersions(status.LatestRelease, coordinator.NodeRelease) > 0
 		if c := status.JournalCapacity; c != nil && (c.Limits.Validate() != nil || c.Records < 0 || c.Records > c.Limits.MaxRecords || c.Bytes < 0 || c.Bytes > c.Limits.MaxTotalBytes || c.ReservedBytes < c.Bytes || c.TerminalRecords < 0 || c.TerminalBytes < 0 || c.AvailableRecords < 0 || c.AvailableRecords > c.Limits.MaxRecords-c.Records) {
 			return errors.New("invalid journal capacity status")
 		}

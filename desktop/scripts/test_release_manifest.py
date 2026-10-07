@@ -284,7 +284,7 @@ class ReleaseManifestTests(ReleaseFixture):
 
     def test_release_version_requires_every_manifest_and_lockfile_to_agree(self):
         manifests = ['desktop/src-tauri/tauri.conf.json', 'desktop/package.json', 'desktop/package-lock.json',
-                     'desktop/src-tauri/Cargo.toml', 'desktop/src-tauri/Cargo.lock']
+                     'desktop/src-tauri/Cargo.toml', 'desktop/src-tauri/Cargo.lock', 'internal/coordinator/release.go']
         repository = self.folder / 'repository'
         for path in manifests:
             (repository / path).parent.mkdir(parents=True, exist_ok=True)
@@ -306,6 +306,15 @@ class ReleaseManifestTests(ReleaseFixture):
         marker = 'name = "scarlett-node-desktop"\nversion = "%s"' % VERSION
         self.assertIn(marker, text)
         cargo.write_text(text.replace(marker, 'name = "scarlett-node-desktop"\nversion = "%s"' % stale))
+        with self.assertRaisesRegex(ValueError, 'reviewed desktop version'):
+            release.check_version(VERSION)
+        cargo.write_text(text)
+        # The node reports NodeRelease to the coordinator, so it must be the released version too.
+        node = repository / 'internal/coordinator/release.go'
+        source = node.read_text()
+        marker = 'const NodeRelease = "%s"' % VERSION
+        self.assertIn(marker, source)
+        node.write_text(source.replace(marker, 'const NodeRelease = "%s"' % stale))
         with self.assertRaisesRegex(ValueError, 'reviewed desktop version'):
             release.check_version(VERSION)
 

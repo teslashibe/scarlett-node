@@ -50,6 +50,11 @@ export type Snapshot = {
     relay_halted?: boolean;
     // The attempt journal alone stops new work.
     journal_full?: boolean;
+    // This build's release and the coordinator's last release notice.
+    release?: string;
+    latest_release?: string;
+    update_available?: boolean;
+    update_required?: boolean;
   } | null;
 };
 // The node accepts at most eight accounts per provider (node.rs MAX_CODEX_ACCOUNTS).
@@ -192,6 +197,20 @@ export const JOURNAL_FULL =
 // unfinished attempts, or receipts too recent to remove, fill it.
 export function journalNote(s: Snapshot): string {
   return nodeLive(s) && s.observation?.journal_full === true ? JOURNAL_FULL : "";
+}
+export type UpdateNotice = { level: "required" | "available"; latest: string; text: string };
+// The coordinator offers new jobs to the latest release and the one before it.
+// A node older than that still finishes its work but gets nothing new, so the
+// notice stays up while the node is stopped too: it is the last thing it heard.
+export function updateNotice(s: Snapshot): UpdateNotice | null {
+  const o = s.observation;
+  const latest = o?.latest_release;
+  if (typeof latest !== "string" || !/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(latest)) return null;
+  if (o?.update_required === true)
+    return { level: "required", latest, text: `Update required · this version no longer receives new jobs. Install Scarlett Node ${latest} to keep earning` };
+  if (o?.update_available === true)
+    return { level: "available", latest, text: `Scarlett Node ${latest} is available · update soon, older versions stop receiving jobs` };
+  return null;
 }
 export function needsXReimport(s: Snapshot, a: Account): boolean {
   return a.service === "x_read" && observedHealth(s, a)?.state === "auth_required";

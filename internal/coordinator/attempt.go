@@ -36,11 +36,13 @@ func (c *Client) AttemptStatus(ctx context.Context, job, attempt, fence string) 
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Credential)
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set(NodeVersionHeader, NodeRelease)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return result, errors.New("attempt reconciliation unavailable")
 	}
 	defer resp.Body.Close()
+	c.observeRelease(resp.Header)
 	if resp.StatusCode != http.StatusOK {
 		return result, errors.New("attempt reconciliation not supported or unauthorized")
 	}

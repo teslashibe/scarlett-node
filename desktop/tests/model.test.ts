@@ -17,6 +17,7 @@ import {
   relayState,
   journalNote,
   JOURNAL_FULL,
+  updateNotice,
   statusPredates,
   xProofModes,
   X_SESSION_EXPIRED,
@@ -243,4 +244,22 @@ test("A full receipt journal is explained while the node runs", () => {
   assert.equal(journalNote({ ...running, observation: { state: "running" } }), "");
   assert.equal(journalNote({ ...running, observation: { state: "offline", journal_full: true } }), "");
   assert.equal(journalNote(base), "");
+});
+test("The update toast follows the coordinator's release notice", () => {
+  const at = (observation: object) => ({ ...base, supervised: true, observation: { state: "running", release: "0.1.10", ...observation } });
+  assert.equal(updateNotice(base), null);
+  // No notice yet, or an older node without the fields: nothing to show.
+  assert.equal(updateNotice(at({})), null);
+  assert.equal(updateNotice(at({ latest_release: "0.1.10" })), null);
+  const available = updateNotice(at({ latest_release: "0.1.11", update_available: true }));
+  assert.equal(available?.level, "available");
+  assert.equal(available?.latest, "0.1.11");
+  assert.match(available!.text, /Scarlett Node 0\.1\.11 is available/);
+  const required = updateNotice(at({ latest_release: "0.1.12", update_available: true, update_required: true }));
+  assert.equal(required?.level, "required");
+  assert.match(required!.text, /^Update required · this version no longer receives new jobs\. Install Scarlett Node 0\.1\.12/);
+  // A stopped or offline node keeps the last notice it heard.
+  assert.equal(updateNotice({ ...at({ latest_release: "0.1.12", update_required: true }), observation: { state: "offline", latest_release: "0.1.12", update_required: true } })?.level, "required");
+  // Anything but a plain version is ignored rather than shown.
+  assert.equal(updateNotice(at({ latest_release: "<b>0.1.12</b>", update_required: true })), null);
 });
