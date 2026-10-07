@@ -277,12 +277,9 @@ fn validate_receipt(kind: &Kind, status: &Status, in_flight: usize) -> Result<()
     }
 }
 
-/// The most a web receipt can hold: the final body and every hop's head in
-/// base64, two URLs per hop and the fixed fields around them.
+/// The most a web receipt can hold (verifier_store::web_receipt_bound).
 fn web_receipt_bound(job: &webpolicy::Job) -> u64 {
-    let base64 = |n: usize| 4 * n.div_ceil(3);
-    let per_hop = base64(webpolicy::MAX_HEAD) + 2 * webpolicy::MAX_URL + 2048;
-    (base64(job.max_response_bytes) + (job.max_redirects + 1) * per_hop + (64 << 10)) as u64
+    verifier_store::web_receipt_bound(job.max_response_bytes, job.max_redirects)
 }
 
 fn valid_web_hop(job: &webpolicy::Job, hop: &WebHop) -> Result<()> {
@@ -321,7 +318,7 @@ impl Sessions {
             if r.expires_ms > now.saturating_add(MAX_TTL.as_millis() as u64) {
                 bail!("verifier receipt expiry exceeds the session bound");
             }
-            if r.in_flight == 0 && r.status["reason"] != "execution_uncertain" && now > r.expires_ms.saturating_add(verifier_store::RETENTION_MS) {
+            if r.in_flight == 0 && r.status["reason"] != "execution_uncertain" && now > r.expires_ms.saturating_add(verifier_store::retention_ms(&r.payload)) {
                 s.store.as_mut().unwrap().remove(&r.job_id, &r.attempt)?;
                 continue;
             }
@@ -406,11 +403,12 @@ impl Sessions {
             self.by_token.retain(|_, value| value != &key);
             self.commit(&key)?;
         }
-        let retention = if self.store.is_some() { verifier_store::RETENTION_MS } else { MAX_TTL.as_millis() as u64 };
+        let durable = self.store.is_some();
+        let retention = |e: &Entry| if durable { verifier_store::retention_ms(&e.payload) } else { MAX_TTL.as_millis() as u64 };
         let stale: Vec<_> = self
             .by_job
             .iter()
-            .filter(|(_, e)| e.in_flight == 0 && !matches!(&e.status, Status::Rejected { reason } if reason == "execution_uncertain") && now > e.expires_ms.saturating_add(retention))
+            .filter(|(_, e)| e.in_flight == 0 && !matches!(&e.status, Status::Rejected { reason } if reason == "execution_uncertain") && now > e.expires_ms.saturating_add(retention(e)))
             .map(|(k, _)| k.clone())
             .collect();
         for key in stale {
@@ -1341,9 +1339,62 @@ mod web_tests {
         let expires = now_ms() + 60_000;
         assert_eq!(create(State(s.clone()), headers(), Json(job(payload("https://example.com/", 5, 10 << 20), expires))).await.0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(create(State(s.clone()), headers(), Json(job(payload("https://example.com/", 5, 2 << 20), expires))).await.0, StatusCode::CREATED);
-        // The default job fits the default record limit and the 24 MiB the deployment sets.
+        // The default job fits the default record limit with room to spare.
         let default = webpolicy::validate_job(&payload("https://example.com/", 5, 10 << 20)).unwrap();
         assert!(web_receipt_bound(&default) <= 24 << 20 && web_receipt_bound(&default) > 10 << 20);
+    }
+
+    #[tokio::test]
+    async fn web_receipts_reserve_their_own_bound_and_leave_soon_after_expiry() {
+        let dir = Temp::new();
+        // Room for one X or Codex reservation (the full record limit) or four
+        // default web jobs (about 14 MiB each).
+        let limits = verifier_store::Limits { max_records: 16, max_record_bytes: 64 << 20, max_total_bytes: 64 << 20 };
+        let open = |dir: &std::path::Path| -> Shared {
+            let (store, records) = Store::open_with_limits(dir, limits).unwrap();
+            Arc::new((
+                Config {
+                    key: KEY.into(),
+                    upstream: "127.0.0.1:1".into(),
+                    session_limit: Duration::from_secs(20),
+                    limits,
+                    concurrency: 64,
+                    slots: Arc::new(tokio::sync::Semaphore::new(64)),
+                    relay_tls: crate::relay::verifier::tls_config(rustls::RootCertStore::empty()).unwrap(),
+                },
+                Mutex::new(Sessions::restore(store, records).unwrap()),
+            ))
+        };
+        let s = open(&dir.0);
+        let expires = now_ms() + 60_000;
+        let web = |attempt: u32| CreateRequest { attempt: attempt.to_string(), ..job(payload("https://example.com/", 5, 10 << 20), expires) };
+        for attempt in 1..=4 {
+            assert_eq!(create(State(s.clone()), headers(), Json(web(attempt))).await.0, StatusCode::CREATED, "web {attempt}");
+        }
+        assert_eq!(create(State(s.clone()), headers(), Json(web(5))).await.0, StatusCode::SERVICE_UNAVAILABLE);
+        let codex = CreateRequest { attempt: "codex".into(), ..job(json!({"type":"response.create","model":"synthetic-model"}), expires) };
+        assert_eq!(create(State(s.clone()), headers(), Json(codex)).await.0, StatusCode::SERVICE_UNAVAILABLE);
+        // Expired web receipts stay ten minutes, then leave, in a purge or on restart.
+        {
+            let mut sessions = s.1.lock().unwrap();
+            let mut age = |sessions: &mut Sessions, attempt: &str, age: u64| {
+                let key = job_key("synthetic", attempt);
+                sessions.by_job.get_mut(&key).unwrap().expires_ms = now_ms() - age;
+                sessions.commit(&key).unwrap();
+            };
+            age(&mut sessions, "1", verifier_store::WEB_RETENTION_MS + 1);
+            age(&mut sessions, "2", verifier_store::WEB_RETENTION_MS - 60_000);
+            sessions.purge().unwrap();
+            assert!(!sessions.by_job.contains_key(&job_key("synthetic", "1")) && sessions.by_job.contains_key(&job_key("synthetic", "2")));
+            assert!(verifier_store::WEB_RETENTION_MS < verifier_store::RETENTION_MS);
+            // Attempt 3 ages while the verifier is down and leaves on restart.
+            age(&mut sessions, "3", verifier_store::WEB_RETENTION_MS + 1);
+        }
+        drop(s);
+        let s = open(&dir.0);
+        let sessions = s.1.lock().unwrap();
+        assert!(!sessions.by_job.contains_key(&job_key("synthetic", "3")));
+        assert!(sessions.by_job.contains_key(&job_key("synthetic", "2")) && sessions.by_job.contains_key(&job_key("synthetic", "4")));
     }
 
     fn valid_hop(index: usize, url: &str, status: u16, location: Option<&str>, body: Option<&[u8]>) -> WebHop {
@@ -1676,7 +1727,9 @@ async fn create(State(shared): State<Shared>, headers: HeaderMap, Json(request):
         }
         return (StatusCode::CONFLICT, Json(serde_json::json!({"error": "session already exists for this attempt"})));
     }
-    if sessions.by_job.len() >= config.limits.max_records || sessions.store.as_ref().is_some_and(|store| !store.capacity().can_register) {
+    // A web job reserves its own receipt bound, so web registrations are not
+    // limited by the larger reservation X and Codex receipts need.
+    if sessions.by_job.len() >= config.limits.max_records || sessions.store.as_ref().is_some_and(|store| !store.can_reserve(&request.payload)) {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"verifier session capacity reached"})));
     }
     sessions.by_job.insert(
