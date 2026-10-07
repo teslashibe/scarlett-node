@@ -465,7 +465,17 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 		status.JournalCapacity = &journalCapacity
 		// In-flight goroutines may not have called Begin yet. Reserve one
 		// additional slot for each before advertising new admission capacity.
-		if journalCapacity.AvailableRecords <= len(slots) {
+		// Finished receipts count only if recent ones fill terminal storage.
+		journalFull := journalCapacity.AvailableRecords <= len(slots)
+		if journalFull != status.JournalFull {
+			if journalFull {
+				fmt.Fprintln(os.Stderr, "journal: receipt journal full; advertising exhausted until receipts clear")
+			} else {
+				fmt.Fprintln(os.Stderr, "journal: receipt journal has room again")
+			}
+		}
+		status.JournalFull = journalFull
+		if journalFull {
 			h.State = "exhausted"
 			for i := range h.Services {
 				h.Services[i].State = "exhausted"

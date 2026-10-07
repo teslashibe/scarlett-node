@@ -563,6 +563,7 @@ fn observation_projection(raw: &[u8]) -> Result<Value> {
         "unresolved_attempts",
         "drain_requested",
         "relay_halted",
+        "journal_full",
     ] {
         if let Some(value) = source.get(key)
             && (value.is_string() || value.is_boolean() || value.is_number())
@@ -1943,6 +1944,10 @@ esac
         assert!(!safe.contains("SECRET"));
         let status=observation_projection(br#"{"state":"running","credential":"SECRET","services":[{"type":"x_read","state":"configured","token":"SECRET"}],"accounts":[{"id":"work","service":"codex","path":"SECRET"}]}"#).unwrap();
         assert!(!status.to_string().contains("SECRET"));
+        // A full journal is shown plainly; its record counts stay local.
+        let status = observation_projection(br#"{"state":"running","journal_full":true,"journal_capacity":{"records":1024,"available_records":0}}"#).unwrap();
+        assert_eq!(status["journal_full"], json!(true));
+        assert!(status.get("journal_capacity").is_none());
     }
     #[test]
     fn account_identity_projection_keeps_only_a_bounded_verified_handle() {

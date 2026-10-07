@@ -177,6 +177,13 @@ func TestRunLoopStopAbortsHeldHeartbeat(t *testing.T) {
 // that waits for it to exit.
 func startLongPollNode(t *testing.T, handler http.HandlerFunc) (config.Config, func()) {
 	t.Helper()
+	return startLongPollNodeWith(t, handler, nil)
+}
+
+// startLongPollNodeWith is startLongPollNode with prepare, if set, adjusting
+// the config and state directory before the node starts.
+func startLongPollNodeWith(t *testing.T, handler http.HandlerFunc, prepare func(*config.Config)) (config.Config, func()) {
+	t.Helper()
 	dir := privateTestDir(t)
 	home := filepath.Join(dir, "codex")
 	if err := privateFixtureMkdir(home, 0700); err != nil {
@@ -194,6 +201,9 @@ func startLongPollNode(t *testing.T, handler http.HandlerFunc) (config.Config, f
 	c.CoordinatorCA = filepath.Join(privateTestDir(t), "synthetic-coordinator-ca.pem")
 	if err := writePrivateFixture(c.CoordinatorCA, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600); err != nil {
 		t.Fatal(err)
+	}
+	if prepare != nil {
+		prepare(&c)
 	}
 	reader, writer := io.Pipe()
 	done := make(chan error, 1)

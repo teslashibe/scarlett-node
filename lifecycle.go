@@ -35,6 +35,9 @@ type runtimeStatus struct {
 	// RelayHalted is set while this node refuses keyed relay after catching
 	// its verifier misusing a session; cleared by `scarlett-node relay-resume`.
 	RelayHalted bool `json:"relay_halted,omitempty"`
+	// JournalFull is set while the attempt journal alone stops new work:
+	// unfinished attempts, or receipts too recent to prune, fill it.
+	JournalFull bool `json:"journal_full,omitempty"`
 }
 
 // statusFresh is how old status.json may be before a running node reads as
@@ -98,7 +101,7 @@ func localCommand(command string, output io.Writer) error {
 		if !validAccountStatuses(status.Accounts) {
 			return errors.New("invalid local account status")
 		}
-		if c := status.JournalCapacity; c != nil && (c.Limits.Validate() != nil || c.Records < 0 || c.Records > c.Limits.MaxRecords || c.Bytes < 0 || c.Bytes > c.Limits.MaxTotalBytes || c.ReservedBytes < c.Bytes || c.AvailableRecords < 0 || c.AvailableRecords > c.Limits.MaxRecords-c.Records) {
+		if c := status.JournalCapacity; c != nil && (c.Limits.Validate() != nil || c.Records < 0 || c.Records > c.Limits.MaxRecords || c.Bytes < 0 || c.Bytes > c.Limits.MaxTotalBytes || c.ReservedBytes < c.Bytes || c.TerminalRecords < 0 || c.TerminalBytes < 0 || c.AvailableRecords < 0 || c.AvailableRecords > c.Limits.MaxRecords-c.Records) {
 			return errors.New("invalid journal capacity status")
 		}
 		if time.Since(status.UpdatedAt) > statusFresh || status.UpdatedAt.After(time.Now().Add(time.Second)) {

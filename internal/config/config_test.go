@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/teslashibe/scarlett-node/internal/attempts"
 )
 
 func TestOrigins(t *testing.T) {
@@ -249,14 +251,27 @@ func TestJournalCapacityEnvironment(t *testing.T) {
 	t.Setenv("SCARLETT_JOURNAL_MAX_RECORD_BYTES", "192000")
 	t.Setenv("SCARLETT_JOURNAL_MAX_TOTAL_BYTES", "268435456")
 	c, err := Load()
-	if err != nil || c.JournalLimits.MaxRecords != 4096 {
+	if err != nil || c.JournalLimits.MaxRecords != 4096 || c.JournalLimits.MaxTerminalRecords != attempts.DefaultLimits().MaxTerminalRecords || c.JournalLimits.MaxTerminalBytes != attempts.DefaultLimits().MaxTerminalBytes {
 		t.Fatal(c.JournalLimits, err)
 	}
-	for _, bad := range []string{"0", "1000001", "garbage", "-1"} {
-		t.Setenv("SCARLETT_JOURNAL_MAX_RECORDS", bad)
-		if _, err := Load(); err == nil {
-			t.Fatal("invalid limit accepted", bad)
+	t.Setenv("SCARLETT_JOURNAL_MAX_TERMINAL_RECORDS", "250000")
+	t.Setenv("SCARLETT_JOURNAL_MAX_TERMINAL_BYTES", "536870912")
+	if c, err = Load(); err != nil || c.JournalLimits.MaxTerminalRecords != 250000 || c.JournalLimits.MaxTerminalBytes != 536870912 {
+		t.Fatal(c.JournalLimits, err)
+	}
+	for name, values := range map[string][]string{
+		"SCARLETT_JOURNAL_MAX_RECORDS":          {"0", "1000001", "garbage", "-1"},
+		"SCARLETT_JOURNAL_MAX_TERMINAL_RECORDS": {"0", "1000001", "garbage", "-1"},
+		"SCARLETT_JOURNAL_MAX_TERMINAL_BYTES":   {"0", "191999", "17179869185", "garbage", "-1"},
+	} {
+		good := os.Getenv(name)
+		for _, bad := range values {
+			t.Setenv(name, bad)
+			if _, err := Load(); err == nil {
+				t.Fatal("invalid limit accepted", name, bad)
+			}
 		}
+		t.Setenv(name, good)
 	}
 }
 

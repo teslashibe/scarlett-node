@@ -15,6 +15,8 @@ import {
   drainingAccounts,
   needsXReimport,
   relayState,
+  journalNote,
+  JOURNAL_FULL,
   statusPredates,
   xProofModes,
   X_SESSION_EXPIRED,
@@ -230,4 +232,15 @@ test("X rows distinguish verified handles, unverified identity and duplicate quo
   assert.match(accountHealth(withX("identity_unverified"), xAccount), /identity not verified/);
   assert.match(accountHealth(withX("duplicate_account"), xAccount), /shares quota/);
   assert.match(errorMessage("duplicate_account"), /already connected under another local name/);
+});
+test("A full receipt journal is explained while the node runs", () => {
+  const running = { ...base, supervised: true, observation: { state: "running", journal_full: true } };
+  assert.equal(journalNote(running), JOURNAL_FULL);
+  assert.match(JOURNAL_FULL, /^Receipt journal full · waiting for receipts to clear/);
+  assert.equal(journalNote({ ...running, observation: { state: "draining", journal_full: true } }), JOURNAL_FULL);
+  // Room in the journal, an older node without the field, or a stopped node: nothing to explain.
+  assert.equal(journalNote({ ...running, observation: { state: "running", journal_full: false } }), "");
+  assert.equal(journalNote({ ...running, observation: { state: "running" } }), "");
+  assert.equal(journalNote({ ...running, observation: { state: "offline", journal_full: true } }), "");
+  assert.equal(journalNote(base), "");
 });

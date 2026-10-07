@@ -48,6 +48,8 @@ export type Snapshot = {
     services?: ServiceHealth[];
     drain_requested?: boolean;
     relay_halted?: boolean;
+    // The attempt journal alone stops new work.
+    journal_full?: boolean;
   } | null;
 };
 // The node accepts at most eight accounts per provider (node.rs MAX_CODEX_ACCOUNTS).
@@ -183,6 +185,13 @@ export function accountHealth(s: Snapshot, a: Account): string {
 // The node wrote this status recently and is still running.
 function nodeLive(s: Snapshot): boolean {
   return s.observation?.state === "running" || s.observation?.state === "draining";
+}
+export const JOURNAL_FULL =
+  "Receipt journal full · waiting for receipts to clear before taking new work";
+// The running node takes no new work because its attempt journal has no room:
+// unfinished attempts, or receipts too recent to remove, fill it.
+export function journalNote(s: Snapshot): string {
+  return nodeLive(s) && s.observation?.journal_full === true ? JOURNAL_FULL : "";
 }
 export function needsXReimport(s: Snapshot, a: Account): boolean {
   return a.service === "x_read" && observedHealth(s, a)?.state === "auth_required";

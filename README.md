@@ -235,9 +235,11 @@ Settings come from the environment, typically via `~/.config/scarlett-node/node.
 | `SCARLETT_INFERENCE_TIMEOUT_SECONDS` | Per-job provider deadline |
 | `SCARLETT_MAX_INPUT_BYTES` | Largest prompt or serialized X request the node accepts |
 | `SCARLETT_MAX_OUTPUT_TOKENS` | Largest Codex completion the node accepts |
-| `SCARLETT_JOURNAL_MAX_RECORDS` | Journal record ceiling; a full journal refuses new work |
+| `SCARLETT_JOURNAL_MAX_RECORDS` | Ceiling on unfinished journal attempts; a full journal refuses new work. Finished receipts do not count |
 | `SCARLETT_JOURNAL_MAX_RECORD_BYTES` | Largest single journal record |
-| `SCARLETT_JOURNAL_MAX_TOTAL_BYTES` | Journal size ceiling |
+| `SCARLETT_JOURNAL_MAX_TOTAL_BYTES` | Space reserved for unfinished attempts |
+| `SCARLETT_JOURNAL_MAX_TERMINAL_RECORDS` | Finished receipts kept for replay protection; the oldest are removed early beyond it |
+| `SCARLETT_JOURNAL_MAX_TERMINAL_BYTES` | Space for finished receipts |
 
 Defaults, ranges and the verifier-host variables are in the [reference](docs/REFERENCE.md).
 
