@@ -303,3 +303,31 @@ func TestLegacyXAccountRespectsExplicitIdentityCeiling(t *testing.T) {
 		p.finishAccount(again, "")
 	}
 }
+
+// A Codex quota failure rests only the Codex account that ran out. X keeps
+// advertising and admitting work, and the node itself does not rest.
+func TestCodexQuotaRestsOnlyItsAccountNotTheNode(t *testing.T) {
+	if !restsNode(false, "capacity_unavailable") || restsNode(true, "capacity_unavailable") || restsNode(false, "x_rate_limited") || restsNode(false, "") {
+		t.Fatal("node-wide rest applies outside an unpooled capacity failure")
+	}
+	p := poolFixture(t, "codex", "x_read")
+	codex, ok := p.acquireAccount("codex")
+	if !ok {
+		t.Fatal("codex account unavailable")
+	}
+	p.finishAccount(codex, "capacity_unavailable")
+	if h := healthKind(t, p, "codex"); h.State != "exhausted" || h.Capacity != 0 || h.LastErrorCode != "capacity_unavailable" {
+		t.Fatalf("quota-limited codex advertised %+v", h)
+	}
+	if _, ok := p.acquireAccount("codex"); ok {
+		t.Fatal("quota-limited codex account admitted work")
+	}
+	if h := healthKind(t, p, "x_read"); (h.State != "configured" && h.State != "ready") || h.Capacity < 1 {
+		t.Fatalf("codex quota blocked x_read: %+v", h)
+	}
+	x, ok := p.acquireAccount("x_read")
+	if !ok {
+		t.Fatal("codex quota blocked x_read admission")
+	}
+	p.finishAccount(x, "")
+}

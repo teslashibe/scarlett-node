@@ -120,8 +120,19 @@ func loadIdentity(c config.Config) (identity, error) {
 	return id, nil
 }
 
-// capacityRest is how long a node reports "exhausted" after its gateway had no capacity.
+// capacityRest is how long a node without an account pool reports "exhausted"
+// after its gateway or prover had no capacity. An account pool rests only the
+// account that ran out (settle), and reuses this as the unreachable retry delay.
 const capacityRest = 30 * time.Second
+
+// restsNode reports whether a job outcome rests the whole node. Without an
+// account pool the node is the only unit that can rest. With one, settle has
+// already exhausted just the account that ran out, for its known reset or 15
+// minutes; a node-wide rest would also stop the node's other services and
+// accounts, which have their own quota.
+func restsNode(pooled bool, code string) bool {
+	return code == "capacity_unavailable" && !pooled
+}
 
 // heartbeatWatchInterval is how often the node rechecks, while the coordinator
 // holds a heartbeat, whether what that heartbeat advertised still holds.
@@ -692,7 +703,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 				defer active.done(key)
 				defer func() {
 					<-slots
-					// Account release and the rest state are already final. Refresh
+					// Account release and any node-wide rest are already final. Refresh
 					// the held heartbeat's capacity and active lease references now
 					// that the worker slot is free. Completions coalesce while the
 					// loop prepares its next heartbeat.
@@ -728,7 +739,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 					}
 				}
 				observation.Finish(diagnosticOutcome(attemptCtx, code, err))
-				if code == "capacity_unavailable" {
+				if restsNode(services != nil, code) {
 					mu.Lock()
 					restUntil = time.Now().Add(capacityRest)
 					mu.Unlock()
@@ -777,19 +788,21 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	if c.LocalAccountID != "" {
 		record.ProviderAccountID, record.ProviderService = c.LocalAccountID, l.ServiceType
 	}
+	// Offer terms are checked before the journal: nothing is bound to an
+	// account or sent yet, so a refused offer leaves no record and a
+	// redelivery is judged afresh. rejectLease would fund acceptance.
+	if l.AcceptanceRequired {
+		if err := coordinator.ValidOffer(l, time.Now()); err != nil {
+			return "invalid_lease", err
+		}
+	}
 	if err := journal.BeginContext(ctx, record); err != nil {
 		return "", err
 	}
 	if l.AcceptanceRequired {
 		// No acceptance HTTP or provider execution happens on either local
 		// refusal below. Keep terminal replay metadata for this pinned attempt;
-		// let its offer expire remotely. rejectLease would fund acceptance.
-		if err := coordinator.ValidOffer(l, time.Now()); err != nil {
-			if terminalErr := journal.TerminalContext(ctx, record); terminalErr != nil {
-				return "invalid_lease", terminalErr
-			}
-			return "invalid_lease", err
-		}
+		// let its offer expire remotely.
 		if l.ServiceType == "codex" && !codexAdmissionValid(c.CodexHome, l.LeaseDeadline) {
 			// The offer itself is valid, so the selected local credential is what
 			// fell short. This is local expiry evidence, never a provider denial.

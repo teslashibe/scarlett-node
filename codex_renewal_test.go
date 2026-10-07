@@ -1067,7 +1067,7 @@ func TestCodexLocalGuardIsLocalExpiryAndInvalidOfferIsNotAuth(t *testing.T) {
 			want := codexLocalAuthExpired
 			if change == "offer-too-long" {
 				// A coordinator clock ahead of ours: Accept would refuse it locally.
-				l.LeaseDeadline = time.Now().Add(coordinator.MaxOfferLifetime + 6*time.Second)
+				l.LeaseDeadline = time.Now().Add(coordinator.MaxOfferLifetime + coordinator.OfferClockSkew + 6*time.Second)
 				l.SettlementDeadline = l.LeaseDeadline
 				want = "invalid_lease"
 			} else if err := writePrivateFixture(filepath.Join(selected.config.CodexHome, "auth.json"), syntheticCodexAuth(time.Now().Add(-time.Minute)), 0600); err != nil {
@@ -1087,6 +1087,10 @@ func TestCodexLocalGuardIsLocalExpiryAndInvalidOfferIsNotAuth(t *testing.T) {
 			p.finishAccount(selected, code)
 			a := selected.account
 			if change == "offer-too-long" {
+				// Refused terms bind nothing: a redelivery is judged afresh.
+				if capacity, err := j.Capacity(); err != nil || capacity.Records != 0 {
+					t.Fatal("refused offer terms consumed a journal record", err)
+				}
 				if a.entry.state == "auth_required" {
 					t.Fatal("invalid offer recorded as an authentication failure")
 				}
