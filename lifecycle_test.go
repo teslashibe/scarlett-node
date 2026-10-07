@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -150,6 +152,10 @@ func TestRelayHaltPersistsUntilRelayResume(t *testing.T) {
 	if _, e := os.Stat(filepath.Join(dir, worker.RelayHaltFile)); !os.IsNotExist(e) {
 		t.Fatal("relay-resume left the marker", e)
 	}
+	// The same running process resumes without a restart or cancelling work.
+	if worker.RelayHalted() || worker.RelayHaltReason() != "" {
+		t.Fatal("relay-resume did not clear the live latch")
+	}
 	worker.ResetRelayHaltForTests()
 	if e := worker.LoadRelayHalt(dir); e != nil || worker.RelayHalted() {
 		t.Fatal("halt came back after relay-resume", e)
@@ -157,5 +163,52 @@ func TestRelayHaltPersistsUntilRelayResume(t *testing.T) {
 	// Resuming when nothing is halted is harmless.
 	if e := localCommand("relay-resume", &output); e != nil {
 		t.Fatal(e)
+	}
+}
+
+func TestRelayResumeUpdatesLiveHeartbeatWithoutInterruptingWork(t *testing.T) {
+	worker.ResetRelayHaltForTests()
+	t.Cleanup(worker.ResetRelayHaltForTests)
+	dir := privateTestDir(t)
+	t.Setenv("SCARLETT_STATE_DIR", dir)
+	if err := worker.LoadRelayHalt(dir); err != nil {
+		t.Fatal(err)
+	}
+	p := poolFixture(t, "x_read")
+	p.config.XRelay = true
+	if !p.acquire("x_read") {
+		t.Fatal("fixture could not start synthetic work")
+	}
+	worker.HaltRelay("synthetic failure")
+	sent := availability{services: serviceStates(p.health())}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	changes := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		watchHeartbeat(ctx, cancel, sent, func() availability {
+			return availability{services: serviceStates(p.health())}
+		}, changes)
+	}()
+	var output bytes.Buffer
+	if err := localCommand("relay-resume", &output); err != nil {
+		t.Fatal(err)
+	}
+	changes <- struct{}{}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("held heartbeat did not pick up relay resume")
+	}
+	if !errors.Is(context.Cause(ctx), errHeartbeatStale) {
+		t.Fatalf("held heartbeat ended with %v", context.Cause(ctx))
+	}
+	health := healthKind(t, p, "x_read")
+	if !reflect.DeepEqual(health.ProofModes, []string{"mpc", "relay"}) || health.InFlight != 1 {
+		t.Fatalf("resumed heartbeat lost relay or active work: modes %v, in flight %d", health.ProofModes, health.InFlight)
+	}
+	if drained, err := drainRequested(dir); err != nil || drained || worker.RelayHalted() {
+		t.Fatalf("resuming relay changed drain state or kept relay halted: drained %v, %v", drained, err)
 	}
 }

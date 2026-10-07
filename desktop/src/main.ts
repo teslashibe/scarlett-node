@@ -127,8 +127,8 @@ function render(s: Snapshot) {
   setText(
     $("relay-detail"),
     relay === "halted"
-      ? "The verifier was caught misusing an X session. Contact the operator before resuming."
-      : "Resume saved. Relay starts again once the node picks it up.",
+      ? "The node could not verify a relay request. This can happen if the connection ends before verification finishes. Check with the operator before resuming."
+      : "Resume saved. Waiting for the node to confirm relay is available again.",
   );
   $("relay-resume").hidden = relay !== "halted";
   $("relay-resume").toggleAttribute("disabled", busy);
@@ -320,7 +320,7 @@ for (const action of ["start", "pause", "resume", "stop"] as const)
 $("relay-resume").addEventListener("click", () => {
   if (
     !confirm(
-      "Resume keyed relay on this node?\n\nOnly continue after the operator confirms the verifier has been checked. The node keeps running and its current work continues. Relay starts again once the node picks up the change.",
+      "Resume keyed relay on this node?\n\nOnly continue after the operator confirms the verifier has been checked. The node keeps running and its current work continues. Relay resumes at the next status update.",
     )
   )
     return;
