@@ -686,6 +686,11 @@ func TestRunLoopHonoursRetryAfterAndBacksOffRejectedHeartbeat(t *testing.T) {
 			w.Header().Set("Retry-After", "1")
 			io.WriteString(w, `{"lease":null}`)
 		case 2:
+			// Answer a little after the arrival so a status save made in the
+			// pause is later than it even on a coarse wall clock: Windows can
+			// stamp both in one tick, and the saved time has no monotonic
+			// reading to tell them apart.
+			time.Sleep(50 * time.Millisecond)
 			w.Header().Set("Retry-After", "2")
 			w.WriteHeader(http.StatusServiceUnavailable)
 			io.WriteString(w, `{"error":{"code":"network_unavailable","message":"synthetic"}}`)
@@ -739,7 +744,7 @@ func TestRunLoopHonoursRetryAfterAndBacksOffRejectedHeartbeat(t *testing.T) {
 	for i, want := range []struct{ min, max time.Duration }{
 		{time.Second, 1500 * time.Millisecond},     // 413: the fixture's fixed second
 		{time.Second, 2 * time.Second},             // 200 with Retry-After 1: one to one and a half seconds
-		{2 * time.Second, 3500 * time.Millisecond}, // 503 with Retry-After 2: two to three seconds
+		{2 * time.Second, 3500 * time.Millisecond}, // 503 with Retry-After 2: two to three seconds, after the 50 ms answer
 	} {
 		if gap := got[i+1].at.Sub(got[i].at); gap < want.min || gap > want.max {
 			t.Fatalf("heartbeat %d followed after %v, want [%v, %v]", i+1, gap, want.min, want.max)
