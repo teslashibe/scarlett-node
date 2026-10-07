@@ -335,7 +335,6 @@ func refreshAccount(a *pooledAccount, now time.Time, helperMissing bool) {
 	if a.spec.Service == "codex" {
 		configured = configured && codexAdmissionValid(a.spec.Path, codexAdmissionWindow(now))
 	}
-	wasLocalInvalid := s.localAuthInvalid
 	stampChanged := stamp != s.stamp
 	if s.state == "" || stampChanged {
 		s.stamp = stamp
@@ -345,7 +344,7 @@ func refreshAccount(a *pooledAccount, now time.Time, helperMissing bool) {
 		if s.restUntil.IsZero() || !now.Before(s.restUntil) {
 			s.lastError = ""
 			s.state = "configured"
-		} else if s.state == "auth_required" && wasLocalInvalid {
+		} else if s.state == "auth_required" {
 			s.state, s.lastError = "exhausted", "capacity_unavailable"
 		}
 	}

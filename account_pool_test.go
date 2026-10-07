@@ -581,3 +581,45 @@ func TestQuotaExpiryDoesNotRepairAuthoritativeAuthentication(t *testing.T) {
 		})
 	}
 }
+
+func TestCredentialChangeDuringRestRepairsProviderDenial(t *testing.T) {
+	p := multiPool(t)
+	f, err := loadAccounts(p.config.AccountsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Accounts = []providerAccount{f.Accounts[0]}
+	f.Accounts[0].Concurrency = 2
+	saveAccountFixture(t, p, f)
+	limited, ok := p.acquireAccount("codex")
+	if !ok {
+		t.Fatal("missing account")
+	}
+	denied, ok := p.acquireAccount("codex")
+	if !ok {
+		t.Fatal("missing concurrent attempt")
+	}
+	p.finishAccount(limited, "capacity_unavailable")
+	p.finishAccount(denied, "auth_required")
+	e := limited.account.entry
+	reset := e.restUntil
+	if e.state != "auth_required" || e.localAuthInvalid || reset.IsZero() {
+		t.Fatalf("provider denial during a rest not recorded: %+v", e)
+	}
+	// The operator logs in again a second later, while the rest still runs.
+	path := filepath.Join(limited.config.CodexHome, "auth.json")
+	if err := writePrivateFixture(path, syntheticCodexAuth(time.Now().Add(366*24*time.Hour)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	refreshAccount(limited.account, time.Now().Add(time.Second), false)
+	if e.state != "exhausted" || e.lastError != "capacity_unavailable" || !e.restUntil.Equal(reset) {
+		t.Fatalf("new credentials during a rest: %+v", e)
+	}
+	if _, ok := p.acquireAccount("codex"); ok {
+		t.Fatal("resting account accepted work")
+	}
+	refreshAccount(limited.account, reset.Add(time.Second), false)
+	if e.state != "configured" || e.lastError != "" || !e.restUntil.IsZero() {
+		t.Fatalf("rest expiry kept a denial the new credentials answered: %+v", e)
+	}
+}
