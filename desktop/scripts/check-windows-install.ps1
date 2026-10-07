@@ -306,6 +306,38 @@ function Click-Button([string]$Name) {
     }
     $invoke.Invoke()
 }
+function Find-Disclosure([string]$Name) {
+    # A summary can share its name with a submit button. Its native expansion
+    # pattern identifies the disclosure without relying on hidden form fields.
+    $condition = [System.Windows.Automation.AndCondition]::new(
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::NameProperty, $Name),
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::IsExpandCollapsePatternAvailableProperty, $true)
+    )
+    return $script:window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+}
+function Open-Disclosure([string]$Name) {
+    Wait-Check {
+        $control = Find-Disclosure $Name
+        return $null -ne $control -and $control.Current.IsEnabled
+    } 30 "UI disclosure did not become available: $Name"
+    $control = Find-Disclosure $Name
+    $scroll = $null
+    if ($control.TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) {
+        $scroll.ScrollIntoView()
+    }
+    $pattern = $null
+    if (-not $control.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$pattern)) {
+        throw "UI disclosure expansion unavailable: $Name"
+    }
+    if ($pattern.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Collapsed) {
+        $pattern.Expand()
+    }
+    Wait-Check {
+        return $pattern.Current.ExpandCollapseState -eq [System.Windows.Automation.ExpandCollapseState]::Expanded
+    } 10 "UI disclosure did not open: $Name"
+}
 function Wait-AppWindow {
     Wait-Check {
         $condition = [System.Windows.Automation.AndCondition]::new(
@@ -320,6 +352,11 @@ function Wait-AppWindow {
         return $null -ne $script:window
     } 45 'Installed desktop window did not appear'
     $script:window.SetFocus()
+    Wait-Check {
+        $control = Find-Disclosure 'Add account'
+        return $null -ne $control -and $control.Current.IsEnabled
+    } 30 'Installed desktop account controls did not become available'
+    Open-Disclosure 'Local model API'
     Wait-Check {
         $start = Find-Button 'Start local API'
         $stop = Find-Button 'Stop local API'
@@ -453,6 +490,8 @@ function Verify-KeyboardDelivery {
     # UIA Invoke/SetFocus can succeed without an interactive input desktop.
     # Prove native text delivery reaches a harmless empty field before blaming a shortcut.
     Write-Output "Installed keyboard probe: interactive=$([Environment]::UserInteractive), session=$([System.Diagnostics.Process]::GetCurrentProcess().SessionId)"
+    Open-Disclosure 'Add account'
+    Open-Disclosure 'Sign in to X'
     # This fixed form pair is independent of browser profile discovery. Tab
     # skips hidden per-account capacity and reaches the reconnect checkbox.
     $name = 'Local account ID for X login'
@@ -621,6 +660,7 @@ function Registered-Command {
 function Check-Preferences {
     if ($null -ne (Registered-Command)) { throw 'Clean runner already has a Scarlett login registration' }
     Start-App
+    Open-Disclosure 'Device settings'
     Check-DefaultCheckbox 'Keep running when the window closes' 'Background mode was not opt-in'
     Check-DefaultCheckbox 'Open Scarlett when I log in' 'Start at login was not opt-in'
     Set-Number 'Saved local API port' 18088
@@ -636,6 +676,7 @@ function Check-Preferences {
     Write-Output 'Installed preferences: default close drained and saved port passed'
 
     Start-App
+    Open-Disclosure 'Device settings'
     if ((Api-Status '/health') -ne 0) { throw 'Opening the app automatically started the API' }
     # Enabling the actual OS registration must quote the installed path with
     # spaces and include no provider/node/API arguments.
@@ -649,6 +690,7 @@ function Check-Preferences {
     Check-QuitShortcut 'Preferences app Quit did not exit'
     Wait-Check { (Api-Status '/health') -eq 0 } 30 'Preferences Quit left API running'
     Start-App
+    Open-Disclosure 'Device settings'
     if (-not (Checkbox-Is 'Open Scarlett when I log in' $true)) { throw 'Native login registration did not survive app reopening' }
     if ((Api-Status '/health') -ne 0) { throw 'Registered app opening automatically started API' }
     Set-Checkbox 'Open Scarlett when I log in' $false
@@ -669,6 +711,7 @@ function Check-Preferences {
     $reopen = Start-Process -FilePath $executable -WorkingDirectory $install -PassThru
     if (-not $reopen.WaitForExit(15000)) { $reopen.Kill(); throw 'Single-instance reopening launched a second desktop' }
     Wait-AppWindow
+    Open-Disclosure 'Device settings'
     if ($application.Id -ne $originalProcess -or (Api-Status '/health') -ne 200) { throw 'Reopening did not retain the same background app and API' }
     Set-Checkbox 'Keep running when the window closes' $false
     Click-Button 'Save device preferences'
@@ -1092,6 +1135,8 @@ with sqlite3.connect(sys.argv[1]) as db:
     try {
         $env:APPDATA, $env:LOCALAPPDATA = $script:fixture.roaming, $script:fixture.local
         Start-App
+        Open-Disclosure 'Add account'
+        Open-Disclosure 'Import an X session'
         Wait-Check { (Find-Input 'Browser profile').Current.IsEnabled } 15 'Isolated browser profiles were not discovered'
         if (@(Imported-Accounts).Count -ne 0) { throw 'Browser test encountered existing accounts' }
         if (-not (Checkbox-Is 'Import only X session cookies from this profile' $false) -or (Find-Button 'Import X account').Current.IsEnabled) { throw 'Browser import did not require opt-in consent' }
@@ -1132,6 +1177,8 @@ with sqlite3.connect(sys.argv[1]) as db:
         }
         Write-SyntheticPrivateJSON (Join-Path $script:importState 'accounts.json') @{ version = 1; accounts = $records }
         Start-App
+        Open-Disclosure 'Add account'
+        Open-Disclosure 'Import an X session'
         Wait-Check { UI-Contains ('X ' + [char]0x00B7 + ' removal-fixture') } 15 'Installed app did not render its private synthetic inventory'
         Wait-Check { UI-Contains 'access not verified' } 15 'Private synthetic inventory claimed verified access'
         Check-SyntheticAccounts @('removal-fixture', 'browser-firefox', 'browser-paste')
@@ -1523,6 +1570,7 @@ function Check-InstallationRoundTrip {
             try { Identity-Diagnostics 'baseline' } catch { Write-Output 'Identity failure diagnostics were unavailable' }
             throw $failure
         }
+        Open-Disclosure 'Device settings'
         Set-Number 'Saved local API port' 18088
         Click-Button 'Save device preferences'
         Wait-Check { Saved-Preferences 18088 $false } 15 'Baseline app did not retain its test port'
