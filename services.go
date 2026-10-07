@@ -39,6 +39,14 @@ type servicePool struct {
 	xRecovery                               func() ([]attempts.Record, error)
 	xRecoveryIdentities                     map[string]bool
 	xRecoveryUnknown                        bool
+	// Durable account state. Memory is authoritative for this process: a
+	// failed write is retried after stateRetryAt. Only the accounts-mode
+	// marker holds admission until it is saved.
+	writeState                   func(dir, name string, raw []byte) error
+	healthDirty, xCooldownsDirty bool
+	healthWritten                []byte
+	stateRetryAt                 time.Time
+	stateWriteErr                error
 }
 
 func newServicePool(c config.Config) *servicePool {

@@ -1129,8 +1129,9 @@ func TestLegacyBlockedHealthDoesNotPersistLocalMarker(t *testing.T) {
 	if e := p.entries["codex"]; e.state != "auth_required" || !e.localAuthInvalid {
 		t.Fatal("legacy local expiry not recorded")
 	}
-	// A failed health write blocks the pool and forces the shared entry away
-	// from auth_required. A later successful save must not keep the marker.
+	// A failed health write neither blocks the pool nor forces the shared
+	// entry away from auth_required. The retried save keeps the marker only
+	// with the local auth_required state it qualifies.
 	healthFile := filepath.Join(p.config.StateDir, "account-health.json")
 	if err := os.Mkdir(healthFile, 0700); err != nil {
 		t.Fatal(err)
@@ -1139,13 +1140,23 @@ func TestLegacyBlockedHealthDoesNotPersistLocalMarker(t *testing.T) {
 	p.saveHealth()
 	p.mu.Unlock()
 	p.health()
+	if p.healthError || p.accountsError || p.entries["codex"].state != "auth_required" {
+		t.Fatal("failed health write blocked the pool")
+	}
 	if err := os.Remove(healthFile); err != nil {
 		t.Fatal(err)
 	}
+	p.stateRetryAt = time.Time{} // The write backoff has elapsed.
 	p.finish("codex", "report_pending")
 	raw, err := os.ReadFile(healthFile)
-	if err != nil || bytes.Contains(raw, []byte("local_auth_invalid")) {
-		t.Fatal("inconsistent local marker persisted")
+	var saved map[string]savedAccountHealth
+	if err != nil || json.Unmarshal(raw, &saved) != nil {
+		t.Fatal("retried health save missing", err)
+	}
+	for _, h := range saved {
+		if h.LocalAuthInvalid && (h.State != "auth_required" || h.Error != "auth_required") {
+			t.Fatal("inconsistent local marker persisted")
+		}
 	}
 	if err := writePrivateFixture(filepath.Join(p.config.CodexHome, "auth.json"), freshSyntheticCodexAuth(), 0600); err != nil {
 		t.Fatal(err)
