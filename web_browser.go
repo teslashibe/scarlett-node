@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"time"
 
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/worker"
@@ -32,6 +34,20 @@ var startBrowserTier = func(ctx context.Context, c config.Config) (worker.Browse
 // wiring sets it; tests replace it.
 var checkWebRuntime = func(ctx context.Context, resources, state string, withBrowser bool) error {
 	return errors.New("web runtime is not part of this build")
+}
+
+// logBrowserUpload logs each browser result upload that the coordinator did
+// not store, with its status and error code ("coordinator HTTP 404"). The
+// worker serves the job from the proven re-fetch either way, so without this
+// line a refused upload shows only as a failed browser_upload diagnostic.
+func logBrowserUpload(upload func(ctx context.Context, jobID string, gzipBody []byte, report time.Time) error, out io.Writer) func(ctx context.Context, jobID string, gzipBody []byte, report time.Time) error {
+	return func(ctx context.Context, jobID string, gzipBody []byte, report time.Time) error {
+		err := upload(ctx, jobID, gzipBody, report)
+		if err != nil {
+			fmt.Fprintln(out, "web browser: result upload not stored:", err)
+		}
+		return err
+	}
 }
 
 // unavailableBrowser is a browser tier that never runs: it reports one closed

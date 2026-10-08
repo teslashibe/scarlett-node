@@ -900,7 +900,7 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 				w.Browser = currentBrowser()
 			}
 			if w.Upload == nil && client != nil {
-				w.Upload = client.UploadBrowserResult
+				w.Upload = logBrowserUpload(client.UploadBrowserResult, os.Stderr)
 			}
 			code = w.Run(ctx, l)
 		} else {
