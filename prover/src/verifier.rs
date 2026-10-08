@@ -3028,10 +3028,9 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
             let session = tokio::time::timeout(hop_limit + Duration::from_secs(10), web_session(&mut conn, config.relay_tls.clone(), &host, authorize, &mut reader, &mut clock)).await;
             let duration_ms = started.elapsed().as_millis() as u64;
             let (reason, detail) = match session {
-                Ok(Ok(sealed)) => match reader.finish().await {
-                    Ok((response, stored)) => {
-                        // What the node chose for this hop, from the bytes just authorized.
-                        let node = webpolicy::authorize(&web, &url, &sealed.sent)?;
+                // What the node chose for this hop, from the bytes just authorized.
+                Ok(Ok(sealed)) => match (reader.finish().await, webpolicy::authorize(&web, &url, &sealed.sent)) {
+                    (Ok((response, stored)), Ok(node)) => {
                         let is_final = !response.followable;
                         let next_url = response.followable.then(|| response.location.clone()).flatten();
                         let hop = WebHop {
@@ -3087,8 +3086,8 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
                         let _ = tokio::time::timeout(Duration::from_secs(10), conn.done(Some(&frame))).await;
                         return Ok(());
                     }
-                    Err(e) => {
-                        println!("verifier: job {job_id} web hop {index} body storage failed: {}", loggable(&e));
+                    (Err(e), _) | (_, Err(e)) => {
+                        println!("verifier: job {job_id} web hop {index} could not be recorded: {}", loggable(&e));
                         (Failure::ProofRejected.reason(), None)
                     }
                 },
