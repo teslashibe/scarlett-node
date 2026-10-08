@@ -17,8 +17,21 @@ type LeaseAcceptance struct {
 	Lease            Lease  `json:"lease"`
 }
 
-// MaxOfferLifetime bounds the unchanged community offer accepted by a node.
-const MaxOfferLifetime = 120 * time.Second
+// MaxOfferLifetime bounds the unchanged community offer accepted by a node
+// for codex and x_read; MaxWebOfferLifetime bounds a web offer, whose job may
+// run 298 s so that a large page fits a slow uplink.
+const (
+	MaxOfferLifetime    = 120 * time.Second
+	MaxWebOfferLifetime = 300 * time.Second
+)
+
+// OfferLifetime is the longest lease a node accepts for service.
+func OfferLifetime(service string) time.Duration {
+	if service == "web" {
+		return MaxWebOfferLifetime
+	}
+	return MaxOfferLifetime
+}
 
 // acceptRetries is how many more times Accept sends the same acceptance after
 // a 503 dispatch_busy or network_unavailable. Both are transient, acceptance
@@ -52,8 +65,8 @@ func acceptRetryAfter(err error) (time.Duration, bool) {
 }
 
 // OfferClockSkew is how far this node's clock may run behind the
-// coordinator's before a fresh offer looks longer than MaxOfferLifetime. The
-// coordinator stamps deadlines up to MaxOfferLifetime ahead of its own clock
+// coordinator's before a fresh offer looks longer than its OfferLifetime. The
+// coordinator stamps deadlines up to that lifetime ahead of its own clock
 // and delivers them within milliseconds, so without a margin a node even a
 // fraction of a second slow refuses most fresh offers (nodes lag by 0.4-0.8 s
 // in production). It loosens only this upper bound: expiry still uses the
@@ -70,7 +83,7 @@ func digest(value string) bool {
 // ValidOffer applies Accept's local checks to the unchanged offered terms. A
 // failure here means acceptance HTTP is never sent for the offer.
 func ValidOffer(offer Lease, now time.Time) error {
-	if !offer.AcceptanceRequired || offer.Version != Version || offer.VerifierToken != "" || !digest(offer.RequestSHA256) || !digest(offer.SignedJobID) || (offer.ServiceType != "codex" && offer.ServiceType != "x_read" && offer.ServiceType != "web") || !offer.LeaseDeadline.After(now) || offer.LeaseDeadline.After(now.Add(MaxOfferLifetime+OfferClockSkew)) || !offer.SettlementDeadline.Equal(offer.LeaseDeadline) {
+	if !offer.AcceptanceRequired || offer.Version != Version || offer.VerifierToken != "" || !digest(offer.RequestSHA256) || !digest(offer.SignedJobID) || (offer.ServiceType != "codex" && offer.ServiceType != "x_read" && offer.ServiceType != "web") || !offer.LeaseDeadline.After(now) || offer.LeaseDeadline.After(now.Add(OfferLifetime(offer.ServiceType)+OfferClockSkew)) || !offer.SettlementDeadline.Equal(offer.LeaseDeadline) {
 		return errors.New("invalid community offer")
 	}
 	// The pre-warm hint belongs to relay web offers only.
