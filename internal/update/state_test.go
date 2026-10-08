@@ -1,9 +1,11 @@
 package update
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -21,7 +23,9 @@ func TestStateRoundTripsAndRefusesUnknownFields(t *testing.T) {
 		t.Fatal("missing state is not a fresh one")
 	}
 	_, err = f.Update(func(s *State) error {
-		s.Pending = &Pending{Phase: PhaseStaged, From: "0.1.13", To: "0.1.14", Kind: "mac-app", Staged: "/tmp/x/Scarlett Node.app", App: "/Applications/Scarlett Node.app", DrainOwner: "none", StartedAt: time.Now().Unix()}
+		// Native absolute paths: the state file refuses anything else.
+		s.Pending = &Pending{Phase: PhaseStaged, From: "0.1.13", To: "0.1.14", Kind: "mac-app", Staged: filepath.Join(dir, "updates", "stage-0.1.14-x", "Scarlett Node.app"),
+			App: filepath.Join(dir, "Applications", "Scarlett Node.app"), DrainOwner: "none", StartedAt: time.Now().Unix()}
 		s.MarkFailed("0.1.12")
 		s.MarkFailed("0.1.12")
 		return nil
@@ -70,16 +74,33 @@ func TestRolloutOffsetIsStableAndInsideTheWindow(t *testing.T) {
 	}
 }
 
-// The desktop shell (updater.rs) round-trips this exact document; both sides
-// must accept it.
+// The desktop shell (updater.rs) round-trips these exact documents; both sides
+// must accept them. A state file never leaves its platform, and its paths are
+// checked as native absolute paths, so each desktop platform reads its own
+// document and refuses the other's.
 func TestStateMatchesTheDesktopShellSchema(t *testing.T) {
-	raw := `{"schema":1,"installed":"0.1.13","high_water":"0.1.13","announced":"0.1.13","snooze":{"version":"0.1.14","until":1791480419},"first_seen":{"version":"0.1.14","at":1791480000},"postponed":2,"failed":["0.1.12"],"pending":{"phase":"staged","from":"0.1.13","to":"0.1.14","kind":"mac-app","staged":"/x/Scarlett Node.app","app":"/Applications/Scarlett Node.app","drain_owner":"none","resume_serving":true,"app_pid":42,"started_at":1791480419}}`
-	s, err := DecodeState([]byte(raw))
+	own, other := "desktop-state-mac-app.json", "desktop-state-nsis.json"
+	if runtime.GOOS == "windows" {
+		own, other = other, own
+	}
+	raw, err := os.ReadFile(filepath.Join("testdata", own))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = bytes.TrimSpace(raw)
+	s, err := DecodeState(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
 	out, _ := json.Marshal(s)
-	if string(out) != raw {
+	if string(out) != string(raw) {
 		t.Fatalf("round trip changed the document:\n%s", out)
+	}
+	foreign, err := os.ReadFile(filepath.Join("testdata", other))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = DecodeState(bytes.TrimSpace(foreign)); err == nil {
+		t.Fatalf("%s accepted on %s", other, runtime.GOOS)
 	}
 }

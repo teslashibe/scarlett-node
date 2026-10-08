@@ -1336,11 +1336,17 @@ mod tests {
 
     #[test]
     fn state_round_trips_the_go_schema_and_drops_nothing_it_knows() {
-        let raw = r#"{"schema":1,"installed":"0.1.13","high_water":"0.1.13","announced":"0.1.13","snooze":{"version":"0.1.14","until":1791480419},"first_seen":{"version":"0.1.14","at":1791480000},"postponed":2,"failed":["0.1.12"],"pending":{"phase":"staged","from":"0.1.13","to":"0.1.14","kind":"mac-app","staged":"/x/Scarlett Node.app","app":"/Applications/Scarlett Node.app","drain_owner":"none","resume_serving":true,"app_pid":42,"started_at":1791480419}}"#;
-        let state: State = serde_json::from_str(raw).unwrap();
-        assert_eq!(state.pending.as_ref().unwrap().to, "0.1.14");
-        let back: serde_json::Value = serde_json::to_value(&state).unwrap();
-        assert_eq!(back, serde_json::from_str::<serde_json::Value>(raw).unwrap());
+        // The Go side (update.TestStateMatchesTheDesktopShellSchema) decodes
+        // the same documents, each on its own platform.
+        for raw in [
+            include_str!("../../../internal/update/testdata/desktop-state-mac-app.json"),
+            include_str!("../../../internal/update/testdata/desktop-state-nsis.json"),
+        ] {
+            let state: State = serde_json::from_str(raw).unwrap();
+            assert_eq!(state.pending.as_ref().unwrap().to, "0.1.14");
+            let back: serde_json::Value = serde_json::to_value(&state).unwrap();
+            assert_eq!(back, serde_json::from_str::<serde_json::Value>(raw).unwrap());
+        }
         let empty: State = serde_json::from_str(r#"{"schema":1}"#).unwrap();
         assert_eq!(serde_json::to_string(&empty).unwrap(), r#"{"schema":1}"#);
     }

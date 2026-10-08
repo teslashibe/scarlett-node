@@ -3,10 +3,17 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
 func TestInstalledBinDirFollowsOnlyThisLayoutsCommandLink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		// install.sh layouts exist only on Linux and macOS: on Windows
+		// update.DetectLayout refuses before installedBinDir is consulted, and
+		// an extensionless "scarlett-node" is never found through PATHEXT.
+		t.Skip("headless install.sh layouts are not installed on Windows")
+	}
 	base := t.TempDir()
 	root := filepath.Join(base, "lib")
 	custom := filepath.Join(base, "custom bin")
