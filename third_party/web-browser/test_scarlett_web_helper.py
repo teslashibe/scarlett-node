@@ -10,7 +10,10 @@ import asyncio
 import json
 import logging
 import os
+import re
+import stat
 import sys
+import tempfile
 import time
 import unittest
 
@@ -32,7 +35,11 @@ def run(coro):
 
 class OptionSetTests(unittest.TestCase):
     def setUp(self):
-        self.session = helper.new_session(sys.executable, UA, "http://127.0.0.1:1111", "http://127.0.0.1:2222", 3)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.profile = os.path.join(tmp.name, helper.PROFILE_PREFIX + "x")
+        helper.seed_profile(self.profile)
+        self.session = helper.new_session(sys.executable, UA, "http://127.0.0.1:1111", "http://127.0.0.1:2222", 3, self.profile)
         self.args = self.session._browser_options["args"]
 
     def test_feature_switches_are_one_merged_pair(self):
@@ -56,18 +63,59 @@ class OptionSetTests(unittest.TestCase):
         # Fake devices, never a fake prompt that grants them.
         self.assertNotIn("--use-fake-ui-for-media-stream", self.args)
         self.assertNotIn("--force-webrtc-ip-handling-policy", self.args)
+        for arg in helper.FILTERED_ARGS:
+            self.assertNotIn(arg, self.args)
 
     def test_launch_options(self):
         options = self.session._browser_options
-        self.assertEqual(options["ignore_default_args"], helper.IGNORE_DEFAULT_ARGS)
-        self.assertIn(helper.PW_DISABLE, options["ignore_default_args"])
-        self.assertIn("--enable-features=CDPScreenshotNewSurface", options["ignore_default_args"])
-        self.assertNotIn("--disable-component-update", options["ignore_default_args"])
+        # The helper passes the whole argv: Patchright's defaults first, the
+        # seeded profile and the pipe last, and nothing of Patchright's own.
+        self.assertIs(options["ignore_default_args"], True)
+        head = helper.PW_SWITCHES + helper.PW_HEADLESS + ["--proxy-server=http://127.0.0.1:2222", "--proxy-bypass-list=<-loopback>"]
+        self.assertEqual(self.args[:len(head)], head)
+        self.assertEqual(self.args[-3:], ["--user-data-dir=" + self.profile, "--remote-debugging-pipe", "--no-startup-window"])
+        self.assertEqual(len([a for a in self.args if "user-data-dir" in a]), 1)
+        self.assertNotIn("--disable-features=" + ",".join(helper.PW_DISABLED), self.args)
+        self.assertNotIn("--enable-features=CDPScreenshotNewSurface", self.args)
         self.assertEqual(options["proxy"], {"server": "http://127.0.0.1:2222"})
         self.assertIs(options["chromium_sandbox"], True)
+        self.assertIs(options["headless"], True)
         self.assertEqual(options["executable_path"], sys.executable)
         self.assertFalse(self.session._config.extra_flags)
         self.assertEqual(helper.option_problems(self.session, 3), [])
+
+    def test_patchright_defaults_match(self):
+        """PW_SWITCHES and PW_HEADLESS are what the shipped Patchright driver
+        builds for a headless launch, and the driver still ends a non-persistent
+        argv with the profile, the pipe and --no-startup-window."""
+        import patchright
+        bundle = os.path.join(os.path.dirname(patchright.__file__), "driver", "package", "lib", "coreBundle.js")
+        with open(bundle, encoding="utf-8") as f:
+            text = f.read()
+        start = text.index("chromiumSwitches = (options) => [")
+        body = text[start:text.index("].filter(Boolean)", start)].splitlines()[1:]
+        switches = []
+        for line in body:
+            line = line.split("//")[0].strip().rstrip(",")
+            if not line or line == '"--disable-features=" + disabledFeatures.join(",")':
+                continue
+            m = re.fullmatch(r'"([^"]+)"', line) or re.fullmatch(r'[\w.?]+ \? "" : "([^"]+)"', line)
+            self.assertIsNotNone(m, line)
+            if m.group(1) != "--enable-features=CDPScreenshotNewSurface":
+                switches.append(m.group(1))
+        self.assertEqual(switches, helper.PW_SWITCHES)
+        disabled = text[text.rindex("disabledFeatures = [", 0, start):start]
+        self.assertEqual(re.findall(r'^\s*"(\w+)"', disabled, re.M), helper.PW_DISABLED)
+        launcher = text.index("const chromeArguments = [...chromiumSwitches()];")
+        headless = text[launcher:text.index("if (options.chromiumSandbox !== true)", launcher)]
+        self.assertEqual(re.findall(r'"(--[^"]+)"', headless), helper.PW_HEADLESS)
+        tail = re.sub(r"\s+", " ", text[text.rindex("async defaultArgs(options, isPersistent, userDataDir)", 0, launcher):launcher])
+        self.assertIn('chromeArguments.push(`--user-data-dir=${userDataDir}`); chromeArguments.push("--remote-debugging-pipe"); '
+                      'if (isPersistent) chromeArguments.push("about:blank"); else chromeArguments.push("--no-startup-window");', tail)
+        proxy = re.sub(r"\s+", " ", text[launcher:launcher + 2500])
+        self.assertIn("chromeArguments.push(`--proxy-server=${proxy.server}`);", proxy)
+        self.assertIn('if (options.socksProxyPort || shouldProxyLoopback(proxy.bypass)) proxyBypassRules.push("<-loopback>");', proxy)
+        self.assertIn("chromeArguments.push(...args); return chromeArguments;", proxy)
 
     def test_context_options(self):
         context = self.session._context_options
@@ -84,17 +132,122 @@ class OptionSetTests(unittest.TestCase):
 
     def test_problems_are_reported(self):
         self.session._browser_options["args"].append("--no-sandbox")
-        self.session._browser_options["ignore_default_args"].append("--disable-component-update")
+        self.session._browser_options["ignore_default_args"] = ["--enable-automation"]
         problems = helper.option_problems(self.session, 2)
         self.assertIn("forbidden-arg", problems)
         self.assertIn("ignore_default_args", problems)
         self.assertIn("max_pages", problems)
+        self.assertIn("profile", problems)  # the profile and the pipe are no longer last
+        self.session._browser_options["args"] = self.session._browser_options["args"][1:]
+        self.assertIn("driver-defaults", helper.option_problems(self.session, 3))
 
     def test_launch_reason(self):
         self.assertEqual(helper.launch_reason(Exception("chrome: error while loading shared libraries: libnss3.so")), "deps_missing")
         self.assertEqual(helper.launch_reason(Exception("Host system is missing dependencies to run browsers.")), "deps_missing")
         self.assertEqual(helper.launch_reason(Exception("[FATAL:zygote_host_impl_linux.cc(128)] No usable sandbox! If you are running on Ubuntu 23.10+")), "sandbox_unavailable")
         self.assertEqual(helper.launch_reason(Exception("Target closed; call log: chromium_sandbox=true --no-first-run")), "launch_failed")
+
+
+class ProfileTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+        self.profile = os.path.join(tmp.name, "p")
+
+    def test_seeded_preferences(self):
+        helper.seed_profile(self.profile)
+        with open(os.path.join(self.profile, "Default", "Preferences"), encoding="utf-8") as f:
+            prefs = json.load(f)
+        handlers = prefs["custom_handlers"]["registered_protocol_handlers"]
+        self.assertIs(prefs["custom_handlers"]["enabled"], True)
+        self.assertEqual(sorted(h["protocol"] for h in handlers), ["mailto", "news"])
+        for h in handlers:
+            # https on a reserved .invalid host: the egress proxy refuses it
+            # before any lookup; usable in the off-the-record job contexts.
+            self.assertEqual(h["url"], "https://scarlett-blocked.invalid/?u=%s")
+            self.assertIs(h["default"], True)
+            self.assertIs(h["is_allowed_in_incognito"], True)
+            self.assertNotIn("security_level", h)  # the strict HTML level
+        # Chrome's always-allowed external schemes never leave the browser.
+        self.assertEqual(prefs["policy"], {"url_blocklist": ["mailto:*", "news:*", "snews:*"]})
+        self.assertEqual(prefs["profile"]["default_content_setting_values"],
+                         {"bluetooth_guard": 2, "hid_guard": 2, "serial_guard": 2, "usb_guard": 2})
+        self.assertIs(prefs["hardware"]["screen_capture_enabled"], False)
+        self.assertEqual(os.listdir(self.profile), ["Default"])
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.profile, "Default")).st_mode) & 0o077, 0)
+        self.assertEqual(helper.profile_problems(self.profile), [])
+
+    def test_seed_needs_a_new_directory_and_problems_are_reported(self):
+        helper.seed_profile(self.profile)
+        with self.assertRaises(FileExistsError):
+            helper.seed_profile(self.profile)
+        with open(os.path.join(self.profile, "Default", "Preferences"), "w", encoding="utf-8") as f:
+            json.dump({"custom_handlers": {"enabled": False}}, f)
+        self.assertEqual(helper.profile_problems(self.profile), ["profile-prefs"])
+        self.assertEqual(helper.profile_problems(os.path.join(self.root, "missing")), ["profile-prefs"])
+
+    def test_serve_removes_the_profile_when_the_browser_cannot_start(self):
+        class NoBrowser:
+            async def start(self):
+                raise Exception("Target closed; call log: chromium_sandbox=true")
+        saved = (helper.new_session, os.environ.copy(), os.dup(1), tempfile.tempdir)
+        seen = []
+
+        def fake_session(executable, ua, proxy, deny, capacity, profile):
+            seen.append((profile, helper.profile_problems(profile)))
+            return NoBrowser()
+        try:
+            helper.new_session = fake_session
+            tempfile.tempdir = self.root
+            os.environ.update({"WEB_HELPER_BEARER": "ab" * 32, "WEB_MAX_PAGES": "1", "WEB_BROWSER_EXECUTABLE": sys.executable,
+                               "WEB_USER_AGENT": UA, "WEB_EGRESS_PROXY": "http://127.0.0.1:1", "WEB_DENY_PROXY": "http://127.0.0.1:2"})
+            with self.assertRaises(helper.LaunchError):
+                run(helper.serve())
+        finally:
+            helper.new_session, env, stdout, tempfile.tempdir = saved
+            os.dup2(stdout, 1)
+            os.close(stdout)
+            os.environ.clear()
+            os.environ.update(env)
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(os.path.basename(seen[0][0]).startswith(helper.PROFILE_PREFIX))
+        self.assertEqual(seen[0][1], [])
+        self.assertEqual(os.listdir(self.root), [])
+
+
+class RedirectGuardTests(unittest.TestCase):
+    def event(self, status, location=None, url="https://example.com/a/b"):
+        headers = [{"name": "Content-Type", "value": "text/html"}]
+        if location is not None:
+            headers.append({"name": "Location", "value": location})
+        return {"requestId": "r1", "request": {"url": url}, "responseStatusCode": status, "responseHeaders": headers}
+
+    def test_only_non_http_redirect_targets_are_refused(self):
+        for location in ("mailto:a@example.com", "  MAILTO:a@example.com", "news:x", "facetime:+15555550100", "tel:1",
+                         "itms-apps://apps.apple.com/app/id0", "intent://x#Intent;scheme=y;end", "javascript:alert(1)",
+                         "data:text/html,x", "file:///etc/passwd", "chrome://settings", "zoommtg://x", "x-apple.systempreferences:",
+                         # Chrome drops tabs and newlines anywhere and C0 controls at the ends.
+                         "mail\tto:a@example.com", "mailto\n:a@example.com", "\x01mailto:a@example.com", "ma\rilto:x"):
+            self.assertTrue(helper.refused_redirect(self.event(302, location)), location)
+        for location in ("/next", "next", "//other.example/x", "https://other.example/", "HTTP://other.example/", "?q=1", ""):
+            self.assertFalse(helper.refused_redirect(self.event(301, location)), location)
+        self.assertFalse(helper.refused_redirect(self.event(200, "mailto:a@example.com")))
+        self.assertFalse(helper.refused_redirect(self.event(302)))
+        self.assertTrue(helper.refused_redirect(self.event(307, "mailto:x", url="http://example.com/")))
+
+    def test_guard_fails_refused_redirects_and_continues_the_rest(self):
+        async def go():
+            page = FakePage("<html></html>")
+            await helper.guard_redirects(page)
+            cdp = page.context.cdp
+            self.assertEqual(cdp.sent[0], ("Fetch.enable", {"patterns": [{"urlPattern": "*", "resourceType": "Document", "requestStage": "Response"}]}))
+            for ev in (self.event(302, "mailto:x"), self.event(302, "/ok"), self.event(200)):
+                cdp.emit("Fetch.requestPaused", ev)
+            await asyncio.sleep(0.01)
+            return cdp.sent[1:]
+        self.assertEqual(run(go()), [("Fetch.failRequest", {"requestId": "r1", "errorReason": "BlockedByClient"}),
+                                     ("Fetch.continueResponse", {"requestId": "r1"}), ("Fetch.continueResponse", {"requestId": "r1"})])
 
 
 class CapTests(unittest.TestCase):
@@ -155,12 +308,32 @@ class FakeResponse:
         return [{"name": k, "value": v} for k, v in self._headers]
 
 
+class FakeCDP:
+    def __init__(self):
+        self.sent, self.handlers = [], {}
+
+    def on(self, event, handler):
+        self.handlers[event] = handler
+
+    def emit(self, event, params):
+        self.handlers[event](params)
+
+    async def send(self, method, params=None):
+        self.sent.append((method, params))
+        return {}
+
+
 class FakeContext:
     def __init__(self, page):
         self.page = page
+        self.cdp = None
 
     async def cookies(self):
         return list(self.page.cookie_jar)
+
+    async def new_cdp_session(self, page):
+        self.cdp = FakeCDP()
+        return self.cdp
 
 
 class FakeFrame:
@@ -274,6 +447,8 @@ class FetchTests(unittest.TestCase):
         self.assertIs(kwargs["solve_cloudflare"], False)
         self.assertIs(kwargs["google_search"], False)
         self.assertNotIn("extra_flags", kwargs)
+        # The redirect guard is on before the page navigates.
+        self.assertEqual(page.context.cdp.sent[0][0], "Fetch.enable")
 
     def test_solver_never_runs_on_a_solved_page(self):
         page = FakePage(SOLVED)

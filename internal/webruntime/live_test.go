@@ -118,16 +118,41 @@ func TestLive(t *testing.T) {
 })();
 </script></body>`, servers)
 	})
+	// External protocols without a gesture: mailto: (which Chrome 155 hands
+	// to the OS mail client without asking) and news: by frame, by frame
+	// location and by a frame's 3xx. Handed to the OS, a frame stays on its
+	// same-origin about:blank; kept in the browser (the seeded URL blocklist,
+	// then the seeded handlers, and the redirect guard for the 3xx) it shows
+	// a cross-origin error page, so its contentDocument is null.
+	mux.HandleFunc("/to-mailto", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "mailto:scarlett-live-redirect@example.invalid")
+		w.WriteHeader(http.StatusFound)
+	})
+	mux.HandleFunc("/external", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<!doctype html><body><script>
+const frames = [];
+const frame = () => { const f = document.createElement('iframe'); document.body.appendChild(f); frames.push(f); return f; };
+for (const src of ['mailto:scarlett-live@example.invalid', 'news:scarlett-live', '/to-mailto']) frame().src = src;
+frame().contentWindow.location = 'mailto:scarlett-live-location@example.invalid';
+setTimeout(() => {
+  const el = document.createElement('div'); el.id = 'done'; el.textContent = String(frames.filter(f => f.contentDocument === null).length);
+  document.body.appendChild(el);
+}, 2500);
+</script></body>`)
+	})
 	// A page that looks like a managed Cloudflare interstitial, so the
 	// solver clicks it; the click handler calls APIs that need a user
-	// gesture. None may reach the operator's clipboard or open anything.
+	// gesture. None may reach the operator's clipboard, a device, the
+	// screen or an app: the device choosers and screen capture fail at
+	// once, as a cancelled chooser does, and the browser does not crash.
 	mux.HandleFunc("/activate", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `<!doctype html><html><head><title>Just a moment...</title></head><body>
 <script id="marker">window._cf_chl_opt={cType: 'managed'};</script>
 <div class="main-content"><p>Checking</p><div><div><div style="width:300px;height:65px;background:#eee"></div></div></div></div>
 <script>
 const out = {};
-const settle = (k, p) => Promise.resolve().then(p).then(v => { out[k] = 'resolved' }, e => { out[k] = 'refused ' + (e && e.name) });
+const settle = (k, p) => Promise.resolve().then(p).then(v => { out[k] = 'resolved' + (Array.isArray(v) ? ' ' + v.length : '') },
+  e => { out[k] = 'refused ' + (e && e.name) });
 document.addEventListener('click', async () => {
   out.activation = navigator.userActivation.isActive;
   const t = document.createElement('textarea'); t.value = 'scarlett-live-exec-copy'; document.body.appendChild(t); t.select();
@@ -136,7 +161,15 @@ document.addEventListener('click', async () => {
     settle('clipboard_write', () => navigator.clipboard.writeText('scarlett-live-clipboard')),
     settle('clipboard_read', () => navigator.clipboard.readText()),
     settle('picker', () => window.showOpenFilePicker()),
-  ]), new Promise(r => setTimeout(r, 3000))]);
+    settle('bluetooth', () => navigator.bluetooth.requestDevice({acceptAllDevices: true})),
+    settle('hid', () => navigator.hid.requestDevice({filters: []})),
+    settle('usb', () => navigator.usb.requestDevice({filters: []})),
+    settle('serial', () => navigator.serial.requestPort()),
+    settle('display', () => navigator.mediaDevices.getDisplayMedia({video: true})),
+  ]), new Promise(r => setTimeout(r, 5000))]);
+  const a = document.createElement('a'); a.href = 'mailto:scarlett-live-click@example.invalid'; a.target = 'mailframe';
+  const mf = document.createElement('iframe'); mf.name = 'mailframe'; document.body.appendChild(mf); document.body.appendChild(a); a.click();
+  out.mail_window = window.open('mailto:scarlett-live-open@example.invalid') ? 'opened' : 'blocked';
   out.popup = window.open('/cookies') ? 'opened' : 'blocked';
   document.getElementById('marker').remove(); document.title = 'done';
   const el = document.createElement('div'); el.id = 'done'; el.textContent = JSON.stringify(out); document.body.appendChild(el);
@@ -254,8 +287,21 @@ document.addEventListener('click', async () => {
 		t.Fatal("LAN names never reached the proxy's name check")
 	}
 
+	// External protocols open nothing: no handler app starts, every frame
+	// navigation stays in the browser, a 3xx to mailto: fails the page.
+	apps := handlerApps(t)
+	if res = fetch(loopback+"/external", "load", "#done"); res.Outcome != "ok" || between(res.HTML, `<div id="done">`, `</div>`) != "4" {
+		t.Fatalf("external-protocol page: outcome %s, frames kept in the browser %q of 4", res.Outcome, between(res.HTML, `<div id="done">`, `</div>`))
+	}
+	if res = fetch(loopback+"/to-mailto", "load", ""); res.Outcome == "ok" || res.HTML != "" {
+		t.Fatalf("a document redirect to mailto: was followed: outcome %s", res.Outcome)
+	}
+
 	// A clicked page gets activation and still reaches nothing outside the
 	// browser: the operator's clipboard is unchanged (compared by hash only).
+	m.mu.Lock()
+	warm := m.helper
+	m.mu.Unlock()
 	clipBefore := clipboardHash(t)
 	res = fetch(loopback+"/activate", "load", "#done")
 	var act struct {
@@ -264,6 +310,11 @@ document.addEventListener('click', async () => {
 		ClipboardWrite string `json:"clipboard_write"`
 		ClipboardRead  string `json:"clipboard_read"`
 		Picker         string `json:"picker"`
+		Bluetooth      string `json:"bluetooth"`
+		HID            string `json:"hid"`
+		USB            string `json:"usb"`
+		Serial         string `json:"serial"`
+		Display        string `json:"display"`
 	}
 	if err := json.Unmarshal([]byte(between(res.HTML, `<div id="done">`, `</div>`)), &act); err != nil || !act.Activation {
 		t.Fatalf("the solver did not click the interstitial-shaped page: %v %+v", err, act)
@@ -271,9 +322,22 @@ document.addEventListener('click', async () => {
 	if !strings.HasPrefix(act.ClipboardWrite, "refused") || !strings.HasPrefix(act.ClipboardRead, "refused") || !strings.HasPrefix(act.Picker, "refused") {
 		t.Fatalf("a gesture-gated API was granted: %+v", act)
 	}
+	// What a cancelled chooser returns: NotFoundError, an empty HID list,
+	// NotAllowedError for screen capture.
+	if act.Bluetooth != "refused NotFoundError" || act.HID != "resolved 0" || act.USB != "refused NotFoundError" ||
+		act.Serial != "refused NotFoundError" || act.Display != "refused NotAllowedError" {
+		t.Fatalf("a device chooser or screen capture did not fail at once: %+v", act)
+	}
 	if clipBefore != clipboardHash(t) {
 		t.Fatal("a clicked page changed the operator's clipboard")
 	}
+	m.mu.Lock()
+	same := m.helper == warm
+	m.mu.Unlock()
+	if !same {
+		t.Fatal("the browser did not survive the clicked page")
+	}
+	checkNoHandlerApp(t, apps)
 
 	// A page that never goes idle returns within load plus the 3 s cap.
 	start := time.Now()
@@ -443,6 +507,46 @@ func checkArgv(t *testing.T, m *Manager, h *helper, tree []procInfo) {
 	for _, a := range argv {
 		if a == "--no-sandbox" || a == "--force-webrtc-ip-handling-policy" || a == "--use-fake-ui-for-media-stream" {
 			t.Fatalf("live argv has %s", a)
+		}
+	}
+	// The browser runs on the profile the helper seeded, under node state.
+	var profiles []string
+	for _, a := range argv {
+		if strings.Contains(a, "user-data-dir") {
+			profiles = append(profiles, a)
+		}
+	}
+	prefix := "--user-data-dir=" + filepath.Join(m.cfg.StateDir, "web-browser", "tmp", "scarlett-profile-")
+	if len(profiles) != 1 || !strings.HasPrefix(profiles[0], prefix) || !slices.Equal(argv[len(argv)-3:], []string{profiles[0], "--remote-debugging-pipe", "--no-startup-window"}) {
+		t.Fatalf("browser profile not the seeded one: %v", profiles)
+	}
+	raw, err := os.ReadFile(filepath.Join(strings.TrimPrefix(profiles[0], "--user-data-dir="), "Default", "Preferences"))
+	var prefs struct {
+		CustomHandlers struct {
+			Enabled    bool `json:"enabled"`
+			Registered []struct {
+				Protocol  string `json:"protocol"`
+				URL       string `json:"url"`
+				Incognito bool   `json:"is_allowed_in_incognito"`
+			} `json:"registered_protocol_handlers"`
+		} `json:"custom_handlers"`
+		Policy struct {
+			URLBlocklist []string `json:"url_blocklist"`
+		} `json:"policy"`
+	}
+	if err != nil || json.Unmarshal(raw, &prefs) != nil || !prefs.CustomHandlers.Enabled {
+		t.Fatalf("seeded profile preferences unreadable: %v", err)
+	}
+	handled := map[string]bool{}
+	for _, h := range prefs.CustomHandlers.Registered {
+		handled[h.Protocol] = h.URL == "https://scarlett-blocked.invalid/?u=%s" && h.Incognito
+	}
+	if !handled["mailto"] || !handled["news"] {
+		t.Fatalf("seeded protocol handlers missing: %+v", prefs.CustomHandlers.Registered)
+	}
+	for _, scheme := range []string{"mailto:*", "news:*", "snews:*"} {
+		if !slices.Contains(prefs.Policy.URLBlocklist, scheme) {
+			t.Fatalf("seeded URL blocklist lacks %s: %v", scheme, prefs.Policy.URLBlocklist)
 		}
 	}
 }

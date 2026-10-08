@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -246,5 +247,45 @@ func checkUnregistered(t *testing.T, state string) {
 	}
 	if n := strings.Count(string(out), filepath.Join(state, "web-browser-bin")); n != 0 {
 		t.Fatalf("%d LaunchServices records of the node's browser remain after the stop", n)
+	}
+}
+
+// handlerApps, on macOS: for each external scheme the fixture pages try,
+// the app LaunchServices would open and the process IDs it has now. A
+// launch shows up as a new process ID (checkNoHandlerApp).
+func handlerApps(t *testing.T) map[string][]string {
+	t.Helper()
+	if runtimeGOOS() != "darwin" {
+		return nil
+	}
+	script := `ObjC.import('AppKit');var o={};['mailto:x@example.invalid','news:x'].forEach(function(u){` +
+		`var a=$.NSWorkspace.sharedWorkspace.URLForApplicationToOpenURL($.NSURL.URLWithString(u));` +
+		`if(a&&!a.isNil())o[u.split(':')[0]]=a.path.js});JSON.stringify(o)`
+	raw, err := exec.Command("/usr/bin/osascript", "-l", "JavaScript", "-e", script).Output()
+	var bundles map[string]string
+	if err != nil || json.Unmarshal(raw, &bundles) != nil {
+		t.Fatalf("default handler apps unreadable: %v", err)
+	}
+	apps := map[string][]string{}
+	for _, bundle := range bundles {
+		apps[bundle] = appPIDs(bundle)
+	}
+	t.Logf("handler apps watched: %d", len(apps))
+	return apps
+}
+
+func appPIDs(bundle string) []string {
+	out, _ := exec.Command("/usr/bin/pgrep", "-f", "--", filepath.Join(bundle, "Contents", "MacOS")+"/").Output()
+	return strings.Fields(string(out))
+}
+
+func checkNoHandlerApp(t *testing.T, apps map[string][]string) {
+	t.Helper()
+	for bundle, before := range apps {
+		for _, pid := range appPIDs(bundle) {
+			if !slices.Contains(before, pid) {
+				t.Fatalf("a fixture page opened %s (pid %s); quit it without saving", filepath.Base(bundle), pid)
+			}
+		}
 	}
 }

@@ -18,10 +18,12 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
+import tempfile
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 SCRAPLING_VERSION = "0.4.15"
 PORT_PREFIX = "SCARLETT_WEB_HELPER_PORT="
@@ -34,16 +36,35 @@ MAX_HEADER_BYTES = 65536
 MAX_SET_COOKIE_NAMES = 50
 MAX_REDIRECTS = 20
 
-# Patchright 1.63.0 chromiumSwitches, in order. Patchright appends these two
-# switches itself; they are replaced by one merged pair (ignore_default_args).
+# Patchright 1.63.0 disabledFeatures, in order. The helper replaces Patchright's
+# feature pair with one merged pair (DISABLED, ENABLED below).
 PW_DISABLED = [
     "AvoidUnnecessaryBeforeUnloadCheckSync", "DestroyProfileOnBrowserClose", "DialMediaRouteProvider",
     "GlobalMediaControls", "HttpsUpgrades", "LensOverlay", "MediaRouter", "PaintHolding", "ThirdPartyStoragePartitioning",
     "BlockOriginHeaderModificationOnRedirect", "Translate", "AutoDeElevate", "OptimizationHints", "msForceBrowserSignIn",
     "msEdgeUpdateLaunchServicesPreferredVersion",
 ]
-PW_DISABLE = "--disable-features=" + ",".join(PW_DISABLED)
-PW_ENABLE = "--enable-features=CDPScreenshotNewSurface"
+# The rest of Patchright 1.63.0's default argv for a headless launch, in its
+# order: chromiumSwitches without the feature pair, then the headless switches.
+# The helper passes the whole argv itself (ignore_default_args=True) because
+# Patchright only takes a profile directory in persistent mode, and the
+# browser must start on a profile the helper created and seeded (PROFILE_PREFS).
+# With the profile path aside, the argv is byte for byte what Patchright built;
+# test_patchright_defaults_match pins these lists to the shipped driver.
+PW_SWITCHES = [
+    "--disable-field-trial-config", "--disable-background-networking", "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows", "--disable-breakpad", "--no-default-browser-check", "--disable-dev-shm-usage",
+    "--disable-edgeupdater", "--disable-hang-monitor", "--disable-prompt-on-repost", "--disable-renderer-backgrounding",
+    "--disable-updater-scheduler", "--force-color-profile=srgb", "--no-first-run", "--password-store=basic",
+    "--use-mock-keychain", "--no-service-autorun", "--export-tagged-pdf", "--disable-search-engine-choice-screen",
+    "--edge-skip-compat-layer-relaunch", "--disable-infobars", "--disable-search-engine-choice-screen", "--disable-sync",
+    "--disable-blink-features=AutomationControlled",
+]
+PW_HEADLESS = ["--headless", "--hide-scrollbars", "--mute-audio",
+               "--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4"]
+# Scrapling's HARMFUL_ARGS without --disable-component-update (which we pass):
+# Patchright used to drop these from the argv; the helper still does.
+FILTERED_ARGS = ["--enable-automation", "--disable-popup-blocking", "--disable-default-apps", "--disable-extensions"]
 # Scrapling's three disabled features, then ours: no Cast, and no mDNS names
 # for local WebRTC candidates (mDNS is a macOS local network operation).
 DISABLED = PW_DISABLED + ["AudioServiceOutOfProcess", "TranslateUI", "BlinkGenPropertyTrees",
@@ -57,8 +78,41 @@ WEBRTC_POLICY = ["--webrtc-ip-handling-policy=disable_non_proxied_udp",
 # device request raised a macOS microphone prompt and hung the browser).
 EXTRA_ARGS = ["--deny-permission-prompts", "--disable-quic", "--disable-component-update",
               "--use-fake-device-for-media-stream"]
-IGNORE_DEFAULT_ARGS = ["--enable-automation", "--disable-popup-blocking", "--disable-default-apps",
-                       "--disable-extensions", PW_DISABLE, PW_ENABLE]
+PIPE_ARGS = ["--remote-debugging-pipe", "--no-startup-window"]
+
+# The browser profile's only file before launch (<profile>/Default/Preferences).
+# Every job context is an off-the-record child of this profile and reads it.
+#  - URL blocklist for Chrome's always-allowed external schemes (mailto: is
+#    the one Chrome 155 still hands to the OS with no prompt and no gesture;
+#    news: and snews: were): a navigation to them fails as blocked before it
+#    reaches the external-protocol code. Every other scheme gets Chrome's
+#    dialog, which the hidden browser never shows.
+#  - Protocol handlers, the second layer for mailto: and news:: a registered
+#    handler takes precedence over the OS handler, so the link becomes an
+#    https navigation to a reserved .invalid host, which the egress proxy
+#    refuses before any lookup. Chrome for Testing never registers with the
+#    OS as a default handler, and the off-the-record contexts see only
+#    handlers marked for incognito.
+#  - Device choosers off (the "don't allow sites to ask" setting): Bluetooth,
+#    USB, HID and serial requests fail at once, before any scan. A scan made a
+#    macOS Bluetooth TCC request and crashed the browser (no usage string).
+#  - Screen capture off (the ScreenCaptureAllowed setting): getDisplayMedia
+#    fails before the picker, which made Screen Recording TCC requests.
+BLOCKED_HANDLER = "https://scarlett-blocked.invalid/?u=%s"
+HANDLED_SCHEMES = ("mailto", "news")
+BLOCKED_SCHEMES = ("mailto", "news", "snews")
+PROFILE_PREFS = {
+    "custom_handlers": {
+        "enabled": True,
+        "registered_protocol_handlers": [
+            {"protocol": scheme, "url": BLOCKED_HANDLER, "default": True, "is_allowed_in_incognito": True}
+            for scheme in HANDLED_SCHEMES],
+    },
+    "policy": {"url_blocklist": [scheme + ":*" for scheme in BLOCKED_SCHEMES]},
+    "profile": {"default_content_setting_values": {"bluetooth_guard": 2, "hid_guard": 2, "serial_guard": 2, "usb_guard": 2}},
+    "hardware": {"screen_capture_enabled": False},
+}
+PROFILE_PREFIX = "scarlett-profile-"
 
 # Cloudflare: the solver runs only on an interstitial, never because a solved
 # page still embeds the Turnstile api.js script.
@@ -71,6 +125,7 @@ KASADA_MARKERS = ("kpsdk", "/ips.js")
 DATADOME_MARKERS = ("captcha-delivery.com", "var dd={")
 TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9a-z-]{1,64}$")
 SELECTOR = re.compile(r"^[\x20-\x7e]{1,256}$")
+URL_STRIP = re.compile(r"[\t\n\r]")
 
 logging.getLogger("scrapling").disabled = True
 
@@ -93,17 +148,36 @@ def launch_reason(error):
     return "launch_failed"
 
 
-def browser_args(base):
-    """The launch argv: Scrapling's set with its feature switches replaced by
-    one merged pair, the WebRTC policy with its value, and ours."""
-    args = [a for a in base if not a.startswith(("--disable-features=", "--enable-features=",
-                                                  "--webrtc-ip-handling-policy", "--force-webrtc-ip-handling-policy"))]
-    return args + ["--disable-features=" + ",".join(DISABLED), "--enable-features=" + ",".join(ENABLED)] + \
-        WEBRTC_POLICY + EXTRA_ARGS
+def browser_args(base, deny_proxy, profile):
+    """The whole launch argv: Patchright's defaults, the deny proxy, Scrapling's
+    set with its feature switches replaced by one merged pair, the WebRTC
+    policy with its value, ours, then the seeded profile and the pipe."""
+    own = [a for a in base if not a.startswith(("--disable-features=", "--enable-features=",
+                                                 "--webrtc-ip-handling-policy", "--force-webrtc-ip-handling-policy"))
+           and a not in FILTERED_ARGS]
+    own += ["--disable-features=" + ",".join(DISABLED), "--enable-features=" + ",".join(ENABLED)] + WEBRTC_POLICY + EXTRA_ARGS
+    return PW_SWITCHES + PW_HEADLESS + ["--proxy-server=" + deny_proxy, "--proxy-bypass-list=<-loopback>"] + own + \
+        ["--user-data-dir=" + profile] + PIPE_ARGS
 
 
-def new_session(executable, user_agent, proxy, deny_proxy, max_pages):
-    """Builds the session exactly as contract C.6 says, without starting it."""
+def seed_profile(profile):
+    """Writes PROFILE_PREFS into a new, empty profile directory."""
+    os.makedirs(os.path.join(profile, "Default"), mode=0o700)
+    with open(os.path.join(profile, "Default", "Preferences"), "x", encoding="utf-8") as f:
+        json.dump(PROFILE_PREFS, f)
+
+
+def profile_problems(profile):
+    try:
+        with open(os.path.join(profile, "Default", "Preferences"), encoding="utf-8") as f:
+            return [] if json.load(f) == PROFILE_PREFS else ["profile-prefs"]
+    except (OSError, ValueError):
+        return ["profile-prefs"]
+
+
+def new_session(executable, user_agent, proxy, deny_proxy, max_pages, profile):
+    """Builds the session exactly as contract C.6 says, without starting it.
+    profile is the seeded profile directory the browser will use."""
     from scrapling.fetchers import AsyncStealthySession
     from scrapling.engines.toolbelt.proxy_rotation import ProxyRotator
 
@@ -119,10 +193,8 @@ def new_session(executable, user_agent, proxy, deny_proxy, max_pages):
     options = session._browser_options
     options["chromium_sandbox"] = True
     options["proxy"] = {"server": deny_proxy}
-    options["args"] = browser_args(options["args"])
-    # Patchright filters user args through this list too, so it must not
-    # name --disable-component-update.
-    options["ignore_default_args"] = list(IGNORE_DEFAULT_ARGS)
+    options["args"] = browser_args(options["args"], deny_proxy, profile)
+    options["ignore_default_args"] = True
     return session
 
 
@@ -145,13 +217,22 @@ def option_problems(session, capacity):
     for arg in WEBRTC_POLICY + EXTRA_ARGS + ["--disable-blink-features=AutomationControlled"]:
         if arg not in args:
             problems.append("missing:" + arg)
-    if any(a == "--no-sandbox" or a == "--force-webrtc-ip-handling-policy" for a in args):
+    if any(a == "--no-sandbox" or a == "--force-webrtc-ip-handling-policy" or a in FILTERED_ARGS or
+           a.startswith(("--remote-debugging-port", "--use-fake-ui-for-media-stream")) for a in args):
         problems.append("forbidden-arg")
-    if options.get("ignore_default_args") != IGNORE_DEFAULT_ARGS or "--disable-component-update" in options.get("ignore_default_args", []):
+    proxy = options.get("proxy") if isinstance(options.get("proxy"), dict) else {}
+    head = PW_SWITCHES + PW_HEADLESS + ["--proxy-server=" + str(proxy.get("server")), "--proxy-bypass-list=<-loopback>"]
+    if args[:len(head)] != head or options.get("headless") is not True:
+        problems.append("driver-defaults")
+    profiles = [a for a in args if "user-data-dir" in a]
+    if len(profiles) != 1 or args[-3:] != profiles + PIPE_ARGS or not profiles[0].startswith("--user-data-dir=") or \
+            not os.path.isabs(profiles[0][len("--user-data-dir="):]) or args.count("--remote-debugging-pipe") != 1:
+        problems.append("profile")
+    if options.get("ignore_default_args") is not True:
         problems.append("ignore_default_args")
     if options.get("chromium_sandbox") is not True:
         problems.append("sandbox")
-    if not isinstance(options.get("proxy"), dict) or not options["proxy"].get("server"):
+    if not proxy.get("server"):
         problems.append("deny-proxy")
     if session._config.extra_flags:
         problems.append("extra_flags")
@@ -179,9 +260,12 @@ def self_check():
     for name in ("_detect_cloudflare", "_cloudflare_solver"):
         assert callable(getattr(AsyncStealthySession, name, None)), "scrapling internal " + name
     # Any existing absolute file stands in for the browser; nothing starts.
-    session = new_session(sys.executable, "Mozilla/5.0", "http://127.0.0.1:9", "http://127.0.0.1:9", 2)
-    assert isinstance(getattr(session, "_browser_options", None), dict), "scrapling internal _browser_options"
-    problems = option_problems(session, 2)
+    with tempfile.TemporaryDirectory() as tmp:
+        profile = os.path.join(tmp, "profile")
+        seed_profile(profile)
+        session = new_session(sys.executable, "Mozilla/5.0", "http://127.0.0.1:9", "http://127.0.0.1:9", 2, profile)
+        assert isinstance(getattr(session, "_browser_options", None), dict), "scrapling internal _browser_options"
+        problems = option_problems(session, 2) + profile_problems(profile)
     assert not problems, "option set: " + ",".join(problems)
     report = {"self_check": "passed", "python": ".".join(map(str, sys.version_info[:3])), "scrapling": scrapling.__version__,
               "patchright": version("patchright"), "playwright": version("playwright"), "curl_cffi": curl_cffi.__version__,
@@ -320,6 +404,47 @@ async def settle_navigation(page, document, remaining):
             return
         if len(document.responses) == seen:
             return
+
+
+def refused_redirect(event):
+    """True for a paused document response that redirects to anything but
+    http(s): mailto:, facetime:, an app's own scheme and the like."""
+    status = event.get("responseStatusCode") or 0
+    if not 300 <= status < 400:
+        return False
+    location = next((h.get("value", "") for h in event.get("responseHeaders") or () if h.get("name", "").lower() == "location"), None)
+    if location is None:
+        return False
+    # As a URL parser does: tabs and newlines go anywhere, C0 controls and
+    # spaces at the ends.
+    location = URL_STRIP.sub("", location).strip("".join(map(chr, range(0x21))))
+    try:
+        target = urljoin(event.get("request", {}).get("url", ""), location)
+        return urlsplit(target).scheme.lower() not in ("http", "https")
+    except ValueError:
+        return True
+
+
+async def guard_redirects(page):
+    """Fails any document redirect whose Location is not http(s), so a 3xx
+    (which Chrome follows like a typed navigation, skipping its anti-flood
+    check) never hands the browser an external protocol. Covers the page's
+    target: the main frame and same-process frames; for cross-site frames,
+    pop-ups and service workers the seeded handlers and Chrome's own dialog
+    remain (PROFILE_PREFS)."""
+    cdp = await page.context.new_cdp_session(page)
+
+    async def paused(event):
+        try:
+            if refused_redirect(event):
+                await cdp.send("Fetch.failRequest", {"requestId": event["requestId"], "errorReason": "BlockedByClient"})
+            else:
+                await cdp.send("Fetch.continueResponse", {"requestId": event["requestId"]})
+        except Exception:
+            pass  # the page or context is gone
+
+    cdp.on("Fetch.requestPaused", lambda event: asyncio.ensure_future(paused(event)))
+    await cdp.send("Fetch.enable", {"patterns": [{"urlPattern": "*", "resourceType": "Document", "requestStage": "Response"}]})
 
 
 async def page_text(page):
@@ -502,6 +627,7 @@ class Fetcher:
 
         async def setup(page):
             marks["context"] = loop.time()
+            await guard_redirects(page)
             document = Document(page)
             state["document"] = document
             page.on("response", document.on_response)
@@ -720,12 +846,23 @@ async def serve():
     # writes to stdout (the driver, the browser) to stderr.
     report = os.fdopen(os.dup(1), "w", encoding="ascii")
     os.dup2(2, 1)
-    session = new_session(env["WEB_BROWSER_EXECUTABLE"], env["WEB_USER_AGENT"], env["WEB_EGRESS_PROXY"],
-                          env["WEB_DENY_PROXY"], capacity)
+    # The profile lives under TMPDIR, which the node wipes before every start.
+    profile = tempfile.mkdtemp(prefix=PROFILE_PREFIX)
     try:
-        await session.start()
-    except Exception as error:
-        raise LaunchError(launch_reason(error))
+        seed_profile(profile)
+        session = new_session(env["WEB_BROWSER_EXECUTABLE"], env["WEB_USER_AGENT"], env["WEB_EGRESS_PROXY"],
+                              env["WEB_DENY_PROXY"], capacity, profile)
+        try:
+            await session.start()
+        except Exception as error:
+            raise LaunchError(launch_reason(error))
+        await run_session(session, report, bearer, env, capacity)
+    finally:
+        report.close()  # if the browser never started: the node reads the marker after EOF
+        shutil.rmtree(profile, ignore_errors=True)
+
+
+async def run_session(session, report, bearer, env, capacity):
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
     threading.Thread(target=watch_stdin, args=(loop, stop), daemon=True).start()

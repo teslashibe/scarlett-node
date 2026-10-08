@@ -169,3 +169,7 @@ func checkPlatform(t *testing.T, _ platformSnapshot, h *helper, tree []procInfo)
 }
 
 func checkUnregistered(*testing.T, string) {}
+
+func handlerApps(*testing.T) map[string][]string { return nil }
+
+func checkNoHandlerApp(*testing.T, map[string][]string) {}

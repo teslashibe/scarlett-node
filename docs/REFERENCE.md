@@ -486,9 +486,11 @@ pinned browser major.
 **Isolation.** New headless mode only, and never the operator's browser. The
 Chrome sandbox stays on; where Linux blocks unprivileged user namespaces the
 tier reports `sandbox_unavailable` instead of running without it. Each launch
-gets a fresh temporary profile under `<state>/web-browser/`, and each job a
-fresh browser context with no permissions, downloads off, muted audio, a mock
-keychain and basic password store, and invalid certificates refused. The helper
+gets a fresh profile under `<state>/web-browser/tmp/` (wiped before every
+start), which the helper creates and seeds before the browser opens it, and
+each job a fresh browser context with no permissions, downloads off, muted
+audio, a mock keychain and basic password store, and invalid certificates
+refused. The helper
 inherits only an allowlist of environment variables, with HOME, the temporary
 and cache directories and the crash-dump location inside node state and no
 display, D-Bus or proxy variables. On macOS the node unregisters its browser
@@ -498,6 +500,55 @@ one file outside node state it can leave is
 with any Chrome for Testing the operator runs and is therefore never deleted.
 On Windows the helper runs in a Job object with no window and below-normal
 priority; on macOS and Linux at nice 10.
+
+**Operating-system reach.** A page must not open an app, show a system prompt
+or crash the browser on the operator's machine, with or without a click (the
+Cloudflare solver's click is a real user gesture). The helper passes the
+browser's whole argv itself, Patchright's defaults unchanged, so that the
+browser starts on the profile it seeded; its `Default/Preferences` holds:
+
+- The URL blocklist preference (the one the `URLBlocklist` policy sets) with
+  `mailto:*`, `news:*` and `snews:*`, Chrome's always-allowed external
+  schemes. Chrome 155 still hands `mailto:` to the OS mail client without a
+  prompt, and without a gesture once per start. A blocked navigation fails in
+  the browser before Chrome's external-protocol code runs. The preference is
+  read from the profile like any other, so no administrator rights are
+  needed; command-line policies exist only on Android, and no switch turns
+  external protocols off.
+- Protocol handlers for `mailto:` and `news:`, the second layer, pointing at
+  `https://scarlett-blocked.invalid/?u=%s` and usable in the job contexts
+  (which are off-the-record children of the profile). A registered handler
+  takes precedence over the OS handler, so the link becomes an https
+  navigation that the egress proxy refuses by name before any lookup. Chrome
+  for Testing never registers itself with the OS as a default handler.
+- The "don't allow sites to ask" setting for Bluetooth, USB, HID and serial
+  devices. `requestDevice` and `requestPort` reject with `NotFoundError` (HID
+  resolves with an empty list) before any scan; a scan made a macOS Bluetooth
+  privacy request and crashed the browser.
+- Screen capture off (the setting behind the `ScreenCaptureAllowed` policy):
+  `getDisplayMedia` rejects with `NotAllowedError` before its picker, which
+  made Screen Recording privacy requests.
+
+Camera and microphone are fake devices (`--use-fake-device-for-media-stream`),
+so `getUserMedia` is refused without a device or a prompt. The helper also
+fails any document response that redirects to a scheme other than http(s): a
+3xx is followed like a typed navigation, which skips Chrome's anti-flood check
+for external protocols. Every other external scheme (`tel:`, `sms:`,
+`facetime:`, `itms-apps:`, `intent:`, an app's own scheme) reaches Chrome's
+external-protocol dialog, which the hidden browser never shows, so nothing is
+opened; blocking those too would make their frames load an error page, which
+a normal Chrome does not do. `file:` and `chrome:` navigations from a page are
+refused by Chrome itself, and `javascript:`, `data:` and `blob:` stay in the
+browser.
+
+What a page can still tell: Bluetooth reports `getAvailability()` false and
+its refusal reads "User or their enterprise policy has disabled Web
+Bluetooth." rather than the cancelled-chooser text; screen capture reads
+"Permission denied" rather than "Permission denied by user"; a frame sent to
+`mailto:`, `news:` or `snews:` loads an error page, as with a webmail handler
+that is unreachable. The redirect check covers the page's main frame and its
+same-process frames; a redirect in a cross-site frame, a pop-up or a service
+worker reaches the blocklist, the handlers and the dialog instead.
 
 **Network.** Every page context uses a loopback filtering proxy in the node.
 It accepts `CONNECT host:443` and absolute-form `http://host[:80]` requests
