@@ -197,6 +197,12 @@ func (g *Guard) rollback(ctx context.Context, p *Pending, reason string) error {
 	return errors.Join(stateErr, launchErr)
 }
 
+// besideAppStagingRoot is the private staging root StagingRoot makes beside
+// an app on another volume than the updates directory.
+func besideAppStagingRoot(app string) string {
+	return filepath.Join(filepath.Dir(app), ".Scarlett Node.update")
+}
+
 // cleanup keeps exactly one previous app or installer and removes downloads.
 func (g *Guard) cleanup(p *Pending) {
 	keep := map[string]bool{}
@@ -228,8 +234,11 @@ func (g *Guard) cleanup(p *Pending) {
 	}
 	if p.Kind == "mac-app" && p.Previous != "" {
 		// A staging root beside the app holds only the previous bundle now.
+		// Only that root is swept: Previous comes from the state file, and a
+		// bundle anywhere else must never widen what is removed to its
+		// grandparent (such as /tmp or a home directory).
 		root := filepath.Dir(filepath.Dir(p.Previous))
-		if root != g.Updates {
+		if root == besideAppStagingRoot(p.App) {
 			siblings, _ := os.ReadDir(root)
 			for _, s := range siblings {
 				if path := filepath.Join(root, s.Name()); path != filepath.Dir(p.Previous) {

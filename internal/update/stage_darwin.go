@@ -136,7 +136,7 @@ func StagingRoot(app, updates string) (string, error) {
 	if sameVolume(updates, filepath.Dir(app)) {
 		return updates, nil
 	}
-	root := filepath.Join(filepath.Dir(app), ".Scarlett Node.update")
+	root := besideAppStagingRoot(app)
 	if err := os.Mkdir(root, 0o700); err != nil && !os.IsExist(err) {
 		return "", fail(CodeNotWritable, err)
 	}
