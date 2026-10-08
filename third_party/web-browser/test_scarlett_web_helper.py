@@ -50,9 +50,11 @@ class OptionSetTests(unittest.TestCase):
                 self.assertIn(arg, self.args)
         for arg in ("--webrtc-ip-handling-policy=disable_non_proxied_udp", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
                     "--deny-permission-prompts", "--disable-quic", "--disable-component-update",
-                    "--disable-blink-features=AutomationControlled"):
+                    "--use-fake-device-for-media-stream", "--disable-blink-features=AutomationControlled"):
             self.assertIn(arg, self.args)
         self.assertNotIn("--no-sandbox", self.args)
+        # Fake devices, never a fake prompt that grants them.
+        self.assertNotIn("--use-fake-ui-for-media-stream", self.args)
         self.assertNotIn("--force-webrtc-ip-handling-policy", self.args)
 
     def test_launch_options(self):
@@ -402,6 +404,36 @@ class DataDomeTests(unittest.TestCase):
         verdict, took = run(go())
         self.assertEqual(verdict, "stop")
         self.assertLess(took, 0.5)
+
+    def test_only_a_captcha_delivery_frame_is_datadome(self):
+        for url in ("https://geo.captcha-delivery.com/interstitial/?x", "https://captcha-delivery.com/c", "https://GEO.Captcha-Delivery.com/captcha/"):
+            self.assertTrue(helper.dd_frame_url(url), url)
+        for url in ("https://buyer.example/x?captcha-delivery.com", "https://buyer.example/captcha-delivery.com/", "https://captcha-delivery.com.buyer.example/",
+                    "https://evilcaptcha-delivery.com/", "http://geo.captcha-delivery.com/", "https://user@buyer.example/#captcha-delivery.com",
+                    "about:blank", "", "https://[::1/"):
+            self.assertFalse(helper.dd_frame_url(url), url)
+
+    def test_a_buyer_frame_naming_datadome_is_never_clicked(self):
+        # The page carries DataDome's markers and a frame whose URL names the
+        # host, with the confirm button shown: the helper waits, never clicks.
+        page = FakePage("<html><script>var dd={'rt':'i'}</script><p>captcha-delivery.com</p></html>", status=200)
+        page.frames.append(FakeFrame("https://buyer.example/x?captcha-delivery.com", page))
+        clicks = []
+        helper_click = helper.dd_click_confirm
+
+        async def recording(p, frame):
+            clicks.append(frame.url)
+            return await helper_click(p, frame)
+        helper.dd_click_confirm = recording
+        try:
+            async def go():
+                loop = asyncio.get_running_loop()
+                return await helper.wait_for_datadome(page, helper.Document(page), loop.time() + 1.5)
+            run(go())
+        finally:
+            helper.dd_click_confirm = helper_click
+        self.assertEqual(clicks, [])
+        self.assertIsNone(helper.dd_frame(page))
 
     def test_interactive_frame_stops_without_retry(self):
         page = self.interstitial()

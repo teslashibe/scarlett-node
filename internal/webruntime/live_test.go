@@ -4,8 +4,10 @@ package webruntime
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -115,6 +117,31 @@ func TestLive(t *testing.T) {
   const el = document.createElement('div'); el.id = 'done'; el.textContent = JSON.stringify(out); document.body.appendChild(el);
 })();
 </script></body>`, servers)
+	})
+	// A page that looks like a managed Cloudflare interstitial, so the
+	// solver clicks it; the click handler calls APIs that need a user
+	// gesture. None may reach the operator's clipboard or open anything.
+	mux.HandleFunc("/activate", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<!doctype html><html><head><title>Just a moment...</title></head><body>
+<script id="marker">window._cf_chl_opt={cType: 'managed'};</script>
+<div class="main-content"><p>Checking</p><div><div><div style="width:300px;height:65px;background:#eee"></div></div></div></div>
+<script>
+const out = {};
+const settle = (k, p) => Promise.resolve().then(p).then(v => { out[k] = 'resolved' }, e => { out[k] = 'refused ' + (e && e.name) });
+document.addEventListener('click', async () => {
+  out.activation = navigator.userActivation.isActive;
+  const t = document.createElement('textarea'); t.value = 'scarlett-live-exec-copy'; document.body.appendChild(t); t.select();
+  out.exec_copy = document.execCommand('copy');
+  await Promise.race([Promise.all([
+    settle('clipboard_write', () => navigator.clipboard.writeText('scarlett-live-clipboard')),
+    settle('clipboard_read', () => navigator.clipboard.readText()),
+    settle('picker', () => window.showOpenFilePicker()),
+  ]), new Promise(r => setTimeout(r, 3000))]);
+  out.popup = window.open('/cookies') ? 'opened' : 'blocked';
+  document.getElementById('marker').remove(); document.title = 'done';
+  const el = document.createElement('div'); el.id = 'done'; el.textContent = JSON.stringify(out); document.body.appendChild(el);
+}, {once: true});
+</script></body></html>`)
 	})
 	plain := httptest.NewServer(mux)
 	defer plain.Close()
@@ -227,6 +254,27 @@ func TestLive(t *testing.T) {
 		t.Fatal("LAN names never reached the proxy's name check")
 	}
 
+	// A clicked page gets activation and still reaches nothing outside the
+	// browser: the operator's clipboard is unchanged (compared by hash only).
+	clipBefore := clipboardHash(t)
+	res = fetch(loopback+"/activate", "load", "#done")
+	var act struct {
+		Activation     bool   `json:"activation"`
+		ExecCopy       bool   `json:"exec_copy"`
+		ClipboardWrite string `json:"clipboard_write"`
+		ClipboardRead  string `json:"clipboard_read"`
+		Picker         string `json:"picker"`
+	}
+	if err := json.Unmarshal([]byte(between(res.HTML, `<div id="done">`, `</div>`)), &act); err != nil || !act.Activation {
+		t.Fatalf("the solver did not click the interstitial-shaped page: %v %+v", err, act)
+	}
+	if !strings.HasPrefix(act.ClipboardWrite, "refused") || !strings.HasPrefix(act.ClipboardRead, "refused") || !strings.HasPrefix(act.Picker, "refused") {
+		t.Fatalf("a gesture-gated API was granted: %+v", act)
+	}
+	if clipBefore != clipboardHash(t) {
+		t.Fatal("a clicked page changed the operator's clipboard")
+	}
+
 	// A page that never goes idle returns within load plus the 3 s cap.
 	start := time.Now()
 	if res = fetch(origin+"/never-idle", "networkidle", ""); res.Outcome != "ok" || time.Since(start) > 8*time.Second || res.Timings.TotalMS > 6500 {
@@ -266,6 +314,20 @@ func TestLive(t *testing.T) {
 		t.Fatalf("files changed outside node state:\nbefore %v\nafter  %v", before, after)
 	}
 	t.Logf("background requests denied: %d; names refused unresolved: %d; addresses refused: %d", m.stats.BackgroundDenied.Load(), m.stats.RefusedName.Load(), m.stats.RefusedAddress.Load())
+}
+
+// clipboardHash is a digest of the operator's clipboard text on macOS ("" elsewhere);
+// the text itself is never kept or logged.
+func clipboardHash(t *testing.T) string {
+	if runtime.GOOS != "darwin" {
+		return ""
+	}
+	out, err := exec.Command("/usr/bin/pbpaste").Output()
+	if err != nil {
+		t.Fatalf("pbpaste: %v", err)
+	}
+	sum := sha256.Sum256(out)
+	return hex.EncodeToString(sum[:])
 }
 
 type loopbackOnly struct{}
@@ -366,7 +428,7 @@ func checkArgv(t *testing.T, m *Manager, h *helper, tree []procInfo) {
 		}
 	}
 	want := []string{"--webrtc-ip-handling-policy=disable_non_proxied_udp", "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-		"--disable-blink-features=AutomationControlled", "--deny-permission-prompts", "--disable-quic", "--disable-component-update",
+		"--disable-blink-features=AutomationControlled", "--deny-permission-prompts", "--disable-quic", "--disable-component-update", "--use-fake-device-for-media-stream",
 		"--proxy-server=" + h.deny.URL(), "--mute-audio", "--use-mock-keychain"}
 	for _, a := range stealth {
 		if !strings.HasPrefix(a, "--disable-features=") && !strings.HasPrefix(a, "--enable-features=") {
@@ -379,7 +441,7 @@ func checkArgv(t *testing.T, m *Manager, h *helper, tree []procInfo) {
 		}
 	}
 	for _, a := range argv {
-		if a == "--no-sandbox" || a == "--force-webrtc-ip-handling-policy" {
+		if a == "--no-sandbox" || a == "--force-webrtc-ip-handling-policy" || a == "--use-fake-ui-for-media-stream" {
 			t.Fatalf("live argv has %s", a)
 		}
 	}

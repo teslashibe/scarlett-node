@@ -45,8 +45,10 @@ func TestWebEgressTable(t *testing.T) {
 		"2001::1", "2001:0:4136:e378:8000:63bf:3fff:fdd2", "2001:10::1", "2001:2::1", "2001:db8::1", "2002:c0a8:101::1", "2002:5db8:d70e::1", "3fff::1",
 		// NAT64: the discovered prefixes carry a private IPv4 address.
 		"2a01:4f8:c0c:1::a00:1", "2a01:4f8:c0c:1::7f00:1", "64:ff9b::a00:1", "64:ff9b::c0a8:101",
-		// Addresses on this host's own interfaces.
-		"203.0.114.7", "::ffff:203.0.114.7", "2a02:6b8::5",
+		// Addresses on this host's own interfaces, and the rest of their
+		// local networks: the on-link IPv4 prefix, and at least the /56
+		// around a global IPv6 address.
+		"203.0.114.7", "::ffff:203.0.114.7", "2a02:6b8::5", "203.0.114.1", "203.0.114.255", "2a02:6b8::1", "2a02:6b8::6", "2a02:6b8:0:ff::1",
 	}
 	for _, a := range denied {
 		if g.Allowed(context.Background(), netip.MustParseAddr(a)) {
@@ -54,9 +56,9 @@ func TestWebEgressTable(t *testing.T) {
 		}
 	}
 	allowed := []string{
-		"93.184.215.14", "1.1.1.1", "8.8.8.8", "151.101.1.57", "100.128.0.1", "172.32.0.1", "192.0.1.1", "203.0.114.8",
+		"93.184.215.14", "1.1.1.1", "8.8.8.8", "151.101.1.57", "100.128.0.1", "172.32.0.1", "192.0.1.1", "203.0.115.8",
 		"::ffff:93.184.215.14",
-		"2606:2800:21f:cb07:6820:80da:af6b:8b2c", "2a00:1450:4001::200e", "2001:200::1", "2a02:6b8::6",
+		"2606:2800:21f:cb07:6820:80da:af6b:8b2c", "2a00:1450:4001::200e", "2001:200::1", "2a02:6b8:0:100::6",
 		// NAT64 carrying a public IPv4 address, through a discovered prefix.
 		"2a01:4f8:c0c:1::5db8:d70e", "64:ff9b::5db8:d70e",
 	}
@@ -72,7 +74,7 @@ func TestWebEgressTable(t *testing.T) {
 		}
 	}
 	// The fixed guard behaves the same way.
-	fixed := NewWebEgressWith([]netip.Prefix{netip.MustParsePrefix("2a01:4f8:c0c:1::/96")}, addrs("203.0.114.7"))
+	fixed := NewWebEgressWith([]netip.Prefix{netip.MustParsePrefix("2a01:4f8:c0c:1::/96")}, []netip.Prefix{netip.MustParsePrefix("203.0.114.7/32")})
 	for a, want := range map[string]bool{"2a01:4f8:c0c:1::a00:1": false, "2a01:4f8:c0c:1::5db8:d70e": true, "203.0.114.7": false, "93.184.215.14": true} {
 		if fixed.Allowed(context.Background(), netip.MustParseAddr(a)) != want {
 			t.Errorf("fixed guard: %s allowed != %v", a, want)
@@ -81,6 +83,36 @@ func TestWebEgressTable(t *testing.T) {
 	// Without discovery the well-known NAT64 prefix stays outside 2000::/3.
 	if egressWith(nil, nil).Allowed(context.Background(), netip.MustParseAddr("64:ff9b::5db8:d70e")) {
 		t.Error("undiscovered NAT64 prefix allowed")
+	}
+}
+
+// A page cannot reach other hosts on the operator's own networks: the
+// router and devices on the on-link IPv6 /64 of a residential connection,
+// other subnets of its delegated prefix, and IPv4 neighbours on a public
+// on-link prefix. A misreported mask never denies more than a /16 or /32.
+func TestWebEgressRefusesLocalNetworks(t *testing.T) {
+	g := egressWith(nil, []string{"2001:db8:1:2::10/64", "2a01:e0a:1:2:a1b2:c3ff:fed4:e5f6/64", "198.51.99.20/28", "2a0c:5a80::1/0", "11.0.0.1/1"})
+	for a, want := range map[string]bool{
+		"2001:db8:1:2::1":              false, // the review's case (documentation space, refused anyway)
+		"2a01:e0a:1:2::1":              false, // the router on the /64
+		"2a01:e0a:1:2:21b:63ff:fe00:1": false, // an EUI-64 neighbour
+		"2a01:e0a:1:20::1":             false, // another subnet of the /56
+		"2a01:e0a:1:100::1":            true,  // outside the /56
+		"198.51.99.17":                 false, // on-link IPv4 neighbour
+		"198.51.99.33":                 true,
+		"2a0c:5a80:ffff::1":            false, // a /0 mask counts as the /32 around the address
+		"2a0d::1":                      true,
+		"11.0.200.1":                   false, // a /1 mask counts as the /16
+		"11.1.0.1":                     true,
+	} {
+		if got := g.Allowed(context.Background(), netip.MustParseAddr(a)); got != want {
+			t.Errorf("%s allowed = %v, want %v", a, got, want)
+		}
+	}
+	// The fixed guard takes the same prefixes.
+	fixed := NewWebEgressWith(nil, []netip.Prefix{netip.MustParsePrefix("2a01:e0a:1:2::10/64")})
+	if fixed.Allowed(context.Background(), netip.MustParseAddr("2a01:e0a:1:2::1")) || !fixed.Allowed(context.Background(), netip.MustParseAddr("2a01:e0a:1:100::1")) {
+		t.Fatal("fixed guard ignores the local network")
 	}
 }
 

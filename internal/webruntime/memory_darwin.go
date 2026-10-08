@@ -50,3 +50,14 @@ func parsePS(out []byte) []procInfo {
 func treeMemory(tree []procInfo) uint64 { return sumBytes(tree) }
 
 func physicalMemory() (uint64, error) { return unix.SysctlUint64("hw.memsize") }
+
+// memoryPressure is the kernel's memory pressure level: 1 normal, 2 warn,
+// 4 critical (kern.memorystatus_vm_pressure_level; no cgo needed), or 0 when
+// unreadable.
+func memoryPressure() int {
+	v, err := unix.SysctlUint32("kern.memorystatus_vm_pressure_level")
+	if err != nil {
+		return 0
+	}
+	return int(v)
+}

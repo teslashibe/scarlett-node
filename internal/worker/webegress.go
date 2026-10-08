@@ -54,13 +54,13 @@ const (
 )
 
 // WebEgress decides which resolved addresses a web hop may dial. Its NAT64
-// prefixes (RFC 7050) and local interface addresses are refreshed in the
-// background by Keep and loaded on first use otherwise.
+// prefixes (RFC 7050) and local networks are refreshed in the background by
+// Keep and loaded on first use otherwise.
 type WebEgress struct {
 	mu       sync.Mutex
 	nat64    []netip.Prefix
 	nat64At  time.Time
-	local    map[netip.Addr]bool
+	local    []netip.Prefix
 	localAt  time.Time
 	now      func() time.Time
 	discover func(context.Context) ([]netip.Addr, error)
@@ -79,9 +79,10 @@ func NewWebEgress() *WebEgress {
 }
 
 // NewWebEgressWith is a guard over fixed /96 NAT64 prefixes and local
-// addresses that never consults this host's resolver or interfaces. Tests and
-// local fixtures use it.
-func NewWebEgressWith(nat64 []netip.Prefix, local []netip.Addr) *WebEgress {
+// interface addresses, each with its on-link prefix (an address alone stands
+// for itself), that never consults this host's resolver or interfaces. Tests
+// and local fixtures use it.
+func NewWebEgressWith(nat64 []netip.Prefix, local []netip.Prefix) *WebEgress {
 	answers := []netip.Addr{}
 	for _, prefix := range nat64 {
 		if prefix.Bits() == 96 && prefix.Addr().Is6() {
@@ -91,8 +92,9 @@ func NewWebEgressWith(nat64 []netip.Prefix, local []netip.Addr) *WebEgress {
 		}
 	}
 	interfaces := []net.Addr{}
-	for _, addr := range local {
-		interfaces = append(interfaces, &net.IPAddr{IP: net.IP(addr.AsSlice())})
+	for _, prefix := range local {
+		ip := net.IP(prefix.Addr().AsSlice())
+		interfaces = append(interfaces, &net.IPNet{IP: ip, Mask: net.CIDRMask(prefix.Bits(), len(ip)*8)})
 	}
 	return &WebEgress{
 		now:      time.Now,
@@ -145,15 +147,12 @@ func (g *WebEgress) refresh(ctx context.Context) {
 			nat64 = nat64Prefixes(found)
 		}
 	}
-	var local map[netip.Addr]bool
+	var local []netip.Prefix
 	if wantLocal && addrs != nil {
-		local = map[netip.Addr]bool{}
 		if list, err := addrs(); err == nil {
 			for _, a := range list {
-				if prefix, err := netip.ParsePrefix(a.String()); err == nil {
-					local[prefix.Addr().Unmap().WithZone("")] = true
-				} else if addr, err := netip.ParseAddr(a.String()); err == nil {
-					local[addr.Unmap().WithZone("")] = true
+				if prefix, ok := localNetwork(a); ok {
+					local = append(local, prefix)
 				}
 			}
 		}
@@ -166,6 +165,72 @@ func (g *WebEgress) refresh(ctx context.Context) {
 	if wantLocal {
 		g.local, g.localAt = local, now
 	}
+}
+
+// Local networks: an interface's own on-link prefix, widened for IPv6 global
+// addresses to at least the /56 around it (other subnets of a delegated
+// prefix are the same site), and never wider than these, so a misreported
+// mask cannot deny the whole internet.
+const (
+	localIPv6SiteBits = 56
+	localIPv4MinBits  = 16
+	localIPv6MinBits  = 32
+)
+
+// localNetwork is the network an interface address stands for: its on-link
+// prefix as above, or the address itself when the mask is unusable.
+func localNetwork(a net.Addr) (netip.Prefix, bool) {
+	var ip net.IP
+	bits := -1
+	switch v := a.(type) {
+	case *net.IPNet:
+		ip = v.IP
+		if ones, size := v.Mask.Size(); size != 0 {
+			bits = ones
+		}
+	case *net.IPAddr:
+		ip = v.IP
+	default:
+		prefix, err := netip.ParsePrefix(a.String())
+		if err != nil {
+			addr, err := netip.ParseAddr(a.String())
+			if err != nil {
+				return netip.Prefix{}, false
+			}
+			return netip.PrefixFrom(addr.Unmap().WithZone(""), addr.Unmap().BitLen()), true
+		}
+		ip, bits = net.IP(prefix.Addr().AsSlice()), prefix.Bits()
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return netip.Prefix{}, false
+	}
+	addr = addr.Unmap().WithZone("")
+	if addr.Is4() && bits > 32 {
+		bits -= 96 // a 16-byte mask on an IPv4 address
+	}
+	if bits < 0 || bits > addr.BitLen() {
+		bits = addr.BitLen()
+	}
+	if addr.Is4() {
+		bits = max(bits, localIPv4MinBits)
+	} else {
+		if allowedWebIPv6.Contains(addr) {
+			bits = min(bits, localIPv6SiteBits)
+		}
+		bits = max(bits, localIPv6MinBits)
+	}
+	return netip.PrefixFrom(addr, bits).Masked(), true
+}
+
+// isLocal reports whether addr is on one of this host's local networks.
+func (g *WebEgress) isLocal(addr netip.Addr) bool {
+	for _, prefix := range g.local {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // nat64Prefixes derives the /96 prefixes from the AAAA answers for
@@ -198,7 +263,7 @@ func (g *WebEgress) Allowed(ctx context.Context, addr netip.Addr) bool {
 		return false
 	}
 	addr = addr.Unmap()
-	if g.local[addr] {
+	if g.isLocal(addr) {
 		return false
 	}
 	if addr.Is6() {
@@ -206,7 +271,7 @@ func (g *WebEgress) Allowed(ctx context.Context, addr netip.Addr) bool {
 			if prefix.Contains(addr) {
 				b := addr.As16()
 				embedded := netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]})
-				return !inAny(embedded, deniedWebIPv4) && !g.local[embedded]
+				return !inAny(embedded, deniedWebIPv4) && !g.isLocal(embedded)
 			}
 		}
 		return allowedWebIPv6.Contains(addr) && !inAny(addr, deniedWebIPv6)

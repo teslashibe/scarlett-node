@@ -21,8 +21,10 @@ import re
 import sys
 import threading
 import time
+from urllib.parse import urlsplit
 
 SCRAPLING_VERSION = "0.4.15"
+PORT_PREFIX = "SCARLETT_WEB_HELPER_PORT="
 ENGINE = "scrapling/" + SCRAPLING_VERSION
 MAX_REQUEST_BODY = 65536
 MAX_REQUEST_HEAD = 16384
@@ -50,7 +52,11 @@ ENABLED = ["CDPScreenshotNewSurface", "NetworkService", "NetworkServiceInProcess
            "TrustTokensAlwaysAllowIssuance"]
 WEBRTC_POLICY = ["--webrtc-ip-handling-policy=disable_non_proxied_udp",
                  "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"]
-EXTRA_ARGS = ["--deny-permission-prompts", "--disable-quic", "--disable-component-update"]
+# Fake capture devices: getUserMedia never reaches the camera or microphone,
+# so a page cannot make the OS ask the operator for them (measured: a real
+# device request raised a macOS microphone prompt and hung the browser).
+EXTRA_ARGS = ["--deny-permission-prompts", "--disable-quic", "--disable-component-update",
+              "--use-fake-device-for-media-stream"]
 IGNORE_DEFAULT_ARGS = ["--enable-automation", "--disable-popup-blocking", "--disable-default-apps",
                        "--disable-extensions", PW_DISABLE, PW_ENABLE]
 
@@ -344,10 +350,22 @@ def dd_hard_block(url, html):
     return "t=bv" in url or "'t':'bv'" in low
 
 
+def dd_frame_url(url):
+    """DataDome's challenge frame: https on captcha-delivery.com or a subdomain
+    of it. Only such a frame is ever clicked, so a page cannot earn a trusted
+    click by naming the host in its own frame's URL."""
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return False
+    return parts.scheme == "https" and (host == "captcha-delivery.com" or host.endswith(".captcha-delivery.com"))
+
+
 def dd_frame(page):
     try:
         for frame in page.frames:
-            if "captcha-delivery.com" in frame.url:
+            if dd_frame_url(frame.url):
                 return frame
     except Exception:
         pass
@@ -694,10 +712,14 @@ def watch_stdin(loop, stop):
 async def serve():
     env = os.environ
     bearer = env.pop("WEB_HELPER_BEARER", "")  # never inherited by the driver or the browser
-    port = int(env["WEB_HELPER_PORT"])
     capacity = int(env["WEB_MAX_PAGES"])
-    if len(bearer) != 64 or not 1 <= capacity <= 4 or not 0 < port < 65536:
+    if len(bearer) != 64 or not 1 <= capacity <= 4:
         raise SystemExit(2)
+    # The node reads the port this helper binds from the first stdout line.
+    # Keep a private copy of stdout for it, and send everything else that
+    # writes to stdout (the driver, the browser) to stderr.
+    report = os.fdopen(os.dup(1), "w", encoding="ascii")
+    os.dup2(2, 1)
     session = new_session(env["WEB_BROWSER_EXECUTABLE"], env["WEB_USER_AGENT"], env["WEB_EGRESS_PROXY"],
                           env["WEB_DENY_PROXY"], capacity)
     try:
@@ -708,7 +730,9 @@ async def serve():
     stop = asyncio.Event()
     threading.Thread(target=watch_stdin, args=(loop, stop), daemon=True).start()
     server = Server(bearer, Fetcher(session, env["WEB_EGRESS_PROXY"], capacity), env["WEB_BROWSER_VERSION"], capacity)
-    listener = await asyncio.start_server(server.handle, "127.0.0.1", port, limit=MAX_REQUEST_HEAD)
+    listener = await asyncio.start_server(server.handle, "127.0.0.1", 0, limit=MAX_REQUEST_HEAD)
+    report.write(PORT_PREFIX + str(listener.sockets[0].getsockname()[1]) + "\n")
+    report.close()
     try:
         while not stop.is_set():
             try:

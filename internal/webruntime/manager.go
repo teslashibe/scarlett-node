@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -29,6 +28,7 @@ const (
 	prewarmIdle     = 30 * time.Second
 	recycleAfter    = 50
 	sampleEvery     = 2 * time.Second
+	sampleBusy      = 500 * time.Millisecond
 	verifyEvery     = 6 * time.Hour
 	readyTimeout    = 20 * time.Second
 	readyPoll       = 50 * time.Millisecond
@@ -224,8 +224,10 @@ type deps struct {
 	quick         func(Root, Browser) error
 	command       func(Root) (string, []string)
 	sample        func(*proc) (uint64, []procInfo, error)
+	pressure      func() int
 	unregister    func(app string)
 	tick          time.Duration
+	busyTick      time.Duration
 	readyTimeout  time.Duration
 	stopGrace     time.Duration
 }
@@ -243,8 +245,9 @@ func defaultDeps() deps {
 			return r.Python(), []string{"-I", "-B", "-X", "utf8", "-m", "scarlett_web_helper"}
 		},
 		sample:     sampleProc,
+		pressure:   memoryPressure,
 		unregister: unregisterApp,
-		tick:       sampleEvery, readyTimeout: readyTimeout, stopGrace: stopGrace,
+		tick:       sampleEvery, busyTick: sampleBusy, readyTimeout: readyTimeout, stopGrace: stopGrace,
 	}
 }
 
@@ -276,6 +279,7 @@ type Manager struct {
 	failedUntil time.Time
 	lastUse     time.Time
 	nextVerify  time.Time
+	verifying   bool
 	logged      string
 	closed      bool
 }
@@ -395,6 +399,7 @@ func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 	}
 	m.inFlight++
 	m.mu.Unlock()
+	m.wake() // sample at the busy rate while the page renders
 	defer func() {
 		m.mu.Lock()
 		m.inFlight--
@@ -572,14 +577,15 @@ func (m *Manager) call(ctx context.Context, h *helper, req FetchRequest) (FetchR
 }
 
 // Run prepares the tier (with backoff 60 s → 1 h on failure) and supervises
-// it until ctx ends: memory samples every 2 s, idle stops, recycling, a
-// helper_failed hold, and a full re-verify every 6 h while no helper is warm.
+// it until ctx ends: memory samples every 2 s, every 500 ms while a page
+// renders, idle stops, recycling, a helper_failed hold, and a full re-verify
+// every 6 h while no helper is warm.
 func (m *Manager) Run(ctx context.Context) {
 	defer m.Close(context.Background())
 	backoff := backoffStart
 	var next time.Time
-	ticker := time.NewTicker(m.d.tick)
-	defer ticker.Stop()
+	timer := time.NewTimer(m.d.tick)
+	defer timer.Stop()
 	for {
 		m.mu.Lock()
 		need := !m.prepared && !m.closed
@@ -601,10 +607,17 @@ func (m *Manager) Run(ctx context.Context) {
 			}
 		}
 		m.tick()
+		m.mu.Lock()
+		wait := m.d.tick
+		if m.inFlight > 0 {
+			wait = min(wait, m.d.busyTick)
+		}
+		m.mu.Unlock()
+		timer.Reset(wait)
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		case <-m.kick:
 		}
 	}
@@ -701,12 +714,14 @@ func (m *Manager) tick() {
 	now := m.d.now()
 	h := m.helper
 	if h == nil || m.stopping != nil {
-		verify := m.prepared && h == nil && m.stopping == nil && !m.starting && m.inFlight == 0 && !now.Before(m.nextVerify)
+		verify := m.prepared && h == nil && m.stopping == nil && !m.starting && m.inFlight == 0 && !m.verifying && !now.Before(m.nextVerify)
 		root, browser := m.root, m.browser
-		m.mu.Unlock()
 		if verify {
-			m.backgroundVerify(root, browser)
+			// The hash takes a while; sampling goes on meanwhile.
+			m.verifying = true
+			go m.backgroundVerify(root, browser)
 		}
+		m.mu.Unlock()
 		return
 	}
 	idle := m.cfg.IdleTimeout
@@ -728,13 +743,16 @@ func (m *Manager) tick() {
 		return
 	}
 	recycle, kill := Thresholds(capacity)
+	level := m.d.pressure()
 	m.mu.Lock()
 	if len(tree) > 0 {
 		h.tree = tree
 	}
 	switch {
-	case bytes > kill:
-		// In-flight fetches fail web_browser_failed.
+	case bytes > kill, h.inFlight > 0 && (level >= pressureCritical || level >= pressureWarn && bytes > recycle):
+		// In-flight fetches fail web_browser_failed. Under host memory
+		// pressure the operator's machine comes first, whatever RSS says
+		// (compressed and swapped renderer pages do not count in it).
 		h.draining = true
 		h.p.kill(h.tree)
 	case bytes > recycle:
@@ -753,6 +771,7 @@ func (m *Manager) backgroundVerify(root Root, browser Browser) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.verifying = false
 	m.nextVerify = m.d.now().Add(verifyEvery)
 	if err != nil {
 		m.prepared = false
@@ -824,7 +843,7 @@ func (w *markerWriter) Marker() string {
 }
 
 // helperEnv is the helper's whole environment: an allowlist, nothing inherited.
-func (m *Manager) helperEnv(state, bearer string, port int, browser Browser, proxy, deny string, capacity int) []string {
+func (m *Manager) helperEnv(state, bearer string, browser Browser, proxy, deny string, capacity int) []string {
 	home := filepath.Join(state, "home")
 	tmp := filepath.Join(state, "tmp")
 	var env []string
@@ -845,7 +864,7 @@ func (m *Manager) helperEnv(state, bearer string, port int, browser Browser, pro
 		"PLAYWRIGHT_NODEJS_PATH="+m.cfg.XLoginNode,
 		"PLAYWRIGHT_BROWSERS_PATH="+filepath.Join(state, "none"),
 		"PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1",
-		"WEB_HELPER_BEARER="+bearer, "WEB_HELPER_PORT="+strconv.Itoa(port),
+		"WEB_HELPER_BEARER="+bearer,
 		"WEB_BROWSER_EXECUTABLE="+browser.Executable, "WEB_BROWSER_VERSION="+browser.Version,
 		"WEB_USER_AGENT="+m.UserAgent(),
 		"WEB_EGRESS_PROXY="+proxy, "WEB_DENY_PROXY="+deny,
@@ -854,8 +873,10 @@ func (m *Manager) helperEnv(state, bearer string, port int, browser Browser, pro
 
 // startHelper starts one helper and waits for it to be ready: private state,
 // a bearer, the runtime lock, a size-and-mode check of the runtime and the
-// browser, the two listeners, then GET /v1/ready and /v1/capabilities every
-// 50 ms for up to 20 s.
+// browser, the two listeners, then the port the helper bound (its first
+// stdout line), then GET /v1/ready and /v1/capabilities every 50 ms, all
+// within 20 s. The helper binds its own port, so no other local process can
+// take a port the node chose and receive the bearer.
 func (m *Manager) startHelper(ctx context.Context) (*helper, error) {
 	m.mu.Lock()
 	root, browser, capacity := m.root, m.browser, m.capacity
@@ -900,26 +921,30 @@ func (m *Manager) startHelper(ctx context.Context) (*helper, error) {
 	if h.deny, err = newDenyListener(&m.stats); err != nil {
 		return nil, errors.New("deny listener unavailable")
 	}
-	reservation, err := net.Listen("tcp4", "127.0.0.1:0")
+	portRead, portWrite, err := os.Pipe()
 	if err != nil {
-		return nil, errors.New("loopback unavailable")
+		return nil, errors.New("helper stdout unavailable")
 	}
-	port := reservation.Addr().(*net.TCPAddr).Port
-	reservation.Close()
-	h.endpoint = "http://127.0.0.1:" + strconv.Itoa(port)
+	defer portWrite.Close()
 	exe, args := m.d.command(root)
 	cmd := exec.Command(exe, args...)
 	cmd.Dir = home
-	cmd.Env = m.helperEnv(state, bearer, port, browser, h.proxy.URL(), h.deny.URL(), capacity)
+	cmd.Env = m.helperEnv(state, bearer, browser, h.proxy.URL(), h.deny.URL(), capacity)
+	cmd.Stdout = portWrite
 	cmd.Stderr = h.stderr
 	if h.stdin, err = cmd.StdinPipe(); err != nil {
+		portRead.Close()
 		return nil, errors.New("helper stdin unavailable")
 	}
 	_, kill := Thresholds(capacity)
 	if h.p, err = startProcess(cmd, kill+2*gib); err != nil {
 		h.stdin.Close()
+		portRead.Close()
 		return nil, errors.New("helper could not start")
 	}
+	portWrite.Close()
+	ports := make(chan int, 1)
+	go readHelperPort(portRead, ports)
 	h.p.done = h.done
 	go func() {
 		_ = cmd.Wait()
@@ -928,6 +953,24 @@ func (m *Manager) startHelper(ctx context.Context) (*helper, error) {
 	}()
 	ctx, cancel := context.WithTimeout(ctx, m.d.readyTimeout)
 	defer cancel()
+	select {
+	case port := <-ports:
+		if port <= 0 {
+			// A helper that could not start closes stdout as it exits; its
+			// launch marker is read once it has.
+			select {
+			case <-h.done:
+			case <-ctx.Done():
+			case <-time.After(2 * time.Second):
+			}
+			return nil, h.startError("helper reported no port")
+		}
+		h.endpoint = "http://127.0.0.1:" + strconv.Itoa(port)
+	case <-h.done:
+		return nil, h.startError("helper exited before readiness")
+	case <-ctx.Done():
+		return nil, h.startError("helper readiness timed out")
+	}
 	for {
 		select {
 		case <-h.done:
@@ -947,6 +990,35 @@ func (m *Manager) startHelper(ctx context.Context) (*helper, error) {
 		case <-time.After(readyPoll):
 		}
 	}
+}
+
+// helperPortPrefix starts the helper's first stdout line.
+const helperPortPrefix = "SCARLETT_WEB_HELPER_PORT="
+
+// readHelperPort reads the helper's first stdout line, at most 64 bytes, and
+// sends the loopback port it names, or 0 when the line is anything else.
+// The rest of stdout is discarded until the helper ends.
+func readHelperPort(r *os.File, ports chan<- int) {
+	defer r.Close()
+	line := make([]byte, 0, 64)
+	buf := make([]byte, 1)
+	port := 0
+	for len(line) < 64 {
+		if n, err := r.Read(buf); n == 0 || err != nil {
+			break
+		}
+		if buf[0] == '\n' {
+			if value, ok := strings.CutPrefix(string(line), helperPortPrefix); ok {
+				if n, err := strconv.Atoi(value); err == nil && n > 0 && n < 65536 && strconv.Itoa(n) == value {
+					port = n
+				}
+			}
+			break
+		}
+		line = append(line, buf[0])
+	}
+	ports <- port
+	_, _ = io.Copy(io.Discard, r)
 }
 
 func (h *helper) startError(what string) error {

@@ -113,11 +113,20 @@ func fakeHelper(mode, dump string) int {
 			"cookies":[{"name":"cf_clearance","value":"secret","domain":".example.com","path":"/","expires":-1,"secure":true,"http_only":true}],
 			"challenge":"none","redirects":[],"started_at_ms":1,"timings":{"context_ms":1,"navigate_ms":1,"settle_ms":1,"challenge_ms":0,"total_ms":3}}}`, req.URL)
 	}))
-	ln, err := net.Listen("tcp4", "127.0.0.1:"+os.Getenv("WEB_HELPER_PORT"))
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		return 4
 	}
 	go http.Serve(ln, mux)
+	// The helper binds its own port and names it on its first stdout line.
+	switch mode {
+	case "bad-port":
+		fmt.Println(helperPortPrefix + "http://127.0.0.1:1")
+	case "silent":
+	default:
+		fmt.Printf("%s%d\n", helperPortPrefix, ln.Addr().(*net.TCPAddr).Port)
+		fmt.Println("anything later on stdout is ignored")
+	}
 	<-stop
 	if mode == "ignore-eof" {
 		time.Sleep(10 * time.Minute)
@@ -148,6 +157,8 @@ type testManagerSetup struct {
 	state   string
 	mode    *atomic.Value
 	sample  *atomic.Uint64
+	level   *atomic.Int64 // host memory pressure
+	samples *atomic.Int64
 	verifyN *atomic.Int64
 	verify  *atomic.Value // error
 }
@@ -157,7 +168,8 @@ func newTestManager(t *testing.T, mode string) *testManagerSetup {
 	dump := t.TempDir()
 	state := filepath.Join(t.TempDir(), "state")
 	s := &testManagerSetup{clock: &fakeClock{now: time.Unix(1_800_000_000, 0)}, dump: dump, state: state, mode: &atomic.Value{}, sample: &atomic.Uint64{},
-		verifyN: &atomic.Int64{}, verify: &atomic.Value{}}
+		level: &atomic.Int64{}, samples: &atomic.Int64{}, verifyN: &atomic.Int64{}, verify: &atomic.Value{}}
+	s.level.Store(1)
 	s.mode.Store(mode)
 	s.verify.Store(verifyResult{})
 	m := New(Config{ResourceDir: t.TempDir(), StateDir: state, Guard: testGuard{}, Capacity: 2, IdleTimeout: 120 * time.Second})
@@ -180,7 +192,8 @@ func newTestManager(t *testing.T, mode string) *testManagerSetup {
 	m.d.command = func(Root) (string, []string) {
 		return self, []string{"-test.run=^TestFakeHelperProcess$", "--", s.mode.Load().(string), dump}
 	}
-	m.d.sample = func(p *proc) (uint64, []procInfo, error) { return s.sample.Load(), p.snapshot(), nil }
+	m.d.sample = func(p *proc) (uint64, []procInfo, error) { s.samples.Add(1); return s.sample.Load(), p.snapshot(), nil }
+	m.d.pressure = func() int { return int(s.level.Load()) }
 	m.d.unregister = func(string) {}
 	m.d.readyTimeout = 5 * time.Second
 	m.d.stopGrace = 2 * time.Second
@@ -256,7 +269,7 @@ func TestManagerStartsHelperWithPrivateStateAndAllowlistedEnv(t *testing.T) {
 	json.Unmarshal(raw, &env)
 	want := []string{"APPDATA", "BREAKPAD_DUMP_LOCATION", "HOME", "LOCALAPPDATA", "PLAYWRIGHT_BROWSERS_PATH", "PLAYWRIGHT_NODEJS_PATH",
 		"PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "TEMP", "TMP", "TMPDIR", "USERPROFILE", "WEB_BROWSER_EXECUTABLE", "WEB_BROWSER_VERSION",
-		"WEB_DENY_PROXY", "WEB_EGRESS_PROXY", "WEB_HELPER_BEARER", "WEB_HELPER_PORT", "WEB_MAX_PAGES", "WEB_USER_AGENT",
+		"WEB_DENY_PROXY", "WEB_EGRESS_PROXY", "WEB_HELPER_BEARER", "WEB_MAX_PAGES", "WEB_USER_AGENT",
 		"XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"}
 	if runtime.GOOS == "windows" {
 		want = append(want, "SystemRoot", "WINDIR")
@@ -289,7 +302,7 @@ func TestManagerStartsHelperWithPrivateStateAndAllowlistedEnv(t *testing.T) {
 }
 
 func TestManagerReadinessTimeoutAndStartFailures(t *testing.T) {
-	for _, mode := range []string{"never-ready", "wrong-caps", "exit", "launch-failed"} {
+	for _, mode := range []string{"never-ready", "wrong-caps", "exit", "launch-failed", "bad-port", "silent"} {
 		t.Run(mode, func(t *testing.T) {
 			s := newTestManager(t, mode)
 			s.m.d.readyTimeout = time.Second
@@ -453,6 +466,89 @@ func TestManagerMemoryRecycleAndKill(t *testing.T) {
 	}
 }
 
+// Host memory pressure kills a helper with a page in flight: critical at
+// once, warn only above the recycle size. An idle helper is left alone.
+func TestManagerKillsUnderHostMemoryPressure(t *testing.T) {
+	recycle, _ := Thresholds(2)
+	for _, c := range []struct {
+		name   string
+		level  int64
+		bytes  uint64
+		killed bool
+	}{
+		{"normal", 1, recycle + 1, false},
+		{"warn below recycle", pressureWarn, recycle, false},
+		{"warn above recycle", pressureWarn, recycle + 1, true},
+		{"critical", pressureCritical, 1 << 20, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := newTestManager(t, "hang")
+			s.prepare(t)
+			s.level.Store(c.level)
+			done := make(chan error, 1)
+			go func() { _, err := s.fetch(context.Background()); done <- err }()
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				s.m.mu.Lock()
+				busy := s.m.helper != nil && s.m.helper.inFlight == 1
+				s.m.mu.Unlock()
+				if busy || time.Now().After(deadline) {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			pid := s.helperPID(t)
+			s.sample.Store(c.bytes)
+			s.m.tick()
+			gone := false
+			for end := time.Now().Add(3 * time.Second); time.Now().Before(end) && !gone; time.Sleep(20 * time.Millisecond) {
+				gone = processGone(pid)
+			}
+			if gone != c.killed {
+				t.Fatalf("killed = %v, want %v", gone, c.killed)
+			}
+			if c.killed {
+				if err := <-done; !errors.Is(err, ErrHelper) {
+					t.Fatalf("in-flight fetch: %v", err)
+				}
+			}
+		})
+	}
+	// Without a page in flight, critical pressure does not kill.
+	s := newTestManager(t, "ok")
+	s.prepare(t)
+	if _, err := s.fetch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	pid := s.helperPID(t)
+	s.level.Store(pressureCritical)
+	s.m.tick()
+	time.Sleep(200 * time.Millisecond)
+	if processGone(pid) {
+		t.Fatal("an idle helper was killed for pressure")
+	}
+}
+
+// Run samples at the busy rate while a page renders.
+func TestManagerSamplesFasterWhileBusy(t *testing.T) {
+	s := newTestManager(t, "hang")
+	s.prepare(t)
+	s.m.d.tick, s.m.d.busyTick = time.Hour, 20*time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() { s.m.Run(ctx); close(stopped) }()
+	defer func() { cancel(); <-stopped }()
+	time.Sleep(100 * time.Millisecond)
+	idle := s.samples.Load()
+	fetchCtx, stop := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer stop()
+	go s.fetch(fetchCtx)
+	time.Sleep(500 * time.Millisecond)
+	if busy := s.samples.Load() - idle; busy < 5 {
+		t.Fatalf("%d samples in 500 ms while busy", busy)
+	}
+}
+
 func TestThresholdsScaleWithCapacity(t *testing.T) {
 	for capacity, want := range map[int][2]float64{1: {2.0, 3.5}, 2: {2.75, 4.25}, 4: {4.25, 5.75}} {
 		recycle, kill := Thresholds(capacity)
@@ -529,8 +625,19 @@ func TestManagerVerifiesOffTheFetchPath(t *testing.T) {
 	s.waitStopped(t)
 	s.verify.Store(verifyResult{fail(ReasonRuntimeInvalid, "tampered")})
 	s.m.tick()
+	s.m.tick() // a verify in progress is not started twice
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s.m.mu.Lock()
+		verifying := s.m.verifying
+		s.m.mu.Unlock()
+		if !verifying || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	if s.verifyN.Load() != after+1 {
-		t.Fatalf("background Verify did not run (%d)", s.verifyN.Load()-after)
+		t.Fatalf("background Verify did not run once (%d)", s.verifyN.Load()-after)
 	}
 	if h := s.m.Health(); h.State != "unavailable" || h.Reason != ReasonRuntimeInvalid {
 		t.Fatalf("health %+v", h)

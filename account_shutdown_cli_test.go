@@ -140,7 +140,7 @@ func TestActualAccountShutdownSnapshotsDrainingAndFinishedWork(t *testing.T) {
 		if e != nil || json.Unmarshal(body, &status) != nil || status.State != "draining" {
 			return false
 		}
-		return len(status.Accounts) == 1 && status.Accounts[0].ID == "sole" && status.Accounts[0].State == "draining" && status.Accounts[0].InFlight == 1 && len(status.Services) == 2 && status.Services[0].InFlight == 1 && status.Services[0].Capacity == 1
+		return len(status.Accounts) == 1 && status.Accounts[0].ID == "sole" && status.Accounts[0].State == "draining" && status.Accounts[0].InFlight == 1 && len(status.Services) == 3 && status.Services[0].InFlight == 1 && status.Services[0].Capacity == 1 && status.Services[2].Kind == "web" && status.Services[2].State == "not_added"
 	})
 	if e := os.WriteFile(release, []byte("finish"), 0600); e != nil {
 		t.Fatal(e)

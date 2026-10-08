@@ -48,7 +48,7 @@ func Check(ctx context.Context, opts CheckOptions) error {
 		return fail(ReasonRuntimeInvalid, "private browser state inaccessible")
 	}
 	m := New(cfg)
-	env := m.helperEnv(state, strings.Repeat("0", 64), 1, Browser{}, "http://127.0.0.1:9", "http://127.0.0.1:9", 1)
+	env := m.helperEnv(state, strings.Repeat("0", 64), Browser{}, "http://127.0.0.1:9", "http://127.0.0.1:9", 1)
 	run := func(args ...string) ([]byte, error) {
 		ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 		defer cancel()
