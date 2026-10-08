@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -80,9 +82,38 @@ func actualServicesCLIHeartbeat(t *testing.T, binary string, empty bool) {
 		cmd.Env = append(cmd.Env, "SCARLETT_PROVER="+helper)
 	}
 	// The node warms its X client at start through the default transport.
-	// Route that at a closed loopback port so the synthetic session never
-	// leaves this machine and the warm-up fails at once.
-	cmd.Env = append(cmd.Env, "HTTPS_PROXY=http://127.0.0.1:9", "HTTP_PROXY=http://127.0.0.1:9", "NO_PROXY=")
+	// Route that at a loopback proxy that accepts and never answers, so the
+	// synthetic session never leaves this machine and the warm-up is still
+	// pending at the first heartbeat. A refused port made the warm-up fail
+	// before the first heartbeat on slower runners, flipping x_read away from
+	// configured.
+	stall, e := net.Listen("tcp", "127.0.0.1:0")
+	if e != nil {
+		t.Fatal(e)
+	}
+	var held []net.Conn
+	var heldMu sync.Mutex
+	go func() {
+		for {
+			c, err := stall.Accept()
+			if err != nil {
+				return
+			}
+			heldMu.Lock()
+			held = append(held, c)
+			heldMu.Unlock()
+		}
+	}()
+	t.Cleanup(func() {
+		stall.Close()
+		heldMu.Lock()
+		for _, c := range held {
+			c.Close()
+		}
+		heldMu.Unlock()
+	})
+	proxy := "http://" + stall.Addr().String()
+	cmd.Env = append(cmd.Env, "HTTPS_PROXY="+proxy, "HTTP_PROXY="+proxy, "NO_PROXY=")
 	var stderr bytes.Buffer
 	cmd.Stdout = io.Discard
 	cmd.Stderr = &stderr
