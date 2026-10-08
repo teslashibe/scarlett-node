@@ -3,6 +3,7 @@ package update
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -68,12 +69,26 @@ func newGuardFixture(t *testing.T, phaseAfterLaunch string) *guardFixture {
 
 func TestGuardInstallsRelaunchesAndKeepsAHealthyUpdate(t *testing.T) {
 	f := newGuardFixture(t, PhaseHealthy)
+	// Cleanup keeps the guard's copy and log and removes finished downloads.
+	for _, dir := range []string{"guard-0.1.13", "downloads"} {
+		if err := localfs.EnsureDir(filepath.Join(f.g.Updates, dir)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(f.g.Updates, "guard.log"), []byte("log\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := f.g.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	s, _ := f.state.Read()
 	if f.installs.Load() != 1 || f.restores.Load() != 0 || f.launches.Load() != 1 || s.Pending.Phase != PhaseHealthy || s.HasFailed("0.1.14") {
 		t.Fatalf("installs %d restores %d launches %d state %+v", f.installs.Load(), f.restores.Load(), f.launches.Load(), s.Pending)
+	}
+	for name, want := range map[string]bool{"guard.log": true, "guard-0.1.13": true, "downloads": false} {
+		if _, err := os.Lstat(filepath.Join(f.g.Updates, name)); (err == nil) != want {
+			t.Fatalf("%s kept=%v, want %v", name, err == nil, want)
+		}
 	}
 }
 

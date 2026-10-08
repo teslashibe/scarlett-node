@@ -92,17 +92,21 @@ func TestManifestRefusesForeignPathsAndDropsUnsafeNotes(t *testing.T) {
 	artifact := func(v map[string]any) map[string]any { return v["artifacts"].([]any)[0].(map[string]any) }
 	updates := func(v map[string]any) map[string]any { return v["updates"].(map[string]any) }
 	for name, change := range map[string]func(map[string]any){
-		"schema":           func(v map[string]any) { v["schemaVersion"] = 2 },
-		"version":          func(v map[string]any) { v["version"] = "0.1.13/../x" },
-		"foreign path":     func(v map[string]any) { artifact(v)["path"] = "https://evil.example/x.dmg" },
-		"other version":    func(v map[string]any) { artifact(v)["path"] = "/downloads/v0.1.12/" + artifact(v)["filename"].(string) },
-		"filename":         func(v map[string]any) { artifact(v)["filename"] = "evil.dmg" },
-		"size":             func(v map[string]any) { artifact(v)["bytes"] = MaxArtifactBytes + 1 },
-		"sha":              func(v map[string]any) { artifact(v)["sha256"] = "AB" },
-		"platform":         func(v map[string]any) { artifact(v)["platform"] = "linux-arm64" },
-		"key id":           func(v map[string]any) { updates(v)["keyId"] = "short" },
-		"desktop filename": func(v map[string]any) { updates(v)["desktop"].(map[string]any)["darwin-arm64"].(map[string]any)["filename"] = "x.dmg" },
-		"headless path":    func(v map[string]any) { updates(v)["headless"].(map[string]any)["linux-amd64"].(map[string]any)["path"] = "/downloads/x" },
+		"schema":        func(v map[string]any) { v["schemaVersion"] = 2 },
+		"version":       func(v map[string]any) { v["version"] = "0.1.13/../x" },
+		"foreign path":  func(v map[string]any) { artifact(v)["path"] = "https://evil.example/x.dmg" },
+		"other version": func(v map[string]any) { artifact(v)["path"] = "/downloads/v0.1.12/" + artifact(v)["filename"].(string) },
+		"filename":      func(v map[string]any) { artifact(v)["filename"] = "evil.dmg" },
+		"size":          func(v map[string]any) { artifact(v)["bytes"] = MaxArtifactBytes + 1 },
+		"sha":           func(v map[string]any) { artifact(v)["sha256"] = "AB" },
+		"platform":      func(v map[string]any) { artifact(v)["platform"] = "linux-arm64" },
+		"key id":        func(v map[string]any) { updates(v)["keyId"] = "short" },
+		"desktop filename": func(v map[string]any) {
+			updates(v)["desktop"].(map[string]any)["darwin-arm64"].(map[string]any)["filename"] = "x.dmg"
+		},
+		"headless path": func(v map[string]any) {
+			updates(v)["headless"].(map[string]any)["linux-amd64"].(map[string]any)["path"] = "/downloads/x"
+		},
 		"headless platform": func(v map[string]any) {
 			updates(v)["headless"].(map[string]any)["windows-amd64"] = updates(v)["headless"].(map[string]any)["linux-amd64"]
 		},

@@ -383,6 +383,9 @@ func (h *Headless) Rollback(ctx context.Context) error {
 	_, err = h.State.Update(func(s *State) error {
 		s.MarkFailed(h.Running)
 		s.Pending = nil
+		if v, ok := strings.CutSuffix(filepath.Base(previous), "-"+h.Layout.Platform); ok && coordinator.ValidVersion(v) {
+			s.Installed = v
+		}
 		return nil
 	})
 	return err

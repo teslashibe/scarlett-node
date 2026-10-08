@@ -105,9 +105,9 @@ func newHeadlessFixture(t *testing.T, newReports string) *headlessFixture {
 			s.InFlight = int(f.inFlight.Load())
 			return s, nil
 		},
-		Drained: func() (bool, error) { return f.drained.Load(), nil },
-		Drain:   func() error { f.drains.Add(1); f.drained.Store(true); return nil },
-		Resume:  func() error { f.resumes.Add(1); f.drained.Store(false); return nil },
+		Drained:       func() (bool, error) { return f.drained.Load(), nil },
+		Drain:         func() error { f.drains.Add(1); f.drained.Store(true); return nil },
+		Resume:        func() error { f.resumes.Add(1); f.drained.Store(false); return nil },
 		ServiceActive: func() bool { return true },
 		RestartService: func() error {
 			f.restarts.Add(1)

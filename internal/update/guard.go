@@ -165,7 +165,8 @@ func (g *Guard) cleanup(p *Pending) {
 			}
 			continue
 		}
-		if keep[path] || strings.HasPrefix(entry.Name(), "guard-") {
+		// The guard's own copy and log stay: the log explains the last update.
+		if keep[path] || strings.HasPrefix(entry.Name(), "guard-") || entry.Name() == "guard.log" {
 			continue
 		}
 		_ = os.RemoveAll(path)

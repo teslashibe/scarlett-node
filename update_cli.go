@@ -167,6 +167,9 @@ func newHeadlessUpdater(bin string, out io.Writer) (*update.Headless, error) {
 		return nil, err
 	}
 	if bin == "" {
+		bin = installedBinDir(os.Args[0], layout.Root)
+	}
+	if bin == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return nil, err
@@ -211,4 +214,32 @@ func newHeadlessUpdater(bin string, out io.Writer) (*update.Headless, error) {
 		},
 		DrainTimeout: 30 * time.Minute, HealthWait: 3 * time.Minute, Poll: 2 * time.Second, Now: time.Now,
 	}, nil
+}
+
+// installedBinDir is the directory of the command link this process was
+// started through, when that is the link install.sh made for this layout
+// ("<bin>/scarlett-node" -> "<root>/current/scarlett-node"). An installation
+// with a custom bin directory then needs no --bin, and the default never
+// points install.sh at another installation's links.
+func installedBinDir(arg0, root string) string {
+	path := arg0
+	if !strings.ContainsRune(path, filepath.Separator) {
+		found, err := exec.LookPath(path)
+		if err != nil {
+			return ""
+		}
+		path = found
+	}
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return ""
+	}
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return ""
+	}
+	if target, err := os.Readlink(path); err != nil || target != filepath.Join(root, "current", "scarlett-node") {
+		return ""
+	}
+	return filepath.Dir(path)
 }

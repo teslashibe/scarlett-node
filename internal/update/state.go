@@ -47,7 +47,7 @@ type Pending struct {
 	Previous string `json:"previous,omitempty"`
 	// DrainOwner is updater when the updater paused new work and must resume
 	// it, operator when the operator had already paused, else none.
-	DrainOwner    string    `json:"drain_owner"`
+	DrainOwner    string `json:"drain_owner"`
 	ResumeServing bool   `json:"resume_serving"`
 	AppPID        int    `json:"app_pid,omitempty"`
 	GuardPID      int    `json:"guard_pid,omitempty"`
