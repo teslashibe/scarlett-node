@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +43,9 @@ type BrowserStatus struct {
 	// ("scrapling/0.4.15+scarlett.2") and UserAgent the pinned User-Agent the
 	// browser sends, which the proven re-fetch repeats.
 	Version, Engine, UserAgent string
+	// KillBytes is the browser tree size above which the node kills its
+	// browser, for the heartbeat; 0 when unknown.
+	KillBytes int64
 	// Solvers are the operator's captcha-solver providers the browser may
 	// use now (names only), for the heartbeat.
 	Solvers []string
@@ -61,22 +65,37 @@ type BrowserFetchRequest struct {
 // BrowserFetchResult is the helper's answer for one page. Cookies carry
 // values; everything else is safe to upload.
 type BrowserFetchResult struct {
-	Outcome        string                        `json:"outcome"` // ok, timeout or failed
-	Error          string                        `json:"error"`
-	FinalURL       string                        `json:"final_url"`
-	StatusCode     int                           `json:"status_code"`
-	Headers        [][2]string                   `json:"headers"`
-	SetCookieNames []string                      `json:"set_cookie_names"`
-	ContentType    string                        `json:"content_type"`
-	HTML           string                        `json:"html"`
-	HTMLTruncated  bool                          `json:"html_truncated"`
-	Cookies        []BrowserCookie               `json:"cookies"`
-	Challenge      string                        `json:"challenge"` // none, solved or unsolved
-	Redirects      []coordinator.BrowserRedirect `json:"redirects"`
-	StartedAtMS    int64                         `json:"started_at_ms"`
+	Outcome string `json:"outcome"` // ok, timeout or failed
+	// Error is set when Outcome is not ok; too_large (the DOM was over the
+	// page ceiling, HTMLBytes is its size) and memory (the node killed the
+	// browser for memory, TreePeakBytes is how large it got) still let the
+	// job deliver the proven re-fetch.
+	Error          string      `json:"error"`
+	FinalURL       string      `json:"final_url"`
+	StatusCode     int         `json:"status_code"`
+	Headers        [][2]string `json:"headers"`
+	SetCookieNames []string    `json:"set_cookie_names"`
+	ContentType    string      `json:"content_type"`
+	// HTMLPath is the DOM file of an ok result (empty DOM for a document
+	// that is not HTML), owned by the worker from Fetch on: it is deleted
+	// once uploaded or dropped. HTMLBytes and HTMLSHA256 describe it.
+	HTMLPath      string                        `json:"html_path"`
+	HTMLBytes     int64                         `json:"html_bytes"`
+	HTMLSHA256    string                        `json:"html_sha256"`
+	TreePeakBytes int64                         `json:"tree_peak_bytes"`
+	Cookies       []BrowserCookie               `json:"cookies"`
+	Challenge     string                        `json:"challenge"` // none, solved or unsolved
+	Redirects     []coordinator.BrowserRedirect `json:"redirects"`
+	StartedAtMS   int64                         `json:"started_at_ms"`
 	// Solver is "used", "needed" or "" (see coordinator.BrowserResult).
 	Solver string `json:"solver"`
 }
+
+// The browser failures that still produce a browser-result manifest.
+const (
+	BrowserErrorTooLarge = "too_large"
+	BrowserErrorMemory   = "memory"
+)
 
 const (
 	// webRefetchReserve is the part of a browser job kept after the browser
@@ -108,38 +127,41 @@ const (
 
 // runBrowser serves a browser job (contract C.7). report is the deadline for
 // the job's report. The browser phase ends 15 s before it; then the upload of
-// the browser's copy and the proven re-fetch run together, and the job is
-// proven if either the upload was stored or the verifier holds a hop.
-func (w Web) runBrowser(ctx context.Context, l coordinator.Lease, plan webPlan, report time.Time) string {
+// the browser's result and the proven re-fetch run together, and the job is
+// proven if either the manifest was stored or the verifier holds a hop. A
+// DOM over the page ceiling, or a browser killed for memory, still runs the
+// re-fetch and posts a manifest saying so (dom too_large or memory), so the
+// coordinator can serve the re-fetch.
+func (w Web) runBrowser(ctx context.Context, l coordinator.Lease, plan webPlan, report time.Time) WebReport {
 	opts := *l.WebRequest.Browser
 	budget := min(time.Duration(opts.TimeoutMS)*time.Millisecond, time.Until(report.Add(-webRefetchReserve)))
 	if budget < webBrowserMinBudget {
-		return "expired"
+		return WebReport{Code: "expired"}
 	}
 	// The page's own host passes the egress guard before any browser work, so
 	// the browser is never started for a page the node would refuse.
 	_, host, err := canonicalWebURL(plan.URL)
 	if err != nil {
-		return "web_egress_denied"
+		return WebReport{Code: "web_egress_denied"}
 	}
 	lookupCtx, cancel := context.WithTimeout(ctx, webLookupLimit)
 	addrs, err := w.resolver()(lookupCtx, host)
 	cancel()
 	if ctx.Err() != nil {
-		return "expired"
+		return WebReport{Code: "expired"}
 	}
 	if err != nil || len(addrs) == 0 {
-		return "web_dns_failed"
+		return WebReport{Code: "web_dns_failed"}
 	}
 	if _, ok := w.egress().pickWebAddr(ctx, addrs); !ok {
-		return "web_egress_denied"
+		return WebReport{Code: "web_egress_denied"}
 	}
 	if w.Browser == nil {
-		return "web_browser_unavailable"
+		return WebReport{Code: "web_browser_unavailable"}
 	}
 	status := w.Browser.Status()
 	if !status.Ready || status.UserAgent == "" {
-		return "web_browser_unavailable"
+		return WebReport{Code: "web_browser_unavailable"}
 	}
 
 	started := time.Now()
@@ -148,20 +170,42 @@ func (w Web) runBrowser(ctx context.Context, l coordinator.Lease, plan webPlan, 
 	res, err := w.Browser.Fetch(fetchCtx, BrowserFetchRequest{URL: plan.URL, Wait: opts.Wait, WaitMS: opts.WaitMS, WaitSelector: opts.WaitSelector, TimeoutMS: int(budget.Milliseconds()), BlockResources: opts.BlockResources, SolveChallenge: opts.SolveChallenge})
 	cancel()
 	duration := time.Since(started)
+	if err != nil {
+		removeDOM(res.HTMLPath)
+		res = BrowserFetchResult{}
+	}
 	if errors.Is(err, ErrBrowserUnavailable) {
 		end("web_browser_unavailable")
-		return "web_browser_unavailable"
+		return WebReport{Code: "web_browser_unavailable"}
 	}
 	browserCode := ""
 	if err != nil || res.Outcome != "ok" {
 		browserCode = "web_browser_failed"
 	}
 	end(webDiagnosticOutcome(ctx, browserCode))
-	// The main document must be a public web page; otherwise the browser copy
-	// is dropped. The re-fetch still runs: the verifier authorizes its hops.
-	upload := browserCode == "" && res.StatusCode >= 100 && res.StatusCode <= 999
-	if browserCode == "" && !browserFinalURLAllowed(res.FinalURL) {
-		browserCode, upload = "web_browser_failed", false
+	// What the manifest says about the DOM: uploaded, over the ceiling, or
+	// never rendered because the browser was killed for memory.
+	dom := ""
+	switch {
+	case browserCode == "" && res.HTMLPath != "" && res.HTMLBytes >= 0 && res.HTMLBytes <= coordinator.MaxBrowserHTMLBytes:
+		dom = coordinator.DOMOK
+	case browserCode == "":
+		// An ok answer without its DOM file is a broken helper.
+		browserCode = "web_browser_failed"
+	case err == nil && res.Error == BrowserErrorTooLarge && res.HTMLBytes > coordinator.MaxBrowserHTMLBytes:
+		dom = coordinator.DOMTooLarge
+	case err == nil && res.Error == BrowserErrorMemory && res.TreePeakBytes > 0:
+		dom = coordinator.DOMMemory
+	}
+	// The main document must be a public web page; otherwise the browser's
+	// result is dropped. The re-fetch still runs: the verifier authorizes its
+	// hops. A memory kill has no document to check.
+	upload := dom == coordinator.DOMMemory || dom != "" && res.StatusCode >= 100 && res.StatusCode <= 999
+	if dom != "" && dom != coordinator.DOMMemory && !browserFinalURLAllowed(res.FinalURL) {
+		upload = false
+		if dom == coordinator.DOMOK {
+			browserCode = "web_browser_failed"
+		}
 	}
 	refetch := res.Challenge != "unsolved"
 
@@ -176,11 +220,13 @@ func (w Web) runBrowser(ctx context.Context, l coordinator.Lease, plan webPlan, 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ok := w.uploadBrowserResult(ctx, l, res, status, started, duration, report)
+			ok := w.uploadBrowserResult(ctx, l, res, dom, status, started, duration, report)
 			mu.Lock()
 			stored = ok
 			mu.Unlock()
 		}()
+	} else {
+		removeDOM(res.HTMLPath)
 	}
 	if refetch {
 		cookies := res.Cookies
@@ -212,22 +258,36 @@ func (w Web) runBrowser(ctx context.Context, l coordinator.Lease, plan webPlan, 
 	defer mu.Unlock()
 	switch {
 	case refetchCode == "relay_misuse":
-		return refetchCode
+		return WebReport{Code: refetchCode}
 	case stored || verified > 0:
-		return ""
+		return WebReport{}
+	case dom == coordinator.DOMTooLarge:
+		return WebReport{Code: "page_too_large", Stage: "dom", ObservedBytes: res.HTMLBytes}
+	case refetch && refetchCode == "page_too_large":
+		return wireReport(refetchCode)
 	case browserCode != "":
-		return browserCode
+		return WebReport{Code: browserCode}
 	case refetch && refetchCode != "":
-		return refetchCode
+		return wireReport(refetchCode)
 	case ctx.Err() != nil:
-		return "expired"
+		return WebReport{Code: "expired"}
 	}
-	return "web_browser_failed"
+	return WebReport{Code: "web_browser_failed"}
 }
 
-// uploadBrowserResult builds, encodes and sends the browser's copy and
-// reports whether the coordinator stored it.
-func (w Web) uploadBrowserResult(ctx context.Context, l coordinator.Lease, res BrowserFetchResult, status BrowserStatus, started time.Time, duration time.Duration, report time.Time) bool {
+// removeDOM deletes a DOM file and its gzip stream, if any.
+func removeDOM(path string) {
+	if path != "" {
+		_ = os.Remove(path)
+		_ = os.Remove(path + ".gz")
+	}
+}
+
+// uploadBrowserResult builds the manifest, compresses the DOM (dom ok), sends
+// both and reports whether the coordinator stored the manifest. It deletes
+// the DOM file and its gzip stream when done.
+func (w Web) uploadBrowserResult(ctx context.Context, l coordinator.Lease, res BrowserFetchResult, dom string, status BrowserStatus, started time.Time, duration time.Duration, report time.Time) bool {
+	defer removeDOM(res.HTMLPath)
 	if w.Upload == nil {
 		return false
 	}
@@ -235,7 +295,7 @@ func (w Web) uploadBrowserResult(ctx context.Context, l coordinator.Lease, res B
 	result := coordinator.BrowserResult{
 		Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence, RequestSHA256: l.RequestSHA256, URL: l.WebRequest.URL,
 		FinalURL: res.FinalURL, StatusCode: res.StatusCode, Headers: browserHeaders(res.Headers), SetCookieNames: browserCookieNames(res.SetCookieNames),
-		ContentType: browserContentType(res.ContentType), HTML: strings.ToValidUTF8(res.HTML, "\uFFFD"), HTMLTruncated: res.HTMLTruncated, Challenge: res.Challenge,
+		ContentType: browserContentType(res.ContentType), DOM: dom, Challenge: res.Challenge, TreePeakBytes: max(res.TreePeakBytes, 0),
 		Redirects: browserRedirects(res.Redirects), Browser: coordinator.BrowserInfo{Engine: status.Engine, Version: status.Version, UserAgent: status.UserAgent},
 		// Go's own clock bounds the browser phase: the start precedes the
 		// helper's and the duration covers it.
@@ -247,9 +307,26 @@ func (w Web) uploadBrowserResult(ctx context.Context, l coordinator.Lease, res B
 	if res.Solver == "used" || res.Solver == "needed" {
 		result.Solver = res.Solver
 	}
-	_, body, err := coordinator.EncodeBrowserResult(result)
+	gzipPath := ""
+	var err error
+	switch dom {
+	case coordinator.DOMOK:
+		gzipPath = res.HTMLPath + ".gz"
+		var up coordinator.BrowserUpload
+		up, err = coordinator.PrepareBrowserUpload(res.HTMLPath, gzipPath)
+		if err == nil && (up.HTMLBytes != res.HTMLBytes || up.HTMLSHA256 != res.HTMLSHA256) {
+			err = errors.New("browser DOM changed")
+		}
+		result.HTMLBytes, result.HTMLSHA256, result.GzipBytes, result.UploadSHA256, result.Parts = up.HTMLBytes, up.HTMLSHA256, up.GzipBytes, up.UploadSHA256, up.Parts
+	case coordinator.DOMTooLarge:
+		result.HTMLBytes = res.HTMLBytes
+	case coordinator.DOMMemory:
+		// The browser died before the page finished: no document metadata.
+		result.FinalURL, result.StatusCode, result.Headers, result.SetCookieNames = "", 0, nil, nil
+		result.ContentType, result.Challenge, result.Redirects, result.Solver = "", "none", nil, ""
+	}
 	if err == nil {
-		err = w.Upload(ctx, l.JobID, body, report)
+		err = w.Upload(ctx, l.JobID, result, gzipPath, report)
 	}
 	if err != nil {
 		end(webDiagnosticOutcome(ctx, "web_browser_failed"))

@@ -332,7 +332,10 @@ func (p *servicePool) browserHealthLocked(webCapacity int) coordinator.BrowserHe
 	if capacity < 1 || status.Version == "" || len(status.Version) > 64 {
 		return unavailable("helper_failed")
 	}
-	return coordinator.BrowserHealth{State: "ready", Capacity: capacity, InFlight: min(p.browserInFlight, capacity), Version: status.Version, Solvers: browserSolvers(status.Solvers)}
+	if status.KillBytes < 1 {
+		return unavailable("helper_failed")
+	}
+	return coordinator.BrowserHealth{State: "ready", Capacity: capacity, InFlight: min(p.browserInFlight, capacity), Version: status.Version, KillBytes: status.KillBytes, Solvers: browserSolvers(status.Solvers)}
 }
 
 // browserSolvers keeps the known solver provider names, once each, in the

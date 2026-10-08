@@ -22,10 +22,15 @@ import (
 const darwinUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
 
 // fakeBrowser stands in for the browser tier: a fixed status and one answer.
+// An ok answer comes with its DOM (html) in a new file in dir, as the runtime
+// hands it over; the worker must delete it.
 type fakeBrowser struct {
 	mu       sync.Mutex
 	status   BrowserStatus
 	result   BrowserFetchResult
+	html     string
+	dir      string
+	paths    []string
 	err      error
 	requests []BrowserFetchRequest
 	prewarms int
@@ -47,7 +52,32 @@ func (f *fakeBrowser) Fetch(ctx context.Context, req BrowserFetchRequest) (Brows
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.requests = append(f.requests, req)
-	return f.result, f.err
+	res := f.result
+	if res.Outcome == "ok" && f.dir != "" {
+		file, err := os.CreateTemp(f.dir, "dom-*.html")
+		if err != nil {
+			return BrowserFetchResult{}, err
+		}
+		file.WriteString(f.html)
+		file.Close()
+		res.HTMLPath, res.HTMLBytes, res.HTMLSHA256 = file.Name(), int64(len(f.html)), SHA(f.html)
+		f.paths = append(f.paths, file.Name())
+	}
+	return res, f.err
+}
+
+// leftovers lists the DOM directory: the worker deletes every DOM file and
+// gzip stream it was handed.
+func (f *fakeBrowser) leftovers() []string {
+	if f == nil || f.dir == "" {
+		return nil
+	}
+	entries, _ := os.ReadDir(f.dir)
+	names := []string{}
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
 }
 
 func (f *fakeBrowser) prewarmCount() int {
@@ -62,12 +92,14 @@ func readyStatus() BrowserStatus {
 
 const secretCookie = "synthetic-clearance-value"
 
+// renderedHTML is the fake browser's DOM.
+const renderedHTML = "<!doctype html><title>Example</title><p>rendered é</p>"
+
 func renderedPage() BrowserFetchResult {
 	return BrowserFetchResult{
 		Outcome: "ok", FinalURL: "https://example.com/", StatusCode: 200,
 		Headers:        [][2]string{{"Content-Type", "text/html; charset=utf-8"}, {"set-cookie", "cf_clearance=" + secretCookie}, {"cookie", "x=y"}, {"x-bad", "a\nb"}},
 		SetCookieNames: []string{"cf_clearance", "__cf_bm"}, ContentType: "text/html; charset=utf-8",
-		HTML: "<!doctype html><title>Example</title><p>rendered</p>",
 		Cookies: []BrowserCookie{
 			{Name: "cf_clearance", Value: secretCookie, Domain: ".example.com", Path: "/", Expires: -1, Secure: true},
 			{Name: "session", Value: "synthetic-session-value", Domain: ".example.com", Path: "/", Expires: -1},
@@ -87,7 +119,7 @@ func webBrowserFixtureLease(t *testing.T) coordinator.Lease {
 	if err := json.Unmarshal(raw, &l); err != nil {
 		t.Fatal(err)
 	}
-	l.LeaseDeadline = time.Now().Add(118 * time.Second)
+	l.LeaseDeadline = time.Now().Add(298 * time.Second)
 	l.SettlementDeadline = l.LeaseDeadline
 	return l
 }
@@ -296,10 +328,11 @@ type uploadCall struct {
 	jobID  string
 	body   BrowserUploadBody
 	raw    []byte
+	html   []byte // the DOM the gzip stream decompresses to (dom ok)
 	report time.Time
 }
 
-// BrowserUploadBody is the decompressed upload, decoded strictly.
+// BrowserUploadBody is the manifest, decoded strictly.
 type BrowserUploadBody = coordinator.BrowserResult
 
 type fakeUpload struct {
@@ -308,12 +341,11 @@ type fakeUpload struct {
 	fn    func(ctx context.Context) error
 }
 
-func (u *fakeUpload) upload(ctx context.Context, jobID string, gz []byte, report time.Time) error {
-	zr, err := gzip.NewReader(bytes.NewReader(gz))
-	if err != nil {
-		return err
-	}
-	raw, err := io.ReadAll(zr)
+// upload checks what the coordinator would: the manifest's JSON decodes
+// strictly and passes the node's own checks, and with dom ok the gzip stream
+// matches its parts and decompresses to html_bytes of html_sha256.
+func (u *fakeUpload) upload(ctx context.Context, jobID string, m coordinator.BrowserResult, gzipPath string, report time.Time) error {
+	_, raw, err := coordinator.EncodeBrowserResult(m)
 	if err != nil {
 		return err
 	}
@@ -323,8 +355,24 @@ func (u *fakeUpload) upload(ctx context.Context, jobID string, gz []byte, report
 	if err := d.Decode(&body); err != nil {
 		return err
 	}
+	call := uploadCall{jobID: jobID, body: body, raw: raw, report: report}
+	if m.DOM == coordinator.DOMOK {
+		stream, err := os.ReadFile(gzipPath)
+		if err != nil || SHA(string(stream)) != m.UploadSHA256 || int64(len(stream)) != m.GzipBytes || len(m.Parts) != (len(stream)+coordinator.BrowserPartBytes-1)/coordinator.BrowserPartBytes {
+			return errors.New("gzip stream does not match the manifest")
+		}
+		zr, err := gzip.NewReader(bytes.NewReader(stream))
+		if err != nil {
+			return err
+		}
+		if call.html, err = io.ReadAll(zr); err != nil || int64(len(call.html)) != m.HTMLBytes || SHA(string(call.html)) != m.HTMLSHA256 {
+			return errors.New("DOM does not match the manifest")
+		}
+	} else if gzipPath != "" {
+		return errors.New("a gzip stream without a DOM")
+	}
 	u.mu.Lock()
-	u.calls = append(u.calls, uploadCall{jobID, body, raw, report})
+	u.calls = append(u.calls, call)
 	u.mu.Unlock()
 	if u.fn != nil {
 		return u.fn(ctx)
@@ -359,9 +407,12 @@ func runBrowserJob(t *testing.T, mode string, l coordinator.Lease, browser *fake
 		w.Browser = browser
 	}
 	started := time.Now()
-	var code string
-	output := captureOutput(t, func() { code = w.Run(context.Background(), l) })
-	run := browserRun{webRun: webRun{code: code, asked: r.asked}, browser: browser, upload: upload, output: output, took: time.Since(started)}
+	var report WebReport
+	output := captureOutput(t, func() { report = w.Report(context.Background(), l) })
+	run := browserRun{webRun: webRun{code: report.Code, report: report, asked: r.asked}, browser: browser, upload: upload, output: output, took: time.Since(started)}
+	if left := browser.leftovers(); len(left) != 0 {
+		t.Fatal("DOM files left behind:", left)
+	}
 	raw, err := os.ReadFile(log)
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
@@ -400,7 +451,11 @@ func captureOutput(t *testing.T, f func()) string {
 }
 
 func browserWith(mutate func(*fakeBrowser)) *fakeBrowser {
-	f := &fakeBrowser{status: readyStatus(), result: renderedPage()}
+	dir, err := os.MkdirTemp("", "scarlett-dom-")
+	if err != nil {
+		panic(err)
+	}
+	f := &fakeBrowser{status: readyStatus(), result: renderedPage(), html: renderedHTML, dir: dir}
 	if mutate != nil {
 		mutate(f)
 	}
@@ -480,7 +535,8 @@ func TestRunBrowserUploadsAndRefetches(t *testing.T) {
 	// names lowercased and cookies, set-cookie and bad values dropped.
 	call := upload.calls[0]
 	body := call.body
-	if call.jobID != l.JobID || !call.report.Equal(l.LeaseDeadline.Add(-webReportMargin)) || body.Version != "node-v1" || body.Attempt != l.Attempt || body.Fence != l.Fence || body.RequestSHA256 != l.RequestSHA256 || body.URL != l.WebRequest.URL || body.FinalURL != "https://example.com/" || body.StatusCode != 200 || body.HTML != renderedPage().HTML || body.HTMLBytes != len(body.HTML) || body.HTMLSHA256 != SHA(body.HTML) || body.HTMLTruncated || body.Challenge != "solved" {
+	if call.jobID != l.JobID || !call.report.Equal(l.LeaseDeadline.Add(-webReportMargin)) || body.Version != "node-v1" || body.Attempt != l.Attempt || body.Fence != l.Fence || body.RequestSHA256 != l.RequestSHA256 || body.URL != l.WebRequest.URL || body.FinalURL != "https://example.com/" || body.StatusCode != 200 ||
+		body.DOM != coordinator.DOMOK || string(call.html) != renderedHTML || body.HTMLBytes != int64(len(renderedHTML)) || body.HTMLSHA256 != SHA(renderedHTML) || len(body.Parts) != 1 || body.Challenge != "solved" {
 		t.Fatalf("upload body %+v", body)
 	}
 	if len(body.Headers) != 1 || body.Headers[0] != [2]string{"content-type", "text/html; charset=utf-8"} || strings.Join(body.SetCookieNames, ",") != "cf_clearance,__cf_bm" || len(body.Redirects) != 1 {

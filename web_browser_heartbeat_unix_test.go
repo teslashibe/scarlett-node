@@ -6,9 +6,12 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -30,14 +33,19 @@ import (
 // scriptedBrowser is a ready browser tier that renders one fixed page.
 type scriptedBrowser struct {
 	mu       sync.Mutex
+	dir      string
 	prewarms int
 	fetches  []worker.BrowserFetchRequest
+	doms     []string
 }
+
+// renderedDOM is the page the scripted browser renders.
+const renderedDOM = "<p>rendered</p>"
 
 const syntheticUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
 
 func (s *scriptedBrowser) Status() worker.BrowserStatus {
-	return worker.BrowserStatus{Ready: true, Capacity: 1, Version: "155.0.8059.39", Engine: "scrapling/0.4.15+scarlett.2", UserAgent: syntheticUA}
+	return worker.BrowserStatus{Ready: true, Capacity: 1, Version: "155.0.8059.39", Engine: "scrapling/0.4.15+scarlett.2", UserAgent: syntheticUA, KillBytes: 16 << 30}
 }
 func (s *scriptedBrowser) Prewarm() {
 	s.mu.Lock()
@@ -48,7 +56,15 @@ func (s *scriptedBrowser) Fetch(_ context.Context, req worker.BrowserFetchReques
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.fetches = append(s.fetches, req)
-	return worker.BrowserFetchResult{Outcome: "ok", FinalURL: "https://example.com/", StatusCode: 200, Headers: [][2]string{{"content-type", "text/html"}}, ContentType: "text/html", HTML: "<p>rendered</p>", Challenge: "solved",
+	// The DOM travels as a file the worker owns from here on.
+	dom := filepath.Join(s.dir, fmt.Sprintf("dom-%d.html", len(s.fetches)))
+	if err := os.WriteFile(dom, []byte(renderedDOM), 0o600); err != nil {
+		return worker.BrowserFetchResult{}, err
+	}
+	s.doms = append(s.doms, dom)
+	sum := sha256.Sum256([]byte(renderedDOM))
+	return worker.BrowserFetchResult{Outcome: "ok", FinalURL: "https://example.com/", StatusCode: 200, Headers: [][2]string{{"content-type", "text/html"}}, ContentType: "text/html",
+		HTMLPath: dom, HTMLBytes: int64(len(renderedDOM)), HTMLSHA256: hex.EncodeToString(sum[:]), Challenge: "solved",
 		Cookies: []worker.BrowserCookie{{Name: "cf_clearance", Value: "synthetic-clearance", Domain: ".example.com", Path: "/", Expires: -1}, {Name: "session", Value: "synthetic-session", Domain: ".example.com", Path: "/", Expires: -1}}}, nil
 }
 func (s *scriptedBrowser) counts() (int, int) {
@@ -88,7 +104,7 @@ func TestRunLoopServesWebBrowserLease(t *testing.T) {
 			if err := os.WriteFile(prover, []byte(script), 0700); err != nil {
 				t.Fatal(err)
 			}
-			browser := &scriptedBrowser{}
+			browser := &scriptedBrowser{dir: privateTestDir(t)}
 			previousStart, previousWorker := startBrowserTier, webWorker
 			startBrowserTier = func(context.Context, config.Config) (worker.BrowserTier, func()) { return browser, func() {} }
 			webWorker = func(c config.Config) worker.Web {
@@ -107,6 +123,8 @@ func TestRunLoopServesWebBrowserLease(t *testing.T) {
 			uploaded := make(chan []byte, 1)
 			var mu sync.Mutex
 			served := false
+			parts := map[int][]byte{}
+			var partRequests []*http.Request
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/api/node/v1/heartbeat":
@@ -133,10 +151,28 @@ func TestRunLoopServesWebBrowserLease(t *testing.T) {
 					accepted := offer
 					accepted.VerifierToken = strings.Repeat("ab", 32)
 					json.NewEncoder(w).Encode(coordinator.LeaseAcceptance{Version: coordinator.Version, State: "leased", FundingAuthority: "production_receipt", Lease: accepted})
+				case "/api/node/v1/jobs/" + offer.JobID + "/browser-result/parts":
+					// Nothing stored yet: the node sends every part.
+					if r.Method != http.MethodGet {
+						w.WriteHeader(http.StatusMethodNotAllowed)
+						return
+					}
+					io.WriteString(w, `{"parts":[]}`)
+				case "/api/node/v1/jobs/" + offer.JobID + "/browser-result/parts/1":
+					raw, _ := io.ReadAll(r.Body)
+					sum := sha256.Sum256(raw)
+					if r.Method != http.MethodPut || r.Header.Get("X-Scarlett-Part-SHA256") != hex.EncodeToString(sum[:]) {
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					mu.Lock()
+					parts[1] = raw
+					partRequests = append(partRequests, r)
+					mu.Unlock()
+					io.WriteString(w, `{"status":"stored"}`)
 				case "/api/node/v1/jobs/" + offer.JobID + "/browser-result":
-					zr, err := gzip.NewReader(r.Body)
-					raw, _ := io.ReadAll(zr)
-					if err != nil {
+					raw, _ := io.ReadAll(r.Body)
+					if r.Method != http.MethodPost || r.Header.Get("Content-Encoding") != "" || !json.Valid(raw) {
 						w.WriteHeader(http.StatusUnsupportedMediaType)
 						return
 					}
@@ -176,7 +212,7 @@ func TestRunLoopServesWebBrowserLease(t *testing.T) {
 			}()
 			first := <-heartbeats
 			web := first.Services[2]
-			if web.Kind != "web" || web.Browser == nil || !reflect.DeepEqual(*web.Browser, coordinator.BrowserHealth{State: "ready", Capacity: 1, Version: "155.0.8059.39"}) || first.Capacity != 2 {
+			if web.Kind != "web" || web.Browser == nil || !reflect.DeepEqual(*web.Browser, coordinator.BrowserHealth{State: "ready", Capacity: 1, Version: "155.0.8059.39", KillBytes: 16 << 30}) || first.Capacity != 2 {
 				t.Fatalf("browser heartbeat %+v %+v", web, web.Browser)
 			}
 			var body []byte
@@ -220,13 +256,34 @@ func TestRunLoopServesWebBrowserLease(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatal("no browser-result upload")
 			}
-			if request.Header.Get("Content-Encoding") != "gzip" || request.Header.Get(coordinator.NodeVersionHeader) != coordinator.NodeRelease || request.Header.Get("Authorization") != "Bearer synthetic-credential" {
-				t.Fatalf("upload headers %v", request.Header)
+			if request.Header.Get("Content-Type") != "application/json" || request.Header.Get(coordinator.NodeVersionHeader) != coordinator.NodeRelease || request.Header.Get("Authorization") != "Bearer synthetic-credential" ||
+				request.Header.Get("X-Scarlett-Attempt") != offer.Attempt || request.Header.Get("X-Scarlett-Fence") != offer.Fence || request.Header.Get("X-Scarlett-Request-SHA256") != offer.RequestSHA256 {
+				t.Fatalf("manifest headers %v", request.Header)
 			}
 			var result coordinator.BrowserResult
 			raw = <-uploaded
-			if err := json.Unmarshal(raw, &result); err != nil || result.Attempt != offer.Attempt || result.Fence != offer.Fence || result.RequestSHA256 != offer.RequestSHA256 || result.HTML != "<p>rendered</p>" || strings.Contains(string(raw), "synthetic-clearance") || strings.Contains(string(raw), "synthetic-session") {
-				t.Fatalf("upload body %s %v", raw, err)
+			domSum := sha256.Sum256([]byte(renderedDOM))
+			if err := json.Unmarshal(raw, &result); err != nil || result.Attempt != offer.Attempt || result.Fence != offer.Fence || result.RequestSHA256 != offer.RequestSHA256 ||
+				result.DOM != coordinator.DOMOK || result.HTMLBytes != int64(len(renderedDOM)) || result.HTMLSHA256 != hex.EncodeToString(domSum[:]) || len(result.Parts) != 1 ||
+				strings.Contains(string(raw), renderedDOM) || strings.Contains(string(raw), "synthetic-clearance") || strings.Contains(string(raw), "synthetic-session") {
+				t.Fatalf("manifest %s %v", raw, err)
+			}
+			// The DOM arrived as one gzip part, sent before the manifest and
+			// bound to the lease and the upload digest.
+			mu.Lock()
+			part, partReqs := parts[1], partRequests
+			mu.Unlock()
+			partSum := sha256.Sum256(part)
+			if len(partReqs) != 1 || partReqs[0].Header.Get("X-Scarlett-Upload-SHA256") != result.UploadSHA256 || partReqs[0].Header.Get("X-Scarlett-Attempt") != offer.Attempt ||
+				int64(len(part)) != result.GzipBytes || hex.EncodeToString(partSum[:]) != result.Parts[0] || result.UploadSHA256 != result.Parts[0] {
+				t.Fatalf("parts %d %+v", len(partReqs), result)
+			}
+			zr, err := gzip.NewReader(bytes.NewReader(part))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if dom, err := io.ReadAll(zr); err != nil || string(dom) != renderedDOM {
+				t.Fatalf("uploaded DOM %q %v", dom, err)
 			}
 			// The browser slot is released with the job.
 			deadline := time.After(10 * time.Second)
@@ -239,6 +296,17 @@ func TestRunLoopServesWebBrowserLease(t *testing.T) {
 				}
 				if web := h.Services[2]; web.InFlight == 0 && web.Browser != nil && web.Browser.InFlight == 0 {
 					break
+				}
+			}
+			// The worker deleted the DOM file and its gzip stream.
+			browser.mu.Lock()
+			doms := browser.doms
+			browser.mu.Unlock()
+			for _, dom := range doms {
+				for _, p := range []string{dom, dom + ".gz"} {
+					if _, err := os.Stat(p); !os.IsNotExist(err) {
+						t.Fatalf("%s left behind: %v", filepath.Base(p), err)
+					}
 				}
 			}
 		})

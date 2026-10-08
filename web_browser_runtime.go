@@ -66,14 +66,15 @@ type runtimeBrowser struct{ m *webruntime.Manager }
 
 func (r runtimeBrowser) Status() worker.BrowserStatus {
 	h := r.m.Health()
-	return worker.BrowserStatus{Ready: h.State == "ready", Reason: string(h.Reason), Capacity: h.Capacity, Version: h.Version, Engine: webruntime.Engine, UserAgent: r.m.UserAgent(), Solvers: h.Solvers}
+	return worker.BrowserStatus{Ready: h.State == "ready", Reason: string(h.Reason), Capacity: h.Capacity, Version: h.Version, Engine: webruntime.Engine, UserAgent: r.m.UserAgent(), Solvers: h.Solvers, KillBytes: int64(min(h.KillBytes, 1<<62))}
 }
 
 func (r runtimeBrowser) Prewarm() { r.m.Prewarm() }
 
 // Fetch maps the runtime's errors to the worker's: ErrUnavailable (not ready,
 // busy, or the helper could not start) is web_browser_unavailable, and any
-// other error a failed render.
+// other error a failed render. An ok result's DOM file passes to the worker,
+// which deletes it.
 func (r runtimeBrowser) Fetch(ctx context.Context, req worker.BrowserFetchRequest) (worker.BrowserFetchResult, error) {
 	res, err := r.m.Fetch(ctx, webruntime.FetchRequest(req))
 	if errors.Is(err, webruntime.ErrUnavailable) {
@@ -82,7 +83,8 @@ func (r runtimeBrowser) Fetch(ctx context.Context, req worker.BrowserFetchReques
 	if err != nil {
 		return worker.BrowserFetchResult{}, err
 	}
-	out := worker.BrowserFetchResult{Outcome: res.Outcome, Error: res.Error, FinalURL: res.FinalURL, StatusCode: res.StatusCode, Headers: res.Headers, SetCookieNames: res.SetCookieNames, ContentType: res.ContentType, HTML: res.HTML, HTMLTruncated: res.HTMLTruncated, Challenge: res.Challenge, StartedAtMS: res.StartedAtMS, Solver: res.Solver}
+	out := worker.BrowserFetchResult{Outcome: res.Outcome, Error: res.Error, FinalURL: res.FinalURL, StatusCode: res.StatusCode, Headers: res.Headers, SetCookieNames: res.SetCookieNames, ContentType: res.ContentType,
+		HTMLPath: res.HTMLPath, HTMLBytes: res.HTMLBytes, HTMLSHA256: res.HTMLSHA256, TreePeakBytes: int64(min(res.TreePeakBytes, 1<<62)), Challenge: res.Challenge, StartedAtMS: res.StartedAtMS, Solver: res.Solver}
 	for _, c := range res.Cookies {
 		out.Cookies = append(out.Cookies, worker.BrowserCookie(c))
 	}

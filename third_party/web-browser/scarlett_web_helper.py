@@ -20,11 +20,14 @@ providers' own APIs.
 
 It never logs URLs, headers, cookies, page content or solver keys. Its only
 stderr line of its own is SCARLETT_WEB_BROWSER_ERROR=<reason> when the browser
-cannot start. Standard library plus that Scrapling build (and certifi, one of
+cannot start. The rendered DOM never travels in the JSON answer: it is written
+to a private file in TMPDIR (html_path), which the node moves away, checks and
+deletes. Standard library plus that Scrapling build (and certifi, one of
 its dependencies, for the solver providers' TLS roots) only.
 """
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
@@ -43,7 +46,10 @@ PORT_PREFIX = "SCARLETT_WEB_HELPER_PORT="
 ENGINE = "scrapling/" + SCRAPLING_VERSION
 MAX_REQUEST_BODY = 65536
 MAX_REQUEST_HEAD = 16384
-HTML_CAP = 10485760
+# The page ceiling: the DOM in UTF-8 bytes. Never cut: a larger DOM is reported
+# as too_large with its size and never written.
+HTML_CAP = 67108864
+DOM_PREFIX, DOM_SUFFIX = "dom-", ".html"
 MAX_HEADERS = 128
 MAX_HEADER_BYTES = 65536
 MAX_SET_COOKIE_NAMES = 50
@@ -423,12 +429,37 @@ class Request:
             raise ValueError("flags")
 
 
-def cap_html(html):
-    """At most HTML_CAP UTF-8 bytes, cut on a code-point boundary."""
-    raw = html.encode("utf-8", "replace")
-    if len(raw) <= HTML_CAP:
-        return raw.decode("utf-8"), False
-    return raw[:HTML_CAP].decode("utf-8", "ignore"), True
+def dom_bytes(body):
+    """The DOM as valid UTF-8 bytes: the body as is when it already is, else
+    decoded with replacement and encoded again."""
+    body = body or b""
+    try:
+        body.decode("utf-8")
+        return body
+    except UnicodeDecodeError:
+        return body.decode("utf-8", "replace").encode("utf-8", "replace")
+
+
+def write_dom(raw):
+    """Writes raw (UTF-8, at most HTML_CAP bytes) to a new private file in
+    TMPDIR (mkstemp: O_EXCL, 0600) and returns html_path, html_bytes and
+    html_sha256."""
+    fd, path = tempfile.mkstemp(prefix=DOM_PREFIX, suffix=DOM_SUFFIX)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+    except BaseException:
+        remove_dom(path)
+        raise
+    return {"html_path": path, "html_bytes": len(raw), "html_sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def remove_dom(path):
+    if path:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def header_pairs(pairs):
@@ -631,6 +662,7 @@ class Fetcher:
             scope = self.solver.scope() if self.solver is not None and request.solver else None
             result = await self._once(request, deadline, scope)
             if result["data"]["challenge"] == "unsolved" and not result["no_retry"] and deadline - loop.time() >= 15:
+                remove_dom(result["data"]["html_path"])  # the first pass's DOM is not the answer
                 result = await self._once(request, deadline, scope)
             data = result["data"]
             if scope is not None:
@@ -712,7 +744,7 @@ class Fetcher:
             state["acted"] = True
 
         data = {"outcome": "failed", "error": "navigation_failed", "final_url": "", "status_code": 0, "headers": [],
-                "set_cookie_names": [], "content_type": "", "html": "", "html_truncated": False, "cookies": [],
+                "set_cookie_names": [], "content_type": "", "html_path": "", "html_bytes": 0, "html_sha256": "", "cookies": [],
                 "challenge": "none", "redirects": [], "started_at_ms": started_at_ms, "solver": "", "solver_cost_micro_usd": 0,
                 "timings": {"context_ms": 0, "navigate_ms": 0, "settle_ms": 0, "challenge_ms": 0, "total_ms": 0}}
         no_retry = False
@@ -758,11 +790,10 @@ class Fetcher:
             pairs = document.pairs(last) if last is not None else list(response.headers.items())
             headers, names = header_pairs(pairs)
             content_type = next((v for k, v in headers if k == "content-type"), "")
-            html = ""
+            raw = b""
             kind = content_type.split(";", 1)[0].strip().lower()
             if kind in ("text/html", "application/xhtml+xml"):
-                html = (response.body or b"").decode("utf-8", "replace")
-            html, truncated = cap_html(html)
+                raw = dom_bytes(response.body)
             redirects = []
             for item in (document.responses if document else []):
                 if 300 <= item.status < 400 and len(redirects) < MAX_REDIRECTS:
@@ -773,9 +804,16 @@ class Fetcher:
                                 "path": c.get("path", "/"), "expires": c.get("expires", -1), "secure": bool(c.get("secure")),
                                 "http_only": bool(c.get("httpOnly"))})
             data.update(outcome="ok", error="", final_url=response.url, status_code=last.status if last is not None else response.status,
-                        headers=headers, set_cookie_names=names, content_type=content_type[:512], html=html,
-                        html_truncated=truncated, cookies=cookies, challenge=challenge, redirects=redirects,
-                        solver=solver, solver_cost_micro_usd=cost)
+                        headers=headers, set_cookie_names=names, content_type=content_type[:512], cookies=cookies,
+                        challenge=challenge, redirects=redirects, solver=solver, solver_cost_micro_usd=cost)
+            if len(raw) > HTML_CAP:
+                # Never cut: the node still runs the proven re-fetch, and the
+                # coordinator serves that when it can.
+                data.update(outcome="failed", error="too_large", html_bytes=len(raw))
+            else:
+                # Off the event loop: other pages keep rendering meanwhile.
+                data.update(await asyncio.to_thread(write_dom, raw))
+            del raw
         timings = data["timings"]
         if marks["context"]:
             timings["context_ms"] = round((marks["context"] - begin) * 1000)
