@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -86,7 +87,7 @@ func TestRuntimeBrowserWithoutArchive(t *testing.T) {
 			break
 		}
 	}
-	if s.Ready || s.Reason != "runtime_missing" && s.Reason != "memory_low" || s.UserAgent == "" || s.Engine != "scrapling/0.4.15" {
+	if s.Ready || s.Reason != "runtime_missing" && s.Reason != "memory_low" || s.UserAgent == "" || s.Engine != "scrapling/0.4.15+scarlett.1" {
 		t.Fatalf("status without an archive: %+v", s)
 	}
 	if _, err := tier.Fetch(context.Background(), worker.BrowserFetchRequest{URL: "https://example.com/", Wait: "load", TimeoutMS: 5000}); !errors.Is(err, worker.ErrBrowserUnavailable) {
@@ -159,5 +160,23 @@ func TestLogBrowserUploadRefusal(t *testing.T) {
 				t.Fatal("credential logged")
 			}
 		})
+	}
+}
+
+func TestRuntimeSolversCarryTheOperatorsKeys(t *testing.T) {
+	if runtimeSolvers(nil) != nil {
+		t.Fatal("solvers without a configuration")
+	}
+	s, err := config.NewWebSolvers(map[string]string{"2captcha": "synthetic-2captcha-key", "capmonster": "synthetic-capmonster-key"}, 3, 2_500_000, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := runtimeSolvers(s)
+	if r == nil || len(r.Keys) != 2 || r.Keys["capmonster"] != "synthetic-capmonster-key" || r.Keys["2captcha"] != "synthetic-2captcha-key" ||
+		r.MaxSolvesPerFetch != 3 || r.MaxMicroUSDPerDay != 2_500_000 || !r.Experimental || strings.Join(r.Providers(), ",") != "capmonster,2captcha" {
+		t.Fatalf("runtime solvers %v", r.Providers())
+	}
+	if strings.Contains(fmt.Sprintf("%v %+v %#v %v", r, *r, r, s), "synthetic") {
+		t.Fatal("solver keys formatted")
 	}
 }

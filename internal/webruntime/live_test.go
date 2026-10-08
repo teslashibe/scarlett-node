@@ -503,10 +503,18 @@ func checkArgv(t *testing.T, m *Manager, h *helper, tree []procInfo) {
 		"--disable-blink-features=AutomationControlled", "--deny-permission-prompts", "--disable-quic", "--disable-component-update", "--use-fake-device-for-media-stream",
 		"--proxy-server=" + h.deny.URL(), "--mute-audio", "--use-mock-keychain"}
 	for _, a := range stealth {
-		if !strings.HasPrefix(a, "--disable-features=") && !strings.HasPrefix(a, "--enable-features=") {
+		if !strings.HasPrefix(a, "--disable-features=") && !strings.HasPrefix(a, "--enable-features=") && !antibotDropped(a) {
 			want = append(want, a)
 		}
 	}
+	// The anti-bot launch hardening drops only display-only headless tells
+	// and adds the host's screen, scale, window and the pinned User-Agent.
+	for _, a := range argv {
+		if antibotDropped(a) && !slices.Contains(antibotAdded(argv), a) {
+			t.Fatalf("live argv keeps the headless tell %s", a)
+		}
+	}
+	want = append(want, "--user-agent="+m.UserAgent())
 	for _, a := range want {
 		if !slices.Contains(argv, a) {
 			t.Fatalf("live argv lacks %s", a)
@@ -525,8 +533,16 @@ func checkArgv(t *testing.T, m *Manager, h *helper, tree []procInfo) {
 		}
 	}
 	prefix := "--user-data-dir=" + filepath.Join(m.cfg.StateDir, "web-browser", "tmp", "scarlett-profile-")
-	if len(profiles) != 1 || !strings.HasPrefix(profiles[0], prefix) || !slices.Equal(argv[len(argv)-3:], []string{profiles[0], "--remote-debugging-pipe", "--no-startup-window"}) {
-		t.Fatalf("browser profile not the seeded one: %v", profiles)
+	tail := slices.Index(argv, "--remote-debugging-pipe") - 1
+	if len(profiles) != 1 || !strings.HasPrefix(profiles[0], prefix) || tail < 0 || len(argv) < tail+3 ||
+		!slices.Equal(argv[tail:tail+3], []string{profiles[0], "--remote-debugging-pipe", "--no-startup-window"}) ||
+		!slices.Equal(antibotAdded(argv), argv[tail+3:]) {
+		t.Fatalf("browser profile not the seeded one, or more than the hardening after it: %v", profiles)
+	}
+	for _, p := range []string{"--screen-info=", "--force-device-scale-factor=", "--window-size="} {
+		if count(p) != 1 {
+			t.Fatalf("live argv has %d %s switches", count(p), p)
+		}
 	}
 	raw, err := os.ReadFile(filepath.Join(strings.TrimPrefix(profiles[0], "--user-data-dir="), "Default", "Preferences"))
 	var prefs struct {
@@ -557,6 +573,33 @@ func checkArgv(t *testing.T, m *Manager, h *helper, tree []procInfo) {
 			t.Fatalf("seeded URL blocklist lacks %s: %v", scheme, prefs.Policy.URLBlocklist)
 		}
 	}
+}
+
+// antibotDropped reports a launch switch the Scrapling fork's anti-bot
+// hardening drops (scarlett_web_helper.ANTIBOT_DROPPED).
+func antibotDropped(a string) bool {
+	switch a {
+	case "--window-position=0,0", "--force-color-profile=srgb", "--hide-scrollbars", "--font-render-hinting=none",
+		"--disable-threaded-animation", "--disable-threaded-scrolling", "--start-maximized":
+		return true
+	}
+	for _, p := range []string{"--blink-settings=", "--window-size=", "--screen-info=", "--force-device-scale-factor="} {
+		if strings.HasPrefix(a, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// antibotAdded is the run of hardening switches at the end of argv
+// (scarlett_web_helper.ANTIBOT_ADDED_PREFIXES).
+func antibotAdded(argv []string) []string {
+	i := len(argv)
+	for i > 0 && slices.ContainsFunc([]string{"--screen-info=", "--force-device-scale-factor=", "--window-size=", "--force-color-profile=scrgb-linear", "--user-agent="},
+		func(p string) bool { return strings.HasPrefix(argv[i-1], p) }) {
+		i--
+	}
+	return argv[i:]
 }
 
 func stealthArgs(t *testing.T, m *Manager) []string {

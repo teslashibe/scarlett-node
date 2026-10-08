@@ -33,14 +33,18 @@ const (
 
 // clearanceCookieNames are the anti-bot clearance cookies the re-fetch may
 // carry, matched exactly and case-sensitively (contract §1, the same list the
-// verifier enforces).
+// verifier enforces): Cloudflare; DataDome; Akamai Bot Manager, including
+// its sensor (sbsd) and SEC-CPT challenge cookies; HUMAN; Imperva; AWS WAF;
+// and Kasada's mirror of its x-kpsdk-ct token.
 var clearanceCookieNames = map[string]bool{
-	"cf_clearance": true, "__cf_bm": true, "_cfuvid": true, "datadome": true, "_abck": true, "bm_sz": true,
-	"ak_bmsc": true, "bm_sv": true, "pxcts": true, "reese84": true, "aws-waf-token": true,
+	"cf_clearance": true, "__cf_bm": true, "_cfuvid": true, "datadome": true,
+	"_abck": true, "bm_sz": true, "ak_bmsc": true, "bm_sv": true, "bm_s": true, "bm_so": true, "bm_sc": true, "bm_lso": true, "bm_mi": true,
+	"sbsd": true, "sbsd_o": true, "sec_cpt": true, "pxcts": true, "reese84": true, "___utmvc": true, "aws-waf-token": true,
+	"KP_UIDz": true, "KP_UIDz-ssn": true, "tkrm_alpekz_s1.3": true, "tkrm_alpekz_s1.3-ssn": true,
 }
 
 // clearanceCookiePrefixes match only when at least one more byte follows.
-var clearanceCookiePrefixes = []string{"_px", "incap_ses_", "visid_incap_", "nlbi_"}
+var clearanceCookiePrefixes = []string{"_px", "incap_ses_", "visid_incap_", "nlbi_", "incap_sh_"}
 
 // ClearanceCookie reports whether name is an anti-bot clearance cookie the
 // verifier accepts on a browser job's re-fetch.

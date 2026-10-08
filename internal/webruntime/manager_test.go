@@ -41,7 +41,8 @@ func fakeHelper(mode, dump string) int {
 	}
 	sort.Strings(keys)
 	env, _ := json.Marshal(map[string]any{"keys": keys, "pid": os.Getpid(), "deny": os.Getenv("WEB_DENY_PROXY"), "proxy": os.Getenv("WEB_EGRESS_PROXY"),
-		"tmp": os.Getenv("TMPDIR"), "home": os.Getenv("HOME"), "pages": os.Getenv("WEB_MAX_PAGES"), "ua": os.Getenv("WEB_USER_AGENT")})
+		"tmp": os.Getenv("TMPDIR"), "home": os.Getenv("HOME"), "pages": os.Getenv("WEB_MAX_PAGES"), "ua": os.Getenv("WEB_USER_AGENT"),
+		"solver_config": os.Getenv("WEB_SOLVER_CONFIG")})
 	os.WriteFile(filepath.Join(dump, "env-"+strconv.Itoa(os.Getpid())+".json"), env, 0o600)
 	switch mode {
 	case "exit":
@@ -93,16 +94,39 @@ func fakeHelper(mode, dump string) int {
 		}
 		fmt.Fprintf(w, `{"data":{"status":%q}}`, status)
 	}))
+	// The providers the helper built from WEB_SOLVER_CONFIG, as the real
+	// helper names them (sorted), or a wrong list in mode wrong-solvers.
+	solvers := []string{}
+	var solverConfig map[string]any
+	if json.Unmarshal([]byte(os.Getenv("WEB_SOLVER_CONFIG")), &solverConfig) == nil {
+		for name := range solverConfig {
+			if slices.Contains(SolverProviders, name) {
+				solvers = append(solvers, name)
+			}
+		}
+	}
+	sort.Strings(solvers)
+	if mode == "wrong-solvers" {
+		solvers = append(solvers, "anticaptcha")
+	}
 	mux.HandleFunc("/v1/capabilities", auth(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `{"data":{"web_browser":1,"engine":%q,"browser_version":%q,"max_pages":%d}}`, Engine, PinnedVersion, pages)
+		names, _ := json.Marshal(solvers)
+		fmt.Fprintf(w, `{"data":{"web_browser":1,"engine":%q,"browser_version":%q,"max_pages":%d,"solvers":%s}}`, Engine, PinnedVersion, pages, names)
 	}))
 	mux.HandleFunc("/v1/fetch", auth(func(w http.ResponseWriter, r *http.Request) {
-		var req FetchRequest
+		var req helperFetch
 		if json.NewDecoder(r.Body).Decode(&req) != nil || r.Header.Get("Content-Type") != "application/json" {
 			http.Error(w, "{}", 400)
 			return
 		}
-		fetches.Add(1)
+		n := fetches.Add(1)
+		os.WriteFile(filepath.Join(dump, "solver-"+strconv.FormatInt(n, 10)), []byte(strconv.FormatBool(req.Solver)), 0o600)
+		if mode == "solver-cost" {
+			fmt.Fprintf(w, `{"data":{"outcome":"ok","error":"","final_url":%q,"status_code":200,"headers":[],"set_cookie_names":[],"content_type":"text/html",
+				"html":"<p>ok</p>","html_truncated":false,"cookies":[],"challenge":"solved","redirects":[],"started_at_ms":1,
+				"timings":{"context_ms":1,"navigate_ms":1,"settle_ms":1,"challenge_ms":1,"total_ms":4},"solver":"used","solver_cost_micro_usd":600000}}`, req.URL)
+			return
+		}
 		if mode == "hang" || mode == "hang-once" && os.WriteFile(filepath.Join(dump, "hung"), nil, 0o600) == nil && !exists(filepath.Join(dump, "hung-done")) {
 			os.WriteFile(filepath.Join(dump, "hung-done"), nil, 0o600)
 			<-stop
@@ -111,7 +135,8 @@ func fakeHelper(mode, dump string) int {
 		fmt.Fprintf(w, `{"data":{"outcome":"ok","error":"","final_url":%q,"status_code":200,"headers":[["content-type","text/html"]],
 			"set_cookie_names":["sid"],"content_type":"text/html","html":"<p>ok</p>","html_truncated":false,
 			"cookies":[{"name":"cf_clearance","value":"secret","domain":".example.com","path":"/","expires":-1,"secure":true,"http_only":true}],
-			"challenge":"none","redirects":[],"started_at_ms":1,"timings":{"context_ms":1,"navigate_ms":1,"settle_ms":1,"challenge_ms":0,"total_ms":3}}}`, req.URL)
+			"challenge":"none","redirects":[],"started_at_ms":1,"timings":{"context_ms":1,"navigate_ms":1,"settle_ms":1,"challenge_ms":0,"total_ms":3},
+			"solver":"","solver_cost_micro_usd":0}}`, req.URL)
 	}))
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -135,6 +160,17 @@ func fakeHelper(mode, dump string) int {
 }
 
 func exists(p string) bool { _, err := os.Stat(p); return err == nil }
+
+// testSolverKey is a synthetic provider key.
+const testSolverKey = "synthetic-capmonster-key-0123456789"
+
+// testSolvers configures a solver for the solver modes only.
+func testSolvers(mode string) *Solvers {
+	if mode != "solver-cost" && mode != "wrong-solvers" {
+		return nil
+	}
+	return &Solvers{Keys: map[string]string{"capmonster": testSolverKey}, MaxSolvesPerFetch: 2, MaxMicroUSDPerDay: 1_000_000}
+}
 
 type verifyResult struct{ err error }
 
@@ -172,7 +208,7 @@ func newTestManager(t *testing.T, mode string) *testManagerSetup {
 	s.level.Store(1)
 	s.mode.Store(mode)
 	s.verify.Store(verifyResult{})
-	m := New(Config{ResourceDir: t.TempDir(), StateDir: state, Guard: testGuard{}, Capacity: 2, IdleTimeout: 120 * time.Second})
+	m := New(Config{ResourceDir: t.TempDir(), StateDir: state, Guard: testGuard{}, Capacity: 2, IdleTimeout: 120 * time.Second, Solvers: testSolvers(mode)})
 	root := Root{Dir: t.TempDir()}
 	browser := Browser{Dir: t.TempDir(), Executable: filepath.Join(t.TempDir(), "chrome"), Version: PinnedVersion}
 	m.d.now = s.clock.Now
@@ -302,7 +338,7 @@ func TestManagerStartsHelperWithPrivateStateAndAllowlistedEnv(t *testing.T) {
 }
 
 func TestManagerReadinessTimeoutAndStartFailures(t *testing.T) {
-	for _, mode := range []string{"never-ready", "wrong-caps", "exit", "launch-failed", "bad-port", "silent"} {
+	for _, mode := range []string{"never-ready", "wrong-caps", "wrong-solvers", "exit", "launch-failed", "bad-port", "silent"} {
 		t.Run(mode, func(t *testing.T) {
 			s := newTestManager(t, mode)
 			s.m.d.readyTimeout = time.Second
@@ -822,5 +858,90 @@ func TestManagerRunRetriesPrepareWithBackoff(t *testing.T) {
 	}
 	if h := s.m.Health(); h.State != "ready" {
 		t.Fatalf("health after recovery %+v", h)
+	}
+}
+
+func TestManagerSolversAndDailyCap(t *testing.T) {
+	s := newTestManager(t, "solver-cost")
+	s.prepare(t)
+	if h := s.m.Health(); !slices.Equal(h.Solvers, []string{"capmonster"}) {
+		t.Fatalf("solvers before any spend: %+v", h)
+	}
+	for i := 1; i <= 3; i++ {
+		res, err := s.fetch(context.Background())
+		if err != nil || res.Solver != "used" || res.SolverCostMicroUSD != 600_000 {
+			t.Fatalf("fetch %d: %v %+v", i, err, res.Solver)
+		}
+	}
+	// $0.60 a fetch against a $1.00 day: the first two may use the solver,
+	// the third may not, and the heartbeat stops naming it.
+	for i, want := range []string{"true", "true", "false"} {
+		raw, _ := os.ReadFile(filepath.Join(s.dump, "solver-"+strconv.Itoa(i+1)))
+		if string(raw) != want {
+			t.Fatalf("fetch %d solver flag %q", i+1, raw)
+		}
+	}
+	if h := s.m.Health(); h.State != "ready" || h.Solvers != nil {
+		t.Fatalf("solvers after the cap: %+v", h)
+	}
+	// The key reaches the helper only in WEB_SOLVER_CONFIG, with the caps.
+	raw, err := os.ReadFile(filepath.Join(s.dump, "env-"+strconv.Itoa(s.helperPID(t))+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env struct {
+		Keys         []string `json:"keys"`
+		SolverConfig string   `json:"solver_config"`
+	}
+	json.Unmarshal(raw, &env)
+	var config map[string]any
+	if json.Unmarshal([]byte(env.SolverConfig), &config) != nil || config["capmonster"] != testSolverKey || config["max_solves_per_fetch"] != float64(2) || config["experimental"] != false || len(config) != 3 {
+		t.Fatalf("solver config %v", config)
+	}
+	if !slices.Contains(env.Keys, "WEB_SOLVER_CONFIG") {
+		t.Fatal("no WEB_SOLVER_CONFIG")
+	}
+	if strings.Contains(fmt.Sprintf("%v %+v %#v", s.m.cfg, s.m.cfg, s.m.cfg.Solvers), testSolverKey) {
+		t.Fatal("a configuration formats the key")
+	}
+	// The day's spend survives a restart, privately, and resets the next UTC day.
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(filepath.Join(s.state, "web-browser", spendFile))
+		if err != nil || info.Mode().Perm() != 0o600 {
+			t.Fatalf("spend file not private: %v", err)
+		}
+	}
+	again := New(Config{StateDir: s.state, Solvers: testSolvers("solver-cost")})
+	again.d.now = s.clock.Now
+	again.mu.Lock()
+	allowed, spent := again.solverAllowedLocked(), again.spentLocked()
+	again.mu.Unlock()
+	if allowed || spent != 1_800_000 {
+		t.Fatalf("after restart: allowed %v spent %d", allowed, spent)
+	}
+	s.clock.Add(24 * time.Hour)
+	if h := s.m.Health(); !slices.Equal(h.Solvers, []string{"capmonster"}) {
+		t.Fatalf("solvers the next day: %+v", h)
+	}
+}
+
+func TestSolverResultValidation(t *testing.T) {
+	ok := FetchResult{Outcome: "ok", StatusCode: 200, Challenge: "solved", Solver: "used", SolverCostMicroUSD: 1200}
+	if err := ok.validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []FetchResult{
+		{Outcome: "ok", StatusCode: 200, Challenge: "none", Solver: "maybe"},
+		{Outcome: "ok", StatusCode: 200, Challenge: "none", SolverCostMicroUSD: -1},
+		{Outcome: "ok", StatusCode: 200, Challenge: "none", SolverCostMicroUSD: maxFetchMicroUSD + 1},
+	} {
+		if bad.validate() == nil {
+			t.Fatalf("accepted %+v", bad.Solver)
+		}
+	}
+	if (&Solvers{Keys: map[string]string{"capmonster": "k"}, MaxSolvesPerFetch: 5, MaxMicroUSDPerDay: 1}).valid() ||
+		(&Solvers{Keys: map[string]string{"anticaptcha": "k"}, MaxSolvesPerFetch: 2, MaxMicroUSDPerDay: 1}).valid() ||
+		(&Solvers{Keys: map[string]string{"capmonster": "k"}, MaxSolvesPerFetch: 2}).valid() || (*Solvers)(nil).valid() {
+		t.Fatal("invalid solver configuration accepted")
 	}
 }

@@ -39,6 +39,11 @@ type BrowserResult struct {
 	Browser        BrowserInfo       `json:"browser"`
 	StartedAtMS    int64             `json:"started_at_ms"`
 	DurationMS     int64             `json:"duration_ms"`
+	// Solver is "used" when the operator's captcha solver cleared the page
+	// and "needed" when the page stopped at a captcha that takes one; absent
+	// otherwise. The coordinator remembers such domains and sends their
+	// browser jobs to nodes that report solvers first.
+	Solver string `json:"solver,omitempty"`
 }
 
 // BrowserRedirect is one main-frame redirect the browser followed.

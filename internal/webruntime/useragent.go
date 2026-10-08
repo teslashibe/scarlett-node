@@ -9,7 +9,7 @@ const (
 	PinnedVersion = "155.0.8059.39"
 	PinnedMajor   = 155
 	// Engine is what the helper reports and the upload names.
-	Engine = "scrapling/0.4.15"
+	Engine = "scrapling/0.4.15+scarlett.1"
 )
 
 // UserAgent is the only User-Agent the browser and the proven re-fetch send,

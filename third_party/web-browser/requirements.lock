@@ -598,9 +598,8 @@ pyee==13.0.1 \
     # via
     #   patchright
     #   playwright
-scrapling==0.4.15 \
-    --hash=sha256:72406900f437316209dd05d9853dae04420f1cab0e11071604bb4588b6e2f713 \
-    --hash=sha256:ae66bde9f63afb793ad6f93bd76b451e29f1631347465a553c4e7765c0ecc1f2
+scrapling @ https://github.com/teslashibe/Scrapling/releases/download/v0.4.15-scarlett.1/scrapling-0.4.15%2Bscarlett.1-py3-none-any.whl \
+    --hash=sha256:85b7bed683aed37041e1788a0b679c0cf1c802937ed17eb4510e6336ead5b415
     # via -r requirements.in
 tld==0.13.2 \
     --hash=sha256:9b8fdbdb880e7ba65b216a4937f2c94c49a7226723783d5838fc958ac76f4e0c \

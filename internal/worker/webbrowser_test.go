@@ -57,7 +57,7 @@ func (f *fakeBrowser) prewarmCount() int {
 }
 
 func readyStatus() BrowserStatus {
-	return BrowserStatus{Ready: true, Capacity: 2, Version: "155.0.8059.39", Engine: "scrapling/0.4.15", UserAgent: darwinUA}
+	return BrowserStatus{Ready: true, Capacity: 2, Version: "155.0.8059.39", Engine: "scrapling/0.4.15+scarlett.1", UserAgent: darwinUA}
 }
 
 const secretCookie = "synthetic-clearance-value"
@@ -486,7 +486,7 @@ func TestRunBrowserUploadsAndRefetches(t *testing.T) {
 	if len(body.Headers) != 1 || body.Headers[0] != [2]string{"content-type", "text/html; charset=utf-8"} || strings.Join(body.SetCookieNames, ",") != "cf_clearance,__cf_bm" || len(body.Redirects) != 1 {
 		t.Fatalf("upload headers %v %v", body.Headers, body.SetCookieNames)
 	}
-	if body.Browser != (coordinator.BrowserInfo{Engine: "scrapling/0.4.15", Version: "155.0.8059.39", UserAgent: darwinUA}) || body.StartedAtMS < started.UnixMilli() || body.StartedAtMS > time.Now().UnixMilli() || body.DurationMS < 0 || body.DurationMS > took.Milliseconds() {
+	if body.Browser != (coordinator.BrowserInfo{Engine: "scrapling/0.4.15+scarlett.1", Version: "155.0.8059.39", UserAgent: darwinUA}) || body.StartedAtMS < started.UnixMilli() || body.StartedAtMS > time.Now().UnixMilli() || body.DurationMS < 0 || body.DurationMS > took.Milliseconds() {
 		t.Fatalf("upload browser %+v %d %d", body.Browser, body.StartedAtMS, body.DurationMS)
 	}
 	// No cookie value is ever uploaded or printed.
@@ -635,6 +635,24 @@ func TestBrowserUploadSanitizersMatchTheCoordinator(t *testing.T) {
 	for _, bad := range []string{"text/html; name=é", "text/html\r\nx: y", strings.Repeat("a", 1025)} {
 		if got := browserContentType(bad); got != "" {
 			t.Fatalf("content type %q kept as %q", bad, got)
+		}
+	}
+}
+
+// The upload says whether the operator's captcha solver cleared the page or
+// would have been needed; nothing else, and nothing when neither.
+func TestRunBrowserUploadNamesTheSolver(t *testing.T) {
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	for solver, want := range map[string]string{"used": "used", "needed": "needed", "": "", "capmonster": ""} {
+		browser := browserWith(func(f *fakeBrowser) { f.result.Solver = solver })
+		upload := &fakeUpload{}
+		run := runBrowserJob(t, "web-final", webBrowserFixtureLease(t), browser, upload, publicAnswers)
+		if run.code != "" || upload.count() != 1 || upload.calls[0].body.Solver != want {
+			t.Fatalf("%q: code %q uploads %d", solver, run.code, upload.count())
+		}
+		if want == "" && bytes.Contains(upload.calls[0].raw, []byte(`"solver"`)) {
+			t.Fatalf("%q: empty solver sent", solver)
 		}
 	}
 }

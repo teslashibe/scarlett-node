@@ -67,6 +67,8 @@ type Config struct {
 	Capacity int
 	// IdleTimeout stops an idle helper; 0 means 120 s.
 	IdleTimeout time.Duration
+	// Solvers is the operator's captcha-solver accounts, or nil.
+	Solvers *Solvers
 	// Logf receives state transitions and closed reasons only.
 	Logf func(format string, args ...any)
 }
@@ -124,6 +126,13 @@ func (r FetchRequest) validate() error {
 	return nil
 }
 
+// helperFetch is POST /v1/fetch: the request plus whether this fetch may use
+// the operator's solver, which the Manager decides from today's spend.
+type helperFetch struct {
+	FetchRequest
+	Solver bool `json:"solver"`
+}
+
 // FetchResult is the helper's answer. It holds page content and cookie
 // values for the worker only; it is never logged.
 type FetchResult struct {
@@ -141,6 +150,11 @@ type FetchResult struct {
 	Redirects      []Redirect  `json:"redirects"`
 	StartedAtMS    int64       `json:"started_at_ms"`
 	Timings        Timings     `json:"timings"`
+	// Solver is "used" when the operator's captcha solver cleared the page,
+	// "needed" when the page stopped at a captcha that takes one, else "".
+	Solver string `json:"solver"`
+	// SolverCostMicroUSD is the providers' estimated charge for this fetch.
+	SolverCostMicroUSD int64 `json:"solver_cost_micro_usd"`
 }
 
 func (FetchResult) String() string   { return "web browser result [redacted]" }
@@ -189,6 +203,14 @@ func (r *FetchResult) validate() error {
 	default:
 		return invalid
 	}
+	switch r.Solver {
+	case "", "used", "needed":
+	default:
+		return invalid
+	}
+	if r.SolverCostMicroUSD < 0 || r.SolverCostMicroUSD > maxFetchMicroUSD {
+		return invalid
+	}
 	if r.Outcome == "ok" && (r.StatusCode < 100 || r.StatusCode > 999) || len(r.HTML) > htmlCap || !utf8.ValidString(r.HTML) ||
 		len(r.Headers) > 128 || len(r.SetCookieNames) > 50 || len(r.Redirects) > 20 || len(r.Cookies) > 1000 || len(r.FinalURL) > 8192 {
 		return invalid
@@ -203,6 +225,9 @@ type Health struct {
 	Capacity int
 	InFlight int
 	Version  string // iff ready
+	// Solvers are the operator's captcha-solver providers this browser may
+	// use now: configured, and today's spend under its cap. Names only.
+	Solvers []string
 }
 
 var (
@@ -282,6 +307,8 @@ type Manager struct {
 	verifying   bool
 	logged      string
 	closed      bool
+	spend       spendRecord
+	spendLoaded bool
 }
 
 type helper struct {
@@ -377,7 +404,11 @@ func (m *Manager) healthLocked() Health {
 	case m.d.now().Before(m.failedUntil):
 		return Health{State: "unavailable", Reason: ReasonHelperFailed}
 	}
-	return Health{State: "ready", Capacity: m.capacity, InFlight: m.inFlight, Version: m.browser.Version}
+	h := Health{State: "ready", Capacity: m.capacity, InFlight: m.inFlight, Version: m.browser.Version}
+	if m.solverAllowedLocked() {
+		h.Solvers = m.cfg.Solvers.Providers()
+	}
+	return h
 }
 
 // Fetch renders one page. Errors wrapping ErrUnavailable mean the tier could
@@ -411,7 +442,13 @@ func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 	if err != nil {
 		return FetchResult{}, err
 	}
-	res, err := m.call(ctx, h, req)
+	m.mu.Lock()
+	solver := m.solverAllowedLocked()
+	m.mu.Unlock()
+	res, err := m.call(ctx, h, helperFetch{FetchRequest: req, Solver: solver})
+	if err == nil {
+		m.recordSpend(res.SolverCostMicroUSD)
+	}
 	m.mu.Lock()
 	h.inFlight--
 	h.served++
@@ -541,7 +578,7 @@ func (m *Manager) recordFailureLocked(err error) {
 	}
 }
 
-func (m *Manager) call(ctx context.Context, h *helper, req FetchRequest) (FetchResult, error) {
+func (m *Manager) call(ctx context.Context, h *helper, req helperFetch) (FetchResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(req.TimeoutMS)*time.Millisecond+5*time.Second)
 	defer cancel()
 	body, err := json.Marshal(req)
@@ -854,7 +891,7 @@ func (m *Manager) helperEnv(state, bearer string, browser Browser, proxy, deny s
 			}
 		}
 	}
-	return append(env,
+	env = append(env,
 		"TMPDIR="+tmp, "TEMP="+tmp, "TMP="+tmp,
 		"HOME="+home, "USERPROFILE="+home,
 		"LOCALAPPDATA="+filepath.Join(home, "AppData", "Local"), "APPDATA="+filepath.Join(home, "AppData", "Roaming"),
@@ -869,6 +906,7 @@ func (m *Manager) helperEnv(state, bearer string, browser Browser, proxy, deny s
 		"WEB_USER_AGENT="+m.UserAgent(),
 		"WEB_EGRESS_PROXY="+proxy, "WEB_DENY_PROXY="+deny,
 		"WEB_MAX_PAGES="+strconv.Itoa(capacity))
+	return append(env, m.solverEnv()...)
 }
 
 // startHelper starts one helper and waits for it to be ready: private state,
@@ -979,7 +1017,7 @@ func (m *Manager) startHelper(ctx context.Context) (*helper, error) {
 			return nil, h.startError("helper readiness timed out")
 		default:
 		}
-		if h.ready(ctx, capacity) {
+		if h.ready(ctx, capacity, m.solversMatch) {
 			h.tree = h.p.snapshot()
 			ok = true
 			return h, nil
@@ -1031,7 +1069,7 @@ func (h *helper) startError(what string) error {
 	return errors.New(what)
 }
 
-func (h *helper) ready(ctx context.Context, capacity int) bool {
+func (h *helper) ready(ctx context.Context, capacity int, solversMatch func([]string) bool) bool {
 	get := func(path string, out any) bool {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, h.endpoint+path, nil)
 		req.Header.Set("Authorization", "Bearer "+h.bearer)
@@ -1049,14 +1087,18 @@ func (h *helper) ready(ctx context.Context, capacity int) bool {
 	}
 	var caps struct {
 		Data struct {
-			WebBrowser     int    `json:"web_browser"`
-			Engine         string `json:"engine"`
-			BrowserVersion string `json:"browser_version"`
-			MaxPages       int    `json:"max_pages"`
+			WebBrowser     int      `json:"web_browser"`
+			Engine         string   `json:"engine"`
+			BrowserVersion string   `json:"browser_version"`
+			MaxPages       int      `json:"max_pages"`
+			Solvers        []string `json:"solvers"`
 		} `json:"data"`
 	}
+	// The helper names the solver providers it built; they must be the
+	// configured ones (none without a configuration).
 	return get("/v1/ready", &ready) && ready.Data.Status == "ready" && get("/v1/capabilities", &caps) &&
-		caps.Data.WebBrowser == 1 && caps.Data.Engine == Engine && caps.Data.BrowserVersion == PinnedVersion && caps.Data.MaxPages == capacity
+		caps.Data.WebBrowser == 1 && caps.Data.Engine == Engine && caps.Data.BrowserVersion == PinnedVersion && caps.Data.MaxPages == capacity &&
+		caps.Data.Solvers != nil && solversMatch(caps.Data.Solvers)
 }
 
 // stopHelper ends a helper: EOF on stdin asks for a graceful stop; after 7 s

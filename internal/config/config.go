@@ -93,7 +93,11 @@ type Config struct {
 	WebBrowserConcurrency int
 	// WebBrowserIdle is how long an idle browser helper stays up
 	// (SCARLETT_WEB_BROWSER_IDLE_SECONDS, 30-3600, default 120).
-	WebBrowserIdle   time.Duration
+	WebBrowserIdle time.Duration
+	// WebSolvers is the operator's own captcha-solver accounts for the
+	// browser tier (SCARLETT_WEB_SOLVERS and one key file per provider), or
+	// nil. Keys never leave this node except to their provider.
+	WebSolvers       *WebSolvers
 	LocalFixture     bool
 	InferenceTimeout time.Duration
 	MaxInputBytes    int
@@ -222,12 +226,17 @@ func Load() (Config, error) {
 		if err := c.loadWebBrowser(runtime.GOOS); err != nil {
 			return c, err
 		}
+		if err := c.loadWebSolvers(); err != nil {
+			return c, err
+		}
 	} else if os.Getenv("SCARLETT_SERVICES") != "" {
 		return c, errors.New("SCARLETT_SERVICES requires services executor")
 	} else if os.Getenv("SCARLETT_WEB_EGRESS_PROXY") != "" {
 		return c, errors.New("SCARLETT_WEB_EGRESS_PROXY requires services executor")
 	} else if os.Getenv("SCARLETT_WEB_BROWSER") != "" || os.Getenv("SCARLETT_WEB_BROWSER_CONCURRENCY") != "" || os.Getenv("SCARLETT_WEB_BROWSER_IDLE_SECONDS") != "" {
 		return c, errors.New("SCARLETT_WEB_BROWSER settings require services executor")
+	} else if anySolverSetting() {
+		return c, errors.New("SCARLETT_WEB_SOLVERS settings require services executor")
 	}
 	if s := os.Getenv("SCARLETT_INFERENCE_TIMEOUT_SECONDS"); s != "" {
 		v, e := strconv.Atoi(s)
@@ -352,6 +361,9 @@ func (c Config) Validate() error {
 		}
 		if c.WebBrowserConcurrency < 0 || c.WebBrowserConcurrency > 4 || c.WebBrowser && c.WebBrowserConcurrency > c.WebConcurrency || c.WebBrowserIdle != 0 && (c.WebBrowserIdle < 30*time.Second || c.WebBrowserIdle > time.Hour) {
 			return errors.New("invalid web browser configuration")
+		}
+		if c.WebSolvers != nil && (!c.WebBrowser || !c.WebSolvers.valid()) {
+			return errors.New("invalid web solver configuration")
 		}
 		if c.AccountsRequired && c.AccountsFile == "" || !filepath.IsAbs(c.AccountsFile) && c.AccountsFile != "" {
 			return errors.New("accounts file must be absolute")

@@ -64,22 +64,23 @@ SITES = [
 WEB_SITES = [
     ('scripts/prepare-web-runtime.mjs', r"python = '(\d+\.\d+\.\d+)'", 'python'),
     ('scripts/prepare-web-runtime.mjs', r"release = '(\d{8})'", 'pbs'),
-    ('scripts/prepare-web-runtime.mjs', r"scrapling = '(\d+\.\d+\.\d+)'", 'scrapling'),
+    ('scripts/prepare-web-runtime.mjs', r"scrapling = '(\d+\.\d+\.\d+(?:\+[a-z0-9.]+)?)'", 'scrapling'),
     ('scripts/prepare-web-runtime.mjs', r"browsers\.version !== '(\d+\.\d+\.\d+\.\d+)'", 'cft'),
     ('scripts/verify-web-runtime.mjs', r"pythonVersion !== '(\d+\.\d+\.\d+)'", 'python'),
-    ('scripts/verify-web-runtime.mjs', r"scraplingVersion !== '(\d+\.\d+\.\d+)'", 'scrapling'),
+    ('scripts/verify-web-runtime.mjs', r"scraplingVersion !== '(\d+\.\d+\.\d+(?:\+[a-z0-9.]+)?)'", 'scrapling'),
     ('scripts/verify-web-runtime.mjs', r"browserVersion !== '(\d+\.\d+\.\d+\.\d+)'", 'cft'),
-    ('third_party/web-browser/requirements.in', r'^scrapling\[fetchers\]==(\d+\.\d+\.\d+)$', 'scrapling'),
-    ('third_party/web-browser/requirements.lock', r'^scrapling==(\d+\.\d+\.\d+) ', 'scrapling'),
-    ('third_party/web-browser/scarlett_web_helper.py', r'^SCRAPLING_VERSION = "(\d+\.\d+\.\d+)"$', 'scrapling'),
-    ('third_party/web-browser/NOTICE.md', r'^\| scrapling \| (\d+\.\d+\.\d+) \|', 'scrapling'),
+    # The fork's wheel URL spells the local version's + as %2B.
+    ('third_party/web-browser/requirements.in', r'^scrapling\[fetchers\] @ https://github\.com/teslashibe/Scrapling/releases/download/v[0-9a-z.-]+/scrapling-(\d+\.\d+\.\d+%2B[a-z0-9.]+)-py3-none-any\.whl$', 'scrapling'),
+    ('third_party/web-browser/requirements.lock', r'^scrapling @ https://github\.com/teslashibe/Scrapling/releases/download/v[0-9a-z.-]+/scrapling-(\d+\.\d+\.\d+%2B[a-z0-9.]+)-py3-none-any\.whl ', 'scrapling'),
+    ('third_party/web-browser/scarlett_web_helper.py', r'^SCRAPLING_VERSION = "(\d+\.\d+\.\d+(?:\+[a-z0-9.]+)?)"$', 'scrapling'),
+    ('third_party/web-browser/NOTICE.md', r'^\| scrapling \| (\d+\.\d+\.\d+(?:\+[a-z0-9.]+)?) \|', 'scrapling'),
     ('third_party/web-browser/NOTICE.md', r'CPython, from python-build-standalone release `(\d{8})`', 'pbs'),
     ('third_party/web-browser/NOTICE.md', r'\| (\d+\.\d+\.\d+) \| PSF License', 'python'),
     ('third_party/web-browser/NOTICE.md', r'Chrome for Testing (\d+\.\d+\.\d+\.\d+) is downloaded', 'cft'),
     ('internal/webruntime/archive.go', r'pythonVersion\s+= "(\d+\.\d+\.\d+)"', 'python'),
-    ('internal/webruntime/archive.go', r'scraplingVersion\s+= "(\d+\.\d+\.\d+)"', 'scrapling'),
+    ('internal/webruntime/archive.go', r'scraplingVersion\s+= "(\d+\.\d+\.\d+(?:\+[a-z0-9.]+)?)"', 'scrapling'),
     ('internal/webruntime/useragent.go', r'PinnedVersion = "(\d+\.\d+\.\d+\.\d+)"', 'cft'),
-    ('internal/webruntime/useragent.go', r'Engine = "scrapling/(\d+\.\d+\.\d+)"', 'scrapling'),
+    ('internal/webruntime/useragent.go', r'Engine = "scrapling/(\d+\.\d+\.\d+(?:\+[a-z0-9.]+)?)"', 'scrapling'),
 ]
 
 
@@ -131,10 +132,10 @@ class VersionPinTests(unittest.TestCase):
             'scrapling': re.search(r"scrapling = '([^']+)'", prepare).group(1),
             'cft': json.loads(text('third_party/web-browser/chrome-for-testing.json'))['version'],
         }
-        self.assertEqual(pins, {'python': '3.13.16', 'pbs': '20261003', 'scrapling': '0.4.15', 'cft': '155.0.8059.39'})
+        self.assertEqual(pins, {'python': '3.13.16', 'pbs': '20261003', 'scrapling': '0.4.15+scarlett.1', 'cft': '155.0.8059.39'})
         for path, pattern, component in WEB_SITES:
             with self.subTest(path=path, pattern=pattern):
-                found = re.findall(pattern, text(path), re.MULTILINE)
+                found = [f.replace('%2B', '+') for f in re.findall(pattern, text(path), re.MULTILINE)]
                 self.assertTrue(found, 'pin copy missing')
                 self.assertEqual(set(found), {pins[component]})
         major = pins['cft'].split('.')[0]

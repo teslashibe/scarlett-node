@@ -44,6 +44,7 @@ func startRuntimeBrowser(ctx context.Context, c config.Config) (worker.BrowserTi
 	if p := c.WebEgressProxy; p != nil {
 		cfg.UpstreamProxy, cfg.UpstreamAuthorization = upstreamProxyURL(p), p.Authorization
 	}
+	cfg.Solvers = runtimeSolvers(c.WebSolvers)
 	m := webruntime.New(cfg)
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
@@ -65,7 +66,7 @@ type runtimeBrowser struct{ m *webruntime.Manager }
 
 func (r runtimeBrowser) Status() worker.BrowserStatus {
 	h := r.m.Health()
-	return worker.BrowserStatus{Ready: h.State == "ready", Reason: string(h.Reason), Capacity: h.Capacity, Version: h.Version, Engine: webruntime.Engine, UserAgent: r.m.UserAgent()}
+	return worker.BrowserStatus{Ready: h.State == "ready", Reason: string(h.Reason), Capacity: h.Capacity, Version: h.Version, Engine: webruntime.Engine, UserAgent: r.m.UserAgent(), Solvers: h.Solvers}
 }
 
 func (r runtimeBrowser) Prewarm() { r.m.Prewarm() }
@@ -81,7 +82,7 @@ func (r runtimeBrowser) Fetch(ctx context.Context, req worker.BrowserFetchReques
 	if err != nil {
 		return worker.BrowserFetchResult{}, err
 	}
-	out := worker.BrowserFetchResult{Outcome: res.Outcome, Error: res.Error, FinalURL: res.FinalURL, StatusCode: res.StatusCode, Headers: res.Headers, SetCookieNames: res.SetCookieNames, ContentType: res.ContentType, HTML: res.HTML, HTMLTruncated: res.HTMLTruncated, Challenge: res.Challenge, StartedAtMS: res.StartedAtMS}
+	out := worker.BrowserFetchResult{Outcome: res.Outcome, Error: res.Error, FinalURL: res.FinalURL, StatusCode: res.StatusCode, Headers: res.Headers, SetCookieNames: res.SetCookieNames, ContentType: res.ContentType, HTML: res.HTML, HTMLTruncated: res.HTMLTruncated, Challenge: res.Challenge, StartedAtMS: res.StartedAtMS, Solver: res.Solver}
 	for _, c := range res.Cookies {
 		out.Cookies = append(out.Cookies, worker.BrowserCookie(c))
 	}
@@ -89,4 +90,16 @@ func (r runtimeBrowser) Fetch(ctx context.Context, req worker.BrowserFetchReques
 		out.Redirects = append(out.Redirects, coordinator.BrowserRedirect(redirect))
 	}
 	return out, nil
+}
+
+// runtimeSolvers hands the operator's solver accounts to the runtime, or nil.
+func runtimeSolvers(s *config.WebSolvers) *webruntime.Solvers {
+	if s == nil || len(s.Providers) == 0 {
+		return nil
+	}
+	out := &webruntime.Solvers{Keys: map[string]string{}, MaxSolvesPerFetch: s.MaxSolvesPerFetch, MaxMicroUSDPerDay: s.MaxMicroUSDPerDay, Experimental: s.Experimental}
+	for _, name := range s.Providers {
+		out.Keys[name] = s.Key(name)
+	}
+	return out
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"os/exec"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -331,7 +332,19 @@ func (p *servicePool) browserHealthLocked(webCapacity int) coordinator.BrowserHe
 	if capacity < 1 || status.Version == "" || len(status.Version) > 64 {
 		return unavailable("helper_failed")
 	}
-	return coordinator.BrowserHealth{State: "ready", Capacity: capacity, InFlight: min(p.browserInFlight, capacity), Version: status.Version}
+	return coordinator.BrowserHealth{State: "ready", Capacity: capacity, InFlight: min(p.browserInFlight, capacity), Version: status.Version, Solvers: browserSolvers(status.Solvers)}
+}
+
+// browserSolvers keeps the known solver provider names, once each, in the
+// canonical order; anything else is dropped.
+func browserSolvers(in []string) []string {
+	var out []string
+	for _, name := range []string{"capmonster", "capsolver", "2captcha"} {
+		if slices.Contains(in, name) {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 // settleWeb applies one finished web job. Only the node's own egress proxy

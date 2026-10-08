@@ -56,7 +56,7 @@ func hexSHA(s string) string {
 
 func TestBrowserResultFixtureDigests(t *testing.T) {
 	r := browserResultFixture(t)
-	if r.HTMLBytes != len(r.HTML) || r.HTMLSHA256 != hexSHA(r.HTML) || r.RequestSHA256 != "f24ba0094ed03be33c287a26997889217a0e6aebf62ca0b278f34dbecf0a175e" || r.Browser.Engine != "scrapling/0.4.15" {
+	if r.HTMLBytes != len(r.HTML) || r.HTMLSHA256 != hexSHA(r.HTML) || r.RequestSHA256 != "f24ba0094ed03be33c287a26997889217a0e6aebf62ca0b278f34dbecf0a175e" || r.Browser.Engine != "scrapling/0.4.15+scarlett.1" {
 		t.Fatal("fixture digests")
 	}
 	encoded, body, err := EncodeBrowserResult(r)

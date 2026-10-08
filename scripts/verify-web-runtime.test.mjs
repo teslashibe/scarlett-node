@@ -44,9 +44,9 @@ function fixture({platform = 'linux-amd64', mutate, order} = {}) {
  const pin = Buffer.from(JSON.stringify({version: '155.0.8059.39', platform, url: `https://storage.googleapis.com/chrome-for-testing-public/155.0.8059.39/${cft}/chrome-${cft}.zip`,
   sha256: 'b'.repeat(64), bytes: 10, executable: 'chrome/chrome', inventory_sha256: sha256(inventory), unpacked_bytes: 1}));
  const files = new Map([[interpreter, Buffer.from('#!python')], [`${site}/scarlett_web_helper.py`, Buffer.from('helper')],
-  [`${site}/scrapling/__init__.py`, Buffer.from('__version__ = "0.4.15"')], ['browser/pin.json', pin], ['browser/inventory.json', inventory],
+  [`${site}/scrapling/__init__.py`, Buffer.from('__version__ = "0.4.15+scarlett.1"')], ['browser/pin.json', pin], ['browser/inventory.json', inventory],
   ['notices/NOTICE.md', Buffer.from('notices')]]);
- const manifest = {schemaVersion: 1, platform, pythonVersion: '3.13.16', pbsRelease: '20261003', scraplingVersion: '0.4.15', lockSha256: 'a'.repeat(64),
+ const manifest = {schemaVersion: 1, platform, pythonVersion: '3.13.16', pbsRelease: '20261003', scraplingVersion: '0.4.15+scarlett.1', lockSha256: 'a'.repeat(64),
   driverNode: {path: 'x-login-runtime/node', sha256: 'c'.repeat(64), version: '22.23.3'}, interpreter, browserVersion: '155.0.8059.39',
   files: [...files].map(([path, data]) => ({path, sha256: sha256(data), bytes: data.length, ...(path === interpreter && !platform.startsWith('windows-') ? {exec: true} : {})}))};
  mutate?.(files, manifest);
@@ -58,7 +58,7 @@ function fixture({platform = 'linux-amd64', mutate, order} = {}) {
  writeFileSync(join(dir, name), archive);
  writeFileSync(join(dir, 'web-runtime.json'), JSON.stringify({schemaVersion: 1, platform, archive: name, archiveSha256: sha256(archive), archiveBytes: archive.length,
   manifestSha256: sha256(manifestRaw), unpackedBytes: [...files.values()].reduce((s, d) => s + d.length, 0), files: files.size,
-  pythonVersion: '3.13.16', scraplingVersion: '0.4.15', browserVersion: '155.0.8059.39', browserZipSha256: 'b'.repeat(64)}));
+  pythonVersion: '3.13.16', scraplingVersion: '0.4.15+scarlett.1', browserVersion: '155.0.8059.39', browserZipSha256: 'b'.repeat(64)}));
  return {dir, name};
 }
 
