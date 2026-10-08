@@ -48,11 +48,11 @@ export function updateErrorText(code: string | null | undefined): string {
     disk_full: "There is not enough free disk space to download the update",
     not_writable: "Scarlett Node can't replace itself in this folder. Reinstall it in Applications (Mac) or for your user (Windows), or update from the download page",
     translocated: "Move Scarlett Node to the Applications folder to turn on updates",
-    app_management: "macOS stopped Scarlett from updating itself. Allow Scarlett Node in System Settings › Privacy & Security › App Management, then try again",
+    app_management: "macOS stopped Scarlett from updating itself. Allow Scarlett Node (it may be listed as scarlett-node) in System Settings › Privacy & Security › App Management, then try again",
     unsupported: "This build can't install updates by itself. Use the download page",
     no_update_key: "This build can't install updates by itself. Use the download page",
-    busy: "Waiting for a login or the local model API to finish before updating",
-    drain_timeout: "Accepted jobs are taking a long time, so the update waits. It tries again in an hour",
+    busy: "It installs once no account login is in progress and the local model API is stopped",
+    drain_timeout: "Accepted jobs were still running after 30 minutes, so Scarlett resumed new jobs and did not install the update",
     cancelled: "Update cancelled",
     window_not_ready: "The new version did not open its window",
     node_not_running: "The new version's node did not start",
@@ -60,6 +60,7 @@ export function updateErrorText(code: string | null | undefined): string {
     app_exited: "The new version closed while starting",
     health_timeout: "The new version did not finish starting",
     launch_failed: "The new version could not be opened",
+    restore_failed: "The previous version could not be restored automatically",
   } as Record<string, string>)[String(code)] ?? "The update could not be installed";
 }
 
@@ -97,7 +98,7 @@ export function updateToast(u: UpdateStatus | undefined, s: Snapshot | undefined
       return { ...base, level: "info", title: `Checking Scarlett Node ${latest ?? ""}`.trim(), detail: "Verifying its signature before anything is installed", buttons: [] };
     case "draining": {
       const n = u.in_flight ?? 0;
-      return { ...base, level: "info", title: `Finishing ${n} accepted ${n === 1 ? "job" : "jobs"} before updating`,
+      return { ...base, level: "info", title: n > 0 ? `Finishing ${n} accepted ${n === 1 ? "job" : "jobs"} before updating` : "Pausing new jobs before updating",
         detail: "New jobs are paused. Accepted jobs are never interrupted", buttons: [{ action: "cancel", label: "Cancel" }] };
     }
     case "installing":
@@ -107,6 +108,18 @@ export function updateToast(u: UpdateStatus | undefined, s: Snapshot | undefined
       return { ...base, level: required ? "required" : "info", title: `Installing Scarlett Node ${latest ?? ""} when current jobs finish`,
         detail: `Starts in ${seconds} s`, buttons: [{ action: "later", label: "Install later" }, ...whatsNew] };
     }
+  }
+  // Downloaded and checked, but waiting: a login or the local model API is
+  // in the way, or accepted jobs ran past the drain limit. Say so, rather
+  // than offering an "Update now" that seems to do nothing.
+  if (u.phase === "ready" && latest && (u.error === "busy" || u.error === "drain_timeout")) {
+    const automatic = u.mode === "automatic";
+    const detail = u.error === "busy" ? updateErrorText("busy")
+      : `${updateErrorText("drain_timeout")}. ${automatic ? "It tries again in an hour" : "Try again when fewer jobs are running"}`;
+    const buttons: UpdateButton[] = u.error === "busy"
+      ? [...(automatic ? [] : [{ action: "cancel" as const, label: "Cancel" }]), ...whatsNew]
+      : [...(automatic ? [] : [install]), ...whatsNew, ...(required || automatic ? [] : [{ action: "later" as const, label: "Later" }])];
+    return { ...base, level: required ? "required" : "info", title: `Scarlett Node ${latest} is ready to install`, detail, buttons };
   }
   if (u.phase === "error" && latest && u.error && u.error !== "cancelled") {
     return { ...base, level: required ? "required" : "info", title: `Scarlett Node ${latest} was not installed`, detail: updateErrorText(u.error),
@@ -147,12 +160,16 @@ export function updatedBanner(u: UpdateStatus | undefined): UpdateBanner | null 
   return { title: `Updated to Scarlett Node ${b.version}`, highlights: highlightsOf(b.notes), version: b.version, offerAutomatic: b.offer_automatic === true && u?.mode !== "automatic" };
 }
 
-export function failureNotice(u: UpdateStatus | undefined): { title: string; detail: string } | null {
+export function failureNotice(u: UpdateStatus | undefined): { title: string; detail: string; retry: boolean } | null {
   const f = u?.failure;
   if (!f || !validVersion(f.version)) return null;
   if (f.rolled_back)
-    return { title: `Scarlett Node ${f.version} could not start`, detail: `Scarlett restored ${u!.version}. ${updateErrorText(f.reason)}. Automatic updates will skip ${f.version}; you can download it manually` };
-  return { title: `Scarlett Node ${f.version} was not installed`, detail: updateErrorText(f.reason) };
+    return { title: `Scarlett Node ${f.version} could not start`, detail: `Scarlett restored ${u!.version}. ${updateErrorText(f.reason)}. Automatic updates will skip ${f.version}; you can download it manually`, retry: false };
+  if (f.reason === "restore_failed")
+    return { title: `Scarlett Node ${f.version} did not pass its start-up checks`, detail: `${updateErrorText(f.reason)}, so ${f.version} is still installed. If the node does not work, reinstall from the download page`, retry: false };
+  // Nothing was replaced. Automatic updates skip this version until the
+  // operator retries, for example after allowing App Management.
+  return { title: `Scarlett Node ${f.version} was not installed`, detail: `${updateErrorText(f.reason)}. Automatic updates skip ${f.version} until you try again`, retry: true };
 }
 
 export function updateSummary(u: UpdateStatus | undefined, s?: Snapshot): string {

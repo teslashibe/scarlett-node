@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -34,7 +35,8 @@ func newGuardFixture(t *testing.T, phaseAfterLaunch string) *guardFixture {
 		t.Fatal(err)
 	}
 	g := NewGuard(f.state, filepath.Join(dir, "updates"))
-	g.Poll, g.ExitWait, g.HealthWait = 10*time.Millisecond, 100*time.Millisecond, 500*time.Millisecond
+	g.Poll, g.ExitWait, g.HealthWait, g.QuitWait, g.NodeWait = 10*time.Millisecond, 100*time.Millisecond, 500*time.Millisecond, 100*time.Millisecond, time.Second
+	g.NodeStopped = func() bool { return true }
 	g.Alive = func(pid int) bool { return pid == 4242 && f.alive.Load() || pid == 5151 && f.alive.Load() }
 	g.Terminate = func(int, bool) { f.terminate.Add(1); f.alive.Store(false) }
 	g.Install = func(_ context.Context, p *Pending) error { f.installs.Add(1); p.Previous = p.Staged; return nil }
@@ -70,7 +72,7 @@ func newGuardFixture(t *testing.T, phaseAfterLaunch string) *guardFixture {
 func TestGuardInstallsRelaunchesAndKeepsAHealthyUpdate(t *testing.T) {
 	f := newGuardFixture(t, PhaseHealthy)
 	// Cleanup keeps the guard's copy and log and removes finished downloads.
-	for _, dir := range []string{"guard-0.1.13", "downloads"} {
+	for _, dir := range []string{"guard", "downloads"} {
 		if err := localfs.EnsureDir(filepath.Join(f.g.Updates, dir)); err != nil {
 			t.Fatal(err)
 		}
@@ -85,7 +87,7 @@ func TestGuardInstallsRelaunchesAndKeepsAHealthyUpdate(t *testing.T) {
 	if f.installs.Load() != 1 || f.restores.Load() != 0 || f.launches.Load() != 1 || s.Pending.Phase != PhaseHealthy || s.HasFailed("0.1.14") {
 		t.Fatalf("installs %d restores %d launches %d state %+v", f.installs.Load(), f.restores.Load(), f.launches.Load(), s.Pending)
 	}
-	for name, want := range map[string]bool{"guard.log": true, "guard-0.1.13": true, "downloads": false} {
+	for name, want := range map[string]bool{"guard.log": true, "guard": true, "downloads": false} {
 		if _, err := os.Lstat(filepath.Join(f.g.Updates, name)); (err == nil) != want {
 			t.Fatalf("%s kept=%v, want %v", name, err == nil, want)
 		}
@@ -116,7 +118,7 @@ func TestGuardReplacesNothingWhileTheOldAppRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	s, _ := f.state.Read()
-	if f.installs.Load() != 0 || f.launches.Load() != 0 || s.Pending.Phase != PhaseFailed || s.Pending.Reason != CodeBusy {
+	if f.installs.Load() != 0 || f.launches.Load() != 0 || s.Pending.Phase != PhaseFailed || s.Pending.Reason != CodeBusy || !s.HasFailed("0.1.14") {
 		t.Fatalf("state %+v", s.Pending)
 	}
 }
@@ -128,7 +130,69 @@ func TestGuardRelaunchesTheOldAppWhenTheInstallFails(t *testing.T) {
 		t.Fatal("install failure not reported")
 	}
 	s, _ := f.state.Read()
-	if f.launches.Load() != 1 || s.Pending.Phase != PhaseFailed || s.Pending.Reason != CodeAppManagement {
+	// Automatic mode must not retry it at once: that would quit and relaunch
+	// the app on every attempt.
+	if f.launches.Load() != 1 || s.Pending.Phase != PhaseFailed || s.Pending.Reason != CodeAppManagement || !s.HasFailed("0.1.14") {
 		t.Fatalf("state %+v", s.Pending)
+	}
+}
+
+func TestGuardRestoresOnlyAfterTheNewNodeFinishesItsWork(t *testing.T) {
+	f := newGuardFixture(t, PhaseUnhealthy)
+	var polls atomic.Int32
+	var restoredWhileBusy atomic.Bool
+	// The new version's node drains accepted work for a few polls after its
+	// app has gone.
+	f.g.NodeStopped = func() bool { return polls.Add(1) > 5 }
+	f.g.Restore = func(context.Context, *Pending) error {
+		if polls.Load() <= 5 {
+			restoredWhileBusy.Store(true)
+		}
+		f.restores.Add(1)
+		return nil
+	}
+	if err := f.g.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := f.state.Read()
+	if restoredWhileBusy.Load() || f.restores.Load() != 1 || s.Pending.Phase != PhaseRolledBack {
+		t.Fatalf("restored while the node was busy: %v, state %+v", restoredWhileBusy.Load(), s.Pending)
+	}
+}
+
+func TestGuardReportsARestoreThatFailed(t *testing.T) {
+	f := newGuardFixture(t, PhaseUnhealthy)
+	f.g.Restore = func(context.Context, *Pending) error {
+		return fail(CodeBusy, errors.New("scarlett-node.exe is still running"))
+	}
+	if err := f.g.Run(context.Background()); err == nil {
+		t.Fatal("failed restore not reported")
+	}
+	s, _ := f.state.Read()
+	// The new version stays installed and is relaunched; it must not claim
+	// that the previous version was restored.
+	if f.launches.Load() != 2 || s.Pending.Phase != PhaseFailed || s.Pending.Reason != "restore_failed" || !s.HasFailed("0.1.14") {
+		t.Fatalf("launches %d state %+v", f.launches.Load(), s.Pending)
+	}
+}
+
+func TestNodeStoppedFollowsTheAttemptJournalLock(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	if err := localfs.EnsureDir(filepath.Join(dir, "attempts")); err != nil {
+		t.Fatal(err)
+	}
+	if !NodeStopped(dir) {
+		t.Fatal("a node that never ran is not running")
+	}
+	lock, err := localfs.LockPrivate(filepath.Join(dir, "attempts", ".lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && NodeStopped(dir) {
+		t.Fatal("a held journal lock reads as stopped")
+	}
+	lock.Close()
+	if !NodeStopped(dir) {
+		t.Fatal("a released journal lock reads as running")
 	}
 }

@@ -271,6 +271,9 @@ func (h *Headless) finish(owner, phase, reason, version string, failed bool) err
 
 // drainIdle pauses new work and waits until no accepted job is in flight. It
 // never stops or kills accepted work: after the timeout it resumes and gives up.
+// The in-flight count is trusted only from a status the node wrote after it
+// saw the pause ("draining"): a job accepted in the instant before the pause
+// is counted there, while an older status may not show it yet.
 func (h *Headless) drainIdle(ctx context.Context) (string, error) {
 	st, err := h.Status()
 	if err != nil || (st.State != "running" && st.State != "draining") || time.Since(st.UpdatedAt) > 2*time.Minute {
@@ -281,7 +284,9 @@ func (h *Headless) drainIdle(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	paused := time.Time{}
 	if !drained {
+		paused = time.Now()
 		if err = h.Drain(); err != nil {
 			return "", err
 		}
@@ -290,10 +295,11 @@ func (h *Headless) drainIdle(ctx context.Context) (string, error) {
 	deadline := h.Now().Add(h.DrainTimeout)
 	for {
 		st, err = h.Status()
-		if err == nil && st.InFlight == 0 {
+		settled := err == nil && (st.State == "draining" || st.State == "stopped") && !st.UpdatedAt.Before(paused)
+		if settled && st.InFlight == 0 {
 			return owner, nil
 		}
-		if err == nil {
+		if err == nil && st.InFlight > 0 {
 			h.printf("Waiting for %d accepted jobs to finish before updating; new jobs are paused", st.InFlight)
 		}
 		if h.Now().After(deadline) {
@@ -357,6 +363,7 @@ func (h *Headless) restore(ctx context.Context, previous string) error {
 }
 
 // Rollback reinstalls the version that was active before the last update.
+// Like an update, it waits for accepted jobs to finish before restarting.
 func (h *Headless) Rollback(ctx context.Context) error {
 	lock, err := localfs.LockPrivate(filepath.Join(h.Layout.Root, ".update-lock"))
 	if err != nil {
@@ -376,18 +383,28 @@ func (h *Headless) Rollback(ctx context.Context) error {
 			return err
 		}
 	}
-	h.printf("Restoring %s", filepath.Base(previous))
-	if err = h.restore(ctx, previous); err != nil {
+	owner, err := h.drainIdle(ctx)
+	if err != nil {
 		return err
 	}
-	_, err = h.State.Update(func(s *State) error {
-		s.MarkFailed(h.Running)
-		s.Pending = nil
-		if v, ok := strings.CutSuffix(filepath.Base(previous), "-"+h.Layout.Platform); ok && coordinator.ValidVersion(v) {
-			s.Installed = v
+	h.printf("Restoring %s", filepath.Base(previous))
+	err = h.restore(ctx, previous)
+	if err == nil {
+		_, err = h.State.Update(func(s *State) error {
+			s.MarkFailed(h.Running)
+			s.Pending = nil
+			if v, ok := strings.CutSuffix(filepath.Base(previous), "-"+h.Layout.Platform); ok && coordinator.ValidVersion(v) {
+				s.Installed = v
+			}
+			return nil
+		})
+	}
+	if owner == "updater" {
+		if resumeErr := h.Resume(); resumeErr != nil {
+			h.printf("Run scarlett-node resume: the rollback paused new work and could not resume it")
+			err = errors.Join(err, resumeErr)
 		}
-		return nil
-	})
+	}
 	return err
 }
 
@@ -434,8 +451,8 @@ func lastLine(s string) string {
 }
 
 // extractBundle unpacks a verified bundle into a private directory. Entries
-// must stay inside the bundle's single top directory; links must be relative
-// and stay inside it too.
+// must be directories or regular files inside the bundle's single top
+// directory.
 func extractBundle(archive, dir string, t Target) (string, func(), error) {
 	work, err := os.MkdirTemp(dir, "extract-"+t.Version+"-")
 	if err != nil {
@@ -497,15 +514,10 @@ func extractBundle(archive, dir string, t Target) (string, func(), error) {
 			if closeErr := out.Close(); err != nil || closeErr != nil {
 				return bad("could not be extracted")
 			}
-		case tar.TypeSymlink:
-			target := filepath.FromSlash(hdr.Linkname)
-			resolved := filepath.Join(filepath.Dir(name), target)
-			if filepath.IsAbs(target) || (resolved != top && !strings.HasPrefix(resolved, top+string(filepath.Separator))) {
-				return bad("has a link outside its bundle")
-			}
-			if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil || os.Symlink(hdr.Linkname, path) != nil {
-				return bad("could not be extracted")
-			}
+		case tar.TypeSymlink, tar.TypeLink:
+			// Bundles hold only regular files (install.sh refuses links too).
+			// A link could also chain through another link out of the bundle.
+			return bad("has a link")
 		default:
 			return bad("has an unsupported entry")
 		}

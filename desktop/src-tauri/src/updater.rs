@@ -497,10 +497,17 @@ impl Updater {
             .is_ok_and(|p| p.updates == "automatic")
     }
 
-    /// Cancel a download or a drain before the hand-off.
+    /// Cancel a download or a drain before the hand-off, or an "Update now"
+    /// that is waiting for a login or the local model API.
     pub async fn cancel(&self) {
         if let Some(cancel) = self.cancel.lock().await.take() {
             let _ = cancel.send(());
+        }
+        if self.install_now.swap(false, Ordering::SeqCst) && !self.automatic() {
+            let mut inner = self.inner.lock().await;
+            if inner.status.phase == "ready" && inner.status.error.as_deref() == Some("busy") {
+                inner.status.error = None;
+            }
         }
     }
 
@@ -520,16 +527,32 @@ impl Updater {
         if let Some(p) = state.pending.clone() {
             match p.phase.as_str() {
                 "installed" | "verifying" if p.to == version => {
-                    if p.drain_owner == "updater" {
-                        // The drain marker persists across restarts.
-                        let _ = self.node.control("resume").await;
-                    }
+                    // The updater's pause (the drain marker persists across
+                    // restarts) holds until this version proves healthy, so
+                    // a rollback never has accepted jobs to wait for.
                     resume = p.resume_serving;
                     verify = true;
                     let pending = state.pending.as_mut().expect("pending");
                     pending.phase = "verifying".into();
                     pending.app_pid = std::process::id();
-                    pending.drain_owner = "none".into();
+                }
+                "failed" if p.to == version && p.reason == "restore_failed" => {
+                    // This version failed its checks and the previous one could
+                    // not be put back: it keeps running and says so.
+                    if p.drain_owner == "updater" {
+                        let _ = self.node.control("resume").await;
+                        if let Some(pending) = state.pending.as_mut() {
+                            pending.drain_owner = "none".into();
+                        }
+                    }
+                    resume = p.resume_serving;
+                    let failure = Failure {
+                        version: p.to.clone(),
+                        reason: p.reason.clone(),
+                        rolled_back: false,
+                    };
+                    self.update(shell.as_ref(), |s| s.failure = Some(failure))
+                        .await;
                 }
                 "rolled_back" | "failed" if p.from == version => {
                     if p.drain_owner == "updater" {
@@ -578,7 +601,12 @@ impl Updater {
         if state.installed.is_empty() || (manual && newer(&version, &state.installed)) {
             state.installed = version.clone();
         }
-        if state.high_water.is_empty() || newer(&version, &state.high_water) {
+        // high_water is the highest version that proved healthy; one being
+        // verified now, or one that failed here, does not count yet.
+        if !verify
+            && !state.failed.contains(&version)
+            && (state.high_water.is_empty() || newer(&version, &state.high_water))
+        {
             state.high_water = version.clone();
         }
         if self.write_state(&state).await.is_err() {
@@ -648,11 +676,14 @@ impl Updater {
         }
         let version = self.version.clone();
         let healthy = reason.is_empty();
+        let mut paused_by_updater = false;
         let written = self
             .change_state(|s| {
                 if let Some(p) = s.pending.as_mut().filter(|p| p.to == version) {
                     if healthy {
                         p.phase = "healthy".into();
+                        paused_by_updater = p.drain_owner == "updater";
+                        p.drain_owner = "none".into();
                     } else {
                         p.phase = "unhealthy".into();
                         p.reason = reason.clone();
@@ -666,6 +697,10 @@ impl Updater {
                 }
             })
             .await;
+        if healthy && written.is_ok() && paused_by_updater {
+            // Healthy: new jobs again.
+            let _ = self.node.control("resume").await;
+        }
         if healthy && written.is_ok() {
             let offer = false;
             self.update(shell.as_ref(), |s| {
@@ -1023,9 +1058,9 @@ impl Updater {
     async fn install(self: &Arc<Self>, shell: Arc<dyn Shell>) -> std::result::Result<(), String> {
         let _busy = self.busy.lock().await;
         let state = self.read_state().await.map_err(|_| "install_failed")?;
-        let pending = state
+        state
             .pending
-            .clone()
+            .as_ref()
             .filter(|p| p.phase == "staged" && p.from == self.version)
             .ok_or("install_failed")?;
         let snapshot = self.node.snapshot().await;
@@ -1069,13 +1104,20 @@ impl Updater {
             let deadline = now() + DRAIN_LIMIT;
             loop {
                 let snap = self.node.snapshot().await;
-                let in_flight = snap
-                    .observation
-                    .as_ref()
+                let observed = snap.observation.as_ref();
+                let in_flight = observed
                     .and_then(|o| o.get("in_flight"))
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0);
-                if !snap.supervised || in_flight == 0 {
+                // Only a status the node wrote after it saw the pause counts:
+                // a job accepted in the instant before is included there.
+                let settled = matches!(
+                    observed
+                        .and_then(|o| o.get("state"))
+                        .and_then(serde_json::Value::as_str),
+                    Some("draining" | "stopped")
+                );
+                if !snap.supervised || (settled && in_flight == 0) {
                     break;
                 }
                 self.update(shell.as_ref(), |s| {
@@ -1111,7 +1153,7 @@ impl Updater {
             undo(self.clone()).await;
             return Err("busy".into());
         }
-        let guard = self.copy_guard(&pending.from).map_err(|_| "install_failed")?;
+        let guard = self.copy_guard().map_err(|_| "install_failed")?;
         let pid = std::process::id();
         self.change_state(|s| {
             if let Some(p) = s.pending.as_mut() {
@@ -1130,9 +1172,12 @@ impl Updater {
     }
 
     /// The guard is a copy of the running node binary outside the bundle, so
-    /// the swap or installer never replaces the program doing it.
-    fn copy_guard(&self, from: &str) -> std::io::Result<PathBuf> {
-        let dir = self.state_dir.join("updates").join(format!("guard-{from}"));
+    /// the swap or installer never replaces the program doing it. Its path
+    /// never changes and its signature keeps the pinned designated
+    /// requirement, so a macOS App Management grant made for it once still
+    /// applies to later updates.
+    fn copy_guard(&self) -> std::io::Result<PathBuf> {
+        let dir = self.state_dir.join("updates").join("guard");
         std::fs::create_dir_all(&dir)?;
         let name = if cfg!(windows) {
             "scarlett-node.exe"

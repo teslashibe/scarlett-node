@@ -382,6 +382,7 @@ function renderUpdate(s: Snapshot) {
   if (failure) {
     setText($("failure-title"), failure.title);
     setText($("failure-detail"), failure.detail);
+    $("failure-retry").hidden = !failure.retry;
   }
   setText($("update-summary"), updateSummary(updateStatus, s));
   for (const id of ["update-mode-notify", "update-mode-automatic"]) {
@@ -446,6 +447,12 @@ $("updated-automatic").addEventListener("click", () => {
 $("updated-dismiss").addEventListener("click", () => {
   $("updated-banner").hidden = true;
   void api.updateDismiss("updated").catch(() => undefined).finally(() => void refreshUpdate());
+});
+$("failure-retry").addEventListener("click", () => {
+  void act(async () => {
+    await api.updateDismiss("failure");
+    await api.updateInstall();
+  }, "Trying the update again. Accepted jobs finish before it installs");
 });
 $("failure-download").addEventListener("click", () => {
   void act(() => api.open("update"), "Opened the download page in your browser");

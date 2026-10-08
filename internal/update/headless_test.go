@@ -98,9 +98,15 @@ func newHeadlessFixture(t *testing.T, newReports string) *headlessFixture {
 		State: StateFile{Path: filepath.Join(root, "update-state.json")},
 		Status: func() (NodeStatus, error) {
 			s := f.status.Load().(NodeStatus)
-			// Accepted work finishes on its own while new work is paused.
-			if f.drained.Load() && f.inFlight.Load() > 0 {
-				f.inFlight.Add(-1)
+			// Accepted work finishes on its own while new work is paused,
+			// and the node's next status reports the pause.
+			if f.drained.Load() {
+				if f.inFlight.Load() > 0 {
+					f.inFlight.Add(-1)
+				}
+				if s.State == "running" {
+					s.State, s.UpdatedAt = "draining", time.Now()
+				}
 			}
 			s.InFlight = int(f.inFlight.Load())
 			return s, nil
@@ -218,6 +224,18 @@ func TestBundleExtractionStaysInsideTheBundle(t *testing.T) {
 		"link": func(tw *tar.Writer) {
 			tw.WriteHeader(&tar.Header{Name: top + "/link", Typeflag: tar.TypeSymlink, Linkname: "../../etc/passwd"})
 		},
+		"link inside": func(tw *tar.Writer) {
+			tw.WriteHeader(&tar.Header{Name: top + "/lib/link", Typeflag: tar.TypeSymlink, Linkname: "../VERSION"})
+		},
+		"chained links": func(tw *tar.Writer) {
+			tw.WriteHeader(&tar.Header{Name: top + "/here", Typeflag: tar.TypeSymlink, Linkname: "."})
+			tw.WriteHeader(&tar.Header{Name: top + "/up", Typeflag: tar.TypeSymlink, Linkname: "here/.."})
+			tw.WriteHeader(&tar.Header{Name: top + "/up/evil", Typeflag: tar.TypeReg, Size: 1})
+			tw.Write([]byte("x"))
+		},
+		"hard link": func(tw *tar.Writer) {
+			tw.WriteHeader(&tar.Header{Name: top + "/hard", Typeflag: tar.TypeLink, Linkname: top + "/VERSION"})
+		},
 		"absolute link": func(tw *tar.Writer) {
 			tw.WriteHeader(&tar.Header{Name: top + "/link", Typeflag: tar.TypeSymlink, Linkname: "/etc/passwd"})
 		},
@@ -235,7 +253,6 @@ func TestBundleExtractionStaysInsideTheBundle(t *testing.T) {
 	os.WriteFile(archive, tarBundle(t, "0.1.13", bundleFiles("0.1.13", "0.1.13"), func(tw *tar.Writer) {
 		tw.WriteHeader(&tar.Header{Name: top + "/._VERSION", Typeflag: tar.TypeReg, Size: 1})
 		tw.Write([]byte("x"))
-		tw.WriteHeader(&tar.Header{Name: top + "/lib/link", Typeflag: tar.TypeSymlink, Linkname: "../VERSION"})
 	}), 0o600)
 	bundle, cleanup, err := extractBundle(archive, dir, Target{Version: "0.1.13", Filename: name})
 	if err != nil {
@@ -274,5 +291,40 @@ func TestDetectLayoutAcceptsOnlyAnInstallShLayout(t *testing.T) {
 	os.Chmod(root, 0o755)
 	if _, err = DetectLayout(filepath.Join(bin, "scarlett-node")); err == nil {
 		t.Fatal("shared installation root accepted")
+	}
+}
+
+func TestHeadlessDrainTrustsOnlyAStatusWrittenAfterThePause(t *testing.T) {
+	f := newHeadlessFixture(t, "0.1.13")
+	// The node has not written a status since the pause: its last one says
+	// running with nothing in flight, but a job accepted in that instant may
+	// not be counted yet. The updater waits for the node's own report.
+	f.inFlight.Store(0)
+	stale := NodeStatus{State: "running", UpdatedAt: time.Now(), Release: "0.1.12", NodeID: "node-a"}
+	f.h.Status = func() (NodeStatus, error) { return stale, nil }
+	f.h.DrainTimeout = 50 * time.Millisecond
+	err := f.h.Apply(context.Background(), ApplyOptions{})
+	if CodeOf(err) != CodeBusy || f.current(t) != "versions/0.1.12-"+Platform() || f.restarts.Load() != 0 || f.resumes.Load() != 1 {
+		t.Fatalf("err %v restarts %d resumes %d", err, f.restarts.Load(), f.resumes.Load())
+	}
+}
+
+func TestHeadlessRollbackDrainsFirstAndResumes(t *testing.T) {
+	f := newHeadlessFixture(t, "0.1.13")
+	if err := f.h.Apply(context.Background(), ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	f.h.Running = "0.1.13"
+	f.h.Layout.Current = filepath.Join(f.root, "versions", "0.1.13-"+Platform())
+	f.h.Layout.Version = "0.1.13"
+	f.inFlight.Store(2)
+	f.status.Store(NodeStatus{State: "running", UpdatedAt: time.Now(), Release: "0.1.13", NodeID: "node-a"})
+	drains, resumes := f.drains.Load(), f.resumes.Load()
+	if err := f.h.Rollback(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	s, _ := f.h.State.Read()
+	if f.current(t) != "versions/0.1.12-"+Platform() || f.inFlight.Load() != 0 || f.drains.Load() != drains+1 || f.resumes.Load() != resumes+1 || !s.HasFailed("0.1.13") || s.Installed != "0.1.12" {
+		t.Fatalf("current %s in flight %d drains %d resumes %d state %+v", f.current(t), f.inFlight.Load(), f.drains.Load()-drains, f.resumes.Load()-resumes, s)
 	}
 }

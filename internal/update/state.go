@@ -18,7 +18,8 @@ import (
 
 // Phases of one install, in order. A pending update moves forward only:
 // staged → draining → handoff → installed → verifying → healthy, or to
-// unhealthy → rolled_back, or to failed when nothing was replaced.
+// unhealthy → rolled_back, or to failed when nothing was replaced (or, with
+// reason restore_failed, when the previous version could not be restored).
 const (
 	PhaseStaged     = "staged"
 	PhaseDraining   = "draining"

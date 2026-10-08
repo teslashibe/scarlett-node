@@ -13,7 +13,7 @@ export const layout = `
 <main id="main" tabindex="-1">
   <p id="notice" role="status" aria-live="polite" hidden></p>
   <section id="updated-banner" class="updated-banner" aria-labelledby="updated-title" hidden><div class="updated-copy"><h2 id="updated-title"></h2><ul id="updated-highlights" class="update-highlights"></ul><div class="actions"><button id="updated-notes" type="button" class="quiet">See what's new ↗</button><button id="updated-automatic" type="button" class="quiet" hidden>Turn on automatic updates</button></div></div><button id="updated-dismiss" type="button" class="quiet dismiss" aria-label="Dismiss update notice">✕</button></section>
-  <section id="update-failure" class="relay-banner danger" aria-labelledby="failure-title" hidden><div><h2 id="failure-title"></h2><p id="failure-detail"></p></div><div class="actions"><button id="failure-download" type="button">Download manually ↗</button><button id="failure-dismiss" type="button" class="quiet">Dismiss</button></div></section>
+  <section id="update-failure" class="relay-banner danger" aria-labelledby="failure-title" hidden><div><h2 id="failure-title"></h2><p id="failure-detail"></p></div><div class="actions"><button id="failure-retry" type="button" hidden>Try again</button><button id="failure-download" type="button">Download manually ↗</button><button id="failure-dismiss" type="button" class="quiet">Dismiss</button></div></section>
   <section class="node-overview" aria-labelledby="status">
     <div class="overview-copy">
       <p class="eyebrow">THIS DEVICE</p>

@@ -105,6 +105,10 @@ test("The updated banner and failure notice", () => {
   const rolled = failureNotice(status({ failure: { version: "0.1.14", reason: "node_exited", rolled_back: true } }));
   assert.equal(rolled?.title, "Scarlett Node 0.1.14 could not start");
   assert.match(rolled?.detail ?? "", /restored 0\.1\.13.*skip 0\.1\.14/);
+  assert.equal(rolled?.retry, false);
+  const refused = failureNotice(status({ failure: { version: "0.1.14", reason: "app_management", rolled_back: false } }));
+  assert.match(refused?.detail ?? "", /App Management.*Automatic updates skip 0\.1\.14 until you try again/);
+  assert.equal(refused?.retry, true);
   assert.match(failureNotice(status({ failure: { version: "0.1.14", reason: "not_writable", rolled_back: false } }))?.detail ?? "", /can't replace itself/);
 });
 
@@ -116,4 +120,27 @@ test("Settings summary and version checks", () => {
   assert.match(updateSummary(status({ checked_at: Date.UTC(2026, 9, 8, 10, 42) })), /^Version 0\.1\.13 · Up to date · checked /);
   for (const bad of ["", "1.2", "1.2.3/../x", "<b>1.2.3</b>", 3]) assert.equal(validVersion(bad), false);
   assert.equal(validVersion("0.1.14-rc.1"), true);
+});
+
+test("An install that waits explains why instead of offering a silent Update now", () => {
+  const busy = updateToast(status({ phase: "ready", latest: "0.1.14", error: "busy", notes }), undefined, "");
+  assert.equal(busy?.title, "Scarlett Node 0.1.14 is ready to install");
+  assert.match(busy?.detail ?? "", /local model API is stopped/);
+  // Cancel withdraws the pending Update now; automatic mode keeps waiting.
+  assert.deepEqual(busy?.buttons.map((b) => b.action), ["cancel", "notes"]);
+  assert.deepEqual(actions(status({ mode: "automatic", phase: "ready", latest: "0.1.14", error: "busy" })), ["notes"]);
+  const required = updateToast(status({ mode: "automatic", phase: "ready", latest: "0.1.14", error: "busy", required: true }), undefined, "");
+  assert.equal(required?.level, "required");
+  const timeout = updateToast(status({ phase: "ready", latest: "0.1.14", error: "drain_timeout" }), undefined, "");
+  assert.match(timeout?.detail ?? "", /resumed new jobs and did not install the update\. Try again/);
+  assert.deepEqual(timeout?.buttons.map((b) => b.action), ["install", "notes", "later"]);
+  assert.match(updateToast(status({ mode: "automatic", phase: "ready", latest: "0.1.14", error: "drain_timeout" }), undefined, "")?.detail ?? "", /tries again in an hour/);
+  assert.equal(updateToast(status({ phase: "draining", latest: "0.1.14", in_flight: 0 }), undefined, "")?.title, "Pausing new jobs before updating");
+});
+
+test("A failed restore says the new version is still installed", () => {
+  const notice = failureNotice(status({ version: "0.1.14", failure: { version: "0.1.14", reason: "restore_failed", rolled_back: false } }));
+  assert.equal(notice?.title, "Scarlett Node 0.1.14 did not pass its start-up checks");
+  assert.match(notice?.detail ?? "", /could not be restored automatically, so 0\.1\.14 is still installed/);
+  assert.equal(notice?.retry, false);
 });

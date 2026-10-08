@@ -7,8 +7,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
+
+	"github.com/teslashibe/scarlett-node/internal/localfs"
 )
 
 // Guard finishes a desktop install after the app has exited: it replaces the
@@ -19,23 +20,49 @@ type Guard struct {
 	State   StateFile
 	Updates string
 	// Hooks; tests replace them.
-	Install    func(ctx context.Context, p *Pending) error
-	Restore    func(ctx context.Context, p *Pending) error
-	Launch     func(app string) error
-	Alive      func(pid int) bool
-	Terminate  func(pid int, force bool)
-	ExitWait   time.Duration
-	HealthWait time.Duration
-	Poll       time.Duration
-	Log        io.Writer
+	Install   func(ctx context.Context, p *Pending) error
+	Restore   func(ctx context.Context, p *Pending) error
+	Launch    func(app string) error
+	Alive     func(pid int) bool
+	Terminate func(pid int, force bool)
+	// NodeStopped reports that no node process still holds the attempt
+	// journal, so the restored app can start its own node.
+	NodeStopped func() bool
+	ExitWait    time.Duration
+	HealthWait  time.Duration
+	// QuitWait is how long an app that reported itself unhealthy gets to
+	// finish its own draining shutdown; NodeWait how long its node gets to
+	// finish accepted work after the app has gone.
+	QuitWait time.Duration
+	NodeWait time.Duration
+	Poll     time.Duration
+	Log      io.Writer
 }
 
 // NewGuard returns a guard with this platform's install steps.
 func NewGuard(state StateFile, updates string) *Guard {
 	g := &Guard{State: state, Updates: updates, Launch: launchApp, Alive: processAlive, Terminate: terminateProcess,
-		ExitWait: 60 * time.Second, HealthWait: 5 * time.Minute, Poll: 2 * time.Second, Log: io.Discard}
+		ExitWait: 60 * time.Second, HealthWait: 5 * time.Minute, QuitWait: 150 * time.Second, NodeWait: 3 * time.Minute,
+		Poll: 2 * time.Second, Log: io.Discard}
 	g.Install, g.Restore = g.install, g.restore
+	g.NodeStopped = func() bool { return NodeStopped(filepath.Dir(state.Path)) }
 	return g
+}
+
+// NodeStopped reports whether no node process holds the attempt journal in
+// stateDir. A node keeps that lock for its whole run, including the drain of
+// accepted work after its owner exits.
+func NodeStopped(stateDir string) bool {
+	path := filepath.Join(stateDir, "attempts", ".lock")
+	if _, err := os.Lstat(path); os.IsNotExist(err) {
+		return true
+	}
+	lock, err := localfs.LockPrivate(path)
+	if err != nil {
+		return false
+	}
+	_ = lock.Close()
+	return true
 }
 
 func (g *Guard) logf(format string, args ...any) {
@@ -80,15 +107,20 @@ func (g *Guard) Run(ctx context.Context) error {
 	if _, err = g.State.Update(func(s *State) error { s.Pending.GuardPID = pid; return nil }); err != nil {
 		return err
 	}
+	// A version that could not be installed is skipped by automatic mode
+	// until the operator retries it: otherwise a lasting refusal (such as
+	// macOS App Management) would quit and relaunch the app, stopping the
+	// node, on every automatic attempt.
+	markFailed := func(s *State) { s.MarkFailed(p.To) }
 	if !g.waitExit(p.AppPID, g.ExitWait) {
 		g.logf("the app did not exit; nothing was replaced")
-		_, err = g.setPhase(PhaseFailed, CodeBusy, nil)
+		_, err = g.setPhase(PhaseFailed, CodeBusy, markFailed)
 		return err
 	}
 	g.logf("installing %s over %s", p.To, p.From)
 	if err = g.Install(ctx, p); err != nil {
 		g.logf("install failed: %v", err)
-		_, _ = g.setPhase(PhaseFailed, CodeOf(err), nil)
+		_, _ = g.setPhase(PhaseFailed, CodeOf(err), markFailed)
 		return errors.Join(err, g.Launch(p.App))
 	}
 	if _, err = g.setPhase(PhaseInstalled, "", func(s *State) { s.Pending.Previous = p.Previous; s.Pending.AppPID = 0 }); err != nil {
@@ -129,19 +161,40 @@ func (g *Guard) rollback(ctx context.Context, p *Pending, reason string) error {
 	}
 	g.logf("rolling back %s to %s: %s", p.To, p.From, reason)
 	if current, err := g.State.Read(); err == nil && current.Pending != nil && current.Pending.AppPID > 0 && g.Alive(current.Pending.AppPID) {
-		// The node child drains accepted work by itself when its owner exits,
-		// so the app may be stopped; installers then wait for the sidecars.
 		app := current.Pending.AppPID
-		g.Terminate(app, false)
-		if !g.waitExit(app, 30*time.Second) {
-			g.Terminate(app, true)
-			g.waitExit(app, 10*time.Second)
+		// An app that found itself unhealthy is already quitting through its
+		// draining shutdown; let it finish before asking it to stop.
+		if current.Pending.Phase == PhaseUnhealthy {
+			g.waitExit(app, g.QuitWait)
+		}
+		if g.Alive(app) {
+			g.Terminate(app, false)
+			if !g.waitExit(app, 30*time.Second) {
+				g.Terminate(app, true)
+				g.waitExit(app, 10*time.Second)
+			}
 		}
 	}
-	err := g.Restore(ctx, p)
+	// A node whose app was stopped drains accepted work by itself. Restoring
+	// waits for it: the Windows installer cannot replace a running node, and
+	// the restored app cannot start its own node while this one holds the
+	// attempt journal.
+	if g.NodeStopped != nil {
+		deadline := time.Now().Add(g.NodeWait)
+		for !g.NodeStopped() && time.Now().Before(deadline) {
+			time.Sleep(g.Poll)
+		}
+	}
+	if err := g.Restore(ctx, p); err != nil {
+		// Nothing was restored: the new version stays installed and says so
+		// when it opens, instead of claiming the previous one is back.
+		g.logf("restore failed: %v", err)
+		_, stateErr := g.setPhase(PhaseFailed, "restore_failed", func(s *State) { s.MarkFailed(p.To) })
+		return errors.Join(err, stateErr, g.Launch(p.App))
+	}
 	_, stateErr := g.setPhase(PhaseRolledBack, reason, func(s *State) { s.MarkFailed(p.To) })
 	launchErr := g.Launch(p.App)
-	return errors.Join(err, stateErr, launchErr)
+	return errors.Join(stateErr, launchErr)
 }
 
 // cleanup keeps exactly one previous app or installer and removes downloads.
@@ -165,8 +218,10 @@ func (g *Guard) cleanup(p *Pending) {
 			}
 			continue
 		}
-		// The guard's own copy and log stay: the log explains the last update.
-		if keep[path] || strings.HasPrefix(entry.Name(), "guard-") || entry.Name() == "guard.log" {
+		// The guard's own copy and log stay: the log explains the last update,
+		// and the copy keeps one fixed path so that a macOS App Management
+		// grant, if the system asks for one, still applies next time.
+		if keep[path] || entry.Name() == "guard" || entry.Name() == "guard.log" {
 			continue
 		}
 		_ = os.RemoveAll(path)
