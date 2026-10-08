@@ -55,6 +55,25 @@ test("Required updates are persistent alerts", () => {
   assert.deepEqual(automatic?.buttons.map((b) => b.action), ["notes"]);
 });
 
+test("The coordinator's minimum keeps the required notice before and without a manifest check", () => {
+  const below = snapshot({ latest_release: "0.1.14", update_required: true });
+  // Before the first check (no latest) and after a failed one, it stays up and cannot be dismissed.
+  for (const u of [status(), status({ error: "network", checked_at: 1 })]) {
+    const toast = updateToast(u, below, "0.1.14");
+    assert.equal(toast?.level, "required");
+    assert.equal(toast?.title, "Update required");
+    assert.match(toast?.detail ?? "", /0\.1\.13 no longer receives new jobs; jobs it already accepted still finish\. Install 0\.1\.14/);
+    assert.deepEqual(toast?.buttons.map((b) => b.action), ["download", "notes"]);
+    assert.equal(toast?.version, "0.1.14");
+  }
+  // Once the updater has the release, Update now replaces the download link.
+  assert.deepEqual(actions(status({ phase: "available", latest: "0.1.14" })), ["install", "notes", "later"]);
+  assert.deepEqual(updateToast(status({ phase: "available", latest: "0.1.14" }), below, "0.1.14")?.buttons.map((b) => b.action), ["install", "notes"]);
+  // An optional release from the coordinator never forces the notice.
+  assert.equal(updateToast(status(), snapshot({ latest_release: "0.1.14", update_available: true }), ""), null);
+  assert.equal(updateSummary(status(), below), "Version 0.1.13 · Update required: 0.1.14");
+});
+
 test("Errors name a fixed reason and always offer the download page", () => {
   const toast = updateToast(status({ phase: "error", latest: "0.1.14", error: "signature_invalid" }), undefined, "");
   assert.equal(toast?.title, "Scarlett Node 0.1.14 was not installed");

@@ -84,6 +84,11 @@ export function updateToast(u: UpdateStatus | undefined, s: Snapshot | undefined
   const install: UpdateButton = u.can_install ? { action: "install", label: "Update now" } : { action: "download", label: "Download ↗" };
   const whatsNew: UpdateButton[] = latest ? [{ action: "notes", label: "What's new ↗" }] : [];
   const base = { highlights: highlightsOf(notes), version: latest };
+  // The coordinator's minimum is authoritative for "required": the notice
+  // stays up from the first status poll, before the updater's first check
+  // and while the download manifest is unreachable.
+  const coordinator = s ? updateNotice(s) : null;
+  const required = u.required || coordinator?.level === "required";
   switch (u.phase) {
     case "downloading":
       return { ...base, level: "info", title: `Downloading Scarlett Node ${latest ?? ""}${typeof u.progress === "number" ? ` · ${u.progress} %` : ""}`.trim(),
@@ -99,20 +104,27 @@ export function updateToast(u: UpdateStatus | undefined, s: Snapshot | undefined
       return { ...base, level: "info", title: "Installing and restarting…", detail: `Scarlett Node ${latest ?? ""} opens by itself when it's ready`.replace("  ", " "), buttons: [] };
     case "scheduled": {
       const seconds = Math.max(0, Math.ceil(((u.install_at ?? now) - now) / 1000));
-      return { ...base, level: u.required ? "required" : "info", title: `Installing Scarlett Node ${latest ?? ""} when current jobs finish`,
+      return { ...base, level: required ? "required" : "info", title: `Installing Scarlett Node ${latest ?? ""} when current jobs finish`,
         detail: `Starts in ${seconds} s`, buttons: [{ action: "later", label: "Install later" }, ...whatsNew] };
     }
   }
   if (u.phase === "error" && latest && u.error && u.error !== "cancelled") {
-    return { ...base, level: u.required ? "required" : "info", title: `Scarlett Node ${latest} was not installed`, detail: updateErrorText(u.error),
+    return { ...base, level: required ? "required" : "info", title: `Scarlett Node ${latest} was not installed`, detail: updateErrorText(u.error),
       buttons: [{ action: "download", label: "Download manually ↗" }, ...(u.can_install && u.error === "network" ? [{ action: "retry" as const, label: "Try again" }] : []), ...whatsNew,
-        ...(u.required ? [] : [{ action: "later" as const, label: "Later" }])] };
+        ...(required ? [] : [{ action: "later" as const, label: "Later" }])] };
   }
-  if (u.required && latest) {
+  if (required && latest) {
     const automatic = u.mode === "automatic" && u.can_install;
     return { ...base, level: "required", title: "Update required",
       detail: `Scarlett Node ${u.version} no longer receives new jobs; jobs it already accepted still finish. ${automatic ? `Scarlett installs ${latest} as soon as it is ready` : `Install ${latest} to keep earning`}`,
       buttons: automatic ? whatsNew : [install, ...whatsNew] };
+  }
+  // Required, but the updater has not (yet) found the release in the
+  // download manifest: keep the notice and offer the download page.
+  if (required && coordinator) {
+    return { level: "required", title: "Update required", highlights: [], version: coordinator.latest,
+      detail: `Scarlett Node ${u.version} no longer receives new jobs; jobs it already accepted still finish. Install ${coordinator.latest} to keep earning`,
+      buttons: [{ action: "download", label: "Download update ↗" }, { action: "notes", label: "What's new ↗" }] };
   }
   if (latest && u.mode !== "automatic" && !u.snoozed && dismissed !== latest) {
     return { ...base, level: "info", title: `Scarlett Node ${latest} is available`, detail: notes?.title ?? "",
@@ -143,10 +155,12 @@ export function failureNotice(u: UpdateStatus | undefined): { title: string; det
   return { title: `Scarlett Node ${f.version} was not installed`, detail: updateErrorText(f.reason) };
 }
 
-export function updateSummary(u: UpdateStatus | undefined, now = Date.now()): string {
+export function updateSummary(u: UpdateStatus | undefined, s?: Snapshot): string {
   if (!u) return "Checking for updates";
-  const latest = validVersion(u.latest) ? u.latest : undefined;
-  const state = u.required && latest ? `Update required: ${latest}`
+  const coordinator = s ? updateNotice(s) : null;
+  const latest = validVersion(u.latest) ? u.latest : coordinator?.level === "required" ? coordinator.latest : undefined;
+  const required = u.required || coordinator?.level === "required";
+  const state = required && latest ? `Update required: ${latest}`
     : u.phase === "checking" ? "Checking…"
     : latest ? `${latest} available`
     : u.error === "network" ? "Couldn't check"
@@ -154,6 +168,5 @@ export function updateSummary(u: UpdateStatus | undefined, now = Date.now()): st
   const checked = typeof u.checked_at === "number"
     ? ` · checked ${new Date(u.checked_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
     : "";
-  void now;
   return `Version ${u.version} · ${state}${checked}`;
 }

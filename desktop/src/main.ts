@@ -383,7 +383,7 @@ function renderUpdate(s: Snapshot) {
     setText($("failure-title"), failure.title);
     setText($("failure-detail"), failure.detail);
   }
-  setText($("update-summary"), updateSummary(updateStatus));
+  setText($("update-summary"), updateSummary(updateStatus, s));
   for (const id of ["update-mode-notify", "update-mode-automatic"]) {
     const input = $<HTMLInputElement>(id);
     input.disabled = busy || !updateStatus;
@@ -412,7 +412,14 @@ function updateAction(action: UpdateAction) {
     case "later":
       dismissedUpdate = version ?? "";
       $("update-toast").hidden = true;
-      if (updateStatus) void api.updateLater().catch(() => undefined).finally(() => void refreshUpdate());
+      // With the native updater, its saved snooze decides when to remind
+      // again (24 hours), so the session-only dismissal is dropped once that
+      // is saved; it remains only if saving failed.
+      if (updateStatus)
+        void api.updateLater().then(() => {
+          if (updateStatus?.phase === "available" && updateStatus.latest === version) updateStatus = { ...updateStatus, snoozed: true };
+          if (dismissedUpdate === (version ?? "")) dismissedUpdate = "";
+        }).catch(() => undefined).finally(() => void refreshUpdate());
       break;
   }
 }
