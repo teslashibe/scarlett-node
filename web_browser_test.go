@@ -3,12 +3,16 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/teslashibe/scarlett-node/internal/config"
+	"github.com/teslashibe/scarlett-node/internal/coordinator"
 	"github.com/teslashibe/scarlett-node/internal/worker"
 )
 
@@ -117,5 +121,43 @@ func TestBrowserRuntimeInputs(t *testing.T) {
 	}
 	if !strings.HasSuffix(xLoginNode("/r"), filepath.Join("x-login-runtime", "node")) && !strings.HasSuffix(xLoginNode("/r"), "node.exe") {
 		t.Fatal("x-login node path", xLoginNode("/r"))
+	}
+}
+
+// A browser result the coordinator does not store is logged with its status
+// and code, and the error still reaches the worker. In production the network
+// host gate answered every upload with Go's plain 404 while the node logged
+// nothing; the job was served from the re-fetch and the gap went unseen.
+func TestLogBrowserUploadRefusal(t *testing.T) {
+	const job = "11111111-1111-4111-8111-111111111111"
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		log    string
+	}{
+		{"host gate 404", http.StatusNotFound, "404 page not found\n", "web browser: result upload not stored: coordinator HTTP 404\n"},
+		{"fenced", http.StatusConflict, `{"error":{"code":"fenced","message":"The browser result does not match the current accepted lease."}}`, "web browser: result upload not stored: coordinator HTTP 409 fenced\n"},
+		{"stored", http.StatusOK, `{"status":"stored"}`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/api/node/v1/jobs/"+job+"/browser-result" {
+					t.Error("unexpected request", r.Method, r.URL.Path)
+				}
+				w.WriteHeader(tc.status)
+				io.WriteString(w, tc.body)
+			}))
+			t.Cleanup(server.Close)
+			var out strings.Builder
+			upload := logBrowserUpload(coordinator.New(server.URL, "synthetic-credential").UploadBrowserResult, &out)
+			err := upload(context.Background(), job, []byte("synthetic gzip"), time.Now().Add(time.Minute))
+			if (err == nil) != (tc.status == http.StatusOK) || out.String() != tc.log {
+				t.Fatalf("err %v, log %q", err, out.String())
+			}
+			if strings.Contains(out.String(), "synthetic-credential") {
+				t.Fatal("credential logged")
+			}
+		})
 	}
 }

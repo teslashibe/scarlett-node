@@ -461,7 +461,11 @@ phase. The upload uses the node's coordinator transport and version headers but
 its own client without the 10 s timeout: each try runs under the report
 deadline, starts only while `max(15 s, size / 250 kB/s)` remains, and there are
 at most three, retried only after a transport error, 429 or 5xx. A repeat of the
-same body is answered 200; a 409 is final.
+same body is answered 200; a 409 is final. An upload that is not stored is
+logged once it gives up, with the status and the coordinator's error code and
+nothing else: `web browser: result upload not stored: coordinator HTTP 409
+fenced`. The job is still served from the re-fetch, so this line is the only
+sign on the node that the coordinator never received the browser's copy.
 
 **Clearance cookies.** The Cookie for a re-fetch hop holds only cookies whose
 names are on the allowlist the verifier enforces: exactly `cf_clearance`,
