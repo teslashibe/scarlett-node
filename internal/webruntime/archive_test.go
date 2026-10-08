@@ -337,8 +337,12 @@ func TestEnsureRebuildsDamagedExtractionAndCollectsOldVersions(t *testing.T) {
 		names = append(names, e.Name())
 	}
 	sort.Strings(names)
-	if strings.Join(names, ",") != filepath.Base(root.Dir)+",extract.lock" {
-		t.Fatalf("after GC: %v", names)
+	want := []string{filepath.Base(root.Dir), "extract.lock"}
+	sort.Strings(want)
+	// The kept directory is named by the archive digest, which can sort
+	// either side of extract.lock.
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Fatalf("after GC: %v, want %v", names, want)
 	}
 }
 
