@@ -83,6 +83,11 @@ func localCommand(command string, output io.Writer) error {
 	if !filepath.IsAbs(dir) {
 		return errors.New("state directory must be absolute")
 	}
+	return localCommandDir(dir, command, output)
+}
+
+// localCommandDir runs one local command against a state directory.
+func localCommandDir(dir, command string, output io.Writer) error {
 	if err := prepareStateDir(dir); err != nil {
 		return err
 	}

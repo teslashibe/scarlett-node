@@ -23,5 +23,8 @@
     "sha256": "040353aabcc26f03d2f584af857d78afaf7d278ab1927f80f05b4c85eee831fa",
     "notAfter": "2046-09-28T21:16:51Z",
     "timestampUrl": "http://timestamp.digicert.com"
+  },
+  "updater": {
+    "minisign": []
   }
 }

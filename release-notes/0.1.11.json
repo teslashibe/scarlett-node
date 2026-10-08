@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "version": "0.1.11",
+  "date": "2026-10-07",
+  "title": "Web scraping",
+  "highlights": [
+    "New web service: serve verified page fetches for AI agents from your own connection, each page proven by Scarlett's verifier",
+    "A hidden, sandboxed browser renders pages behind Cloudflare challenges or JavaScript (on by default on macOS and Linux)",
+    "An egress guard keeps page traffic away from your home network, loopback and link-local addresses"
+  ]
+}

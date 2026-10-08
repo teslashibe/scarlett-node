@@ -8,18 +8,34 @@ Every record is checked against desktop/signing/identities.json (never a
 rehearsal file, never rehearsal evidence) and against the installer's own
 SHA-256 before anything is written.
 
+Release notes come from release-notes/<version>.json (one file per release,
+see release-notes/README.md). They become the manifest's "notes", the
+cumulative changelog.json the network site renders, and the GitHub release body.
+
+Headless bundles (scripts/package.sh) and the updater's minisign signatures
+(`tauri signer sign --app-version`, from the release-signing job) are optional
+inputs. With signatures, every one is verified against the pinned updater keys
+in desktop/signing/identities.json and the manifest gains "updates"; the
+headless bundles are then published beside the installers. Without them the
+release has no "updates" and installed apps fall back to the download page.
+
 The new output directory receives:
-  release/    manifest.json, provenance.json and the three renamed installers;
-              exactly the set the download publisher accepts
-  SHA256SUMS  "<sha256>  <installer>" lines, sorted (the publisher writes its own
+  release/    manifest.json, provenance.json, changelog.json, the three renamed
+              installers and, when signed, the three headless bundles; exactly
+              the set the download publisher accepts
+  SHA256SUMS  "<sha256>  <file>" lines, sorted (the publisher writes its own
               copy inside the published version, so this stays outside release/)
-  evidence/   the signing evidence and component manifests, for review
+  evidence/   the signing evidence, component manifests and release-notes.md
+  headless/   unsigned headless bundles (GitHub release assets only)
 
   release-manifest.py check-version 0.1.1
   release-manifest.py assemble --version 0.1.1 --channel stable \\
       --node-commit <GITHUB_SHA> --model-api-commit <open-agent-api v0.1.32 commit> \\
       --workflow-run https://github.com/<owner>/<repo>/actions/runs/<id>/attempts/<n> \\
-      --darwin-arm64 DIR --darwin-amd64 DIR --windows-amd64 DIR --output NEW_DIR
+      --darwin-arm64 DIR --darwin-amd64 DIR --windows-amd64 DIR \\
+      [--headless-linux-amd64 DIR --headless-darwin-arm64 DIR --headless-darwin-amd64 DIR] \\
+      [--signatures DIR] --output NEW_DIR
+  release-manifest.py changelog --version 0.1.1 --output changelog.json
 """
 import argparse
 import hashlib
@@ -32,6 +48,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import signing_identities  # noqa: E402
+import updater_signatures  # noqa: E402
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 VERSION = re.compile(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[a-z0-9]+(?:[.-][a-z0-9]+)*)?')
@@ -50,6 +67,14 @@ MODEL_API_COMMIT = '3a2559dbe65c85a051de40e2bbafc2639fb99e73'
 COMPONENTS = ['claude-cli', 'codex-cli', 'desktop', 'model-api', 'node', 'prover']
 SIDECARS = {'scarlett-node', 'scarlett-prover', 'open-agent-api'}
 UNTRUSTED_ROOT = '0x800B0109'
+HEADLESS_PLATFORMS = ('linux-amd64', 'darwin-arm64', 'darwin-amd64')
+RELEASE_NOTES = REPOSITORY / 'release-notes'
+CHANGELOG_URL = 'https://network.scarlett.ai/changelog/#v%s'
+GITHUB_RELEASE = 'https://github.com/teslashibe/scarlett-node/releases/tag/v%s'
+DETAILS_PREFIX = 'https://network.scarlett.ai/docs/'
+DATE = re.compile(r'20[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])')
+NOTES_KEYS = {'schemaVersion', 'version', 'date', 'title', 'highlights'}
+MAX_CHANGELOG_BYTES = 65536
 PLATFORMS = {
     'darwin-arm64': {'identity': 'macos', 'extension': '.dmg', 'target': 'aarch64-apple-darwin'},
     'darwin-amd64': {'identity': 'macos', 'extension': '.dmg', 'target': 'x86_64-apple-darwin'},
@@ -111,7 +136,140 @@ def check_version(version):
         raise ValueError('Release versions are semantic versions')
     if app_versions() != {version}:
         raise ValueError('The release version must equal the reviewed desktop version on this commit')
+    load_notes(version)
     return version
+
+
+def version_key(version):
+    """Semantic version precedence for release ordering."""
+    if not isinstance(version, str) or not VERSION.fullmatch(version):
+        raise ValueError('Release versions are semantic versions')
+    core, _, pre = version.partition('-')
+    numbers = tuple(int(part) for part in core.split('.'))
+    if not pre:
+        return numbers + (1,)
+    ids = tuple((0, int(i), '') if i.isdigit() else (1, 0, i) for i in pre.split('.'))
+    return numbers + (0,) + ids
+
+
+def plain_text(value, limit):
+    """Operator-facing note text: short, trimmed, no markup or control characters."""
+    return (isinstance(value, str) and 0 < len(value) <= limit and value.strip() == value and
+            not any(c in '<>' or ord(c) < 32 or 0x7f <= ord(c) < 0xa0 or c in '\u2028\u2029\ufffd' for c in value))
+
+
+def check_notes(notes, version):
+    if not isinstance(notes, dict) or not NOTES_KEYS <= set(notes) <= NOTES_KEYS | {'details'}:
+        raise ValueError('Release notes have schemaVersion, version, date, title, highlights and optional details')
+    if notes['schemaVersion'] != 1 or notes['version'] != version:
+        raise ValueError('Release notes belong to another version')
+    if not isinstance(notes['date'], str) or not DATE.fullmatch(notes['date']):
+        raise ValueError('Release notes need a YYYY-MM-DD date')
+    if not plain_text(notes['title'], 80):
+        raise ValueError('Release notes need a plain title of at most 80 characters')
+    highlights = notes['highlights']
+    if not isinstance(highlights, list) or not 1 <= len(highlights) <= 3 or not all(plain_text(h, 160) for h in highlights):
+        raise ValueError('Release notes need one to three plain highlights of at most 160 characters')
+    details = notes.get('details')
+    if details is not None and (not isinstance(details, str) or not details.startswith(DETAILS_PREFIX) or len(details) > 200 or
+                                any(c in details for c in '<>"\' \\') or not plain_text(details, 200)):
+        raise ValueError('Release note details link to the developer docs on network.scarlett.ai')
+    return notes
+
+
+def load_notes(version, directory=None):
+    """release-notes/<version>.json, validated."""
+    path = Path(directory or RELEASE_NOTES) / ('%s.json' % version)
+    version_key(version)
+    return check_notes(read_json(path, 4096), version)
+
+
+def manifest_notes(notes):
+    """The manifest's notes: what the app shows before a version is installed."""
+    version = notes['version']
+    return {'title': notes['title'], 'date': notes['date'], 'highlights': list(notes['highlights']),
+            'changelog': CHANGELOG_URL % version, 'release': GITHUB_RELEASE % version}
+
+
+def changelog(version, directory=None):
+    """Every release's notes up to version, newest first: the public changelog."""
+    directory = Path(directory or RELEASE_NOTES)
+    entries = []
+    for path in directory.glob('*.json'):
+        name = path.name[:-len('.json')]
+        if not VERSION.fullmatch(name) or version_key(name) > version_key(version):
+            continue
+        notes = load_notes(name, directory)
+        entry = {'version': name, 'date': notes['date'], 'title': notes['title'],
+                 'highlights': list(notes['highlights']), 'release': GITHUB_RELEASE % name}
+        if 'details' in notes:
+            entry['details'] = notes['details']
+        entries.append(entry)
+    entries.sort(key=lambda e: version_key(e['version']), reverse=True)
+    if not entries or entries[0]['version'] != version:
+        raise ValueError('The changelog needs release notes for this version')
+    document = {'schemaVersion': 1, 'releases': entries[:100]}
+    if len(json.dumps(document, indent=2).encode()) > MAX_CHANGELOG_BYTES:
+        raise ValueError('The changelog exceeds 64 KiB')
+    return document
+
+
+def release_body(notes):
+    """The GitHub release body, from the same notes."""
+    version = notes['version']
+    lines = ['**%s**' % notes['title'], '']
+    lines += ['- %s' % h for h in notes['highlights']]
+    lines += ['', 'Changelog: %s' % (CHANGELOG_URL % version)]
+    if 'details' in notes:
+        lines.append('Developer details: %s' % notes['details'])
+    return '\n'.join(lines) + '\n'
+
+
+def headless_name(version, platform):
+    return 'scarlett-node-%s-%s.tar.gz' % (version, platform)
+
+
+def headless_input(directory, version, platform):
+    """package.sh output: exactly the bundle and its .sha256 line."""
+    directory = Path(directory)
+    if not directory.is_absolute() or directory.is_symlink() or not directory.is_dir():
+        raise ValueError('Each headless bundle output must be an absolute directory')
+    name = headless_name(version, platform)
+    if sorted(p.name for p in directory.iterdir()) != [name, name + '.sha256']:
+        raise ValueError('A headless output holds exactly %s and its .sha256' % name)
+    bundle = regular(directory / name)
+    sha256 = digest(bundle)
+    if (directory / (name + '.sha256')).read_text(encoding='ascii') != '%s  %s\n' % (sha256, name) or bundle.stat().st_size == 0:
+        raise ValueError('Headless bundle checksum does not match')
+    return {'platform': platform, 'path': bundle, 'filename': name, 'sha256': sha256, 'bytes': bundle.stat().st_size}
+
+
+def verify_signatures(directory, version, files, identities):
+    """Check one updater signature per file against the pinned keys."""
+    keys = signing_identities.updater_keys(identities)
+    if not keys:
+        raise ValueError('Signed updates need pinned updater keys in desktop/signing/identities.json')
+    directory = Path(directory)
+    if not directory.is_absolute() or directory.is_symlink() or not directory.is_dir():
+        raise ValueError('Updater signatures must be an absolute directory')
+    expected = {name + '.sig' for name in files}
+    if {p.name for p in directory.iterdir()} != expected:
+        raise ValueError('Updater signatures must cover exactly the installers and headless bundles')
+    signatures, signers = {}, set()
+    for name, path in files.items():
+        text = read_json_text(directory / (name + '.sig'), 4096)
+        signers.add(updater_signatures.verify(text, updater_signatures.blake2b_file(path), name, version, keys))
+        signatures[name] = text.strip()
+    if len(signers) != 1:
+        raise ValueError('One updater key signs a whole release')
+    return signers.pop(), signatures
+
+
+def read_json_text(path, limit):
+    regular(path)
+    if path.stat().st_size > limit:
+        raise ValueError('Release record is too large')
+    return path.read_text(encoding='ascii')
 
 
 def installer_name(version, platform):
@@ -210,7 +368,7 @@ def write_json(path, value):
         stream.write('\n')
 
 
-def build_records(verified, version, channel, source, workflow_run):
+def build_records(verified, version, channel, source, workflow_run, notes=None, updates=None):
     artifacts, signing = [], {}
     for item in verified:
         platform, identity = item['platform'], item['identity']
@@ -229,13 +387,35 @@ def build_records(verified, version, channel, source, workflow_run):
                                   'checks': VERIFIED_WITH[PLATFORMS[platform]['identity']]}
         signing[platform] = record
     manifest = {'schemaVersion': 1, 'version': version, 'channel': channel, 'source': dict(source), 'artifacts': artifacts}
+    if notes is not None:
+        manifest['notes'] = manifest_notes(notes)
+    if updates is not None:
+        manifest['updates'] = updates
     provenance = {'version': version, 'source': dict(source), 'workflowRun': workflow_run,
                   'components': {'codex': CODEX_VERSION, 'claude': CLAUDE_VERSION, 'modelApi': MODEL_API_VERSION},
                   'signing': signing}
     return manifest, provenance
 
 
-def assemble(version, channel, node_commit, model_api_commit, workflow_run, inputs, output, environ=None):
+def updates_record(version, key_id, signatures, verified, headless):
+    """The manifest's "updates": signatures over the installers already listed
+    in artifacts, plus each signed headless bundle with its own path and hash."""
+    desktop = {}
+    for item in verified:
+        name = installer_name(version, item['platform'])
+        desktop[item['platform']] = {'filename': name, 'signature': signatures[name]}
+    bundles = {}
+    for item in headless:
+        bundles[item['platform']] = {'filename': item['filename'], 'path': '/downloads/v%s/%s' % (version, item['filename']),
+                                     'bytes': item['bytes'], 'sha256': item['sha256'], 'signature': signatures[item['filename']]}
+    record = {'schemaVersion': 1, 'keyId': key_id, 'desktop': desktop}
+    if bundles:
+        record['headless'] = bundles
+    return record
+
+
+def assemble(version, channel, node_commit, model_api_commit, workflow_run, inputs, output, environ=None,
+             headless=None, signatures=None):
     """Verify every input, then write the release layout into a new directory."""
     check_version(version)
     if channel not in CHANNELS:
@@ -248,17 +428,28 @@ def assemble(version, channel, node_commit, model_api_commit, workflow_run, inpu
         raise ValueError('Name the exact workflow run attempt that signed this release')
     if set(inputs) != set(PLATFORMS):
         raise ValueError('A release has exactly the three reviewed platforms')
+    if headless is not None and set(headless) != set(HEADLESS_PLATFORMS):
+        raise ValueError('Headless bundles come for all three platforms or none')
     identities = signing_identities.load(os.environ if environ is None else environ)
     if identities['rehearsal']:
         raise ValueError('Rehearsal identities never assemble a release')
     output = Path(output)
     if not output.is_absolute() or output.exists() or output.is_symlink() or not output.parent.is_dir():
         raise ValueError('Supply a new absolute output directory')
+    notes = load_notes(version)
+    history = changelog(version)
     verified = [verify_platform(inputs[platform], platform, identities, node_commit) for platform in PLATFORMS]
     if len({item['sha256'] for item in verified}) != len(verified):
         raise ValueError('Each platform has its own installer')
+    bundles = [headless_input(headless[platform], version, platform) for platform in HEADLESS_PLATFORMS] if headless else []
+    updates = None
+    if signatures is not None:
+        files = {installer_name(version, item['platform']): item['installer'] for item in verified}
+        files.update({item['filename']: item['path'] for item in bundles})
+        key_id, signed = verify_signatures(signatures, version, files, identities)
+        updates = updates_record(version, key_id, signed, verified, bundles)
     source = {'node': node_commit, 'modelApi': model_api_commit}
-    manifest, provenance = build_records(verified, version, channel, source, workflow_run)
+    manifest, provenance = build_records(verified, version, channel, source, workflow_run, notes, updates)
     output.mkdir()
     try:
         release, evidence = output / 'release', output / 'evidence'
@@ -272,13 +463,24 @@ def assemble(version, channel, node_commit, model_api_commit, workflow_run, inpu
             copy_exact(item['components'], evidence / ('%s.COMPONENTS.json' % item['platform']),
                        item['componentManifestSha256'])
             files[name] = item['sha256']
+        if bundles:
+            # Only signed bundles are published; unsigned ones stay GitHub assets.
+            destination = release if updates else output / 'headless'
+            destination.mkdir(exist_ok=True)
+            for item in bundles:
+                copy_exact(item['path'], destination / item['filename'], item['sha256'])
+                if updates:
+                    files[item['filename']] = item['sha256']
         write_json(release / 'manifest.json', manifest)
         write_json(release / 'provenance.json', provenance)
+        write_json(release / 'changelog.json', history)
+        with (evidence / 'release-notes.md').open('x', encoding='utf-8') as stream:
+            stream.write(release_body(notes))
         with (output / 'SHA256SUMS').open('x', encoding='ascii', newline='\n') as stream:
             stream.write(''.join('%s  %s\n' % (sha, name) for name, sha in sorted(files.items())))
         if (release / 'manifest.json').stat().st_size > 16384:
             raise ValueError('Release manifest exceeds the publisher limit')
-        if {p.name for p in release.iterdir()} != set(files) | {'manifest.json', 'provenance.json'}:
+        if {p.name for p in release.iterdir()} != set(files) | {'manifest.json', 'provenance.json', 'changelog.json'}:
             raise ValueError('Release directory must hold only the publishable set')
     except BaseException:
         shutil.rmtree(output, ignore_errors=True)
@@ -299,16 +501,34 @@ def main(argv=None):
     build.add_argument('--workflow-run', required=True)
     for platform in PLATFORMS:
         build.add_argument('--' + platform, required=True, type=Path)
+    for platform in HEADLESS_PLATFORMS:
+        build.add_argument('--headless-' + platform, type=Path)
+    build.add_argument('--signatures', type=Path)
     build.add_argument('--output', required=True, type=Path)
+    history = commands.add_parser('changelog', help='write the cumulative changelog.json for a version')
+    history.add_argument('--version', required=True)
+    history.add_argument('--output', required=True, type=Path)
     args = parser.parse_args(argv)
     if args.command == 'check-version':
-        print('Release version %s matches the reviewed desktop version' % check_version(args.version))
+        print('Release version %s matches the reviewed desktop version and has release notes' % check_version(args.version))
+        return
+    if args.command == 'changelog':
+        if args.output.exists():
+            raise ValueError('Supply a new output file')
+        write_json(args.output, changelog(args.version))
         return
     inputs = {platform: getattr(args, platform.replace('-', '_')) for platform in PLATFORMS}
+    given = {platform: getattr(args, 'headless_' + platform.replace('-', '_')) for platform in HEADLESS_PLATFORMS}
+    if any(given.values()) and not all(given.values()):
+        raise ValueError('Supply headless bundles for all three platforms or none')
     manifest, _ = assemble(args.version, args.channel, args.node_commit, args.model_api_commit, args.workflow_run,
-                           inputs, args.output)
+                           inputs, args.output, headless=given if all(given.values()) else None, signatures=args.signatures)
     for artifact in manifest['artifacts']:
         print('%s  %s' % (artifact['sha256'], artifact['filename']))
+    if 'updates' in manifest:
+        print('Updater signatures verified with pinned key %s' % manifest['updates']['keyId'])
+    else:
+        print('No updater signatures: installed apps will offer the download page for this release')
     print('Assembled Scarlett Node %s (%s) from pinned self-signed evidence' % (manifest['version'], manifest['channel']))
 
 

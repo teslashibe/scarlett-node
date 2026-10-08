@@ -9,8 +9,9 @@ require (
 	github.com/teslashibe/open-agent-api v0.1.32
 	github.com/teslashibe/x-go v1.13.0
 	go.yaml.in/yaml/v2 v2.4.2
+	golang.org/x/crypto v0.52.0
 	golang.org/x/sys v0.45.0
-	golang.org/x/term v0.34.0
+	golang.org/x/term v0.43.0
 )
 
 require (

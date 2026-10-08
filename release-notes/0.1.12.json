@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "version": "0.1.12",
+  "date": "2026-10-08",
+  "title": "Better at getting past bot protection",
+  "highlights": [
+    "The hidden browser now works through DataDome, Akamai, HUMAN, Imperva, AWS WAF and Kasada as well as Cloudflare",
+    "Optional captcha solvers you pay for (CapMonster, CapSolver, 2Captcha), with a daily spend cap; keys stay on your node",
+    "On 24 test pages that challenge a plain client, 20 now load, up from 9"
+  ]
+}

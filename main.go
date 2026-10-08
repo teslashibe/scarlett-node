@@ -46,14 +46,17 @@ func start(args []string) error {
 	if len(args) > 0 && args[0] == "web-runtime" {
 		return webRuntimeCommand(args[1:], os.Stdout)
 	}
+	if len(args) > 0 && args[0] == "update" {
+		return updateCommand(args[1:], os.Stdin, os.Stdout)
+	}
 	if len(args) != 1 {
-		return errors.New("usage: scarlett-node pair|run|status|diagnostics|drain|resume|relay-resume|accounts|web-runtime")
+		return errors.New("usage: scarlett-node pair|run|status|diagnostics|drain|resume|relay-resume|accounts|web-runtime|update")
 	}
 	if args[0] == "status" || args[0] == "diagnostics" || args[0] == "drain" || args[0] == "resume" || args[0] == "relay-resume" {
 		return localCommand(args[0], os.Stdout)
 	}
 	if args[0] != "pair" && args[0] != "run" {
-		return errors.New("usage: scarlett-node pair|run|status|diagnostics|drain|resume|relay-resume|accounts|web-runtime")
+		return errors.New("usage: scarlett-node pair|run|status|diagnostics|drain|resume|relay-resume|accounts|web-runtime|update")
 	}
 	c, err := config.Load()
 	if err != nil {
