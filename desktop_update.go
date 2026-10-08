@@ -49,29 +49,31 @@ func desktopUpdateCommand(args []string, input io.Reader, out io.Writer) error {
 	case len(args) == 2 && args[0] == "update-stage" && (args[1] == "auto" || args[1] == "auto-throttled" || args[1] == "manual"):
 		return desktopStage(dir, state, args[1], out)
 	case len(args) == 1 && args[0] == "update-state-get":
-		s, err := state.Read()
+		r, err := state.ReadRevisioned()
 		if err != nil {
 			return errors.New("update state unavailable")
 		}
-		return json.NewEncoder(out).Encode(s)
+		return json.NewEncoder(out).Encode(r)
 	case len(args) == 1 && args[0] == "update-state-set":
-		raw, err := io.ReadAll(io.LimitReader(input, 16385))
+		// A compare-and-swap: the shell sends the revision it read, and a state
+		// changed since then is refused with {"conflict":true} so that the
+		// shell reads it again and reapplies its change.
+		raw, err := io.ReadAll(io.LimitReader(input, 17<<10))
 		if err != nil {
 			return errors.New("update state unavailable")
 		}
-		next, err := update.DecodeState(bytes.TrimSpace(raw))
+		next, err := update.DecodeRevisioned(bytes.TrimSpace(raw))
 		if err != nil {
 			return err
 		}
-		lock, err := state.Lock()
+		written, err := state.CompareAndSwap(next)
+		if errors.Is(err, update.ErrStateChanged) {
+			return json.NewEncoder(out).Encode(map[string]bool{"conflict": true})
+		}
 		if err != nil {
 			return errors.New("update state unavailable")
 		}
-		defer lock.Close()
-		if err = state.Write(next); err != nil {
-			return errors.New("update state unavailable")
-		}
-		return json.NewEncoder(out).Encode(next)
+		return json.NewEncoder(out).Encode(written)
 	case len(args) == 1 && args[0] == "update-guard":
 		return desktopGuard(dir, state)
 	}

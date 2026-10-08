@@ -1,6 +1,7 @@
 package update
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -75,19 +76,15 @@ func newGuardFixture(t *testing.T, phaseAfterLaunch string) *guardFixture {
 		if s.Pending == nil || s.Pending.Phase != PhaseInstalled {
 			return nil
 		}
-		// The relaunched app reports, as setup() does: verifying with its own
-		// pid, then its health. The guard reads the state only after Launch.
+		// The relaunched app reports, as on_launch and verify do: verifying
+		// with its own pid, then its health. The guard reads the state only
+		// after Launch.
 		f.alive.Store(true)
-		for _, report := range []func(*Pending){
-			func(p *Pending) { p.Phase, p.AppPID = PhaseVerifying, 5151 },
-			func(p *Pending) {
-				p.Phase = phaseAfterLaunch
-				if phaseAfterLaunch == PhaseUnhealthy {
-					p.Reason = "node_exited"
-				}
-			},
+		for _, report := range []func(*State){
+			func(s *State) { s.Pending.Phase, s.Pending.AppPID = PhaseVerifying, 5151 },
+			func(s *State) { reportHealth(s, phaseAfterLaunch) },
 		} {
-			if _, err = f.state.Update(func(s *State) error { report(s.Pending); return nil }); err != nil {
+			if _, err = f.state.Update(func(s *State) error { report(s); return nil }); err != nil {
 				f.appErr = err
 				return nil
 			}
@@ -96,6 +93,18 @@ func newGuardFixture(t *testing.T, phaseAfterLaunch string) *guardFixture {
 	}
 	f.g = g
 	return f
+}
+
+// reportHealth records the relaunched app's verdict as verify() does: healthy
+// also makes the new version the installed one.
+func reportHealth(s *State, phase string) {
+	s.Pending.Phase = phase
+	switch phase {
+	case PhaseHealthy:
+		s.Installed, s.HighWater = s.Pending.To, s.Pending.To
+	case PhaseUnhealthy:
+		s.Pending.Reason = "node_exited"
+	}
 }
 
 // result is the state after Run, failing the test when it cannot be read or
@@ -138,6 +147,121 @@ func TestGuardInstallsRelaunchesAndKeepsAHealthyUpdate(t *testing.T) {
 		if _, err := os.Lstat(filepath.Join(f.g.Updates, name)); (err == nil) != want {
 			t.Fatalf("%s kept=%v, want %v", name, err == nil, want)
 		}
+	}
+}
+
+// afterFirstLaunch runs change on the state right after the new version has
+// reported, before the guard's first look at it.
+func (f *guardFixture) afterFirstLaunch(t *testing.T, change func(*State)) {
+	launch := f.g.Launch
+	f.g.Launch = func(app string) error {
+		first := f.launches.Load() == 0
+		err := launch(app)
+		if first {
+			if _, updateErr := f.state.Update(func(s *State) error { change(s); return nil }); updateErr != nil {
+				t.Error(updateErr)
+			}
+		}
+		return err
+	}
+}
+
+// A healthy update the app has already moved past is kept: the next automatic
+// stage may replace the healthy record with a newer release, and the app
+// clears it when it next launches. Neither is a lost state to roll back, and
+// the guard never writes its verdict onto someone else's install.
+func TestGuardKeepsAHealthyUpdateTheAppMovedPast(t *testing.T) {
+	for name, change := range map[string]func(*State){
+		"newer release staged": func(s *State) {
+			s.Pending = &Pending{Phase: PhaseStaged, From: "0.1.14", To: "0.1.15", Kind: "mac-app", Staged: s.Pending.Staged, App: s.Pending.App,
+				DrainOwner: "none", StartedAt: time.Now().Unix()}
+		},
+		"relaunched": func(s *State) { s.Pending = nil },
+	} {
+		f := newGuardFixture(t, PhaseHealthy)
+		f.afterFirstLaunch(t, change)
+		if err := f.g.Run(context.Background()); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		s, err := f.state.Read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if f.restores.Load() != 0 || f.terminate.Load() != 0 || f.launches.Load() != 1 || s.Installed != "0.1.14" || s.HasFailed("0.1.14") {
+			t.Fatalf("%s: restores %d terminate %d launches %d state %+v", name, f.restores.Load(), f.terminate.Load(), f.launches.Load(), s)
+		}
+		if p := s.Pending; p != nil && (p.To != "0.1.15" || p.Phase != PhaseStaged || p.Reason != "") {
+			t.Fatalf("%s: the guard changed the newer pending release: %+v", name, p)
+		}
+	}
+}
+
+// The app may finish recording its health while the guard is stopping it
+// after the deadline: that update is kept and the app started again.
+func TestGuardKeepsAnUpdateThatReportsHealthyWhileStopping(t *testing.T) {
+	f := newGuardFixture(t, PhaseVerifying)
+	f.g.HealthWait = 50 * time.Millisecond
+	f.g.Terminate = func(int, bool) {
+		f.terminate.Add(1)
+		if _, err := f.state.Update(func(s *State) error { reportHealth(s, PhaseHealthy); return nil }); err != nil {
+			t.Error(err)
+		}
+		f.alive.Store(false)
+	}
+	if err := f.g.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	s := f.result(t)
+	if f.restores.Load() != 0 || f.terminate.Load() != 1 || f.launches.Load() != 2 || s.Pending.Phase != PhaseHealthy || s.HasFailed("0.1.14") {
+		t.Fatalf("restores %d terminate %d launches %d state %+v", f.restores.Load(), f.terminate.Load(), f.launches.Load(), s.Pending)
+	}
+}
+
+// guardLog calls onReadError for each state read the guard reports failing.
+type guardLog struct{ onReadError func() }
+
+func (l guardLog) Write(b []byte) (int, error) {
+	if bytes.Contains(b, []byte("reading the update state")) {
+		l.onReadError()
+	}
+	return len(b), nil
+}
+
+// A state that briefly cannot be read is read again, not taken for a lost
+// install.
+func TestGuardRereadsAStateItCouldNotRead(t *testing.T) {
+	f := newGuardFixture(t, PhaseVerifying)
+	var good []byte
+	launch := f.g.Launch
+	f.g.Launch = func(app string) error {
+		err := launch(app)
+		var readErr error
+		if good, readErr = os.ReadFile(f.state.Path); readErr != nil {
+			t.Error(readErr)
+		}
+		if writeErr := localfs.WriteAtomic(f.state.Path, []byte("{"), true); writeErr != nil {
+			t.Error(writeErr)
+		}
+		return err
+	}
+	var failures atomic.Int32
+	f.g.Log = guardLog{onReadError: func() {
+		if failures.Add(1) != 3 {
+			return
+		}
+		if err := localfs.WriteAtomic(f.state.Path, good, true); err != nil {
+			t.Error(err)
+		}
+		if _, err := f.state.Update(func(s *State) error { reportHealth(s, PhaseHealthy); return nil }); err != nil {
+			t.Error(err)
+		}
+	}}
+	if err := f.g.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	s := f.result(t)
+	if failures.Load() != 3 || f.restores.Load() != 0 || s.Pending.Phase != PhaseHealthy {
+		t.Fatalf("read failures %d restores %d state %+v", failures.Load(), f.restores.Load(), s.Pending)
 	}
 }
 

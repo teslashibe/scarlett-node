@@ -30,7 +30,12 @@ const DRAIN_LIMIT: u64 = 30 * 60;
 const HEALTH_LIMIT: u64 = 4 * 60;
 const SERVING_SETTLE: u64 = 60;
 const COUNTDOWN: u64 = 60;
-const STATE_LIMIT: usize = 16384;
+// A revisioned state document (update.Revisioned) is the state plus a
+// 64-character revision.
+const STATE_LIMIT: usize = 17 * 1024;
+// A change refused because another writer got there first is read and applied
+// again this many times.
+const STATE_ATTEMPTS: usize = 8;
 
 fn now() -> u64 {
     SystemTime::now()
@@ -203,6 +208,119 @@ pub struct State {
 }
 fn is_zero_u8(v: &u8) -> bool {
     *v == 0
+}
+
+/// A state with the revision it was read at (update.Revisioned). Writes name
+/// that revision, so the helper refuses one based on a state that another
+/// writer changed in between.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Revisioned {
+    pub revision: String,
+    pub state: State,
+}
+/// What `desktop update-state-set` reports.
+#[derive(Clone, Debug, Default, Deserialize)]
+struct SetResult {
+    #[serde(default)]
+    conflict: bool,
+}
+
+/// What `on_launch` decided from the state it read.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Launch {
+    /// Start the node again (it was serving before the install).
+    resume: bool,
+    /// Lift the updater's pause on new work.
+    resume_work: bool,
+    /// Check this version's health for the guard.
+    verify: bool,
+    failure: Option<Failure>,
+    /// Show the "Updated to" banner for a manual install.
+    banner: bool,
+}
+
+/// The launch half of an install, applied to the state: finish a pending
+/// install, mark one to verify, and keep installed and high_water current.
+fn plan_launch(state: &mut State, version: &str, fresh: bool, identity: bool) -> Launch {
+    let mut launch = Launch::default();
+    if let Some(p) = state.pending.clone() {
+        match p.phase.as_str() {
+            "installed" | "verifying" if p.to == version => {
+                // The updater's pause (the drain marker persists across
+                // restarts) holds until this version proves healthy, so a
+                // rollback never has accepted jobs to wait for.
+                launch.resume = p.resume_serving;
+                launch.verify = true;
+                let pending = state.pending.as_mut().expect("pending");
+                pending.phase = "verifying".into();
+                pending.app_pid = std::process::id();
+            }
+            "failed" if p.to == version && p.reason == "restore_failed" => {
+                // This version failed its checks and the previous one could
+                // not be put back: it keeps running and says so.
+                if p.drain_owner == "updater" {
+                    launch.resume_work = true;
+                    if let Some(pending) = state.pending.as_mut() {
+                        pending.drain_owner = "none".into();
+                    }
+                }
+                launch.resume = p.resume_serving;
+                launch.failure = Some(Failure {
+                    version: p.to.clone(),
+                    reason: p.reason.clone(),
+                    rolled_back: false,
+                });
+            }
+            "rolled_back" | "failed" if p.from == version => {
+                if p.drain_owner == "updater" {
+                    launch.resume_work = true;
+                    if let Some(pending) = state.pending.as_mut() {
+                        pending.drain_owner = "none".into();
+                    }
+                }
+                launch.resume = p.resume_serving;
+                launch.failure = Some(Failure {
+                    version: p.to.clone(),
+                    reason: if p.reason.is_empty() {
+                        "install_failed".into()
+                    } else {
+                        p.reason.clone()
+                    },
+                    rolled_back: p.phase == "rolled_back",
+                });
+            }
+            "healthy" if p.to == version => {
+                // The guard has kept this version; nothing is pending.
+                state.pending = None;
+            }
+            "draining" | "handoff" if p.from == version => {
+                // Interrupted before the guard ran: undo our pause.
+                launch.resume_work = p.drain_owner == "updater";
+                if let Some(pending) = state.pending.as_mut() {
+                    pending.phase = "staged".into();
+                    pending.drain_owner = "none".into();
+                }
+            }
+            _ if !newer(&p.to, version) && p.phase == "staged" => state.pending = None,
+            _ => {}
+        }
+    }
+    // A manual install over existing state also gets the banner once.
+    launch.banner = state.pending.is_none()
+        && state.announced != version
+        && ((fresh && identity) || (!state.installed.is_empty() && state.installed != version));
+    if state.installed.is_empty() || (launch.banner && newer(version, &state.installed)) {
+        state.installed = version.to_owned();
+    }
+    // high_water is the highest version that proved healthy; one being
+    // verified now, or one that failed here, does not count yet.
+    if !launch.verify
+        && !state.failed.iter().any(|v| v == version)
+        && (state.high_water.is_empty() || newer(version, &state.high_water))
+    {
+        state.high_water = version.to_owned();
+    }
+    launch
 }
 
 /// What `desktop update-check` reports.
@@ -380,6 +498,9 @@ impl Updater {
 
     // State file through the Go helper, which validates and locks it.
     pub async fn read_state(&self) -> Result<State> {
+        Ok(self.read_revisioned().await?.state)
+    }
+    async fn read_revisioned(&self) -> Result<Revisioned> {
         let raw = self
             .node
             .helper_call(&["desktop", "update-state-get"], None, 10, STATE_LIMIT)
@@ -387,9 +508,16 @@ impl Updater {
             .map_err(|_| Error::PrivateStorageUnavailable)?;
         serde_json::from_slice(&raw).map_err(|_| Error::PrivateStorageUnavailable)
     }
-    pub async fn write_state(&self, state: &State) -> Result<()> {
-        let raw = serde_json::to_vec(state).map_err(|_| Error::InvalidInput)?;
-        self.node
+    /// Write `state` only while the saved state is still at `revision`;
+    /// false when another writer changed it first.
+    async fn write_state(&self, revision: &str, state: &State) -> Result<bool> {
+        let raw = serde_json::to_vec(&Revisioned {
+            revision: revision.to_owned(),
+            state: state.clone(),
+        })
+        .map_err(|_| Error::InvalidInput)?;
+        let out = self
+            .node
             .helper_call(
                 &["desktop", "update-state-set"],
                 Some(raw),
@@ -398,13 +526,26 @@ impl Updater {
             )
             .await
             .map_err(|_| Error::PrivateStorageUnavailable)?;
-        Ok(())
+        let result: SetResult =
+            serde_json::from_slice(&out).map_err(|_| Error::PrivateStorageUnavailable)?;
+        Ok(!result.conflict)
     }
-    async fn change_state<F: FnOnce(&mut State)>(&self, change: F) -> Result<State> {
-        let mut state = self.read_state().await?;
-        change(&mut state);
-        self.write_state(&state).await?;
-        Ok(state)
+    /// One read-modify-write. The helper holds the lock only for each call,
+    /// so the write is a compare-and-swap: when the guard, update-stage or
+    /// another task here changed the state since it was read, `change` is
+    /// applied again to the newer state instead of overwriting it.
+    async fn change_state<F: FnMut(&mut State)>(&self, mut change: F) -> Result<State> {
+        for _ in 0..STATE_ATTEMPTS {
+            let Revisioned {
+                revision,
+                mut state,
+            } = self.read_revisioned().await?;
+            change(&mut state);
+            if self.write_state(&revision, &state).await? {
+                return Ok(state);
+            }
+        }
+        Err(Error::PrivateStorageUnavailable)
     }
 
     /// The renderer finished its first render: one half of post-update health.
@@ -472,7 +613,7 @@ impl Updater {
         match notice {
             "updated" => {
                 let version = self.version.clone();
-                self.change_state(|s| s.announced = version).await?;
+                self.change_state(|s| s.announced = version.clone()).await?;
                 self.update(shell, |s| s.updated = None).await;
             }
             "failure" => {
@@ -518,101 +659,23 @@ impl Updater {
     /// serving. Returns whether the node should start (resume serving).
     pub async fn on_launch(self: &Arc<Self>, shell: Arc<dyn Shell>) -> bool {
         let fresh = !self.state_dir.join("update-state.json").exists();
-        let Ok(mut state) = self.read_state().await else {
-            return false;
-        };
-        let version = self.version.clone();
-        let mut resume = false;
-        let mut verify = false;
-        if let Some(p) = state.pending.clone() {
-            match p.phase.as_str() {
-                "installed" | "verifying" if p.to == version => {
-                    // The updater's pause (the drain marker persists across
-                    // restarts) holds until this version proves healthy, so
-                    // a rollback never has accepted jobs to wait for.
-                    resume = p.resume_serving;
-                    verify = true;
-                    let pending = state.pending.as_mut().expect("pending");
-                    pending.phase = "verifying".into();
-                    pending.app_pid = std::process::id();
-                }
-                "failed" if p.to == version && p.reason == "restore_failed" => {
-                    // This version failed its checks and the previous one could
-                    // not be put back: it keeps running and says so.
-                    if p.drain_owner == "updater" {
-                        let _ = self.node.control("resume").await;
-                        if let Some(pending) = state.pending.as_mut() {
-                            pending.drain_owner = "none".into();
-                        }
-                    }
-                    resume = p.resume_serving;
-                    let failure = Failure {
-                        version: p.to.clone(),
-                        reason: p.reason.clone(),
-                        rolled_back: false,
-                    };
-                    self.update(shell.as_ref(), |s| s.failure = Some(failure))
-                        .await;
-                }
-                "rolled_back" | "failed" if p.from == version => {
-                    if p.drain_owner == "updater" {
-                        let _ = self.node.control("resume").await;
-                        if let Some(pending) = state.pending.as_mut() {
-                            pending.drain_owner = "none".into();
-                        }
-                    }
-                    resume = p.resume_serving;
-                    let failure = Failure {
-                        version: p.to.clone(),
-                        reason: if p.reason.is_empty() {
-                            "install_failed".into()
-                        } else {
-                            p.reason.clone()
-                        },
-                        rolled_back: p.phase == "rolled_back",
-                    };
-                    self.update(shell.as_ref(), |s| s.failure = Some(failure))
-                        .await;
-                }
-                "healthy" if p.to == version => {
-                    // The guard has kept this version; nothing is pending.
-                    state.pending = None;
-                }
-                "draining" | "handoff" if p.from == version => {
-                    // Interrupted before the guard ran: undo our pause.
-                    if p.drain_owner == "updater" {
-                        let _ = self.node.control("resume").await;
-                    }
-                    if let Some(pending) = state.pending.as_mut() {
-                        pending.phase = "staged".into();
-                        pending.drain_owner = "none".into();
-                    }
-                }
-                _ if !newer(&p.to, &version) && p.phase == "staged" => state.pending = None,
-                _ => {}
-            }
-        }
-        // A manual install over existing state also gets the banner once.
         let identity = self.state_dir.join("identity.json").exists();
-        let manual = state.pending.is_none()
-            && state.announced != version
-            && ((fresh && identity)
-                || (!state.installed.is_empty() && state.installed != version));
-        if state.installed.is_empty() || (manual && newer(&version, &state.installed)) {
-            state.installed = version.clone();
+        let version = self.version.clone();
+        let mut launch = Launch::default();
+        let written = self
+            .change_state(|state| launch = plan_launch(state, &version, fresh, identity))
+            .await;
+        if let Some(failure) = launch.failure.take() {
+            self.update(shell.as_ref(), |s| s.failure = Some(failure))
+                .await;
         }
-        // high_water is the highest version that proved healthy; one being
-        // verified now, or one that failed here, does not count yet.
-        if !verify
-            && !state.failed.contains(&version)
-            && (state.high_water.is_empty() || newer(&version, &state.high_water))
-        {
-            state.high_water = version.clone();
-        }
-        if self.write_state(&state).await.is_err() {
+        if written.is_err() {
             return false;
         }
-        if manual {
+        if launch.resume_work {
+            let _ = self.node.control("resume").await;
+        }
+        if launch.banner {
             let offer = !self.automatic();
             self.update(shell.as_ref(), |s| {
                 s.updated = Some(Banner {
@@ -623,12 +686,12 @@ impl Updater {
             })
             .await;
         }
-        if verify {
+        if launch.verify {
             let updater = self.clone();
             let shell = shell.clone();
-            tauri::async_runtime::spawn(async move { updater.verify(shell, resume).await });
+            tauri::async_runtime::spawn(async move { updater.verify(shell, launch.resume).await });
         }
-        resume
+        launch.resume
     }
 
     /// Post-update health: the window rendered and, when the node was
@@ -679,6 +742,7 @@ impl Updater {
         let mut paused_by_updater = false;
         let written = self
             .change_state(|s| {
+                paused_by_updater = false;
                 if let Some(p) = s.pending.as_mut().filter(|p| p.to == version) {
                     if healthy {
                         p.phase = "healthy".into();
@@ -1349,6 +1413,77 @@ mod tests {
         }
         let empty: State = serde_json::from_str(r#"{"schema":1}"#).unwrap();
         assert_eq!(serde_json::to_string(&empty).unwrap(), r#"{"schema":1}"#);
+    }
+
+    #[test]
+    fn state_writes_carry_the_revision_they_read() {
+        // update-state-get and a successful update-state-set print a
+        // revisioned state; a refused write prints {"conflict":true}.
+        let raw = format!(
+            r#"{{"revision":"{}","state":{}}}"#,
+            "0".repeat(64),
+            include_str!("../../../internal/update/testdata/desktop-state-mac-app.json").trim()
+        );
+        let read: Revisioned = serde_json::from_str(&raw).unwrap();
+        assert_eq!(read.revision.len(), 64);
+        assert_eq!(read.state.pending.as_ref().unwrap().to, "0.1.14");
+        let sent: serde_json::Value = serde_json::to_value(&read).unwrap();
+        assert_eq!(sent, serde_json::from_str::<serde_json::Value>(&raw).unwrap());
+        assert!(!serde_json::from_str::<SetResult>(&raw).unwrap().conflict);
+        assert!(serde_json::from_str::<SetResult>(r#"{"conflict":true}"#).unwrap().conflict);
+    }
+
+    #[test]
+    fn launch_verifies_a_new_version_and_forgets_a_kept_one() {
+        let pending = |phase: &str| Pending {
+            phase: phase.into(),
+            from: "0.1.13".into(),
+            to: "0.1.14".into(),
+            kind: "mac-app".into(),
+            drain_owner: "updater".into(),
+            resume_serving: true,
+            ..Default::default()
+        };
+        let mut state = State {
+            schema: 1,
+            installed: "0.1.13".into(),
+            high_water: "0.1.13".into(),
+            pending: Some(pending("installed")),
+            ..Default::default()
+        };
+        let launch = plan_launch(&mut state, "0.1.14", false, true);
+        assert!(launch.verify && launch.resume && !launch.resume_work && !launch.banner);
+        let p = state.pending.as_ref().unwrap();
+        assert_eq!((p.phase.as_str(), p.app_pid), ("verifying", std::process::id()));
+        // Not healthy yet: nothing below it is ruled out.
+        assert_eq!((state.installed.as_str(), state.high_water.as_str()), ("0.1.13", "0.1.13"));
+
+        state.pending = Some(pending("healthy"));
+        state.installed = "0.1.14".into();
+        state.high_water = "0.1.14".into();
+        let launch = plan_launch(&mut state, "0.1.14", false, true);
+        assert_eq!(launch, Launch::default());
+        assert!(state.pending.is_none());
+
+        // The previous version, back after a rollback, lifts the updater's
+        // pause and says what happened.
+        state.pending = Some(Pending {
+            reason: "health_timeout".into(),
+            ..pending("rolled_back")
+        });
+        state.installed = "0.1.13".into();
+        state.high_water = "0.1.13".into();
+        let launch = plan_launch(&mut state, "0.1.13", false, true);
+        assert!(launch.resume && launch.resume_work && !launch.verify);
+        assert_eq!(
+            launch.failure,
+            Some(Failure {
+                version: "0.1.14".into(),
+                reason: "health_timeout".into(),
+                rolled_back: true
+            })
+        );
+        assert_eq!(state.pending.as_ref().unwrap().drain_owner, "none");
     }
 
     #[test]

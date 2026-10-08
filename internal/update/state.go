@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -212,6 +213,66 @@ func (f StateFile) Update(change func(*State) error) (State, error) {
 		return s, err
 	}
 	return s, f.Write(s)
+}
+
+// ErrStateChanged refuses a write based on a state that has changed since it
+// was read.
+var ErrStateChanged = errors.New("update state changed since it was read")
+
+// Revision identifies one state: the SHA-256 of its canonical encoding.
+func (s State) Revision() string {
+	raw, _ := json.Marshal(s)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+// Revisioned is a state with the revision it was read at. The desktop shell
+// changes the state through a separate helper process for each read and
+// write, so a write names the revision it started from and is refused when
+// another writer (the shell's other tasks, update-stage or the guard) changed
+// the state in between.
+type Revisioned struct {
+	Revision string `json:"revision"`
+	State    State  `json:"state"`
+}
+
+// DecodeRevisioned strictly decodes one revisioned state.
+func DecodeRevisioned(raw []byte) (Revisioned, error) {
+	var r Revisioned
+	if len(raw) > maxStateBytes+256 {
+		return r, errors.New("update state too large")
+	}
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&r); err != nil || d.Decode(new(any)) != io.EOF || len(r.Revision) != 64 {
+		return Revisioned{}, errors.New("invalid update state")
+	}
+	return r, r.State.Validate()
+}
+
+// ReadRevisioned returns the state with its revision.
+func (f StateFile) ReadRevisioned() (Revisioned, error) {
+	s, err := f.Read()
+	if err != nil {
+		return Revisioned{}, err
+	}
+	return Revisioned{Revision: s.Revision(), State: s}, nil
+}
+
+// CompareAndSwap replaces the state with next.State only while the saved
+// state is still at next.Revision, and returns what it saved.
+func (f StateFile) CompareAndSwap(next Revisioned) (Revisioned, error) {
+	s, err := f.Update(func(s *State) error {
+		if s.Revision() != next.Revision {
+			return ErrStateChanged
+		}
+		*s = next.State
+		return nil
+	})
+	if err != nil {
+		return Revisioned{}, err
+	}
+	return Revisioned{Revision: s.Revision(), State: s}, nil
 }
 
 // RolloutWindow spreads optional updates so the network never drains at once.
