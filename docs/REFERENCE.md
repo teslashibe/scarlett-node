@@ -52,13 +52,15 @@ An X job containing identical requested reads is rejected before a session is cr
 
 Restart preserves accepted receipts. A proof interrupted in flight becomes `execution_uncertain`, loses its token and cannot be retried as new provider work. Status includes the job/attempt, fence, exact registered request hash, absolute expiry and a `durable` flag; it never includes the token. The coordinator must check those bindings, complete X fulfilment, quoted bounds and separate funding/settlement evidence. A stored proof is not a paid receipt or a points award. Durable X sessions allow 1–3 pinned exchanges and one attempt per exchange; legacy ephemeral tests retain the wider read policy.
 
-The private store has validated limits: `SCARLETT_VERIFIER_MAX_RECORDS` (default 1024, range 1 to 1,000,000), `SCARLETT_VERIFIER_MAX_RECORD_BYTES` (default 67108864, range 1048576 to 67108864), and `SCARLETT_VERIFIER_MAX_TOTAL_BYTES` (default 268435456, at least the per-record limit and at most 1099511627776). Values are decimal integers. Choose the per-record bound to hold the largest allowed request and verified response together; lowering it below an existing receipt prevents startup. Pending proofs reserve their full per-record budget before registration returns a token; a pending web fetch reserves only its own receipt bound (the base64 response cap plus every hop's head and URLs, about 14 MiB for a 10 MiB page with five redirects), never more than the per-record budget. Completed proofs release that reservation to their actual encoded size. Expired unspent tokens are revoked during maintenance and release their reservation while the receipt remains available for reconciliation. In-flight proofs keep their reservation through completion. The defaults therefore allow at most four pending durable sessions, fewer when retained receipts use space; the connection limit is a separate ceiling. Raising the record count alone does not raise this storage capacity.
+The private store has validated limits: `SCARLETT_VERIFIER_MAX_RECORDS` (default 1024, range 1 to 1,000,000), `SCARLETT_VERIFIER_MAX_RECORD_BYTES` (default 67108864, range 1048576 to 67108864), and `SCARLETT_VERIFIER_MAX_TOTAL_BYTES` (default 268435456, at least the per-record limit and at most 1099511627776). Values are decimal integers. Choose the per-record bound to hold the largest allowed request and verified response together; lowering it below an existing receipt prevents startup. Pending proofs reserve their full per-record budget before registration returns a token. A pending web fetch reserves its own bound instead, never clamped by the per-record budget: its receipt JSON (at most 658,324 bytes with five redirects; the page is never in the JSON) plus a full 64 MiB page, 67,767,188 bytes in all. Completed proofs release that reservation to their actual encoded size. Expired unspent tokens are revoked during maintenance and release their reservation while the receipt remains available for reconciliation. In-flight proofs keep their reservation through completion. The defaults therefore allow at most four pending durable sessions, fewer when retained receipts use space; the connection limit is a separate ceiling. Raising the record count alone does not raise this storage capacity.
+
+**Web pages in the verifier** (contract `api/verifier-v1.md`, fixtures `api/fixtures/verifier/`): a web job's final page is streamed to a private body file `<sha256(job\nattempt)>.body` beside its receipt (written as `.body.partial`, fsynced, renamed and the directory fsynced before the receipt that names it is committed), never into the receipt. The final hop of a complete chain says `body_stored: true`; `body_bytes` and `body_sha256` describe the entity (de-chunked, still content-encoded) on every hop. The coordinator reads the page with authenticated `GET /v1/sessions/{job_id}/{attempt}/body` (`application/octet-stream`, `X-Body-SHA256`, `X-Body-Bytes`, one `Range: bytes=a-b` or `a-` answered 206; 404 `no body` or `unknown session`, 410 `body released`, 416 `invalid range`) and releases it with `DELETE` on the same path (204, idempotent), which records `body_released_at_ms` in the receipt before unlinking the file. Retention purges a web receipt and its body 10 minutes after expiry either way. Startup deletes partial and orphan body files, and refuses to start when a receipt says a body is stored but the file is missing, not private or not `body_bytes` long, or when any receipt still holds a page inline as `body_base64` (from before body files: pause web and let those age out). `SCARLETT_VERIFIER_MAX_WEB_BYTES` (default 201326592, range 67767188 to 1099511627776) bounds the web pool: web receipts' charges plus their stored bodies. It must leave one full receipt beside it (`MAX_WEB_BYTES + MAX_RECORD_BYTES <= MAX_TOTAL_BYTES`), so web can never take the room X and Codex need; a web registration needs room in the pool and in the total (`503 verifier web capacity reached`), X and Codex in the total only. Production uses a 32 GiB total and a 24 GiB pool (380 pending web pages, an 8 GiB X/Codex floor). `SCARLETT_VERIFIER_WEB_CONCURRENCY` (default 48, range 1 to 240, at most `SCARLETT_VERIFIER_CONCURRENCY - 16`) bounds web hops in progress; a web session beyond it is answered with one relay `FAILED` frame `{"reason":"verifier_busy"}` and closed without spending its token, and X and Codex always keep 16 connection slots. A web job's `max_response_bytes` must be 67108864 (the page ceiling, on the final hop's entity bytes); a hop may take at most 68,222,976 decrypted bytes in all (heads, interim heads, trailers and chunk framing included). Each hop runs at most `min(280 s, session limit, receipt expiry)`; the verifier also ends it as `session_timeout` 60 s after the sealed request with no response byte, 20 s after the last target byte, or when, from 30 s after the first byte, the target sent fewer than 1,966,080 bytes (64 KiB/s) over the trailing 30 s. These limits run inside the session, so a sealed request is always opened for the node first. A failed hop's receipt carries `rejection` `{reason, received_bytes, entity_bytes, declared_bytes}` beside `rejections` (`response_too_large` is now `page_too_large`), and once it is committed the node gets one `FAILED` frame with the reason.
 
 Successful `prove` and `prove-x` summaries report provider transcript `sent_bytes` and `received_bytes`, plus `verifier_sent_bytes` and `verifier_received_bytes` measured below the verifier connection's outer TLS layer. `verifier_transport_layer` is `tcp_payload`: the counters include TLS handshake and record bytes accepted by TCP, excluding IP/TCP headers and retransmissions. Counts saturate at 1 TiB per direction and then set `verifier_bytes_saturated: true`. Use these supplier diagnostics for local bandwidth measurements; billing and points use verified provider evidence.
 
 After funded acceptance, the node retains these verifier counters in optional private journal `proof_traffic` metadata bound to the attempt's lease fingerprint. It reserves a numbered sample before each helper starts, up to one Codex call or the signed X plan's one to three calls. A failed reservation prevents execution. Missing, malformed, failed or saturated summaries remain incomplete; numeric zero is recorded only when explicitly reported. A crash can leave a started sample without counters. Completion and worker-finished markers survive acknowledgement and restart under the existing journal retention rules, while recovery never starts another helper. These observations stay local and do not change the `node-v1` report or its hash. They measure verifier TCP payload bytes, excluding provider/bootstrap connections, coordinator requests and total network-interface overhead.
 
-Authenticated `GET /v1/capacity` on the existing loopback verifier API reports `healthy`, `durable`, configured connection limits, receipt count and storage limits/actual/reserved bytes. `active_connections`, `in_flight_proofs` and `pending_sessions` report control connections, ongoing proofs and unexpired issued tokens. Pause new coordinator dispatch, then wait for all three to reach zero before a verifier restart; an issued token can still start a proof after dispatch is paused. `storage.can_register` indicates room for another worst-case receipt. A full store remains healthy for existing status/recovery reads; storage failures return HTTP 503 with `healthy: false`. The route contains no receipt content, tokens or credentials and requires the verifier key.
+Authenticated `GET /v1/capacity` on the existing loopback verifier API reports `healthy`, `durable`, configured connection limits, receipt count and storage limits/actual/reserved bytes, including stored body files (`storage.body_files`, `storage.body_bytes`), and under `web` the web pool (`can_register`, `reserved_bytes`, `body_files`, `body_bytes`, `max_bytes`) and web sessions (`concurrency`, `active_sessions`, `busy_refusals`). `active_connections`, `in_flight_proofs` and `pending_sessions` report control connections, ongoing proofs and unexpired issued tokens. Pause new coordinator dispatch, then wait for all three to reach zero before a verifier restart; an issued token can still start a proof after dispatch is paused. `storage.can_register` indicates room for another worst-case receipt. A full store remains healthy for existing status/recovery reads; storage failures return HTTP 503 with `healthy: false`. The route contains no receipt content, tokens or credentials and requires the verifier key.
 
 Resolved payloads and receipts are removed 24 hours after session expiry by a minute maintenance pass and on restart. Unacknowledged coordinator results must be reconciled within that window. Web fetch receipts are removed 10 minutes after session expiry instead: the coordinator reads a web receipt only before its job's deadline and keeps the signed result itself, and a day of web pages would fill the store Codex and X share. Interrupted proof receipts become `execution_uncertain`, lose their tokens, and retain replay metadata beyond that window. They need an explicit reviewed reconciliation process before removal; capacity pressure never purges them. Corrupt, public, symlinked or oversized files fail startup; a full store refuses more work. Provider credential values never enter the store, but buyer requests and verified response copies do, so preserve its private permissions. Without a state directory the legacy verifier stays ephemeral and reports `durable: false`. Proof connections use verified TLS as described below.
 
@@ -276,11 +278,15 @@ ready), or while keyed relay is halted. After acceptance it checks that
 `SCARLETT_MAX_INPUT_BYTES`), that the payload has unique keys, integer numbers,
 exactly its seven fields (eight with `node_headers` for `web-browser-v1`), a
 URL equal to `web_request.url`, 0–5 redirects,
-1–10485760 response bytes and at most the three allowlisted headers in order,
+`max_response_bytes` exactly 67108864 (the 64 MiB page ceiling, on the final
+hop's entity bytes) and at most the three allowlisted headers in order,
 and that the lease carries no Codex or X fields; otherwise it reports
 `invalid_lease`. Well-formed terms whose URL is not canonical (including an IP
 literal, a reserved name or an X host) are reported `web_egress_denied` without
-any lookup. The job runs until the lease deadline less a 10 s report margin.
+any lookup. The job runs until the lease deadline less a 10 s report margin. A
+web job's deadline is its creation second plus 298 s (X and Codex keep 118 s),
+and the node accepts a web offer whose deadline is at most 300 s (plus 5 s of
+clock skew) ahead of its own clock, 120 s for the other services.
 
 A browser-mode lease (`web_request.mode` `browser`) also carries
 `web_request.browser` and a `web-browser-v1` payload; see
@@ -307,12 +313,20 @@ verifier token, at most `max_redirects + 1` of them. For each hop the node:
 4. picks the first IPv4 address, else the first IPv6 address;
 5. runs the helper with stdin `{verifier, verifier_ca_file?, plaintext_fixture?,
    token, hop, url, ip, port: 443, proxy?, payload, timeout_ms, node_headers?}`,
-   where `timeout_ms` is the smaller of 30 s and the time left and
+   where `timeout_ms` is the smaller of 280 s and the time left and
    `node_headers` (`{user_agent, cookie?}`) is present only for a browser job's
    re-fetch. stdout is capped at 64 KiB and stderr at 16 KiB;
 6. reads the one-line summary: `status` `proof_sent`, the same `hop`, a
    `status_code`, and either `final: true` or a canonical `next_url` for a
    301, 302, 303, 307 or 308 that the verifier authorized.
+
+A verifier at its web session limit answers the hop `verifier_busy`
+(`SCARLETT_WEB_ERROR=verifier_busy`) before anything is spent; the node runs
+the hop again after 1, 2 and 4 s and then every 5 s, while at least a second of
+the hop's budget would remain (diagnostics phase `verifier_busy_wait`). A page
+whose final entity is over 64 MiB fails the hop at the verifier
+(`SCARLETT_WEB_ERROR=page_too_large`); a Content-Length over it fails at the
+head, before any body byte is relayed.
 
 The helper never receives page plaintext; the summary carries counters and the
 next URL only. Each hop is one proof-traffic sample (up to six per attempt) and
@@ -329,7 +343,8 @@ reported `proven`, because the verifier already holds the verified hops.
 | `web_dns_failed` | No address within 5 s |
 | `web_connect_failed` | The helper could not open TCP to the checked address (`SCARLETT_WEB_ERROR=connect_failed`); no verifier session was spent |
 | `web_proxy_failed` | The egress proxy was unreachable, refused authentication or did not answer 200 (`SCARLETT_WEB_ERROR=proxy_failed`) |
-| `web_fetch_failed` | The relay session failed after the token was presented, or the helper's summary was invalid |
+| `web_fetch_failed` | The relay session failed after the token was presented, the verifier stayed busy for the whole hop budget, or the helper's summary was invalid |
+| `page_too_large` | The page is over the 64 MiB ceiling: `stage` `wire` when the verifier refused the first hop's entity (`observed_bytes` 67108865, a lower bound; the coordinator reads the verifier's own counts), or `stage` `dom` for a browser job whose DOM was over 64 MiB when neither its manifest was stored nor a re-fetch hop verified (`observed_bytes` the DOM's UTF-8 size) |
 | `relay_misuse` | The helper caught the verifier misusing the session; keyed relay halts node-wide, for X and web alike, until `scarlett-node relay-resume` |
 | `expired` | The lease deadline passed first |
 | `prover_error` | The helper could not run |
@@ -422,7 +437,7 @@ policy, `browser` and `node_headers` go together. Bounds: `wait` is `load` or
 5000–45000. A `web-browser-v1` payload has exactly the two headers `accept`
 and `accept-language` with their default values in that order, no
 `user-agent`, `node_headers` exactly `["user-agent","cookie"]`, five
-redirects and 10485760 response bytes; anything else is `invalid_lease`. The
+redirects and 67108864 response bytes; anything else is `invalid_lease`. The
 pre-warm hint on a browser lease is `invalid_lease`, and an offer carrying it
 is refused before acceptance.
 
@@ -443,15 +458,16 @@ left; under 5 s the job is `expired`. Then:
 3. The final document must be an absolute `http` or `https` URL of at most
    2048 bytes and not an X host; otherwise the browser copy is dropped.
 4. As soon as the browser returns, two things run at once. The **upload**
-   posts the rendered copy to `/api/node/v1/jobs/{job_id}/browser-result`. The
+   sends the rendered DOM in parts and then its manifest (below). The
    **re-fetch** is the relay hop loop above with the same token, each hop
    carrying `node_headers`: the pinned User-Agent and a Cookie built from the
    browser's cookies (below). The re-fetch is skipped when the browser could not
    clear a bot challenge.
 5. The node reports once both are done, or at the report deadline: `/proven`
-   when the upload was stored or the verifier holds at least one re-fetch hop,
-   otherwise `/fail` with the first code from steps 1–2, then the re-fetch's
-   first-hop code. Verifier misuse in the re-fetch is reported `relay_misuse`
+   when the manifest was stored or the verifier holds at least one re-fetch hop,
+   otherwise `/fail` with `page_too_large` (`stage` `dom`) for a DOM over the
+   ceiling, else the first code from steps 1–2, then the re-fetch's first-hop
+   code. Verifier misuse in the re-fetch is reported `relay_misuse`
    and halts relay as always.
 
 **Anti-bot pass.** The helper's session is built with Scrapling's
@@ -536,24 +552,46 @@ coordinator remembers such a domain and offers its browser jobs to nodes that
 report `solvers` first. The desktop app does not configure solvers yet; a
 keychain-backed setting is the planned next step.
 
-**Upload.** The body is gzip JSON (`Content-Encoding: gzip`), at most
-12582912 bytes compressed and 16777216 decompressed, encoded with HTML escaping
-off. When the decompressed body would exceed 16711680 bytes, `html` is cut on a
-code point boundary and `html_truncated` set; `html` is capped at 10485760
-bytes either way. `html_bytes` and `html_sha256` are computed on the string
-sent. Response headers are lowercased and kept only as token names of at most 64
-bytes with printable values of at most 4096 bytes (128 pairs and 65536 bytes in
-total), never `set-cookie` or `cookie`; `set_cookie_names` carries names only.
-`started_at_ms` and `duration_ms` come from the node's clock around the browser
-phase. The upload uses the node's coordinator transport and version headers but
-its own client without the 10 s timeout: each try runs under the report
-deadline, starts only while `max(15 s, size / 250 kB/s)` remains, and there are
-at most three, retried only after a transport error, 429 or 5xx. A repeat of the
-same body is answered 200; a 409 is final. An upload that is not stored is
-logged once it gives up, with the status and the coordinator's error code and
-nothing else: `web browser: result upload not stored: coordinator HTTP 409
-fenced`. The job is still served from the re-fetch, so this line is the only
-sign on the node that the coordinator never received the browser's copy.
+**DOM.** The helper writes the rendered document's DOM (UTF-8, at most 64 MiB,
+never cut) to a private file `dom-*.html` (0600, exclusive) in its own temporary
+directory and answers only `html_path`, `html_bytes` and `html_sha256`; its JSON
+answer is at most 1 MiB. The node moves the file into its private
+`<state>/web-browser/dom/` directory, checks its size and SHA-256 there, and
+deletes it after the upload (and its gzip copy) or on failure; that directory
+is emptied once per node start. A DOM over 64 MiB is never written: the helper
+answers `failed` with `error: "too_large"` and `html_bytes`.
+
+**Upload.** The DOM is compressed once with gzip level 6 into a private file,
+which is cut into parts of 2097152 bytes (the last 1–2097152), at most 33.
+`upload_sha256` is the SHA-256 of the whole gzip stream. The node reads the
+stored set (`GET …/browser-result/parts`), sends each part it lacks with
+`PUT /api/node/v1/jobs/{job_id}/browser-result/parts/{n}` (headers
+`X-Scarlett-Attempt`, `X-Scarlett-Fence`, `X-Scarlett-Request-SHA256`,
+`X-Scarlett-Upload-SHA256`, `X-Scarlett-Part-SHA256`; one part in memory at a
+time), then posts the manifest, plain JSON of at most 256 KiB, to
+`/api/node/v1/jobs/{job_id}/browser-result`: today's metadata without the DOM,
+plus `dom` (`ok`, `too_large` with `html_bytes` and no parts, or `memory` with
+`tree_peak_bytes` when the node killed its browser before the page finished),
+`html_bytes`, `html_sha256`, `gzip_bytes`, `upload_sha256` and the part
+digests. A manifest answered `409 parts_incomplete` sends what is missing
+once more and posts again; a coordinator that holds parts under another upload
+sha replaces them. Response headers are lowercased and kept only as token
+names of at most 64 bytes with printable values of at most 4096 bytes (128
+pairs and 65536 bytes in total), never `set-cookie` or `cookie`;
+`set_cookie_names` carries names only. `started_at_ms` and `duration_ms` come
+from the node's clock around the browser phase. Every request uses the node's
+coordinator transport and version headers but its own client without the 10 s
+timeout, runs under the report deadline, and is tried at most three times (1,
+2 and 4 s apart, or the coordinator's longer `Retry-After`), retried only after
+a transport error, 429 or 5xx; a part try starts only while `max(10 s, part
+size / 250 kB/s + 5 s)` remains, a manifest try while 3 s does. A too_large or
+memory manifest still runs the proven re-fetch, so the coordinator can serve
+it. An upload that is not stored is logged once it gives up, with the route,
+the status and the coordinator's error code, the DOM state and the part
+counts, and nothing else: `web browser: result upload not stored (dom ok, 2
+parts sent, 0 skipped, 1 retries): PUT part: coordinator HTTP 409 fenced`.
+The job is still served from the re-fetch, so this line is the only sign on
+the node that the coordinator never received the browser's result.
 
 **Clearance cookies.** The Cookie for a re-fetch hop holds only cookies whose
 names are on the allowlist the verifier enforces: exactly `cf_clearance`,
@@ -664,21 +702,30 @@ extraction and full verification, browser download and verification, then one
 launch-and-close probe. The helper starts on demand, or early for a browser
 offer or the pre-warm hint, stays warm while jobs flow and stops after the idle
 time (30 s after a pre-warm that served nothing). It is recycled after 50 pages,
-or when the memory of its whole process tree passes `1.25 GiB + 0.75 GiB ×
-capacity`, and killed 1.5 GiB above that. On macOS the node also reads the
-host's memory pressure level (`kern.memorystatus_vm_pressure_level`, sampled
-every 500 ms while a page renders): with a page in flight, critical kills the
-helper at once whatever its size, and warn kills it above the recycle size; the
-in-flight fetches fail `web_browser_failed`. Elsewhere the tree-size limits
-stand alone. A failed preparation is retried after 60 s, doubling to 1 h; a
+or, draining first, when the memory of its whole process tree passes
+`recycle = 1.25 GiB + 0.75 GiB × capacity`: the pages in flight finish, then
+the helper restarts. It is killed at once above `kill = max(recycle + 1.5 GiB,
+physical memory / 4)` (`kill_bytes` in the heartbeat; on Windows the job
+object's limit is `kill + 2 GiB`). On macOS the node also reads the host's
+memory pressure level (`kern.memorystatus_vm_pressure_level`, sampled every
+500 ms while a page renders): with a page in flight, critical kills the helper
+at once whatever its size; warn only drains above the recycle size, so a large
+page finishes (warn is common on healthy Macs). The diagnostics log names the
+action: `kill_size`, `kill_critical` or `recycle_after_page`. A page in flight
+when the helper is killed still runs the proven re-fetch and posts a `memory`
+manifest with the largest tree size sampled while it loaded
+(`tree_peak_bytes`); the coordinator may send the job once more to a node whose
+`kill_bytes` is at least 1.5 times that. Elsewhere the tree-size limits stand
+alone. A failed preparation is retried after 60 s, doubling to 1 h; a
 restart retries at once. `memory_low` is not retried until the node restarts.
 Three start failures within ten minutes make it `helper_failed` for ten
 minutes. A full verification of the runtime and browser repeats every six hours
 while no helper is warm.
 
 **Readiness.** The enabled web entry always carries `browser`:
-`{"state":"ready","capacity":N,"in_flight":M,"version":"155.0.8059.39"}`, with
-capacity 1–4 and at most the web capacity and, when solvers are configured and
+`{"state":"ready","capacity":N,"in_flight":M,"version":"155.0.8059.39","kill_bytes":K}`,
+with capacity 1–4 and at most the web capacity, `kill_bytes` the tree size at
+which this node kills its browser (above), and, when solvers are configured and
 the day's spend is under its cap, `"solvers":["capmonster","capsolver"]`
 (provider names in that order, never keys), or
 `{"state":"unavailable","reason":R,"capacity":0,"in_flight":0}`. A browser job
