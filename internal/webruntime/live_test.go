@@ -360,10 +360,16 @@ document.addEventListener('click', async () => {
 	if h == nil {
 		t.Fatal("no warm helper")
 	}
+	// The sample covers the whole tree, Chrome included, not only the helper:
+	// Chrome's processes add well over 192 MiB to the helper's own figure on
+	// every platform (linux counts Pss, so its absolute figures run lowest),
+	// more than the helper and its driver Node together could.
 	bytes, tree, err := m.d.sample(h.p)
-	if err != nil || bytes < 500<<20 {
-		t.Fatalf("tree memory %d bytes (%v) while Chrome is up", bytes, err)
+	own := ownBytes(h.p.pid())
+	if err != nil || own == 0 || bytes < own+192<<20 {
+		t.Fatalf("tree memory %d bytes, helper alone %d (%v) while Chrome is up", bytes, own, err)
 	}
+	t.Logf("tree memory %d bytes, helper alone %d, %d processes", bytes, own, len(tree))
 	checkArgv(t, m, h, tree)
 	checkSockets(t, tree)
 	checkPlatform(t, platform, h, tree)

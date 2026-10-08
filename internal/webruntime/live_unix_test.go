@@ -58,6 +58,21 @@ func browserArgv(t *testing.T, m *Manager, tree []procInfo) []string {
 	return nil
 }
 
+// ownBytes is one process's memory by the measure treeBytes sums (darwin RSS,
+// linux Pss).
+func ownBytes(pid int) uint64 {
+	table, err := processTable()
+	if err != nil {
+		return 0
+	}
+	for _, row := range table {
+		if row.PID == pid {
+			return treeMemory([]procInfo{row})
+		}
+	}
+	return 0
+}
+
 // checkSockets: no connected non-loopback socket and no UDP 5353 in the tree.
 // Unconnected wildcard UDP binds are counted and reported, not failed.
 func checkSockets(t *testing.T, tree []procInfo) {

@@ -411,6 +411,34 @@ func TestProxyTunnelCap(t *testing.T) {
 	}
 }
 
+// Over the cap, the 503 follows the request head. Answering first and closing
+// with the head unread resets the connection, and on Windows the reset
+// discards the 503 before the client reads it.
+func TestProxyOverCapAnswersAfterTheHead(t *testing.T) {
+	f := &fakeNet{target: echoServer(t)}
+	p, _ := newTestProxy(t, f, nil, 1)
+	_, held := connect(t, p.URL(), "example.com:443")
+	defer held.Close()
+	c, err := net.Dial("tcp4", strings.TrimPrefix(p.URL(), "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, err := c.Read(make([]byte, 1)); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("answered before the request head: %d %v", n, err)
+	}
+	fmt.Fprintf(c, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: http.MethodConnect})
+	if err != nil || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("over-cap answer: %v", err)
+	}
+	if n, err := c.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+		t.Fatalf("over-cap connection not closed cleanly: %d %v", n, err)
+	}
+}
+
 func TestDenyListenerAnswers403WithoutNetworking(t *testing.T) {
 	var buf bytes.Buffer
 	log.SetOutput(&buf)

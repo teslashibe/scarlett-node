@@ -44,6 +44,10 @@ const (
 	proxyDialLimit    = 10 * time.Second
 	denyHeadLimit     = 8 << 10
 	denyReadLimit     = 5 * time.Second
+	// Over-cap 503 answers in flight at once; past it a connection is closed
+	// unanswered. Each lasts at most proxyRefuseLimit per direction.
+	proxyRefusals    = 16
+	proxyRefuseLimit = time.Second
 )
 
 // ProxyStats are the proxy's only output besides traffic: counters. Hosts
@@ -99,6 +103,7 @@ type egressProxy struct {
 	upstream     *url.URL
 	upstreamAuth string
 	slots        chan struct{}
+	refusals     chan struct{}
 	stats        *ProxyStats
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -125,7 +130,7 @@ func newEgressProxy(guard EgressGuard, resolve func(context.Context, string) ([]
 	ctx, cancel := context.WithCancel(context.Background())
 	dialer := &net.Dialer{Timeout: proxyDialLimit}
 	p := &egressProxy{ln: ln, guard: guard, resolve: resolve, dial: dialer.DialContext, upstream: upstream, upstreamAuth: upstreamAuth,
-		slots: make(chan struct{}, tunnels), stats: stats, ctx: ctx, cancel: cancel, conns: map[net.Conn]struct{}{}}
+		slots: make(chan struct{}, tunnels), refusals: make(chan struct{}, proxyRefusals), stats: stats, ctx: ctx, cancel: cancel, conns: map[net.Conn]struct{}{}}
 	if upstream != nil && upstream.User != nil && upstreamAuth == "" {
 		password, _ := upstream.User.Password()
 		p.upstreamAuth = "Basic " + base64.StdEncoding.EncodeToString([]byte(upstream.User.Username()+":"+password))
@@ -147,10 +152,7 @@ func (p *egressProxy) serve() {
 		select {
 		case p.slots <- struct{}{}:
 		default:
-			// Over the tunnel cap: Chrome retries the request.
-			_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
-			_, _ = io.WriteString(conn, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-			conn.Close()
+			p.refuse(conn)
 			continue
 		}
 		if !p.track(conn, true) {
@@ -167,6 +169,37 @@ func (p *egressProxy) serve() {
 			p.handle(conn)
 		}()
 	}
+}
+
+// refuse answers a connection over the tunnel cap with 503, which Chrome
+// retries. The request head is read before the answer: closing a socket that
+// still holds unread bytes resets the connection, and the reset can discard
+// the 503 before the client reads it (Windows does). Answers run off the
+// accept loop, at most proxyRefusals at once and each bounded by
+// proxyRefuseLimit; past that a connection is closed unanswered.
+func (p *egressProxy) refuse(conn net.Conn) {
+	select {
+	case p.refusals <- struct{}{}:
+	default:
+		conn.Close()
+		return
+	}
+	if !p.track(conn, true) {
+		<-p.refusals
+		conn.Close()
+		return
+	}
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		defer func() { <-p.refusals }()
+		defer p.track(conn, false)
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(proxyRefuseLimit))
+		_, _ = http.ReadRequest(bufio.NewReader(io.LimitReader(conn, proxyHeadLimit)))
+		_ = conn.SetWriteDeadline(time.Now().Add(proxyRefuseLimit))
+		_, _ = io.WriteString(conn, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+	}()
 }
 
 func (p *egressProxy) track(conn net.Conn, add bool) bool {

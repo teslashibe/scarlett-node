@@ -34,18 +34,24 @@ func (p *proc) treeBytes() (uint64, error) {
 	}
 	var total uint64
 	for _, pid := range pids {
-		h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-		if err != nil {
-			continue
-		}
-		var counters processMemoryCounters
-		counters.cb = uint32(unsafe.Sizeof(counters))
-		if r, _, _ := procK32GetProcessMemInfo.Call(uintptr(h), uintptr(unsafe.Pointer(&counters)), uintptr(counters.cb)); r != 0 {
-			total += uint64(counters.WorkingSetSize)
-		}
-		windows.CloseHandle(h)
+		total += workingSet(pid)
 	}
 	return total, nil
+}
+
+// workingSet is one process's working set, or 0 when it cannot be read.
+func workingSet(pid uint32) uint64 {
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return 0
+	}
+	defer windows.CloseHandle(h)
+	var counters processMemoryCounters
+	counters.cb = uint32(unsafe.Sizeof(counters))
+	if r, _, _ := procK32GetProcessMemInfo.Call(uintptr(h), uintptr(unsafe.Pointer(&counters)), uintptr(counters.cb)); r == 0 {
+		return 0
+	}
+	return uint64(counters.WorkingSetSize)
 }
 
 // memoryStatusEx is MEMORYSTATUSEX.

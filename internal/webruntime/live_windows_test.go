@@ -168,6 +168,9 @@ func checkPlatform(t *testing.T, _ platformSnapshot, h *helper, tree []procInfo)
 	}
 }
 
+// ownBytes is one process's memory by the measure treeBytes sums (working set).
+func ownBytes(pid int) uint64 { return workingSet(uint32(pid)) }
+
 func checkUnregistered(*testing.T, string) {}
 
 func handlerApps(*testing.T) map[string][]string { return nil }

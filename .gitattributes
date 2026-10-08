@@ -1,6 +1,12 @@
 # Preserve exact upstream bytes for the snapshot and patch integrity checks.
 third_party/x-go/** -text
 third_party/social-login/** -text
+# Pinned bytes: the Chrome for Testing inventories are checked against their
+# sha256 at release preparation and by the node, on every platform.
+third_party/web-browser/** -text
 
 # The collector emits LF bytes on every platform.
 desktop/tests/fixtures/pacing-diagnostics-v1.json text eol=lf
+# The wire fixtures are pinned by sha256 (the app and the verifier share them),
+# so a Windows checkout must not rewrite their line endings.
+api/fixtures/** -text
