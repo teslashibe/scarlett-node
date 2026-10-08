@@ -7,28 +7,40 @@
 //! joined in through the split tag. It opens X's records itself, so the
 //! response it returns is what X sent on this connection.
 //!
-//! A web hop (`run_web`) is the same session for any public https host with
-//! nothing hidden: the verifier seals exactly the canonical request for the
-//! hop URL, frames the response itself, and sends the supplier no plaintext,
-//! only the hop's status and the next URL it authorizes (OUTCOME).
+//! A web hop (`web_session`) is the same session for any public https host
+//! with nothing hidden: the verifier seals exactly the canonical request for
+//! the hop URL, frames the response itself and streams its entity to a body
+//! file (`WebReader`), and sends the supplier no plaintext. Once the caller
+//! has recorded the hop it sends only the hop's status and the next URL it
+//! authorizes (OUTCOME), or, when the hop failed, the reason (FAILED). A web
+//! hop is held to its timing rules (`HopClock`) inside the session, so a
+//! sealed request is always opened for the supplier however the hop ends.
 
-use std::{fmt, io, ops::Range, sync::Arc};
+use std::{
+    collections::VecDeque,
+    fmt, io,
+    ops::Range,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 use rustls::{ClientConfig, ClientConnection, ConnectionTrafficSecrets, RootCertStore, pki_types::ServerName};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 
 use super::{
     MAX_HIDDEN_BITS, MAX_REQUEST, VERSION,
     ot::VerifierOt,
     record::{self, Keys},
     tag,
-    wire::{self, CHUNK},
+    wire::{self, CHUNK, FrameReader},
 };
 use crate::{
-    webpolicy::{FrameError, Framer, Response},
+    body::{Sink, Stored},
+    webpolicy::{Counts, FrameError, Framer, Response},
     xpolicy,
     xprove::MAX_RECV,
 };
@@ -54,23 +66,26 @@ pub struct TlsInfo {
     pub leaf_cert_sha256: [u8; 32],
 }
 
-/// One verified web hop: the request the verifier sealed and the response
-/// it decrypted.
+/// One verified web hop, for tests: the request the verifier sealed, the
+/// response it framed and the entity it stored.
+#[cfg(test)]
 pub struct WebOutcome {
     pub sent: Vec<u8>,
     pub response: Response,
     pub tls: TlsInfo,
+    pub body: Vec<u8>,
 }
 
 /// Why a web hop ended without a verified response. Every error from
-/// `run_web` carries one; anything unclassified is `ProofRejected`.
+/// `web_session` carries one; anything unclassified is `ProofRejected`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Failure {
     TlsFailed,
     RequestRejected,
-    ResponseTooLarge,
+    PageTooLarge,
     ResponseInvalid,
     ServerClosed,
+    SessionTimeout,
     ProofRejected,
 }
 
@@ -79,9 +94,10 @@ impl Failure {
         match self {
             Self::TlsFailed => "tls_failed",
             Self::RequestRejected => "request_rejected",
-            Self::ResponseTooLarge => "response_too_large",
+            Self::PageTooLarge => "page_too_large",
             Self::ResponseInvalid => "response_invalid",
             Self::ServerClosed => "server_closed",
+            Self::SessionTimeout => "session_timeout",
             Self::ProofRejected => "proof_rejected",
         }
     }
@@ -99,6 +115,133 @@ impl fmt::Display for Failure {
 
 impl std::error::Error for Failure {}
 
+/// Which timing rule ended a web hop (`session_timeout` in the receipt):
+/// `hop_limit`, `ttfb_timeout`, `idle_timeout` or `throughput_floor`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimedOut(pub &'static str);
+
+impl fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for TimedOut {}
+
+/// The timing rules of one web hop (api/verifier-v1.md section 8.2).
+#[derive(Clone, Copy, Debug)]
+pub struct Timing {
+    /// From the sealed request's release to the first decrypted response byte.
+    pub ttfb: Duration,
+    /// After the first response byte, the longest gap with no target bytes.
+    pub idle: Duration,
+    /// The throughput floor applies from this long after the first byte,
+    pub floor_after: Duration,
+    /// over the trailing window of this length,
+    pub floor_window: Duration,
+    /// at this many bytes per second.
+    pub floor_rate: u64,
+}
+
+impl Timing {
+    pub const WEB: Self = Self { ttfb: Duration::from_secs(60), idle: Duration::from_secs(20), floor_after: Duration::from_secs(30), floor_window: Duration::from_secs(30), floor_rate: 64 << 10 };
+
+    /// The bytes the floor requires over its window.
+    pub fn floor_bytes(&self) -> u64 {
+        (u128::from(self.floor_rate) * self.floor_window.as_millis() / 1000) as u64
+    }
+}
+
+/// The clock of one web hop: its deadline and timing rules, fed with the
+/// session's events and asked when it must be checked next.
+pub struct HopClock {
+    timing: Timing,
+    deadline: Instant,
+    sent: Option<Instant>,
+    first: Option<Instant>,
+    last: Option<Instant>,
+    /// Target bytes so far, and (time, total) after each arrival, pruned to
+    /// one entry at or before the floor window.
+    total: u64,
+    samples: VecDeque<(Instant, u64)>,
+    next_floor: Option<Instant>,
+}
+
+impl HopClock {
+    pub fn new(timing: Timing, deadline: Instant) -> Self {
+        Self { timing, deadline, sent: None, first: None, last: None, total: 0, samples: VecDeque::new(), next_floor: None }
+    }
+
+    /// The sealed request went to the supplier.
+    pub fn request_sent(&mut self, now: Instant) {
+        self.sent.get_or_insert(now);
+    }
+
+    /// `bytes` arrived from the target.
+    pub fn target(&mut self, now: Instant, bytes: usize) {
+        self.total += bytes as u64;
+        self.samples.push_back((now, self.total));
+        if self.first.is_some() {
+            self.last = Some(now);
+        }
+    }
+
+    /// The first decrypted response byte.
+    pub fn first_byte(&mut self, now: Instant) {
+        if self.first.is_none() {
+            self.first = Some(now);
+            self.last = Some(now);
+            self.next_floor = Some(now + self.timing.floor_after);
+        }
+    }
+
+    /// When `check` must run next.
+    pub fn wake(&self) -> Instant {
+        let mut wake = self.deadline;
+        if let (Some(sent), None) = (self.sent, self.first) {
+            wake = wake.min(sent + self.timing.ttfb);
+        }
+        if let Some(last) = self.last {
+            wake = wake.min(last + self.timing.idle);
+        }
+        if let Some(floor) = self.next_floor {
+            wake = wake.min(floor);
+        }
+        wake
+    }
+
+    /// Ends the hop when a rule is broken at `now`, naming the rule.
+    pub fn check(&mut self, now: Instant) -> Result<(), TimedOut> {
+        if now >= self.deadline {
+            return Err(TimedOut("hop_limit"));
+        }
+        if let (Some(sent), None) = (self.sent, self.first)
+            && now >= sent + self.timing.ttfb
+        {
+            return Err(TimedOut("ttfb_timeout"));
+        }
+        if let Some(last) = self.last
+            && now >= last + self.timing.idle
+        {
+            return Err(TimedOut("idle_timeout"));
+        }
+        if let Some(floor) = self.next_floor
+            && now >= floor
+        {
+            let start = now.checked_sub(self.timing.floor_window).unwrap_or(now);
+            while self.samples.len() > 1 && self.samples[1].0 <= start {
+                self.samples.pop_front();
+            }
+            let before = self.samples.front().filter(|(at, _)| *at <= start).map_or(0, |(_, total)| *total);
+            if self.total - before < self.timing.floor_bytes() {
+                return Err(TimedOut("throughput_floor"));
+            }
+            self.next_floor = Some(now + Duration::from_secs(1));
+        }
+        Ok(())
+    }
+}
+
 /// How a session takes the server's response.
 trait Reader {
     /// Whether the supplier receives the plaintext as it arrives.
@@ -107,6 +250,8 @@ trait Reader {
     const HIDDEN: bool;
     /// Takes decrypted application data; returns whether the response is complete.
     fn push(&mut self, data: &[u8]) -> Result<bool>;
+    /// Passes on what `push` framed, before the next record is read.
+    fn flush(&mut self) -> impl Future<Output = Result<()>> + Send;
     /// The server's close_notify.
     fn close_notify(&mut self) -> Result<()>;
     fn complete(&self) -> bool;
@@ -127,6 +272,9 @@ impl Reader for XReader {
         self.0.extend_from_slice(data);
         Ok(xpolicy::response_complete(&self.0))
     }
+    async fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn close_notify(&mut self) -> Result<()> {
         bail!("server closed before the response was complete")
     }
@@ -138,20 +286,61 @@ impl Reader for XReader {
     }
 }
 
-/// A web hop: the response is framed as it arrives and stays with the verifier.
-struct WebReader(Framer);
+/// A web hop's response: framed as it arrives and kept by the verifier. Its
+/// entity streams to the body file `path` unless the response is a
+/// followable redirect.
+pub struct WebReader {
+    framer: Framer,
+    path: PathBuf,
+    sink: Option<Sink>,
+}
+
+impl WebReader {
+    pub fn new(framer: Framer, path: PathBuf) -> Self {
+        Self { framer, path, sink: None }
+    }
+
+    /// What the hop took, also when it failed.
+    pub fn counts(&self) -> Counts {
+        self.framer.counts()
+    }
+
+    /// After a complete session: the response, and its body file closed
+    /// (flushed, fsynced, renamed, directory fsynced) unless it was a
+    /// followable redirect.
+    pub async fn finish(&mut self) -> Result<(Response, Option<Stored>)> {
+        let response = self.framer.finish();
+        if response.followable {
+            return Ok((response, None));
+        }
+        let sink = self.sink.take().unwrap_or_else(|| Sink::open(self.path.clone()));
+        let stored = sink.finish(response.body_bytes as u64).await?;
+        Ok((response, Some(stored)))
+    }
+}
 
 impl Reader for WebReader {
     const PLAIN: bool = false;
     const HIDDEN: bool = false;
     fn push(&mut self, data: &[u8]) -> Result<bool> {
-        self.0.push(data).map_err(frame_failure)
+        self.framer.push(data).map_err(frame_failure)
+    }
+    async fn flush(&mut self) -> Result<()> {
+        if !self.framer.stores_body() {
+            return Ok(());
+        }
+        let entity = self.framer.take_entity();
+        if entity.is_empty() {
+            return Ok(());
+        }
+        let path = &self.path;
+        self.sink.get_or_insert_with(|| Sink::open(path.clone())).write(&entity).await.map_err(|e| e.context(Failure::ProofRejected))
     }
     fn close_notify(&mut self) -> Result<()> {
-        self.0.close_notify().map_err(frame_failure)
+        self.framer.close_notify().map_err(frame_failure)
     }
     fn complete(&self) -> bool {
-        self.0.complete()
+        self.framer.complete()
     }
     fn tag(error: anyhow::Error, failure: Failure) -> anyhow::Error {
         if error.downcast_ref::<Failure>().is_some() { error } else { error.context(failure) }
@@ -160,7 +349,7 @@ impl Reader for WebReader {
 
 fn frame_failure(error: FrameError) -> anyhow::Error {
     let failure = match error {
-        FrameError::TooLarge => Failure::ResponseTooLarge,
+        FrameError::TooLarge => Failure::PageTooLarge,
         FrameError::Invalid => Failure::ResponseInvalid,
         FrameError::Closed => Failure::ServerClosed,
     };
@@ -168,10 +357,54 @@ fn frame_failure(error: FrameError) -> anyhow::Error {
 }
 
 /// What a session sealed, and the server it reached.
-struct Sealed {
-    sent: Vec<u8>,
-    hidden: Vec<Range<usize>>,
-    tls: TlsInfo,
+pub struct Sealed {
+    /// The request as the verifier saw it: hidden bytes are zero.
+    pub sent: Vec<u8>,
+    pub hidden: Vec<Range<usize>>,
+    pub tls: TlsInfo,
+}
+
+/// The verifier's end of one supplier connection.
+pub struct Conn<S> {
+    reader: FrameReader<ReadHalf<S>>,
+    writer: WriteHalf<S>,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
+    pub fn new(socket: S) -> Self {
+        let (reader, writer) = tokio::io::split(socket);
+        Self { reader: FrameReader::new(reader), writer }
+    }
+
+    /// Ends a session with its result: a web hop's OUTCOME, then DONE.
+    pub async fn done(&mut self, outcome: Option<&[u8]>) -> Result<()> {
+        if let Some(frame) = outcome {
+            wire::send(&mut self.writer, wire::OUTCOME, frame).await?;
+        }
+        wire::send(&mut self.writer, wire::DONE, b"{\"status\":\"complete\"}").await?;
+        self.close().await;
+        Ok(())
+    }
+
+    /// Ends a web session without a hop: one FAILED frame naming `reason`.
+    pub async fn refuse(&mut self, reason: &str) -> Result<()> {
+        wire::send(&mut self.writer, wire::FAILED, &serde_json::to_vec(&serde_json::json!({ "reason": reason }))?).await?;
+        self.close().await;
+        Ok(())
+    }
+
+    /// The supplier may still be forwarding the server's close. Dropping the
+    /// socket with those frames unread can reset it and lose the last frame
+    /// on its way out, so close our half and let the supplier finish, briefly.
+    async fn close(&mut self) {
+        let _ = self.writer.shutdown().await;
+        let reader = self.reader.get_mut();
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut sink = [0u8; 4096];
+            while matches!(reader.read(&mut sink).await, Ok(n) if n > 0) {}
+        })
+        .await;
+    }
 }
 
 #[derive(Deserialize)]
@@ -250,26 +483,23 @@ pub async fn run<S>(socket: S, config: Arc<ClientConfig>, server_name: &str, aut
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut conn = Conn::new(socket);
     let mut received = XReader(Vec::new());
-    let sealed = session(socket, config, server_name, authorize, &mut received, |_, _| Ok(None)).await?;
+    let sealed = session(&mut conn, config, server_name, authorize, &mut received, None).await?;
+    conn.done(None).await?;
     Ok(Outcome { sent: sealed.sent, hidden: sealed.hidden, received: received.0 })
 }
 
-/// Runs one web hop for `server_name`. The verifier authorizes only a
-/// request with nothing hidden that `authorize` accepts (see
-/// `webpolicy::authorize`), and frames the response within
-/// `max_response_bytes`. Once the supplier has the record opening,
-/// `conclude` records the hop and returns the OUTCOME frame, which is sent
-/// only after it returns: the supplier cannot start the next hop before
-/// this one is recorded. Errors carry a `Failure`.
-pub async fn run_web<S>(
-    socket: S,
-    config: Arc<ClientConfig>,
-    server_name: &str,
-    authorize: impl Fn(&[u8]) -> Result<()>,
-    max_response_bytes: usize,
-    conclude: impl FnOnce(&WebOutcome) -> Result<Vec<u8>>,
-) -> Result<WebOutcome>
+/// Runs one web hop for `server_name` on `conn`, up to the complete
+/// response. The verifier authorizes only a request with nothing hidden that
+/// `authorize` accepts (see `webpolicy::authorize`), frames the response with
+/// `reader` (whose framer holds the hop's limits) and holds the hop to
+/// `clock`. Whatever the outcome, a sealed request is opened for the
+/// supplier before this returns. The caller then records the hop and ends
+/// the session with `Conn::done` (OUTCOME) or `Conn::refuse` (FAILED), so the
+/// supplier cannot start the next hop before this one is recorded. Errors
+/// carry a `Failure`; a timing failure also carries its `TimedOut`.
+pub async fn web_session<S>(conn: &mut Conn<S>, config: Arc<ClientConfig>, server_name: &str, authorize: impl Fn(&[u8]) -> Result<()>, reader: &mut WebReader, clock: &mut HopClock) -> Result<Sealed>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -279,31 +509,74 @@ where
         }
         authorize(public).map_err(|e| e.context(Failure::RequestRejected))
     };
-    let mut response = WebReader(Framer::new(max_response_bytes));
-    let mut verified = None;
-    session(socket, config, server_name, authorize, &mut response, |sealed, response| {
-        let outcome = WebOutcome { sent: sealed.sent.clone(), response: response.0.finish(), tls: sealed.tls.clone() };
-        let frame = conclude(&outcome)?;
-        verified = Some(outcome);
-        Ok(Some(frame))
-    })
-    .await?;
-    verified.context("web session ended without a verified hop")
+    session(conn, config, server_name, authorize, reader, Some(clock)).await
+}
+
+/// One whole web hop for tests: `web_session` with the default timing and
+/// the body file `body` (read back into the outcome), then `conclude` for
+/// the OUTCOME frame, and DONE.
+#[cfg(test)]
+pub async fn run_web<S>(
+    socket: S,
+    config: Arc<ClientConfig>,
+    server_name: &str,
+    authorize: impl Fn(&[u8]) -> Result<()>,
+    framer: Framer,
+    body: PathBuf,
+    conclude: impl FnOnce(&WebOutcome) -> Result<Vec<u8>>,
+) -> Result<WebOutcome>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut conn = Conn::new(socket);
+    let mut reader = WebReader::new(framer, body.clone());
+    let mut clock = HopClock::new(Timing::WEB, Instant::now() + crate::webpolicy::HOP_LIMIT);
+    let sealed = web_session(&mut conn, config, server_name, authorize, &mut reader, &mut clock).await?;
+    let (response, stored) = reader.finish().await?;
+    let body = match stored {
+        Some(stored) => {
+            stored.commit();
+            std::fs::read(&body)?
+        }
+        None => Vec::new(),
+    };
+    let outcome = WebOutcome { sent: sealed.sent, response, tls: sealed.tls, body };
+    let frame = conclude(&outcome)?;
+    conn.done(Some(&frame)).await?;
+    Ok(outcome)
+}
+
+/// The next frame, or the hop's first broken timing rule.
+async fn next_frame<T: AsyncRead + Unpin>(reader: &mut FrameReader<T>, clock: &mut Option<&mut HopClock>) -> Result<(u8, Vec<u8>)> {
+    let Some(clock) = clock.as_deref_mut() else {
+        return reader.recv().await;
+    };
+    loop {
+        tokio::select! {
+            frame = reader.recv() => return frame,
+            _ = tokio::time::sleep_until(clock.wake().into()) => clock.check(Instant::now())?,
+        }
+    }
+}
+
+/// Tags a timing failure as `session_timeout`.
+fn timed<R: Reader>(error: anyhow::Error) -> anyhow::Error {
+    if error.downcast_ref::<TimedOut>().is_some() { R::tag(error, Failure::SessionTimeout) } else { error }
 }
 
 async fn session<S, R: Reader>(
-    socket: S,
+    conn: &mut Conn<S>,
     config: Arc<ClientConfig>,
     server_name: &str,
     authorize: impl Fn(&[u8], &[Range<usize>]) -> Result<()>,
     response: &mut R,
-    conclude: impl FnOnce(&Sealed, &mut R) -> Result<Option<Vec<u8>>>,
+    mut clock: Option<&mut HopClock>,
 ) -> Result<Sealed>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let (mut reader, mut writer) = tokio::io::split(socket);
-    let (kind, payload) = wire::recv(&mut reader).await?;
+    let Conn { reader, writer } = conn;
+    let (kind, payload) = next_frame(reader, &mut clock).await.map_err(timed::<R>)?;
     if kind != wire::HELLO {
         bail!("relay session must start with a hello");
     }
@@ -326,7 +599,7 @@ where
     let mut sent: Option<(Vec<u8>, Vec<Range<usize>>)> = None;
 
     // The ClientHello does not depend on the server, so it goes out first.
-    flush_handshake(tls.as_mut().expect("handshake is in progress"), &mut writer, &mut to_server).await.map_err(|e| R::tag(e, Failure::TlsFailed))?;
+    flush_handshake(tls.as_mut().expect("handshake is in progress"), writer, &mut to_server).await.map_err(|e| R::tag(e, Failure::TlsFailed))?;
 
     // Whatever ends the session after a record was sealed, success or any
     // failure, the supplier gets the client key and so can always check what
@@ -334,16 +607,16 @@ where
     // otherwise be indistinguishable from one hiding a request of its own.
     let outcome: Result<()> = async {
     loop {
-        let (kind, payload) = wire::recv(&mut reader).await?;
+        let (kind, payload) = next_frame(reader, &mut clock).await.map_err(timed::<R>)?;
         match kind {
             wire::CO_SETUP => {
                 let (kind, reply) = ot.as_mut().context("session prepared no transfers")?.on_setup(&payload)?;
-                wire::send(&mut writer, kind, &reply).await?;
+                wire::send(writer, kind, &reply).await?;
             }
             wire::CO_PAYLOAD => ot.as_mut().context("session prepared no transfers")?.on_payload(&payload)?,
             wire::KOS_EXTEND => {
                 if let Some((kind, chi)) = ot.as_mut().context("session prepared no transfers")?.on_extend(&payload)? {
-                    wire::send(&mut writer, kind, &chi).await?;
+                    wire::send(writer, kind, &chi).await?;
                 }
             }
             wire::KOS_CHECK => ot.as_mut().context("session prepared no transfers")?.on_check(&payload)?,
@@ -356,6 +629,9 @@ where
                 request = Some(parsed);
             }
             wire::FROM_SERVER => {
+                if let Some(clock) = clock.as_deref_mut() {
+                    clock.target(Instant::now(), payload.len());
+                }
                 inbound.extend_from_slice(&payload);
                 while let Some((outer, record)) = record::take(&mut inbound)? {
                     if let Some(conn) = tls.as_mut() {
@@ -374,7 +650,7 @@ where
                             }
                             conn.process_new_packets().context("TLS handshake with the server failed").map_err(failed)?;
                         }
-                        flush_handshake(conn, &mut writer, &mut to_server).await.map_err(failed)?;
+                        flush_handshake(conn, writer, &mut to_server).await.map_err(failed)?;
                         if !conn.is_handshaking() {
                             let conn = tls.take().expect("handshake just completed");
                             server_tls = Some(tls_info(&conn));
@@ -391,10 +667,16 @@ where
                             if sent.is_none() {
                                 bail!("server sent application data before the request");
                             }
+                            if !data.is_empty()
+                                && let Some(clock) = clock.as_deref_mut()
+                            {
+                                clock.first_byte(Instant::now());
+                            }
                             let complete = response.push(&data)?;
+                            response.flush().await?;
                             if R::PLAIN {
                                 for chunk in data.chunks(CHUNK) {
-                                    wire::send(&mut writer, wire::PLAIN, chunk).await?;
+                                    wire::send(writer, wire::PLAIN, chunk).await?;
                                 }
                             }
                             // X closes right behind a `Connection: close` response, and
@@ -445,10 +727,21 @@ where
             payload.extend_from_slice(&material.ciphertext);
             payload.extend_from_slice(&material.tag_share);
             material.masked.iter().for_each(|block| payload.extend_from_slice(block));
-            wire::send(&mut writer, wire::MATERIAL, &payload).await?;
+            wire::send(writer, wire::MATERIAL, &payload).await?;
+            if let Some(clock) = clock.as_deref_mut() {
+                clock.request_sent(Instant::now());
+            }
         }
         if sent.is_some() && response.complete() {
             break;
+        }
+        // A busy session may never let the timer win the race for the
+        // next frame, so the rules are checked here too.
+        if let Some(clock) = clock.as_deref_mut() {
+            let now = Instant::now();
+            if now >= clock.wake() {
+                clock.check(now).map_err(|e| timed::<R>(e.into()))?;
+            }
         }
     }
     Ok(())
@@ -462,28 +755,14 @@ where
     if sent.is_some()
         && let Some(((key, iv, seq), _)) = keys.as_ref()
     {
-        let opening = wire::send(&mut writer, wire::OPENING, &[&key[..], &iv[..], &seq.to_be_bytes()[..]].concat()).await;
+        let opening = wire::send(writer, wire::OPENING, &[&key[..], &iv[..], &seq.to_be_bytes()[..]].concat()).await;
         if outcome.is_ok() {
             opening?;
         }
     }
     outcome?;
     let (sent, hidden) = sent.expect("loop ends only after a request was sent");
-    let sealed = Sealed { sent, hidden, tls: server_tls.expect("a request is sent only after the handshake") };
-    if let Some(frame) = conclude(&sealed, response)? {
-        wire::send(&mut writer, wire::OUTCOME, &frame).await?;
-    }
-    wire::send(&mut writer, wire::DONE, b"{\"status\":\"complete\"}").await?;
-    // The supplier may still be forwarding X's close. Dropping the socket
-    // with those frames unread can reset it and lose the result on its way
-    // out, so close our half and let the supplier finish, briefly.
-    let _ = writer.shutdown().await;
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        let mut sink = [0u8; 4096];
-        while matches!(reader.read(&mut sink).await, Ok(n) if n > 0) {}
-    })
-    .await;
-    Ok(sealed)
+    Ok(Sealed { sent, hidden, tls: server_tls.expect("a request is sent only after the handshake") })
 }
 
 fn tls_info(conn: &ClientConnection) -> TlsInfo {

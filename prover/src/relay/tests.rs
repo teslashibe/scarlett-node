@@ -20,6 +20,28 @@ use super::{node, ot::NodeOt, record, tag, verifier::{self, Failure}, wire};
 use crate::xpolicy;
 
 pub(crate) const AUTH: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// A private directory for a test's page body files, removed with it.
+pub(crate) struct BodyDir(pub std::path::PathBuf);
+
+impl BodyDir {
+    pub fn new() -> Self {
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = std::env::temp_dir().join(format!("scarlett-relay-bodies-{:032x}", rand::random::<u128>()));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        Self(dir)
+    }
+
+    pub fn file(&self) -> std::path::PathBuf {
+        self.0.join(format!("{:032x}.body", rand::random::<u128>()))
+    }
+}
+
+impl Drop for BodyDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 pub(crate) const RESPONSE_BODY: &str = r#"{"data":{"user":{"result":{"rest_id":"12","legacy":{"screen_name":"jack"}}}}}"#;
 
 fn csrf() -> String {
@@ -955,7 +977,8 @@ where
     };
     let request = crate::webpolicy::request(&url, &web_headers());
     let server_name = crate::webpolicy::url_host(&url).to_owned();
-    let outcome = within(verifier::run_web(verifier_end, config, &server_name, exactly(&request), max, |outcome| {
+    let bodies = BodyDir::new();
+    let outcome = within(verifier::run_web(verifier_end, config, &server_name, exactly(&request), crate::webpolicy::Framer::new(max), bodies.file(), |outcome| {
         Ok(serde_json::to_vec(&serde_json::json!({"hop":0,"url":url,"status_code":outcome.response.status,"final":true})).unwrap())
     }))
     .await;
@@ -987,7 +1010,7 @@ async fn a_web_hop_reaches_the_verifier_and_only_its_outcome_reaches_the_supplie
     assert_eq!((reported.hop, reported.url.as_str(), reported.status_code, reported.is_final, reported.next_url), (0, url, 200, true, None));
     assert_eq!(origin.seen.lock().unwrap().as_deref(), Some(&raw[..]));
     assert_eq!(outcome.sent, raw);
-    assert_eq!((outcome.response.status, outcome.response.body.as_slice(), outcome.response.received), (200, &b"<p>secret</p>"[..], PAGE.len()));
+    assert_eq!((outcome.response.status, outcome.body.as_slice(), outcome.response.received, outcome.response.body_bytes), (200, &b"<p>secret</p>"[..], PAGE.len(), 13));
     assert_eq!(outcome.tls.alpn.as_deref(), Some("http/1.1"));
     // The supplier got the record material, the opening, the outcome and DONE: never the page.
     let frames = to_node.lock().unwrap();
@@ -1052,7 +1075,7 @@ async fn a_web_verifier_authorizes_only_the_canonical_request_and_classifies_fai
     let cases: Vec<(&str, Respond, bool, Vec<u8>, usize, Failure)> = vec![
         ("tampered request", page(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", End::Wait), false, other, 1 << 20, Failure::RequestRejected),
         ("tls 1.2", page(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", End::Wait), true, honest.clone(), 1 << 20, Failure::TlsFailed),
-        ("too large", page(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n", End::Wait), false, honest.clone(), 80, Failure::ResponseTooLarge),
+        ("too large", page(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n", End::Wait), false, honest.clone(), 80, Failure::PageTooLarge),
         ("bad head", page(b"HTTP/1.1 200 OK\r\nNo colon here\r\n\r\n", End::Wait), false, honest.clone(), 1 << 20, Failure::ResponseInvalid),
         ("cut short", page(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort", End::Close), false, honest.clone(), 1 << 20, Failure::ServerClosed),
         ("bare eof", page(b"HTTP/1.1 200 OK\r\n\r\nno length", End::Drop), false, honest.clone(), 1 << 20, Failure::ServerClosed),
@@ -1082,7 +1105,7 @@ async fn a_close_delimited_page_completes_on_close_notify_and_keeps_its_encoding
     let (node_result, outcome) = web_hop(origin.roots.clone(), node_end, verifier_end, tcp, url, crate::webpolicy::request(url, &web_headers()), "www.example.com", 1 << 20).await;
     let outcome = outcome.unwrap();
     assert!(node_result.is_ok());
-    assert_eq!((outcome.response.framing, outcome.response.body.as_slice()), (crate::webpolicy::Framing::Close, &b"\x1f\x8b\x08\x00binary"[..]));
+    assert_eq!((outcome.response.framing, outcome.body.as_slice()), (crate::webpolicy::Framing::Close, &b"\x1f\x8b\x08\x00binary"[..]));
 }
 
 #[tokio::test]
@@ -1093,7 +1116,8 @@ async fn a_web_session_refuses_hidden_bytes() {
     let supplier = tokio::spawn(rogue_supplier(origin.addr, node_end, 64, vec![]));
     let url = "https://example.com/";
     let request = crate::webpolicy::request(url, &web_headers());
-    let error = within(verifier::run_web(verifier_end, verifier::tls_config(origin.roots.clone()).unwrap(), "example.com", exactly(&request), 1 << 20, |_| Ok(Vec::new()))).await.err().unwrap();
+    let bodies = BodyDir::new();
+    let error = within(verifier::run_web(verifier_end, verifier::tls_config(origin.roots.clone()).unwrap(), "example.com", exactly(&request), crate::webpolicy::Framer::new(1 << 20), bodies.file(), |_| Ok(Vec::new()))).await.err().unwrap();
     assert_eq!(Failure::of(&error), Failure::RequestRejected);
     assert_eq!(within(supplier).await.unwrap(), 0);
 }
@@ -1108,7 +1132,8 @@ async fn browser_hop(origin: &Server, node_raw: Vec<u8>) -> (Result<node::HopOut
     let tcp = TcpStream::connect(origin.addr).await.unwrap();
     let node = tokio::spawn(async move { node::web_session(node_end, tcp, &node_raw, "example.com", 0, url, &crate::diagnostics::Trace::new()).await });
     let config = verifier::tls_config(origin.roots.clone()).unwrap();
-    let outcome = within(verifier::run_web(verifier_end, config, "example.com", |public| webpolicy::authorize(&job, url, public).map(drop), 1 << 20, |outcome| {
+    let bodies = BodyDir::new();
+    let outcome = within(verifier::run_web(verifier_end, config, "example.com", |public| webpolicy::authorize(&job, url, public).map(drop), webpolicy::Framer::new(1 << 20), bodies.file(), |outcome| {
         Ok(serde_json::to_vec(&serde_json::json!({"hop":0,"url":url,"status_code":outcome.response.status,"final":true})).unwrap())
     }))
     .await;
@@ -1164,7 +1189,8 @@ async fn live_web_hop_is_verified() {
         let (raw, host, url) = (raw.clone(), host.clone(), url.clone());
         tokio::spawn(async move { node::web_session(node_end, tcp, &raw, &host, 0, &url, &crate::diagnostics::Trace::new()).await })
     };
-    let outcome = within(verifier::run_web(verifier_end, config, &host, exactly(&raw), crate::webpolicy::MAX_RESPONSE, |outcome| {
+    let bodies = BodyDir::new();
+    let outcome = within(verifier::run_web(verifier_end, config, &host, exactly(&raw), crate::webpolicy::Framer::new(crate::webpolicy::PAGE_MAX), bodies.file(), |outcome| {
         Ok(serde_json::to_vec(&serde_json::json!({"hop":0,"url":url,"status_code":outcome.response.status,"final":true})).unwrap())
     }))
     .await;
@@ -1175,7 +1201,7 @@ async fn live_web_hop_is_verified() {
             outcome.response.status,
             reported.status_code,
             outcome.response.framing.name(),
-            outcome.response.body.len(),
+            outcome.response.body_bytes,
             outcome.response.received,
             outcome.tls.alpn,
             started.elapsed()

@@ -34,14 +34,23 @@ pub const BROWSER_POLICY: &str = "web-browser-v1";
 pub const PAYLOAD_TYPE: &str = "web.fetch";
 pub const MAX_REDIRECTS: usize = 5;
 pub const MAX_URL: usize = 2048;
-/// Decrypted response bytes per hop, heads and chunk framing included.
-pub const MAX_RESPONSE: usize = 10 << 20;
+/// The page ceiling: a hop's entity bytes (de-chunked, still
+/// content-encoded). Every web job's `max_response_bytes` must equal it.
+pub const PAGE_MAX: usize = 64 << 20;
 /// All response heads of one hop, interim 1xx heads included.
 pub const MAX_HEAD: usize = 64 << 10;
 const MAX_TRAILERS: usize = 8 << 10;
 const MAX_CHUNK_LINE: usize = 4 << 10;
-/// Longest a single hop's session may run on either side.
-pub const HOP_LIMIT: Duration = Duration::from_secs(30);
+/// Longest a single hop's session may run on either side: a 64 MiB page at
+/// 1.92 Mbit/s.
+pub const HOP_LIMIT: Duration = Duration::from_secs(280);
+
+/// Every decrypted byte one hop may take for an entity of at most
+/// `max_entity` bytes: the entity, its heads (interim heads included),
+/// trailers and chunk framing. Chunks of 1 KiB or more always fit.
+pub const fn max_wire(max_entity: usize) -> usize {
+    max_entity + MAX_HEAD + max_entity / 64
+}
 /// Payload header names in the only order they may appear, and their wire spelling.
 const HEADERS: [(&str, &str); 3] = [("user-agent", "User-Agent"), ("accept", "Accept"), ("accept-language", "Accept-Language")];
 const MAX_HEADER_VALUE: usize = 512;
@@ -358,6 +367,11 @@ pub struct Job {
 }
 
 impl Job {
+    /// What hop `index` at `url` may do with a redirect.
+    pub fn rule(&self, url: &str, index: usize) -> HopRule {
+        HopRule { url: url.to_owned(), can_follow: index < self.max_redirects }
+    }
+
     /// The request bytes for one hop: the node's headers are required
     /// under `web-browser-v1` and refused otherwise.
     pub fn hop_request(&self, url: &str, node: Option<&NodeHeaders>) -> Result<Vec<u8>> {
@@ -408,8 +422,11 @@ pub fn validate_job(payload: &Value) -> Result<Job> {
     if canonical_url(&p.url).ok().as_deref() != Some(p.url.as_str()) {
         bail!("web job URL must be a canonical public https URL");
     }
-    if p.max_redirects > MAX_REDIRECTS as u64 || !(1..=MAX_RESPONSE as u64).contains(&p.max_response_bytes) {
+    if p.max_redirects > MAX_REDIRECTS as u64 {
         bail!("web job limits are out of range");
+    }
+    if p.max_response_bytes != PAGE_MAX as u64 {
+        bail!("web jobs must set max_response_bytes to the page ceiling, {PAGE_MAX}");
     }
     if policy == Policy::Browser {
         let headers: Vec<(&str, &str)> = p.headers.iter().map(|h| (h.name.as_str(), h.value.as_str())).collect();
@@ -419,7 +436,7 @@ pub fn validate_job(payload: &Value) -> Result<Job> {
         if p.node_headers.as_deref().is_none_or(|names| names != NODE_HEADERS) {
             bail!("{BROWSER_POLICY} jobs must name node_headers user-agent and cookie, in that order");
         }
-        if p.max_redirects != MAX_REDIRECTS as u64 || p.max_response_bytes != MAX_RESPONSE as u64 {
+        if p.max_redirects != MAX_REDIRECTS as u64 {
             bail!("{BROWSER_POLICY} jobs must use the default limits");
         }
     } else if p.node_headers.is_some() {
@@ -652,7 +669,8 @@ impl Framing {
 /// Why a response could not be framed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameError {
-    /// More decrypted bytes than the job allows.
+    /// The entity is over the job's page ceiling, or the hop took more
+    /// decrypted bytes than that ceiling allows (`max_wire`).
     TooLarge,
     /// A malformed head or body framing.
     Invalid,
@@ -663,7 +681,7 @@ pub enum FrameError {
 impl fmt::Display for FrameError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::TooLarge => "response exceeds the job's size limit",
+            Self::TooLarge => "response exceeds the page ceiling",
             Self::Invalid => "response head or framing is invalid",
             Self::Closed => "server closed before the response was complete",
         })
@@ -685,39 +703,68 @@ enum State {
     Done,
 }
 
-/// One complete response as the verifier decrypted it.
+/// What a hop's final response may do next: the URL its `Location`
+/// resolves against, and whether a followable redirect may be followed (the
+/// hop is below the job's `max_redirects`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HopRule {
+    pub url: String,
+    pub can_follow: bool,
+}
+
+/// One complete response as the verifier decrypted it. The entity itself is
+/// not here: it was handed out as it arrived (`Framer::take_entity`).
+#[derive(Debug)]
 pub struct Response {
     pub status: u16,
     /// The final (non-1xx) status line and header lines, through the blank line.
     pub head: Vec<u8>,
-    /// The entity body: transfer-decoded, still content-encoded.
-    pub body: Vec<u8>,
+    /// Entity bytes: transfer-decoded, still content-encoded.
+    pub body_bytes: usize,
+    /// SHA-256 of the entity.
+    pub body_sha256: [u8; 32],
     pub framing: Framing,
     /// Decrypted bytes up to completion, interim heads and chunk framing included.
     pub received: usize,
     /// SHA-256 of those bytes.
     pub response_sha256: [u8; 32],
-    locations: Vec<Vec<u8>>,
+    /// The canonical next URL of a redirect's `Location`, set even on the
+    /// last allowed hop.
+    pub location: Option<String>,
+    /// Why a redirect's `Location` could not be followed.
+    pub location_refused: Option<&'static str>,
+    /// Whether the verifier follows `location`. Its entity was hashed and
+    /// counted but never handed out; every other response's was.
+    pub followable: bool,
 }
 
-impl Response {
-    /// The `Location` header, if exactly one value was sent.
-    pub fn location(&self) -> Option<Result<&str, UrlError>> {
-        let first = self.locations.first()?;
-        if self.locations.iter().any(|l| l != first) {
-            return Some(Err(UrlError::Invalid));
-        }
-        Some(std::str::from_utf8(first).map_err(|_| UrlError::Invalid))
-    }
+/// What a hop had taken when it ended, complete or not.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    /// Decrypted bytes, heads and framing included.
+    pub received: usize,
+    /// Entity bytes.
+    pub entity: usize,
+    /// The final head's Content-Length, if it had one.
+    pub declared: Option<u64>,
 }
 
 /// Frames an HTTP/1.x response as its bytes arrive. Each byte is examined
 /// once: the head search resumes where it stopped, and the body is parsed
-/// as a stream.
+/// as a stream. The entity is counted and hashed here and, unless the
+/// response is a followable redirect, handed out in pieces through
+/// `take_entity`, so a page is never held whole. Followability is decided
+/// once, when the final head is parsed.
 pub struct Framer {
-    max: usize,
+    max_entity: usize,
+    max_wire: usize,
     received: usize,
+    entity: usize,
+    declared: Option<u64>,
+    /// The entity passed `max_entity`; the step that did it has been counted.
+    over: bool,
     hasher: Sha256,
+    body_hasher: Sha256,
     state: State,
     head: Vec<u8>,
     /// Bytes of earlier interim heads.
@@ -726,16 +773,27 @@ pub struct Framer {
     trailers: usize,
     status: u16,
     framing: Framing,
-    body: Vec<u8>,
-    locations: Vec<Vec<u8>>,
+    rule: Option<HopRule>,
+    location: Option<String>,
+    location_refused: Option<&'static str>,
+    followable: bool,
+    /// Entity bytes not yet taken.
+    out: Vec<u8>,
 }
 
 impl Framer {
-    pub fn new(max_response_bytes: usize) -> Self {
+    /// A framer for a response that is never followed: its entity is always
+    /// handed out and no `Location` is resolved.
+    pub fn new(max_entity: usize) -> Self {
         Self {
-            max: max_response_bytes,
+            max_entity,
+            max_wire: max_wire(max_entity),
             received: 0,
+            entity: 0,
+            declared: None,
+            over: false,
             hasher: Sha256::new(),
+            body_hasher: Sha256::new(),
             state: State::Head,
             head: Vec::new(),
             interim: 0,
@@ -743,25 +801,53 @@ impl Framer {
             trailers: 0,
             status: 0,
             framing: Framing::None,
-            body: Vec::new(),
-            locations: Vec::new(),
+            rule: None,
+            location: None,
+            location_refused: None,
+            followable: false,
+            out: Vec::new(),
         }
+    }
+
+    /// A framer for one hop under `rule`.
+    pub fn for_hop(max_entity: usize, rule: HopRule) -> Self {
+        Self { rule: Some(rule), ..Self::new(max_entity) }
     }
 
     pub fn complete(&self) -> bool {
         self.state == State::Done
     }
 
+    /// Whether the final head is parsed and the entity is to be kept: every
+    /// final response but a followable redirect.
+    pub fn stores_body(&self) -> bool {
+        self.status != 0 && !self.followable
+    }
+
+    /// Entity bytes framed since the last call (always empty for a
+    /// followable redirect).
+    pub fn take_entity(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.out)
+    }
+
+    pub fn counts(&self) -> Counts {
+        Counts { received: self.received, entity: self.entity, declared: self.declared }
+    }
+
     /// Takes decrypted bytes and returns whether the response is complete.
-    /// Bytes after the end of the response are not part of it.
+    /// Bytes after the end of the response are not part of it. A failure
+    /// leaves `counts` at what was taken, the byte that broke a limit
+    /// included.
     pub fn push(&mut self, mut data: &[u8]) -> Result<bool, FrameError> {
         while !data.is_empty() && self.state != State::Done {
-            let used = self.step(data)?;
+            // Never take more than one byte past the wire limit.
+            let room = (self.max_wire + 1).saturating_sub(self.received);
+            let used = self.step(&data[..data.len().min(room)])?;
             self.received += used;
-            if self.received > self.max {
+            self.hasher.update(&data[..used]);
+            if self.over || self.received > self.max_wire {
                 return Err(FrameError::TooLarge);
             }
-            self.hasher.update(&data[..used]);
             data = &data[used..];
             if self.state == State::Head && self.head.ends_with(b"\r\n\r\n") {
                 self.parse_head()?;
@@ -789,12 +875,32 @@ impl Framer {
         Response {
             status: self.status,
             head: std::mem::take(&mut self.head),
-            body: std::mem::take(&mut self.body),
+            body_bytes: self.entity,
+            body_sha256: std::mem::take(&mut self.body_hasher).finalize().into(),
             framing: self.framing,
             received: self.received,
             response_sha256: std::mem::take(&mut self.hasher).finalize().into(),
-            locations: std::mem::take(&mut self.locations),
+            location: self.location.take(),
+            location_refused: self.location_refused,
+            followable: self.followable,
         }
+    }
+
+    /// Takes entity bytes, at most one past the ceiling, and returns how
+    /// many it took.
+    fn entity(&mut self, data: &[u8], remaining: usize) -> usize {
+        let take = remaining.min(data.len()).min(self.max_entity + 1 - self.entity);
+        let bytes = &data[..take];
+        self.entity += take;
+        if self.entity > self.max_entity {
+            self.over = true;
+            return take;
+        }
+        self.body_hasher.update(bytes);
+        if !self.followable {
+            self.out.extend_from_slice(bytes);
+        }
+        take
     }
 
     /// Consumes a prefix of `data` in the current state and returns its length.
@@ -817,8 +923,7 @@ impl Framer {
                 }
             }
             State::Length(remaining) => {
-                let take = remaining.min(data.len());
-                self.body.extend_from_slice(&data[..take]);
+                let take = self.entity(data, remaining);
                 self.state = if take == remaining { State::Done } else { State::Length(remaining - take) };
                 take
             }
@@ -831,8 +936,7 @@ impl Framer {
                 used
             }
             State::ChunkData(remaining) => {
-                let take = remaining.min(data.len());
-                self.body.extend_from_slice(&data[..take]);
+                let take = self.entity(data, remaining);
                 self.state = if take == remaining { State::ChunkEnd(0) } else { State::ChunkData(remaining - take) };
                 take
             }
@@ -854,10 +958,7 @@ impl Framer {
                 }
                 used
             }
-            State::Close => {
-                self.body.extend_from_slice(data);
-                data.len()
-            }
+            State::Close => self.entity(data, usize::MAX),
             State::Done => 0,
         })
     }
@@ -885,7 +986,8 @@ impl Framer {
     }
 
     /// Parses a complete head and sets up the body, or waits for the next
-    /// head after an interim response.
+    /// head after an interim response. The final head also decides, once,
+    /// whether the response is a followable redirect.
     fn parse_head(&mut self) -> Result<(), FrameError> {
         let head = &self.head;
         let status_line_end = find(head, b"\r\n").ok_or(FrameError::Invalid)?;
@@ -933,7 +1035,21 @@ impl Framer {
             return Ok(());
         }
         self.status = status;
-        self.locations = locations;
+        // A redirect's Location: every value equal, UTF-8, and resolving to
+        // a canonical public https URL. It is followed only below the job's
+        // redirect limit; the last allowed hop is final either way.
+        if let (Some(rule), true, Some(first)) = (&self.rule, REDIRECTS.contains(&status), locations.first()) {
+            let resolved = if locations.iter().any(|l| l != first) {
+                Err(UrlError::Invalid)
+            } else {
+                std::str::from_utf8(first).map_err(|_| UrlError::Invalid).and_then(|location| resolve_location(&rule.url, location))
+            };
+            match resolved {
+                Ok(next) => self.location = Some(next),
+                Err(refused) => self.location_refused = Some(refused.code()),
+            }
+            self.followable = self.location.is_some() && rule.can_follow;
+        }
         (self.framing, self.state) = if matches!(status, 204 | 304) {
             (Framing::None, State::Done)
         } else if transfer_encoding {
@@ -942,11 +1058,13 @@ impl Framer {
             if lengths.iter().any(|l| l != first) || first.is_empty() || first.len() > 19 || !first.iter().all(u8::is_ascii_digit) {
                 return Err(FrameError::Invalid);
             }
-            let length = std::str::from_utf8(first).ok().and_then(|s| s.parse::<usize>().ok()).ok_or(FrameError::Invalid)?;
-            if length > self.max.saturating_sub(self.received) {
+            let length = std::str::from_utf8(first).ok().and_then(|s| s.parse::<u64>().ok()).ok_or(FrameError::Invalid)?;
+            self.declared = Some(length);
+            // Refused at the head, before any body byte is relayed.
+            if length > self.max_entity as u64 {
                 return Err(FrameError::TooLarge);
             }
-            (Framing::ContentLength, if length == 0 { State::Done } else { State::Length(length) })
+            (Framing::ContentLength, if length == 0 { State::Done } else { State::Length(length as usize) })
         } else {
             (Framing::Close, State::Close)
         };
@@ -990,7 +1108,7 @@ pub(crate) mod fixtures {
 
     /// The B.2 `web_payload` for `url`.
     pub fn browser_payload(url: &str) -> Value {
-        json!({"type":"web.fetch","proof_mode":"relay","proof_policy":"web-browser-v1","url":url,"max_redirects":5,"max_response_bytes":10485760,
+        json!({"type":"web.fetch","proof_mode":"relay","proof_policy":"web-browser-v1","url":url,"max_redirects":5,"max_response_bytes":67108864,
             "headers":[{"name":"accept","value":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},{"name":"accept-language","value":"en-US,en;q=0.9"}],
             "node_headers":["user-agent","cookie"]})
     }
@@ -1233,11 +1351,11 @@ mod tests {
     #[test]
     fn validates_the_browser_payload_and_rejects_every_mutation() {
         let job = browser_job();
-        assert_eq!((job.policy, job.max_redirects, job.max_response_bytes, job.headers.len()), (Policy::Browser, 5, 10 << 20, 2));
+        assert_eq!((job.policy, job.max_redirects, job.max_response_bytes, job.headers.len()), (Policy::Browser, 5, PAGE_MAX, 2));
         assert_eq!((Policy::Browser.name(), Policy::Relay.name()), ("web-browser-v1", "web-relay-v1"));
         assert_eq!(validate_job(&payload()).unwrap().policy, Policy::Relay);
         // The coordinator registers it as these exact bytes (B.2's request_sha256).
-        assert_eq!(format!("{:x}", Sha256::digest(serde_json::to_vec(&browser_payload("https://example.com/")).unwrap())), "f24ba0094ed03be33c287a26997889217a0e6aebf62ca0b278f34dbecf0a175e");
+        assert_eq!(format!("{:x}", Sha256::digest(serde_json::to_vec(&browser_payload("https://example.com/")).unwrap())), "964f55b17be3ad0fb55ae96c3a1cdd36883b9a2f4833da2946c1eeefcdd62ba7");
         let mutations: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
             ("user agent header", Box::new(|p| p["headers"].as_array_mut().unwrap().insert(0, json!({"name":"user-agent","value":DARWIN_UA})))),
             ("header order", Box::new(|p| p["headers"].as_array_mut().unwrap().swap(0, 1))),
@@ -1350,18 +1468,19 @@ mod tests {
     }
 
     fn payload() -> Value {
-        json!({"type":"web.fetch","proof_mode":"relay","proof_policy":"web-relay-v1","url":"https://example.com/","max_redirects":5,"max_response_bytes":10485760,"headers":vectors()["default_headers"]})
+        json!({"type":"web.fetch","proof_mode":"relay","proof_policy":"web-relay-v1","url":"https://example.com/","max_redirects":5,"max_response_bytes":67108864,"headers":vectors()["default_headers"]})
     }
 
     #[test]
     fn validates_the_contract_payload_and_rejects_every_mutation() {
         let job = validate_job(&payload()).unwrap();
-        assert_eq!((job.url.as_str(), job.max_redirects, job.max_response_bytes, job.headers.len()), ("https://example.com/", 5, 10 << 20, 3));
+        assert_eq!((job.url.as_str(), job.max_redirects, job.max_response_bytes, job.headers.len()), ("https://example.com/", 5, PAGE_MAX, 3));
         let mut minimal = payload();
         minimal["headers"] = json!([]);
         minimal["max_redirects"] = 0.into();
-        minimal["max_response_bytes"] = 1.into();
         assert!(validate_job(&minimal).is_ok());
+        // The relay payload of the node contract (api/fixtures/lease-web.json) hashes to its request_sha256.
+        assert_eq!(format!("{:x}", Sha256::digest(serde_json::to_vec(&payload()).unwrap())), "d4362de8c9e08295b9a777f758e8f9833a4257b30b689c391d609c0e4a7c610c");
         let mutations: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
             ("type", Box::new(|p| p["type"] = "x.read".into())),
             ("mode", Box::new(|p| p["proof_mode"] = "mpc".into())),
@@ -1373,7 +1492,9 @@ mod tests {
             ("redirects", Box::new(|p| p["max_redirects"] = 6.into())),
             ("negative", Box::new(|p| p["max_redirects"] = (-1).into())),
             ("zero bytes", Box::new(|p| p["max_response_bytes"] = 0.into())),
-            ("bytes", Box::new(|p| p["max_response_bytes"] = (MAX_RESPONSE + 1).into())),
+            ("bytes", Box::new(|p| p["max_response_bytes"] = (PAGE_MAX + 1).into())),
+            ("fewer bytes", Box::new(|p| p["max_response_bytes"] = (PAGE_MAX - 1).into())),
+            ("ten MiB", Box::new(|p| p["max_response_bytes"] = (10u64 << 20).into())),
             ("non-canonical", Box::new(|p| p["url"] = "https://Example.com/".into())),
             ("http", Box::new(|p| p["url"] = "http://example.com/".into())),
             ("x host", Box::new(|p| p["url"] = "https://x.com/".into())),
@@ -1396,30 +1517,32 @@ mod tests {
         }
     }
 
-    fn frame(response: &[u8], max: usize) -> Result<Response, FrameError> {
+    /// Frames a whole response and returns it with its entity.
+    fn frame(response: &[u8], max: usize) -> Result<(Response, Vec<u8>), FrameError> {
         let mut framer = Framer::new(max);
         if !framer.push(response)? {
             framer.close_notify()?;
         }
-        Ok(framer.finish())
+        let body = framer.take_entity();
+        Ok((framer.finish(), body))
     }
 
     #[test]
     fn content_length_and_bodyless_responses() {
-        let r = frame(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhelloEXTRA", 1 << 20).unwrap();
-        assert_eq!((r.status, r.body.as_slice(), r.framing, r.received), (200, &b"hello"[..], Framing::ContentLength, 62));
+        let (r, body) = frame(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhelloEXTRA", 1 << 20).unwrap();
+        assert_eq!((r.status, body.as_slice(), r.framing, r.received, r.body_bytes), (200, &b"hello"[..], Framing::ContentLength, 62, 5));
+        assert_eq!(r.body_sha256, <[u8; 32]>::from(Sha256::digest(b"hello")));
         assert_eq!(r.head, b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n");
         assert_eq!(r.response_sha256, <[u8; 32]>::from(Sha256::digest(&b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello"[..])));
         for head in [&b"HTTP/1.1 204 No Content\r\nContent-Length: 10\r\n\r\n"[..], b"HTTP/1.0 304 Not Modified\r\nTransfer-Encoding: chunked\r\n\r\n", b"HTTP/1.1 200\r\nContent-Length: 0\r\n\r\n"] {
             let mut framer = Framer::new(1 << 20);
             assert!(framer.push(head).unwrap());
-            assert!(framer.finish().body.is_empty());
+            assert!(framer.take_entity().is_empty());
+            assert_eq!(framer.finish().body_bytes, 0);
         }
-        let r = frame(b"HTTP/1.1 301 Moved\r\nLocation: /next\r\nContent-Length: 0\r\n\r\n", 1 << 20).unwrap();
-        assert_eq!((r.framing, r.location()), (Framing::ContentLength, Some(Ok("/next"))));
-        let mut framer = Framer::new(1 << 20);
-        assert!(framer.push(b"HTTP/1.1 302 Found\r\nLocation: /a\r\nLocation: /b\r\nContent-Length: 0\r\n\r\n").unwrap());
-        assert_eq!(framer.finish().location(), Some(Err(UrlError::Invalid)));
+        // Without a hop rule nothing is resolved or followed.
+        let (r, _) = frame(b"HTTP/1.1 301 Moved\r\nLocation: /next\r\nContent-Length: 0\r\n\r\n", 1 << 20).unwrap();
+        assert_eq!((r.framing, r.location, r.followable), (Framing::ContentLength, None, false));
         // Conflicting lengths are refused, whether on one line or several.
         for head in [&b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n"[..], b"HTTP/1.1 200 OK\r\nContent-Length: 5, 6\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n", b"HTTP/1.1 200 OK\r\nContent-Length: 0x5\r\n\r\n"] {
             assert_eq!(Framer::new(1 << 20).push(head).err(), Some(FrameError::Invalid));
@@ -1429,22 +1552,26 @@ mod tests {
     #[test]
     fn chunked_bodies_parse_at_every_split_without_rescanning() {
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n5;name=value\r\nhello\r\n7 ; x\r\n, world\r\n0\r\nX-Trailer: yes\r\nOther: 1\r\n\r\nNEXT";
-        let whole = frame(response, 1 << 20).unwrap();
-        assert_eq!((whole.body.as_slice(), whole.framing, whole.received), (&b"hello, world"[..], Framing::Chunked, response.len() - 4));
+        let (whole, whole_body) = frame(response, 1 << 20).unwrap();
+        assert_eq!((whole_body.as_slice(), whole.framing, whole.received, whole.body_bytes), (&b"hello, world"[..], Framing::Chunked, response.len() - 4, 12));
         for split in 0..response.len() {
             let mut framer = Framer::new(1 << 20);
             let first = framer.push(&response[..split]).unwrap();
             assert!(!first || split >= response.len() - 4, "complete early at {split}");
+            let mut body = framer.take_entity();
             assert!(framer.push(&response[split..]).unwrap(), "split at {split}");
+            body.extend(framer.take_entity());
             let r = framer.finish();
-            assert_eq!((r.body, r.received, r.response_sha256), (whole.body.clone(), whole.received, whole.response_sha256));
+            assert_eq!((body.as_slice(), r.received, r.response_sha256, r.body_sha256), (whole_body.as_slice(), whole.received, whole.response_sha256, whole.body_sha256));
         }
         // Byte by byte as well.
         let mut framer = Framer::new(1 << 20);
+        let mut body = Vec::new();
         for byte in response {
             framer.push(std::slice::from_ref(byte)).unwrap();
+            body.extend(framer.take_entity());
         }
-        assert_eq!(framer.finish().body, b"hello, world");
+        assert_eq!(body, b"hello, world");
         for bad in [
             &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"[..],
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX",
@@ -1461,8 +1588,8 @@ mod tests {
     #[test]
     fn interim_responses_are_skipped_and_switching_protocols_refused() {
         let response = b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\nHTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
-        let r = frame(response, 1 << 20).unwrap();
-        assert_eq!((r.status, r.body.as_slice()), (200, &b"ok"[..]));
+        let (r, body) = frame(response, 1 << 20).unwrap();
+        assert_eq!((r.status, body.as_slice()), (200, &b"ok"[..]));
         assert_eq!(r.head, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n");
         assert_eq!(r.received, response.len());
         assert_eq!(Framer::new(1 << 20).push(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: x\r\n\r\n").err(), Some(FrameError::Invalid));
@@ -1475,8 +1602,9 @@ mod tests {
             assert!(!framer.push(head).unwrap());
             assert!(!framer.push(b"partial page").unwrap());
             framer.close_notify().unwrap();
+            let body = framer.take_entity();
             let r = framer.finish();
-            assert_eq!((r.body.as_slice(), r.framing), (&b"partial page"[..], Framing::Close));
+            assert_eq!((body.as_slice(), r.framing, r.body_bytes), (&b"partial page"[..], Framing::Close, 12));
         }
         // A close_notify ends nothing that has its own length.
         let mut framer = Framer::new(1 << 20);
@@ -1505,14 +1633,21 @@ mod tests {
         exact.extend(b"\r\nContent-Length: 0\r\n\r\n");
         assert_eq!(exact.len(), MAX_HEAD);
         assert!(Framer::new(1 << 20).push(&exact).unwrap());
+        // The ceiling is on entity bytes: heads and framing do not count.
         let body = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
-        assert_eq!(Framer::new(100).push(body).err(), Some(FrameError::TooLarge));
-        let mut framer = Framer::new(60);
+        assert!(!Framer::new(100).push(body).unwrap());
+        let mut framer = Framer::new(99);
+        assert_eq!(framer.push(body).err(), Some(FrameError::TooLarge));
+        assert_eq!(framer.counts(), Counts { received: body.len(), entity: 0, declared: Some(100) });
+        let mut framer = Framer::new(31);
         framer.push(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
         assert_eq!(framer.push(b"20\r\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n").err(), Some(FrameError::TooLarge));
-        let mut framer = Framer::new(50);
+        assert_eq!((framer.counts().entity, framer.counts().declared), (32, None));
+        let mut framer = Framer::new(39);
         framer.push(b"HTTP/1.0 200 OK\r\n\r\n").unwrap();
-        assert_eq!(framer.push(&[b'a'; 40]).err(), Some(FrameError::TooLarge));
+        assert_eq!(framer.push(&[b'a'; 50]).err(), Some(FrameError::TooLarge));
+        // Counting stops at the first byte over the ceiling.
+        assert_eq!(framer.counts(), Counts { received: 19 + 40, entity: 40, declared: None });
     }
 
     #[test]
@@ -1531,7 +1666,115 @@ mod tests {
             assert_eq!(Framer::new(1 << 20).push(head).err(), Some(FrameError::Invalid), "{}", String::from_utf8_lossy(head));
         }
         // Non-standard statuses and binary bodies are fine.
-        let r = frame(b"HTTP/1.1 999 Request denied\r\nContent-Length: 3\r\n\r\n\xff\x00\xfe", 1 << 20).unwrap();
-        assert_eq!((r.status, r.body.as_slice()), (999, &b"\xff\x00\xfe"[..]));
+        let (r, body) = frame(b"HTTP/1.1 999 Request denied\r\nContent-Length: 3\r\n\r\n\xff\x00\xfe", 1 << 20).unwrap();
+        assert_eq!((r.status, body.as_slice()), (999, &b"\xff\x00\xfe"[..]));
+    }
+
+    /// A response's entity streamed through a framer in `chunk`-byte
+    /// pushes, discarding what it hands out; returns the response, how many
+    /// entity bytes it handed out and their SHA-256.
+    fn stream(framer: &mut Framer, parts: impl IntoIterator<Item = Vec<u8>>) -> Result<(usize, [u8; 32]), FrameError> {
+        let (mut handed, mut hash) = (0, Sha256::new());
+        for part in parts {
+            for piece in part.chunks(16 << 10) {
+                framer.push(piece)?;
+                let out = framer.take_entity();
+                handed += out.len();
+                hash.update(&out);
+            }
+        }
+        Ok((handed, hash.finalize().into()))
+    }
+
+    /// `PAGE_MAX + extra` entity bytes in chunks of `size`, as a chunked response.
+    fn chunked_page(size: usize, extra: usize) -> impl Iterator<Item = Vec<u8>> {
+        let total = PAGE_MAX + extra;
+        let head = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        std::iter::once(head)
+            .chain((0..total.div_ceil(size)).map(move |i| {
+                let n = size.min(total - i * size);
+                let mut chunk = format!("{n:x}\r\n").into_bytes();
+                chunk.extend(std::iter::repeat_n(b'a' + (i % 26) as u8, n));
+                chunk.extend(b"\r\n");
+                chunk
+            }))
+            .chain(std::iter::once(b"0\r\n\r\n".to_vec()))
+    }
+
+    #[test]
+    fn a_page_of_exactly_the_ceiling_passes_in_small_chunks_and_one_byte_more_does_not() {
+        assert_eq!((PAGE_MAX, max_wire(PAGE_MAX)), (67_108_864, 68_222_976));
+        for size in [1 << 10, 8 << 10] {
+            let mut framer = Framer::new(PAGE_MAX);
+            let (handed, hash) = stream(&mut framer, chunked_page(size, 0)).unwrap();
+            assert!(framer.complete(), "{size}");
+            let r = framer.finish();
+            assert_eq!((handed, r.body_bytes, r.framing), (PAGE_MAX, PAGE_MAX, Framing::Chunked), "{size}");
+            assert_eq!(hash, r.body_sha256);
+            assert!(r.received > PAGE_MAX && r.received <= max_wire(PAGE_MAX), "{size}: {}", r.received);
+        }
+        let mut framer = Framer::new(PAGE_MAX);
+        assert_eq!(stream(&mut framer, chunked_page(8 << 10, 1)).err(), Some(FrameError::TooLarge));
+        let counts = framer.counts();
+        assert_eq!((counts.entity, counts.declared), (PAGE_MAX + 1, None));
+        assert!(counts.received > PAGE_MAX + 1);
+        // Content-Length: exactly the ceiling streams; one more is refused at the head.
+        let head = |n: usize| format!("HTTP/1.1 200 OK\r\nContent-Length: {n}\r\n\r\n").into_bytes();
+        let mut framer = Framer::new(PAGE_MAX);
+        let (handed, _) = stream(&mut framer, [head(PAGE_MAX), vec![b'x'; PAGE_MAX]]).unwrap();
+        assert_eq!((handed, framer.complete()), (PAGE_MAX, true));
+        let mut framer = Framer::new(PAGE_MAX);
+        assert_eq!(framer.push(&head(PAGE_MAX + 1)).err(), Some(FrameError::TooLarge));
+        assert_eq!(framer.counts(), Counts { received: head(PAGE_MAX + 1).len(), entity: 0, declared: Some(PAGE_MAX as u64 + 1) });
+        // Close-delimited: counting stops one byte over.
+        let mut framer = Framer::new(PAGE_MAX);
+        let close = b"HTTP/1.0 200 OK\r\n\r\n".to_vec();
+        assert_eq!(stream(&mut framer, [close.clone(), vec![b'y'; PAGE_MAX + 100]]).err(), Some(FrameError::TooLarge));
+        assert_eq!(framer.counts(), Counts { received: close.len() + PAGE_MAX + 1, entity: PAGE_MAX + 1, declared: None });
+        // Framing beyond max_wire is too large even when the entity is not:
+        // one-byte chunks cost six wire bytes each.
+        let mut framer = Framer::new(1 << 20);
+        let tiny: Vec<Vec<u8>> = std::iter::once(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec()).chain(std::iter::repeat_n(b"1\r\na\r\n".to_vec(), 400_000)).collect();
+        assert_eq!(stream(&mut framer, tiny).err(), Some(FrameError::TooLarge));
+        assert!(framer.counts().entity < 1 << 20);
+        assert_eq!(framer.counts().received, max_wire(1 << 20) + 1);
+    }
+
+    #[test]
+    fn followability_is_decided_once_at_the_final_head() {
+        let rule = |can_follow| HopRule { url: "https://example.com/a/b".into(), can_follow };
+        let run = |response: &[u8], can_follow| {
+            let mut framer = Framer::for_hop(1 << 20, rule(can_follow));
+            assert!(framer.push(response).unwrap());
+            let body = framer.take_entity();
+            (framer.finish(), body)
+        };
+        // A followable redirect: its body is hashed and counted, never handed out.
+        let (r, body) = run(b"HTTP/1.1 302 Found\r\nLocation: /next?x=1\r\nContent-Length: 5\r\n\r\nmoved", true);
+        assert_eq!((r.location.as_deref(), r.location_refused, r.followable, body.len(), r.body_bytes), (Some("https://example.com/next?x=1"), None, true, 0, 5));
+        assert_eq!(r.body_sha256, <[u8; 32]>::from(Sha256::digest(b"moved")));
+        // The same redirect on the last allowed hop is final and keeps its body.
+        let (r, body) = run(b"HTTP/1.1 302 Found\r\nLocation: /next?x=1\r\nContent-Length: 5\r\n\r\nmoved", false);
+        assert_eq!((r.location.as_deref(), r.followable, body.as_slice()), (Some("https://example.com/next?x=1"), false, &b"moved"[..]));
+        // A refused Location, and conflicting ones, are final with their reason and body.
+        for (head, reason) in [
+            (&b"HTTP/1.1 301 Moved\r\nLocation: http://example.com/\r\nContent-Length: 4\r\n\r\nbody"[..], "insecure"),
+            (b"HTTP/1.1 307 Temporary\r\nLocation: /a\r\nLocation: /b\r\nContent-Length: 4\r\n\r\nbody", "invalid"),
+            (b"HTTP/1.1 308 Permanent\r\nLocation: \xff\r\nContent-Length: 4\r\n\r\nbody", "invalid"),
+            (b"HTTP/1.1 303 See Other\r\nLocation: https://x.com/\r\nContent-Length: 4\r\n\r\nbody", "x_host"),
+        ] {
+            let (r, body) = run(head, true);
+            assert_eq!((r.location.as_deref(), r.location_refused, r.followable, body.as_slice()), (None, Some(reason), false, &b"body"[..]), "{reason}");
+        }
+        // Equal repeated Locations are one; a 3xx outside the five, or without a Location, is final.
+        let (r, _) = run(b"HTTP/1.1 301 Moved\r\nLocation: /n\r\nLocation: /n\r\nContent-Length: 0\r\n\r\n", true);
+        assert!(r.followable);
+        for head in [&b"HTTP/1.1 300 Multiple\r\nLocation: /n\r\nContent-Length: 1\r\n\r\nx"[..], b"HTTP/1.1 302 Found\r\nContent-Length: 1\r\n\r\nx"] {
+            let (r, body) = run(head, true);
+            assert_eq!((r.location, r.location_refused, r.followable, body.as_slice()), (None, None, false, &b"x"[..]));
+        }
+        // An interim head's Location decides nothing.
+        let (r, body) = run(b"HTTP/1.1 103 Early\r\nLocation: /n\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", true);
+        assert_eq!((r.status, r.followable, r.location, body.as_slice()), (200, false, None, &b"ok"[..]));
     }
 }
