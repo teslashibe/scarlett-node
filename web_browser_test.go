@@ -131,14 +131,19 @@ func TestBrowserRuntimeInputs(t *testing.T) {
 // nothing; the job was served from the re-fetch and the gap went unseen.
 func TestLogBrowserUploadRefusal(t *testing.T) {
 	const job = "11111111-1111-4111-8111-111111111111"
+	manifest := coordinator.BrowserResult{
+		Version: "node-v1", Attempt: "22222222-2222-4222-8222-222222222222", Fence: "33333333-3333-4333-8333-333333333333",
+		RequestSHA256: strings.Repeat("a", 64), URL: "https://example.com/", DOM: coordinator.DOMMemory, TreePeakBytes: 1 << 30,
+		Challenge: "none", Browser: coordinator.BrowserInfo{Engine: "chromium", Version: "1", UserAgent: "ua"},
+	}
 	for _, tc := range []struct {
 		name   string
 		status int
 		body   string
 		log    string
 	}{
-		{"host gate 404", http.StatusNotFound, "404 page not found\n", "web browser: result upload not stored: coordinator HTTP 404\n"},
-		{"fenced", http.StatusConflict, `{"error":{"code":"fenced","message":"The browser result does not match the current accepted lease."}}`, "web browser: result upload not stored: coordinator HTTP 409 fenced\n"},
+		{"host gate 404", http.StatusNotFound, "404 page not found\n", "web browser: result upload not stored (dom memory, 0 parts sent, 0 skipped, 0 retries): POST manifest: coordinator HTTP 404\n"},
+		{"fenced", http.StatusConflict, `{"error":{"code":"fenced","message":"The browser result does not match the current accepted lease."}}`, "web browser: result upload not stored (dom memory, 0 parts sent, 0 skipped, 0 retries): POST manifest: coordinator HTTP 409 fenced\n"},
 		{"stored", http.StatusOK, `{"status":"stored"}`, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -152,7 +157,7 @@ func TestLogBrowserUploadRefusal(t *testing.T) {
 			t.Cleanup(server.Close)
 			var out strings.Builder
 			upload := logBrowserUpload(coordinator.New(server.URL, "synthetic-credential").UploadBrowserResult, &out)
-			err := upload(context.Background(), job, []byte("synthetic gzip"), time.Now().Add(time.Minute))
+			err := upload(context.Background(), job, manifest, "", time.Now().Add(time.Minute))
 			if (err == nil) != (tc.status == http.StatusOK) || out.String() != tc.log {
 				t.Fatalf("err %v, log %q", err, out.String())
 			}

@@ -17,7 +17,7 @@ import (
 )
 
 // webPayloadA2 is the exact verifier payload of contract §A.2.
-const webPayloadA2 = `{"type":"web.fetch","proof_mode":"relay","proof_policy":"web-relay-v1","url":"https://example.com/","max_redirects":5,"max_response_bytes":10485760,"headers":[{"name":"user-agent","value":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"},{"name":"accept","value":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},{"name":"accept-language","value":"en-US,en;q=0.9"}]}`
+const webPayloadA2 = `{"type":"web.fetch","proof_mode":"relay","proof_policy":"web-relay-v1","url":"https://example.com/","max_redirects":5,"max_response_bytes":67108864,"headers":[{"name":"user-agent","value":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"},{"name":"accept","value":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},{"name":"accept-language","value":"en-US,en;q=0.9"}]}`
 
 func readLeaseFixture(t *testing.T, name string) Lease {
 	t.Helper()
@@ -128,11 +128,11 @@ func TestOpenAPIDescribesWeb(t *testing.T) {
 		t.Fatal("web request schema")
 	}
 	payload := get(schemas, "WebPayload")
-	if get(payload, "additionalProperties") != false || len(strs(get(payload, "required"))) != 7 || get(payload, "properties", "max_redirects", "maximum") != 5 || get(payload, "properties", "max_response_bytes", "maximum") != 10485760 || get(payload, "properties", "headers", "maxItems") != 3 || !slices.Equal(strs(get(payload, "properties", "headers", "items", "properties", "name", "enum")), []string{"user-agent", "accept", "accept-language"}) {
+	if get(payload, "additionalProperties") != false || len(strs(get(payload, "required"))) != 7 || get(payload, "properties", "max_redirects", "maximum") != 5 || !slices.Equal(get(payload, "properties", "max_response_bytes", "enum").([]any), []any{67108864}) || get(payload, "properties", "headers", "maxItems") != 3 || !slices.Equal(strs(get(payload, "properties", "headers", "items", "properties", "name", "enum")), []string{"user-agent", "accept", "accept-language"}) {
 		t.Fatal("web payload schema")
 	}
 	codes := strs(get(schemas, "Failure", "properties", "code", "enum"))
-	for _, code := range []string{"web_egress_denied", "web_dns_failed", "web_connect_failed", "web_proxy_failed", "web_fetch_failed"} {
+	for _, code := range []string{"web_egress_denied", "web_dns_failed", "web_connect_failed", "web_proxy_failed", "web_fetch_failed", "page_too_large"} {
 		if !slices.Contains(codes, code) {
 			t.Fatal("missing failure code", code)
 		}
@@ -155,7 +155,7 @@ func TestOpenAPIDescribesWeb(t *testing.T) {
 
 // webBrowserPayloadB2 is the exact web-browser-v1 verifier payload of
 // contract §B.2.
-const webBrowserPayloadB2 = `{"type":"web.fetch","proof_mode":"relay","proof_policy":"web-browser-v1","url":"https://example.com/","max_redirects":5,"max_response_bytes":10485760,"headers":[{"name":"accept","value":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},{"name":"accept-language","value":"en-US,en;q=0.9"}],"node_headers":["user-agent","cookie"]}`
+const webBrowserPayloadB2 = `{"type":"web.fetch","proof_mode":"relay","proof_policy":"web-browser-v1","url":"https://example.com/","max_redirects":5,"max_response_bytes":67108864,"headers":[{"name":"accept","value":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},{"name":"accept-language","value":"en-US,en;q=0.9"}],"node_headers":["user-agent","cookie"]}`
 
 func TestWebBrowserFixturesBindTheExactPayload(t *testing.T) {
 	want := WebRequest{Operation: "scrape", URL: "https://example.com/", Mode: "browser", Browser: &WebBrowser{Wait: "networkidle", TimeoutMS: 30000, SolveChallenge: true}}
@@ -194,7 +194,7 @@ func TestWebBrowserFixturesBindTheExactPayload(t *testing.T) {
 	}
 	var heartbeat Heartbeat
 	raw, _ := os.ReadFile("../../api/fixtures/heartbeat-web-browser.json")
-	if err := json.Unmarshal(raw, &heartbeat); err != nil || heartbeat.Services[2].Browser == nil || !reflect.DeepEqual(*heartbeat.Services[2].Browser, BrowserHealth{State: "ready", Capacity: 2, Version: "155.0.8059.39", Solvers: []string{"capmonster", "capsolver"}}) || heartbeat.Services[2].Browser.Capacity > heartbeat.Services[2].Capacity {
+	if err := json.Unmarshal(raw, &heartbeat); err != nil || heartbeat.Services[2].Browser == nil || !reflect.DeepEqual(*heartbeat.Services[2].Browser, BrowserHealth{State: "ready", Capacity: 2, Version: "155.0.8059.39", KillBytes: 16 << 30, Solvers: []string{"capmonster", "capsolver"}}) || heartbeat.Services[2].Browser.Capacity > heartbeat.Services[2].Capacity {
 		t.Fatal("browser heartbeat fixture", err)
 	}
 }
@@ -213,10 +213,12 @@ func readFailureCode(t *testing.T, name string) string {
 }
 
 // The core web fixtures, which the app and verifier pin, keep their bytes.
+// Large pages (node 0.1.13) changed both leases' max_response_bytes to the
+// 64 MiB page ceiling; nothing else in them changed.
 func TestCoreWebFixturesUnchanged(t *testing.T) {
 	for name, want := range map[string]string{
-		"lease-web-offer.json": "c1d1fad1523f3491ff873eea205b94746c301e49c74391a0f5cbdaad4e42ba4d",
-		"lease-web.json":       "b77e83335788b314ca405b860f9d1c8520d968d0d24ad865e2dedbfc642441ff",
+		"lease-web-offer.json": "ee4255592947bb649addaab8be86beb071905fd50043775f1d76c2fea0c83635",
+		"lease-web.json":       "e31866fc84f662860a568d46b5560b4697b5958de8bf39db176e8afbe7d27aca",
 		"heartbeat-web.json":   "b0c3866d9babd74be4a03d815f7320ba428d77b1431c8d525abcba72757b5a65",
 		"failure-web.json":     "ede9d412a9524c44cae1a5cfc9dc9105407b3a360914f3d4aa100c27da56c8d8",
 	} {
@@ -322,12 +324,41 @@ func TestOpenAPIDescribesTheBrowserTier(t *testing.T) {
 		t.Fatal("browser payload or hint")
 	}
 	codes := strs(get(schemas, "Failure", "properties", "code", "enum"))
-	if !slices.Contains(codes, "web_browser_unavailable") || !slices.Contains(codes, "web_browser_failed") {
+	if !slices.Contains(codes, "web_browser_unavailable") || !slices.Contains(codes, "web_browser_failed") || !slices.Contains(codes, "page_too_large") ||
+		!slices.Equal(strs(get(schemas, "Failure", "properties", "stage", "enum")), []string{"wire", "dom"}) || get(schemas, "Failure", "properties", "observed_bytes", "minimum") != PageMax+1 {
 		t.Fatal("browser failure codes")
 	}
 	path := get(spec, "paths", "/api/node/v1/jobs/{job_id}/browser-result", "post")
-	if get(path, "requestBody", "content", "application/json", "schema", "$ref") != "#/components/schemas/BrowserResult" || get(path, "responses", "409") == nil || get(path, "responses", "415") == nil {
+	if get(path, "requestBody", "content", "application/json", "schema", "$ref") != "#/components/schemas/BrowserResult" || get(path, "responses", "409") == nil || get(path, "responses", "415") != nil {
 		t.Fatal("browser-result path")
+	}
+	// The parts routes: PUT part n of at most 33, 2 MiB each, bound by the
+	// lease headers and the upload sha256; GET the stored set.
+	put := get(spec, "paths", "/api/node/v1/jobs/{job_id}/browser-result/parts/{n}", "put")
+	headers := []string{}
+	for _, p := range get(put, "parameters").([]any) {
+		param := p.(map[any]any)
+		if ref, ok := param["$ref"].(string); ok {
+			param = get(spec, "components", "parameters", strings.TrimPrefix(ref, "#/components/parameters/")).(map[any]any)
+		}
+		if param["in"] == "header" {
+			headers = append(headers, param["name"].(string))
+		}
+		if param["name"] == "n" && (get(param, "schema", "minimum") != 1 || get(param, "schema", "maximum") != MaxBrowserParts) {
+			t.Fatal("part number bounds")
+		}
+	}
+	if !slices.Equal(headers, []string{"X-Scarlett-Attempt", "X-Scarlett-Fence", "X-Scarlett-Request-SHA256", "X-Scarlett-Upload-SHA256", "X-Scarlett-Part-SHA256"}) ||
+		get(put, "requestBody", "content", "application/octet-stream", "schema", "maxLength") != BrowserPartBytes || get(put, "responses", "413") == nil {
+		t.Fatal("part route", headers)
+	}
+	list := get(spec, "paths", "/api/node/v1/jobs/{job_id}/browser-result/parts", "get")
+	if get(list, "responses", "200", "content", "application/json", "schema", "$ref") != "#/components/schemas/BrowserResultParts" {
+		t.Fatal("parts list route")
+	}
+	if !slices.Equal(strs(get(schemas, "BrowserResult", "properties", "dom", "enum")), []string{DOMOK, DOMTooLarge, DOMMemory}) || get(schemas, "BrowserResult", "properties", "parts", "maxItems") != MaxBrowserParts ||
+		get(schemas, "BrowserResult", "properties", "html") != nil || get(schemas, "BrowserResult", "properties", "html_truncated") != nil || get(schemas, "BrowserHealth", "properties", "kill_bytes", "type") != "integer" {
+		t.Fatal("manifest schema")
 	}
 	// Every fixture field is one the spec names.
 	fields := func(name string) map[string]any {
@@ -353,9 +384,14 @@ func TestOpenAPIDescribesTheBrowserTier(t *testing.T) {
 	}
 	result := fields("browser-result.json")
 	within(result, "BrowserResult")
-	if len(strs(get(schemas, "BrowserResult", "required"))) != len(result) {
+	// The dom ok fixture names every manifest field but the optional solver.
+	if len(get(schemas, "BrowserResult", "properties").(map[any]any)) != len(result)+1 {
 		t.Fatal("browser result fixture leaves a field out")
 	}
+	within(fields("browser-result-too-large.json"), "BrowserResult")
+	within(fields("browser-result-memory.json"), "BrowserResult")
+	within(fields("browser-result-parts.json"), "BrowserResultParts")
+	within(fields("failure-web-too-large.json"), "Failure")
 	web := fields("heartbeat-web-browser.json")["services"].([]any)[2].(map[string]any)
 	within(web, "ServiceHealth")
 	within(web["browser"].(map[string]any), "BrowserHealth")

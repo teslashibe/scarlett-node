@@ -157,6 +157,9 @@ type BrowserHealth struct {
 	Capacity int    `json:"capacity"`          // 1-4 when ready, 0 when unavailable
 	InFlight int    `json:"in_flight"`         // 0-Capacity
 	Version  string `json:"version,omitempty"` // Chrome for Testing version, when ready
+	// KillBytes is the browser tree size above which the node kills its
+	// browser, when ready: max(recycle + 1.5 GiB, physical memory / 4).
+	KillBytes int64 `json:"kill_bytes,omitempty"`
 	// Solvers names the operator's captcha-solver providers (capmonster,
 	// capsolver, 2captcha) the browser may use now: present only when ready,
 	// configured and under the operator's daily spend cap. Never keys.
@@ -200,6 +203,10 @@ type Failure struct {
 	Attempt string `json:"attempt"`
 	Fence   string `json:"fence"`
 	Code    string `json:"code"`
+	// Stage ("wire" or "dom") and ObservedBytes (a lower bound) are set
+	// exactly when Code is page_too_large.
+	Stage         string `json:"stage,omitempty"`
+	ObservedBytes int64  `json:"observed_bytes,omitempty"`
 }
 type Heartbeat struct {
 	Version  string          `json:"version"`
