@@ -593,20 +593,21 @@ func TestWebRunRetriesABusyVerifier(t *testing.T) {
 		}
 	}
 	// Busy for the whole budget: the hop fails as a fetch failure once less
-	// than a second would remain after the next wait.
+	// than a second would remain after the next wait. The budget leaves room
+	// for a slow fake prover start (CI macOS Intel takes over 0.7 s).
 	l := webFixtureLease(t)
-	l.LeaseDeadline = time.Now().Add(webReportMargin + 2*time.Second)
+	l.LeaseDeadline = time.Now().Add(webReportMargin + 6*time.Second)
 	l.SettlementDeadline = l.LeaseDeadline
 	log := filepath.Join(t.TempDir(), "relay-web.log")
 	t.Setenv("SCARLETT_FAKE_PROVER", "web-busy-always")
 	t.Setenv("SCARLETT_FAKE_WEB_LOG", log)
 	started := time.Now()
 	w := Web{Config: webConfig(), Resolver: (&fakeResolver{answers: publicAnswers}).resolve, Egress: staticEgress(), busyWait: func(int) time.Duration { return 300 * time.Millisecond }}
-	if code := w.Run(context.Background(), l); code != "web_fetch_failed" || time.Since(started) > 3*time.Second {
+	if code := w.Run(context.Background(), l); code != "web_fetch_failed" || time.Since(started) > 8*time.Second {
 		t.Fatal("always busy", code, time.Since(started))
 	}
 	raw, _ := os.ReadFile(log)
-	if tries := bytes.Count(raw, []byte("\n")); tries < 2 || tries > 5 {
+	if tries := bytes.Count(raw, []byte("\n")); tries < 2 || tries > 20 {
 		t.Fatal("tries", tries)
 	}
 	got := []time.Duration{}
