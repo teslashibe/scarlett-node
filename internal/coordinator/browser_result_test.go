@@ -74,7 +74,7 @@ func TestBrowserResultFixtures(t *testing.T) {
 	html := gunzip(t, part)
 	if ok.DOM != DOMOK || len(ok.Parts) != 1 || ok.Parts[0] != hexSHA(part) || ok.UploadSHA256 != hexSHA(part) || ok.GzipBytes != int64(len(part)) ||
 		ok.HTMLBytes != int64(len(html)) || ok.HTMLSHA256 != hexSHA(html) || !bytes.Contains(html, []byte("<title>Example Domain</title>")) ||
-		ok.RequestSHA256 != "f24ba0094ed03be33c287a26997889217a0e6aebf62ca0b278f34dbecf0a175e" || ok.Browser.Engine != "scrapling/0.4.15+scarlett.2" {
+		ok.RequestSHA256 != "964f55b17be3ad0fb55ae96c3a1cdd36883b9a2f4833da2946c1eeefcdd62ba7" || ok.Browser.Engine != "scrapling/0.4.15+scarlett.2" {
 		t.Fatalf("dom ok fixture: %+v", ok)
 	}
 	for _, name := range []string{"browser-result.json", "browser-result-too-large.json", "browser-result-memory.json"} {

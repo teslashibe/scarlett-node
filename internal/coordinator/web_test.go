@@ -45,7 +45,7 @@ func TestWebLeaseFixturesBindTheExactPayload(t *testing.T) {
 		if sum := sha256.Sum256(request); hex.EncodeToString(sum[:]) != l.InputSHA256 || l.InputSHA256 != "7afc6139ad4118976d0b226e279ab1a668e2d73009b84043efefe4e98c89d0ab" {
 			t.Fatalf("%s: input digest", name)
 		}
-		if l.RequestSHA256 != "71dba31576cd0825efd7ec112e1693f2274fd7e2d6b5fb55e0f903b435f053a1" || l.ModelID != "" || l.Prompt != "" || l.XRequest != nil || len(l.XPayload) != 0 || len(l.CodexPayload) != 0 {
+		if l.RequestSHA256 != "d4362de8c9e08295b9a777f758e8f9833a4257b30b689c391d609c0e4a7c610c" || l.ModelID != "" || l.Prompt != "" || l.XRequest != nil || len(l.XPayload) != 0 || len(l.CodexPayload) != 0 {
 			t.Fatalf("%s: unexpected shape", name)
 		}
 		if (name == "lease-web.json") != (l.VerifierToken != "") {
@@ -168,7 +168,7 @@ func TestWebBrowserFixturesBindTheExactPayload(t *testing.T) {
 		if sum := sha256.Sum256(request); hex.EncodeToString(sum[:]) != l.InputSHA256 || l.InputSHA256 != "15907c5fbdfe9bda3af12efbcfbd1784f3651d13227899485b2a6bd974afca63" {
 			t.Fatalf("%s: input digest", name)
 		}
-		if l.RequestSHA256 != "f24ba0094ed03be33c287a26997889217a0e6aebf62ca0b278f34dbecf0a175e" || (name == "lease-web-browser.json") != (l.VerifierToken == strings.Repeat("ab", 32)) {
+		if l.RequestSHA256 != "964f55b17be3ad0fb55ae96c3a1cdd36883b9a2f4833da2946c1eeefcdd62ba7" || (name == "lease-web-browser.json") != (l.VerifierToken == strings.Repeat("ab", 32)) {
 			t.Fatalf("%s: request digest or token", name)
 		}
 	}
@@ -214,11 +214,12 @@ func readFailureCode(t *testing.T, name string) string {
 
 // The core web fixtures, which the app and verifier pin, keep their bytes.
 // Large pages (node 0.1.13) changed both leases' max_response_bytes to the
-// 64 MiB page ceiling; nothing else in them changed.
+// 64 MiB page ceiling and so their request_sha256; nothing else in them
+// changed.
 func TestCoreWebFixturesUnchanged(t *testing.T) {
 	for name, want := range map[string]string{
-		"lease-web-offer.json": "ee4255592947bb649addaab8be86beb071905fd50043775f1d76c2fea0c83635",
-		"lease-web.json":       "e31866fc84f662860a568d46b5560b4697b5958de8bf39db176e8afbe7d27aca",
+		"lease-web-offer.json": "541ac07c8776ea88974cbe454c42c987e4c6d8c83a5ba82e3862482f5417ca15",
+		"lease-web.json":       "197f0f5a8b47aaddf08a7b6e02d2d83021aa818e3def350e35b2d7d3fce3d8a6",
 		"heartbeat-web.json":   "b0c3866d9babd74be4a03d815f7320ba428d77b1431c8d525abcba72757b5a65",
 		"failure-web.json":     "ede9d412a9524c44cae1a5cfc9dc9105407b3a360914f3d4aa100c27da56c8d8",
 	} {
