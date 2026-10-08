@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -193,7 +194,7 @@ func TestWebBrowserFixturesBindTheExactPayload(t *testing.T) {
 	}
 	var heartbeat Heartbeat
 	raw, _ := os.ReadFile("../../api/fixtures/heartbeat-web-browser.json")
-	if err := json.Unmarshal(raw, &heartbeat); err != nil || heartbeat.Services[2].Browser == nil || *heartbeat.Services[2].Browser != (BrowserHealth{State: "ready", Capacity: 2, Version: "155.0.8059.39"}) || heartbeat.Services[2].Browser.Capacity > heartbeat.Services[2].Capacity {
+	if err := json.Unmarshal(raw, &heartbeat); err != nil || heartbeat.Services[2].Browser == nil || !reflect.DeepEqual(*heartbeat.Services[2].Browser, BrowserHealth{State: "ready", Capacity: 2, Version: "155.0.8059.39", Solvers: []string{"capmonster", "capsolver"}}) || heartbeat.Services[2].Browser.Capacity > heartbeat.Services[2].Capacity {
 		t.Fatal("browser heartbeat fixture", err)
 	}
 }

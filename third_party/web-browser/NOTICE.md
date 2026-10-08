@@ -7,7 +7,7 @@ The node's web browser tier runs `scarlett_web_helper.py` inside a bundled Pytho
 | Component | Version | Licence |
 |---|---|---|
 | CPython, from python-build-standalone release `20261003` (`install_only_stripped`) | 3.13.16 | PSF License (`python/lib/python3.13/LICENSE.txt`; Windows `python/LICENSE.txt`); the python-build-standalone build scripts are MPL-2.0 |
-| scrapling | 0.4.15 | BSD-3-Clause |
+| scrapling | 0.4.15+scarlett.2 | BSD-3-Clause; its `NOTICE` (in `scrapling-0.4.15+scarlett.2.dist-info/licenses/`) lists the Apache-2.0 and MIT code it adapts |
 | patchright | 1.63.0 | Apache-2.0 |
 | playwright | 1.63.0 | Apache-2.0 |
 | curl-cffi | 0.16.3 | MIT |
@@ -36,8 +36,10 @@ The Playwright and Patchright driver packages are kept; their bundled Node execu
 
 Chrome for Testing 155.0.8059.39 is downloaded by the node from `storage.googleapis.com/chrome-for-testing-public`, checked against the zip sha256 and per-file inventory in `chrome-for-testing.json` and `chrome-inventory/`, and extracted into node state. Chromium's licence and third-party notices are inside that download (`chrome://credits`, and `ABOUT` at the zip root).
 
+## The Scrapling build
+
+The runtime installs Scrapling from Scarlett's fork, [teslashibe/Scrapling](https://github.com/teslashibe/Scrapling), release `v0.4.15-scarlett.2`: upstream 0.4.15 plus the anti-bot handlers (`scrapling/engines/antibot/`) and the captcha-solver router, built from branch `scarlett/antibot` at commit `87bbb2aa9a3b5fc1b15ce935d17cdcad9fd136d7`. `requirements.lock` pins the release's wheel by its sha256, so the build installs those exact bytes. The fork stays under Scrapling's BSD-3-Clause licence. Its `NOTICE`, shipped in the wheel's `dist-info/licenses/`, credits the code the handlers adapt: Averyy/wafer (Apache-2.0; the full licence text is `wafer-LICENSE.txt` here), Crawl4AI (Apache-2.0), Hyper Solutions hyper-sdk-py (MIT), SeleniumBase (MIT) and xKiian/awswaf (MIT).
+
 ## Code adapted from other projects
 
-`scarlett_web_helper.py` `wait_for_datadome`, `dd_frame`, `dd_frame_blocked` and `dd_click_confirm` are adapted from [Averyy/wafer](https://github.com/Averyy/wafer) `wafer/browser/_datadome.py` (`wait_for_datadome`, `_find_dd_frame`, `_is_hard_block`, `_try_click_confirm`), read on 2026-10-07 at revision `f353ddafa01893aae9cbbd2dd2111e1a7f7a6c3d`. Copyright 2026 Avery. Licensed under the Apache License, Version 2.0; the full text is in `wafer-LICENSE.txt`.
-
-Changes from the original: ported from wafer's synchronous solver to Patchright's async API inside a Scrapling `page_action`; the wait is bounded by the job's remaining budget (at most 15 s); the mouse-replay recordings are replaced by a short direct move before the confirm click; a cookie change counts as a clearance only when the challenge iframe has left and the page no longer carries DataDome challenge markers; `t=bv`, a restricted or blocked device and an interactive (`/captcha/`) frame end the wait and stop the helper's fresh-context retry; logging is removed.
+`scarlett_web_helper.py` no longer carries code from other projects. Its earlier DataDome device-check wait, adapted from [Averyy/wafer](https://github.com/Averyy/wafer) `wafer/browser/_datadome.py` (Apache-2.0, Copyright 2026 Avery), now lives in the fork's `scrapling/engines/antibot/datadome.py` with the attribution above.

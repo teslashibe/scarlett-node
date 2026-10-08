@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -36,7 +37,7 @@ type scriptedBrowser struct {
 const syntheticUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
 
 func (s *scriptedBrowser) Status() worker.BrowserStatus {
-	return worker.BrowserStatus{Ready: true, Capacity: 1, Version: "155.0.8059.39", Engine: "scrapling/0.4.15", UserAgent: syntheticUA}
+	return worker.BrowserStatus{Ready: true, Capacity: 1, Version: "155.0.8059.39", Engine: "scrapling/0.4.15+scarlett.2", UserAgent: syntheticUA}
 }
 func (s *scriptedBrowser) Prewarm() {
 	s.mu.Lock()
@@ -175,7 +176,7 @@ func TestRunLoopServesWebBrowserLease(t *testing.T) {
 			}()
 			first := <-heartbeats
 			web := first.Services[2]
-			if web.Kind != "web" || web.Browser == nil || *web.Browser != (coordinator.BrowserHealth{State: "ready", Capacity: 1, Version: "155.0.8059.39"}) || first.Capacity != 2 {
+			if web.Kind != "web" || web.Browser == nil || !reflect.DeepEqual(*web.Browser, coordinator.BrowserHealth{State: "ready", Capacity: 1, Version: "155.0.8059.39"}) || first.Capacity != 2 {
 				t.Fatalf("browser heartbeat %+v %+v", web, web.Browser)
 			}
 			var body []byte

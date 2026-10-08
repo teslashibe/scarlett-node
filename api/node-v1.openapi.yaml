@@ -428,6 +428,16 @@ components:
         capacity: {type: integer, minimum: 0, maximum: 4, description: "1-4 when ready, 0 when unavailable"}
         in_flight: {type: integer, minimum: 0, maximum: 4, description: At most capacity}
         version: {type: string, maxLength: 64, description: Chrome for Testing version; present exactly when ready}
+        solvers:
+          type: array
+          maxItems: 3
+          uniqueItems: true
+          items: {type: string, enum: [capmonster, capsolver, 2captcha]}
+          description: >-
+            Optional, ready only. The captcha-solver providers the node operator configured
+            (SCARLETT_WEB_SOLVERS) and may use now: absent without a configuration and once the
+            operator's daily spend cap is reached. Names only; the operator pays the providers and
+            their keys never leave the node except to them.
     ActiveLease:
       type: object
       additionalProperties: false
@@ -691,11 +701,20 @@ components:
           additionalProperties: false
           required: [engine, version, user_agent]
           properties:
-            engine: {type: string, enum: [scrapling/0.4.15]}
+            engine: {type: string, enum: [scrapling/0.4.15+scarlett.2], description: "Scrapling 0.4.15 plus the anti-bot handlers, from teslashibe/Scrapling release v0.4.15-scarlett.2"}
             version: {type: string, description: Chrome for Testing version}
             user_agent: {type: string, description: The pinned User-Agent the browser sent}
         started_at_ms: {type: integer, minimum: 0, description: "Unix milliseconds when the browser phase started; the coordinator accepts accepted_at - 5000 to received_at"}
         duration_ms: {type: integer, minimum: 0}
+        solver:
+          type: string
+          enum: [used, needed]
+          description: >-
+            Optional. used: the node operator's own captcha solver cleared a captcha on this page.
+            needed: the page stopped at a captcha that takes a solver (none configured, none allowed
+            under the operator's daily cap, or the solver failed). Absent otherwise. The coordinator
+            remembers the page's domain and offers its browser jobs to nodes that report solvers
+            first.
     Result:
       type: object
       description: >-

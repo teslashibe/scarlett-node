@@ -384,7 +384,7 @@ on Windows in this release. Without web the tier is off whatever it says.
 may not exceed `SCARLETT_WEB_CONCURRENCY`; unset, the runtime uses 1 below
 16 GiB of physical memory and 2 otherwise, never more than web capacity.
 `SCARLETT_WEB_BROWSER_IDLE_SECONDS` (30–3600, default 120) is the idle stop.
-All three need the services executor. A desktop node started with
+All three need the services executor (so do the solver settings below). A desktop node started with
 `SCARLETT_DESKTOP_WEB=1` inherits the defaults; the desktop app passes an
 explicit `SCARLETT_WEB_BROWSER` of `on` or `off` from its own environment to
 the node, and only together with web.
@@ -392,9 +392,14 @@ the node, and only together with web.
 **What ships and what is fetched.** The node bundle and the desktop app carry
 `web-runtime-<platform>.tar.gz` and `web-runtime.json` beside
 `x-login-runtime/`: a pinned CPython 3.13.16 (python-build-standalone
-`20261003`) with `scrapling[fetchers]==0.4.15`, Patchright and Playwright
+`20261003`) with Scrapling `0.4.15+scarlett.2`, Patchright and Playwright
 1.63.0 from a hash-locked, wheels-only lock, and the node's helper
-`scarlett_web_helper`. The helper's driver reuses the x-login runtime's Node
+`scarlett_web_helper`. The Scrapling wheel is the asset of release
+`v0.4.15-scarlett.2` on [teslashibe/Scrapling](https://github.com/teslashibe/Scrapling)
+(branch `scarlett/antibot`, commit `87bbb2a`), named in
+`third_party/web-browser/requirements.lock` by URL and sha256; `pip
+--require-hashes --only-binary=:all:` installs those exact bytes and nothing is
+built from source. The helper's driver reuses the x-login runtime's Node
 22.23.3. The resource directory is found as for X login:
 `SCARLETT_X_LOGIN_RESOURCE_DIR` when set (the desktop sets it), else the
 installed layout beside the executable. The archive is extracted into
@@ -433,7 +438,8 @@ left; under 5 s the job is `expired`. Then:
 1. The page's host is resolved and checked with the egress guard before any
    browser work: `web_dns_failed` or `web_egress_denied`.
 2. The browser renders the page in a fresh context: `web_browser_unavailable`
-   if it could not run at all, `web_browser_failed` if it failed.
+   if it could not run at all, `web_browser_failed` if it failed. After the
+   page loads, the anti-bot pass (below) runs within the browser budget.
 3. The final document must be an absolute `http` or `https` URL of at most
    2048 bytes and not an X host; otherwise the browser copy is dropped.
 4. As soon as the browser returns, two things run at once. The **upload**
@@ -447,6 +453,88 @@ left; under 5 s the job is `expired`. Then:
    otherwise `/fail` with the first code from steps 1–2, then the re-fetch's
    first-hop code. Verifier misuse in the re-fetch is reported `relay_misuse`
    and halts relay as always.
+
+**Anti-bot pass.** The helper's session is built with Scrapling's
+`solve_antibot` on, so the browser launches hardened: the fork drops the
+display-only headless switches the helper's argv carries
+(`--hide-scrollbars`, `--force-color-profile=srgb`, the touch-pointer
+`--blink-settings`, window placement and the like) and adds `--screen-info`,
+scale and window size for one common display (a 14" MacBook Pro screen on
+macOS, a 1080p screen elsewhere), a wide-gamut colour profile on macOS, and
+`--user-agent` with the pinned value. Pages see that display in every frame,
+never the operator's own monitors, their layout or the menu bar and Dock
+settings, and the helper's self-check fails if the fork would describe the
+host's displays instead. Nothing else changes: the deny
+proxy, the sandbox, the seeded profile, the pipe and every other switch are
+as built, and the helper's self-check fails if the launch argv differs from
+that in any other way. Each page is hardened in every frame and worker before
+it navigates. After navigation the page is read without touching its own
+JavaScript world and checked for DataDome, HUMAN (PerimeterX), Akamai,
+Imperva, AWS WAF, Kasada and Cloudflare; a detected vendor's handler runs
+until the pass's budget less a tenth (1–3 s), and a solved page is checked
+again, up to three layers; until a new document loads, that check keeps the
+status and headers the page was detected with, so a block page that never
+changed is never reported solved. Handlers navigate only within the page's origin
+and the vendor's own challenge frames and type only into vendor widgets. The
+outcome maps to `challenge`: nothing detected is `none`, every layer solved is
+`solved`, anything else `unsolved`. A hard ban, and anything a captcha solver
+touched or needs, is not retried in a fresh context; other unsolved pages are,
+once, with at least 15 s left. The retry pass gets only the time left of the
+browser budget, so its handlers and any paid solve end inside it.
+
+**Captcha solvers.** Optional and paid by the operator.
+`SCARLETT_WEB_SOLVERS` lists providers (`capmonster`, `capsolver`,
+`2captcha`; `twocaptcha` is accepted) and needs the browser tier. Each listed
+provider needs `SCARLETT_WEB_SOLVER_<PROVIDER>_KEY_FILE`: a clean absolute
+path to a regular file only its owner can read (mode 0600 on macOS and Linux;
+on Windows a file whose ACL grants only you and SYSTEM, below such a
+directory, such as the node's state directory), at most 4 KiB, holding one key
+of 8–256 printable characters. A key file for an unlisted provider, or a
+solver setting without the list, is a configuration error, and errors name the
+variable, never the key. `SCARLETT_WEB_SOLVER_MAX_SOLVES_PER_FETCH` (1–4,
+default 2) caps paid solves per page, `SCARLETT_WEB_SOLVER_MAX_USD_PER_DAY`
+(up to six decimals, default 1.00) caps the providers' estimated spend per UTC
+day, and `SCARLETT_WEB_SOLVER_EXPERIMENTAL=on` lets them take DataDome's
+jigsaw slider and Turnstile challenge pages. The node reads the keys once at
+start and passes them to each helper in `WEB_SOLVER_CONFIG`, which the helper
+removes from its environment before the driver or the browser start. The
+helper reaches the providers directly over TLS verified against certifi's
+roots, never through the page's proxy or `SCARLETT_WEB_EGRESS_PROXY`, and
+never hands a provider a proxy. For a token (Turnstile, hCaptcha, AWS WAF) a
+provider sees the challenge's site key and the page's address cut to
+`scheme://host/path`, never its query string, fragment or credentials (the
+AWS WAF task also carries the challenge's own `gokuProps` and script URLs);
+for a recognition task (DataDome's jigsaw slider, AWS WAF's image grid) it
+sees only the puzzle images and the question. Nothing else. DataDome's
+slide-to-target slider is not dragged (a live drag ended in DataDome's
+hard-block page, which then holds for the operator's IP): it ends the pass
+as unsolved with no solver need, and the fresh-context retry runs.
+Routing is by challenge
+type with fallback: tokens (Turnstile, reCAPTCHA, GeeTest, AWS WAF) go to
+CapMonster Cloud first, image and slider recognition to CapSolver, and
+FunCaptcha to 2Captcha, each falling back to the next configured provider; a
+provider that reports a bad key, an empty balance or throttling rests for a
+while. Spend is counted when a task is sent to a provider, at its estimated
+price (the provider's own figure replaces it when it reports one), so a task
+abandoned at the deadline or lost to network errors still counts; only
+failures providers do not bill (a refused task, an unsolvable challenge) are
+refunded, and a provider that fails after accepting a task is not followed by
+another for the same challenge. Both passes of a fetch share one budget
+(`SCARLETT_WEB_SOLVER_MAX_SOLVES_PER_FETCH` covers the retry too) and one
+ledger, and the helper reports that ledger's total for the fetch, also when
+the fetch timed out. The node adds it to
+the day's total in `<state>/web-browser/solver-spend.json` (private) and,
+once the cap is reached, sends the helper `"solver": false` until the next UTC
+day. The helper's `/v1/capabilities` names the providers it built, and a
+helper that built anything but the configured set never becomes ready. The
+browser upload carries `solver: "used"` when a paid solve cleared the page and
+`"needed"` when the page stopped at a captcha a provider can take (a
+Turnstile gate, Imperva's hCaptcha, an AWS WAF captcha, DataDome's jigsaw
+slider) or after a paid solve that did not clear it; a ban, a press-and-hold,
+a block and widgets no provider takes never set it. The
+coordinator remembers such a domain and offers its browser jobs to nodes that
+report `solvers` first. The desktop app does not configure solvers yet; a
+keychain-backed setting is the planned next step.
 
 **Upload.** The body is gzip JSON (`Content-Encoding: gzip`), at most
 12582912 bytes compressed and 16777216 decompressed, encoded with HTML escaping
@@ -470,8 +558,11 @@ sign on the node that the coordinator never received the browser's copy.
 **Clearance cookies.** The Cookie for a re-fetch hop holds only cookies whose
 names are on the allowlist the verifier enforces: exactly `cf_clearance`,
 `__cf_bm`, `_cfuvid`, `datadome`, `_abck`, `bm_sz`, `ak_bmsc`, `bm_sv`,
-`pxcts`, `reese84`, `aws-waf-token`, or a name starting with `_px`,
-`incap_ses_`, `visid_incap_` or `nlbi_` followed by at least one more byte.
+`bm_s`, `bm_so`, `bm_sc`, `bm_lso`, `bm_mi`, `sbsd`, `sbsd_o`, `sec_cpt`,
+`pxcts`, `reese84`, `___utmvc`, `aws-waf-token`, `KP_UIDz`, `KP_UIDz-ssn`,
+`tkrm_alpekz_s1.3`, `tkrm_alpekz_s1.3-ssn`, or a name starting with `_px`,
+`incap_ses_`, `visid_incap_`, `nlbi_` or `incap_sh_` followed by at least one
+more byte.
 Each must match the hop's host (host-only, or a domain cookie for the host or
 a parent) and path, be unexpired, and have a valid name and value; secure
 cookies are sent only over `https`. Longer paths come first, then the browser's
@@ -587,7 +678,9 @@ while no helper is warm.
 
 **Readiness.** The enabled web entry always carries `browser`:
 `{"state":"ready","capacity":N,"in_flight":M,"version":"155.0.8059.39"}`, with
-capacity 1–4 and at most the web capacity, or
+capacity 1–4 and at most the web capacity and, when solvers are configured and
+the day's spend is under its cap, `"solvers":["capmonster","capsolver"]`
+(provider names in that order, never keys), or
 `{"state":"unavailable","reason":R,"capacity":0,"in_flight":0}`. A browser job
 also counts in the web entry's `in_flight`.
 

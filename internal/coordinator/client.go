@@ -157,6 +157,10 @@ type BrowserHealth struct {
 	Capacity int    `json:"capacity"`          // 1-4 when ready, 0 when unavailable
 	InFlight int    `json:"in_flight"`         // 0-Capacity
 	Version  string `json:"version,omitempty"` // Chrome for Testing version, when ready
+	// Solvers names the operator's captcha-solver providers (capmonster,
+	// capsolver, 2captcha) the browser may use now: present only when ready,
+	// configured and under the operator's daily spend cap. Never keys.
+	Solvers []string `json:"solvers,omitempty"`
 }
 
 // Per-operation lanes overlap and must never be added together. Admission

@@ -62,10 +62,15 @@ const UA_SUFFIX: &str = ".0.0.0 Safari/537.36";
 pub const MAX_COOKIE: usize = 4096;
 pub const MAX_COOKIE_PAIRS: usize = 50;
 const MAX_COOKIE_NAME: usize = 256;
-/// Anti-bot clearance cookies a re-fetch may carry: these names exactly...
-const CLEARANCE_COOKIES: [&str; 11] = ["cf_clearance", "__cf_bm", "_cfuvid", "datadome", "_abck", "bm_sz", "ak_bmsc", "bm_sv", "pxcts", "reese84", "aws-waf-token"];
+/// Anti-bot clearance cookies a re-fetch may carry: these names exactly
+/// (Cloudflare; DataDome; Akamai Bot Manager with its sensor and SEC-CPT
+/// cookies; HUMAN; Imperva; AWS WAF; Kasada's token mirror)...
+const CLEARANCE_COOKIES: [&str; 24] = [
+    "cf_clearance", "__cf_bm", "_cfuvid", "datadome", "_abck", "bm_sz", "ak_bmsc", "bm_sv", "bm_s", "bm_so", "bm_sc", "bm_lso", "bm_mi", "sbsd", "sbsd_o", "sec_cpt", "pxcts", "reese84",
+    "___utmvc", "aws-waf-token", "KP_UIDz", "KP_UIDz-ssn", "tkrm_alpekz_s1.3", "tkrm_alpekz_s1.3-ssn",
+];
 /// ...and these prefixes, each followed by at least one more byte.
-const CLEARANCE_PREFIXES: [&str; 4] = ["_px", "incap_ses_", "visid_incap_", "nlbi_"];
+const CLEARANCE_PREFIXES: [&str; 5] = ["_px", "incap_ses_", "visid_incap_", "nlbi_", "incap_sh_"];
 const X_HOSTS: [&str; 2] = ["x.com", "twitter.com"];
 const RESERVED: [&str; 9] = ["localhost", "local", "internal", "home.arpa", "lan", "localdomain", "onion", "invalid", "test"];
 /// Statuses whose `Location` the verifier follows.
@@ -1103,10 +1108,14 @@ mod tests {
     fn clearance_cookie_name_vectors() {
         for allowed in [
             "cf_clearance", "__cf_bm", "_cfuvid", "datadome", "_abck", "bm_sz", "ak_bmsc", "bm_sv", "pxcts", "reese84", "aws-waf-token", "_px3", "_pxhd", "incap_ses_123_456", "visid_incap_789", "nlbi_1",
+            "bm_s", "bm_so", "bm_sc", "bm_lso", "bm_mi", "sbsd", "sbsd_o", "sec_cpt", "___utmvc", "KP_UIDz", "KP_UIDz-ssn", "tkrm_alpekz_s1.3", "tkrm_alpekz_s1.3-ssn", "incap_sh_2483049",
         ] {
             assert!(clearance_cookie(allowed), "{allowed} refused");
         }
-        for refused in ["session", "sid", "CF_CLEARANCE", "cf_clearance2", "_px", "incap_ses_", "__Secure-session", "visid_incap_", "nlbi_", "", "xcf_clearance"] {
+        for refused in [
+            "session", "sid", "CF_CLEARANCE", "cf_clearance2", "_px", "incap_ses_", "__Secure-session", "visid_incap_", "nlbi_", "", "xcf_clearance", "incap_sh_", "SBSD", "sbsd_x", "sec_cpt2",
+            "kp_uidz", "KP_UID", "KP_UIDz-ssn2", "tkrm_alpekz", "tkrm_alpekz_s1.4", "__utmvc", "bm_", "bm_s2",
+        ] {
             assert!(!clearance_cookie(refused), "{refused} accepted");
         }
         // Grammar and names are separate checks; a receipt's list needs both and must fit one header.

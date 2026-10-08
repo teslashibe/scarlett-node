@@ -39,9 +39,12 @@ type BrowserStatus struct {
 	Reason   string
 	Capacity int
 	// Version is the Chrome for Testing version, Engine the helper engine
-	// ("scrapling/0.4.15") and UserAgent the pinned User-Agent the browser
-	// sends, which the proven re-fetch repeats.
+	// ("scrapling/0.4.15+scarlett.2") and UserAgent the pinned User-Agent the
+	// browser sends, which the proven re-fetch repeats.
 	Version, Engine, UserAgent string
+	// Solvers are the operator's captcha-solver providers the browser may
+	// use now (names only), for the heartbeat.
+	Solvers []string
 }
 
 // BrowserFetchRequest is one page for the helper (POST /v1/fetch).
@@ -71,6 +74,8 @@ type BrowserFetchResult struct {
 	Challenge      string                        `json:"challenge"` // none, solved or unsolved
 	Redirects      []coordinator.BrowserRedirect `json:"redirects"`
 	StartedAtMS    int64                         `json:"started_at_ms"`
+	// Solver is "used", "needed" or "" (see coordinator.BrowserResult).
+	Solver string `json:"solver"`
 }
 
 const (
@@ -238,6 +243,9 @@ func (w Web) uploadBrowserResult(ctx context.Context, l coordinator.Lease, res B
 	}
 	if result.Challenge != "solved" && result.Challenge != "unsolved" {
 		result.Challenge = "none"
+	}
+	if res.Solver == "used" || res.Solver == "needed" {
+		result.Solver = res.Solver
 	}
 	_, body, err := coordinator.EncodeBrowserResult(result)
 	if err == nil {

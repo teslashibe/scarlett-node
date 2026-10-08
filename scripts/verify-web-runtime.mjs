@@ -67,7 +67,7 @@ export function verify(dir, expectedPlatform) {
  const pins = JSON.parse(readFileSync(pinsPath, 'utf8'));
  if (pins.schemaVersion !== 1 || !goPlatforms.includes(pins.platform) || (expectedPlatform && pins.platform !== expectedPlatform) ||
   pins.archive !== `web-runtime-${pins.platform}.tar.gz` || !hex64(pins.archiveSha256) || !hex64(pins.manifestSha256) || !hex64(pins.browserZipSha256) ||
-  pins.pythonVersion !== '3.13.16' || pins.scraplingVersion !== '0.4.15' || pins.browserVersion !== '155.0.8059.39') throw Error('Incompatible web runtime pins');
+  pins.pythonVersion !== '3.13.16' || pins.scraplingVersion !== '0.4.15+scarlett.2' || pins.browserVersion !== '155.0.8059.39') throw Error('Incompatible web runtime pins');
  const archivePath = join(dir, pins.archive), info = lstatSync(archivePath);
  if (!info.isFile() || info.size !== pins.archiveBytes || info.size > maxArchiveBytes) throw Error('Web runtime archive size invalid');
  const archive = readFileSync(archivePath);

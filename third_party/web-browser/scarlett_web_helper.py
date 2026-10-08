@@ -7,9 +7,21 @@ Scrapling's AsyncStealthySession and Chrome for Testing. Every per-job context
 uses the node's filtering egress proxy; the browser's own background traffic
 goes to the node's deny listener.
 
-It never logs URLs, headers, cookies or page content. Its only stderr line of
-its own is SCARLETT_WEB_BROWSER_ERROR=<reason> when the browser cannot start.
-Standard library plus Scrapling 0.4.15 only.
+Bot protection is handled by the Scrapling build the runtime pins
+(0.4.15+scarlett.2, teslashibe/Scrapling): with solve_antibot on the session
+the browser launches as one ordinary desktop browser (a common display, never
+the operator's own monitors), and after each navigation the page
+is checked for DataDome, HUMAN (PerimeterX), Akamai, Imperva, AWS WAF, Kasada
+and Cloudflare and their challenges are solved within the fetch's budget. The
+outcome is response.meta["antibot"]. When the operator configured captcha
+solver accounts, the node passes them in WEB_SOLVER_CONFIG; the helper takes
+the variable out of its environment at once and the keys only ever go to the
+providers' own APIs.
+
+It never logs URLs, headers, cookies, page content or solver keys. Its only
+stderr line of its own is SCARLETT_WEB_BROWSER_ERROR=<reason> when the browser
+cannot start. Standard library plus that Scrapling build (and certifi, one of
+its dependencies, for the solver providers' TLS roots) only.
 """
 
 import asyncio
@@ -19,13 +31,14 @@ import logging
 import os
 import re
 import shutil
+import ssl
 import sys
 import tempfile
 import threading
 import time
 from urllib.parse import urljoin, urlsplit
 
-SCRAPLING_VERSION = "0.4.15"
+SCRAPLING_VERSION = "0.4.15+scarlett.2"
 PORT_PREFIX = "SCARLETT_WEB_HELPER_PORT="
 ENGINE = "scrapling/" + SCRAPLING_VERSION
 MAX_REQUEST_BODY = 65536
@@ -114,15 +127,28 @@ PROFILE_PREFS = {
 }
 PROFILE_PREFIX = "scarlett-profile-"
 
-# Cloudflare: the solver runs only on an interstitial, never because a solved
-# page still embeds the Turnstile api.js script.
-CF_INTERSTITIAL = ("non-interactive", "managed", "interactive")
-# Other vendors: wait for the marker to leave or a new main-frame document.
-# The Kasada SDK loads on served pages too, so its markers count only on an
-# error status.
-VENDOR_MARKERS = ("sec-if-cpt-container", "px-captcha", "pardon our interruption", "_incapsula_resource")
-KASADA_MARKERS = ("kpsdk", "/ips.js")
-DATADOME_MARKERS = ("captcha-delivery.com", "var dd={")
+# The launch switches the anti-bot launch hardening may drop from the
+# helper's argv (display-only headless tells: window placement, colour
+# profile, scrollbars, font hinting, compositor threading, a touch pointer),
+# and the only switches it may add: the common display's screen, scale and
+# window, a wide-gamut colour profile and the User-Agent.
+ANTIBOT_DROPPED = ("--window-position=0,0", "--force-color-profile=srgb", "--hide-scrollbars", "--font-render-hinting=none",
+                   "--disable-threaded-animation", "--disable-threaded-scrolling", "--start-maximized")
+ANTIBOT_DROPPED_PREFIXES = ("--blink-settings=", "--window-size=", "--screen-info=", "--force-device-scale-factor=")
+ANTIBOT_ADDED_PREFIXES = ("--screen-info=", "--force-device-scale-factor=", "--window-size=",
+                          "--force-color-profile=scrgb-linear", "--user-agent=")
+# Captcha-solver providers and the options the node may set (WEB_SOLVER_CONFIG).
+SOLVER_PROVIDERS = ("capmonster", "capsolver", "2captcha")
+SOLVER_OPTIONS = ("max_solves_per_fetch", "experimental")
+# What the hardened browser shows pages as its screen: one common display for
+# the platform. "host" would show every monitor of the operator's desk, its
+# layout and menu bar and Dock settings to any page a buyer points it at.
+DISPLAY_POLICY = "canonical"
+# DataDome's slide-to-target slider is not dragged: one live drag (2026-10-08)
+# ended in DataDome's hard-block page, which then holds for the operator's IP.
+# The slider ends as "slider" with no solver need, and the job's fresh-context
+# retry gets its chance instead.
+DATADOME_DRAG_SLIDER = False
 TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9a-z-]{1,64}$")
 SELECTOR = re.compile(r"^[\x20-\x7e]{1,256}$")
 URL_STRIP = re.compile(r"[\t\n\r]")
@@ -177,13 +203,21 @@ def profile_problems(profile):
 
 def new_session(executable, user_agent, proxy, deny_proxy, max_pages, profile):
     """Builds the session exactly as contract C.6 says, without starting it.
-    profile is the seeded profile directory the browser will use."""
+    profile is the seeded profile directory the browser will use. The anti-bot
+    pass is on for the session, so the browser launches hardened (the fork
+    rewrites the launch argv at start(); launch_problems checks the result);
+    each fetch still turns the pass on or off and picks its solver."""
+    from scrapling.engines.antibot import registry
+    from scrapling.engines.antibot.headless import set_display_policy
     from scrapling.fetchers import AsyncStealthySession
     from scrapling.engines.toolbelt.proxy_rotation import ProxyRotator
 
+    set_display_policy(DISPLAY_POLICY)
+    registry.get("datadome").drag_simple_slider = DATADOME_DRAG_SLIDER
     session = AsyncStealthySession(
         headless=True, executable_path=executable, useragent=user_agent, locale="en-US", google_search=False,
         retries=1, block_webrtc=True, hide_canvas=False, allow_webgl=True, max_pages=max_pages, timeout=30000,
+        solve_antibot=True,
         # Launch mode (chromium.launch) with a fresh context per fetch.
         proxy_rotator=ProxyRotator([proxy]),
         additional_args={"permissions": [], "accept_downloads": False, "service_workers": "allow",
@@ -243,7 +277,84 @@ def option_problems(session, capacity):
         problems.append("max_pages")
     if not logging.getLogger("scrapling").disabled:
         problems.append("logger")
+    from scrapling.engines.antibot import registry
+    from scrapling.engines.antibot.headless import canonical_displays, display_policy
+
+    if display_policy() != DISPLAY_POLICY or not any(
+            d.screen_info_switch() in (session._launch_options().get("args") or ()) for d in canonical_displays()):
+        problems.append("display")
+    if getattr(registry.get("datadome"), "drag_simple_slider", None) is not DATADOME_DRAG_SLIDER:
+        problems.append("datadome-slider")
+    return problems + launch_problems(session)
+
+
+def antibot_dropped(arg):
+    return arg in ANTIBOT_DROPPED or arg.startswith(ANTIBOT_DROPPED_PREFIXES)
+
+
+def launch_problems(session):
+    """What the browser really starts with. With solve_antibot on the session
+    the fork rewrites the argv at start(): it may drop only the headless tells
+    (ANTIBOT_DROPPED) and append only the common display's screen, scale,
+    window, colour profile and User-Agent; every other launch option, the deny
+    proxy, the sandbox, the seeded profile and the pipe stay as built."""
+    problems = []
+    config = session._config
+    if not (config.solve_antibot and config.headless and not config.cdp_url and session._antibot_hardened_launch()):
+        return ["antibot-launch"]
+    built = session._browser_options
+    launch = session._launch_options()
+    if {k: v for k, v in launch.items() if k != "args"} != {k: v for k, v in built.items() if k != "args"}:
+        problems.append("launch-options")
+    kept = [a for a in built["args"] if not antibot_dropped(a)]
+    args = launch.get("args") or []
+    added = args[len(kept):]
+    if args[:len(kept)] != kept:
+        problems.append("launch-kept")
+    if any(not a.startswith(ANTIBOT_ADDED_PREFIXES) for a in added) or \
+            any(sum(a.startswith(p) for a in added) > 1 for p in ANTIBOT_ADDED_PREFIXES):
+        problems.append("launch-added")
+    if any(a.startswith("--user-agent=") and a != "--user-agent=" + config.useragent for a in added):
+        problems.append("launch-user-agent")
+    if any(a == "--no-sandbox" or a in FILTERED_ARGS or a.startswith(("--remote-debugging-port", "--use-fake-ui-for-media-stream"))
+           for a in args) or args.count("--remote-debugging-pipe") != 1:
+        problems.append("launch-forbidden-arg")
+    if session._context_options.get("no_viewport") is not True:
+        problems.append("launch-viewport")
     return problems
+
+
+def solver_router(raw):
+    """The SolverRouter for WEB_SOLVER_CONFIG, or None when it is empty.
+
+    raw is the node's JSON: provider keys (capmonster, capsolver, 2captcha)
+    and SOLVER_OPTIONS. Providers are reached directly (never through the
+    page's proxy, and never with a proxy for the provider to use), over TLS
+    verified against certifi's roots. Raises ValueError without the value."""
+    if not raw:
+        return None
+    try:
+        config = json.loads(raw)
+    except ValueError:
+        raise ValueError("solver config") from None
+    if not isinstance(config, dict) or set(config) - set(SOLVER_PROVIDERS) - set(SOLVER_OPTIONS) or \
+            not any(isinstance(config.get(p), str) and config.get(p) for p in SOLVER_PROVIDERS):
+        raise ValueError("solver config")
+    solves = config.get("max_solves_per_fetch", 2)
+    if type(solves) is not int or not 1 <= solves <= 4 or type(config.get("experimental", False)) is not bool:
+        raise ValueError("solver config")
+    for name in SOLVER_PROVIDERS:
+        key = config.get(name)
+        if key is not None and (not isinstance(key, str) or not 8 <= len(key) <= 256 or any(not "!" <= c <= "~" for c in key)):
+            raise ValueError("solver config")
+    import certifi
+    from scrapling.engines.antibot.solvers import SolverRouter, UrllibTransport
+
+    context = ssl.create_default_context(cafile=certifi.where())
+    options = {name: config[name] for name in SOLVER_PROVIDERS if config.get(name)}
+    options.update(allow_proxy=False, trust_env=False, max_solves_per_fetch=solves, max_attempts_per_solve=3,
+                   experimental=config.get("experimental", False))
+    return SolverRouter.from_config(options, transport=UrllibTransport(ssl_context=context))
 
 
 def self_check():
@@ -254,11 +365,17 @@ def self_check():
     import scrapling
     from importlib.metadata import version
 
+    from scrapling.engines.antibot import runner
     from scrapling.fetchers import AsyncStealthySession
 
     assert scrapling.__version__ == SCRAPLING_VERSION, "scrapling version"
-    for name in ("_detect_cloudflare", "_cloudflare_solver"):
+    for name in ("_antibot_hardened_launch", "_launch_options", "_antibot_solve", "_antibot_prepare"):
         assert callable(getattr(AsyncStealthySession, name, None)), "scrapling internal " + name
+    for name in ("solve_page", "prepare_page", "read_signal"):
+        assert callable(getattr(runner, name, None)), "scrapling antibot " + name
+    # A router builds offline from a synthetic key; nothing is sent.
+    router = solver_router(json.dumps({"capmonster": "0" * 32, "max_solves_per_fetch": 2}))
+    assert router is not None and router.providers == ["capmonster"] and router.allow_proxy is False, "solver router"
     # Any existing absolute file stands in for the browser; nothing starts.
     with tempfile.TemporaryDirectory() as tmp:
         profile = os.path.join(tmp, "profile")
@@ -280,7 +397,7 @@ def self_check():
 class Request:
     def __init__(self, raw):
         if not isinstance(raw, dict) or set(raw) - {"url", "wait", "wait_ms", "wait_selector", "timeout_ms",
-                                                     "block_resources", "solve_challenge"}:
+                                                     "block_resources", "solve_challenge", "solver"}:
             raise ValueError("fields")
         self.url = raw.get("url")
         self.wait = raw.get("wait", "networkidle")
@@ -289,6 +406,8 @@ class Request:
         self.timeout_ms = raw.get("timeout_ms", 30000)
         self.block_resources = raw.get("block_resources", False)
         self.solve_challenge = raw.get("solve_challenge", True)
+        # The node turns the operator's solver off once its daily cap is spent.
+        self.solver = raw.get("solver", False)
         if not isinstance(self.url, str) or len(self.url) > 2048 or not self.url.startswith(("https://", "http://")) or \
                 any(c <= " " or c == "\x7f" for c in self.url):
             raise ValueError("url")
@@ -300,7 +419,7 @@ class Request:
                 raise ValueError(name)
         if self.wait_selector and not SELECTOR.match(self.wait_selector):
             raise ValueError("wait_selector")
-        if type(self.block_resources) is not bool or type(self.solve_challenge) is not bool:
+        if type(self.block_resources) is not bool or type(self.solve_challenge) is not bool or type(self.solver) is not bool:
             raise ValueError("flags")
 
 
@@ -448,180 +567,86 @@ async def guard_redirects(page):
     await cdp.send("Fetch.enable", {"patterns": [{"urlPattern": "*", "resourceType": "Document", "requestStage": "Response"}]})
 
 
-async def page_text(page):
-    try:
-        return await page.content()
-    except Exception:
+def solver_state(outcome):
+    """'used' when an operator-paid solve cleared the page; 'needed' when the
+    page stopped where a captcha solver can act (the fork names the kind on
+    the layer: none was configured or allowed for this fetch, the provider
+    does not offer it, or its answer was rejected) or after a paid solve
+    that did not clear it; else ''. A ban never needs a solver, and nor does
+    a press-and-hold, a block or a widget no provider takes."""
+    layers = [layer for layer in outcome.get("layers") or () if isinstance(layer, dict)]
+    used = bool((outcome.get("solver") or {}).get("attempts")) or any(layer.get("used_solver") for layer in layers)
+    if outcome.get("solved"):
+        return "used" if used else ""
+    last = layers[-1] if layers else {}
+    if last.get("kind") == "ban" or last.get("reason") == "ban" or outcome.get("reason") == "ban":
         return ""
+    return "needed" if used or last.get("solver_kind") else ""
 
 
-def cf_cleared(html):
-    return "cType: '" not in html and "<title>just a moment" not in html.lower()
+def antibot_result(outcome, solving):
+    """Maps response.meta["antibot"] to the node's closed fields: challenge
+    (none, solved, unsolved), no_retry, solver ('', used, needed) and the
+    estimated solver spend in micro-USD. A fetch that asked for the pass and
+    got no outcome is unsolved; a ban, and anything a solver touched or
+    needs, is never retried in a fresh context."""
+    if not solving:
+        return "none", False, "", 0
+    if not isinstance(outcome, dict):
+        return "unsolved", False, "", 0
+    cost = micro_usd((outcome.get("solver") or {}).get("cost_usd"))
+    solver = solver_state(outcome)
+    if outcome.get("vendor") is None and outcome.get("reason") == "none":
+        return "none", False, solver, cost
+    if outcome.get("solved") is True:
+        return "solved", False, solver, cost
+    banned = outcome.get("kind") == "ban" or outcome.get("reason") == "ban" or \
+        any(isinstance(layer, dict) and layer.get("kind") == "ban" for layer in outcome.get("layers") or ())
+    return "unsolved", banned or solver != "", solver, cost
 
 
-# --- DataDome device check. The wait logic is ported from Averyy/wafer
-# wafer/browser/_datadome.py (Apache-2.0; see NOTICE.md): wait for the
-# datadome cookie to change and the captcha-delivery iframe to leave, click a
-# shown confirm button once, stop on a blocked visitor (t=bv), and never call
-# a check that is still pending a success.
-
-
-def dd_markers(html):
-    low = html.lower()
-    return any(m in low for m in DATADOME_MARKERS)
-
-
-def dd_hard_block(url, html):
-    low = html.replace(" ", "").replace('"', "'")
-    return "t=bv" in url or "'t':'bv'" in low
-
-
-def dd_frame_url(url):
-    """DataDome's challenge frame: https on captcha-delivery.com or a subdomain
-    of it. Only such a frame is ever clicked, so a page cannot earn a trusted
-    click by naming the host in its own frame's URL."""
+def micro_usd(value):
+    """USD as whole micro-dollars, clamped to 0..10 USD; junk is 0."""
     try:
-        parts = urlsplit(url)
-        host = (parts.hostname or "").lower()
-    except ValueError:
-        return False
-    return parts.scheme == "https" and (host == "captcha-delivery.com" or host.endswith(".captcha-delivery.com"))
-
-
-def dd_frame(page):
-    try:
-        for frame in page.frames:
-            if dd_frame_url(frame.url):
-                return frame
-    except Exception:
-        pass
-    return None
-
-
-def dd_cookie(cookies):
-    for cookie in cookies:
-        if cookie.get("name") == "datadome":
-            return cookie.get("value")
-    return None
-
-
-async def dd_click_confirm(page, frame):
-    try:
-        button = frame.locator("button.captcha_display_button_submit").first
-        if not await button.is_visible(timeout=1000):
-            return False
-        box = await button.bounding_box(timeout=2000)
-        if not box:
-            return False
-        x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
-        await page.mouse.move(x - 40, y - 25, steps=8)
-        await page.mouse.move(x, y, steps=12)
-        await asyncio.sleep(0.2)
-        await page.mouse.click(x, y, delay=90)
-        return True
-    except Exception:
-        return False
-
-
-async def dd_frame_blocked(frame):
-    try:
-        text = (await frame.locator("[data-dd-captcha-human-title]").first.text_content(timeout=500) or "").lower()
-        return "restricted" in text or "blocked" in text
-    except Exception:
-        return False
-
-
-async def wait_for_datadome(page, document, deadline):
-    """'solved'; 'unsolved' (pending at the deadline, retry allowed); or
-    'stop': a blocked visitor (t=bv), a restricted or blocked device, or an
-    interactive challenge (slider, audio). Retrying those never helps, and
-    DataDome rejects CDP-dispatched input on them even with a right answer."""
-    loop = asyncio.get_running_loop()
-    html = await page_text(page)
-    if dd_hard_block(page.url, html):
-        return "stop"
-    start = loop.time()
-    initial = dd_cookie(await page.context.cookies())
-    documents = len(document.responses)
-    seen = None
-    confirmed = False
-    while loop.time() < deadline:
-        if "t=bv" in page.url:
-            return "stop"
-        cookie = dd_cookie(await page.context.cookies())
-        if cookie and cookie != initial:
-            # A new cookie is a clearance only if the challenge iframe leaves
-            # and the page is no longer a challenge; otherwise it was a
-            # rejection and the next attempt's cookie.
-            settle = min(loop.time() + 10, deadline)
-            while loop.time() < settle:
-                if dd_frame(page) is None:
-                    html = await page_text(page)
-                    if not dd_markers(html) and not dd_hard_block(page.url, html):
-                        return "solved"
-                await asyncio.sleep(0.5)
-            initial, confirmed = cookie, False
-            continue
-        frame = dd_frame(page)
-        if frame is not None:
-            seen = seen or loop.time()
-            if not confirmed and await dd_click_confirm(page, frame):
-                confirmed = True
-                await asyncio.sleep(2)
-                continue
-            # The device check runs on its own; past 5 s an interactive or
-            # blocked frame will not resolve.
-            if loop.time() - seen > 5 and ("/captcha/" in frame.url or await dd_frame_blocked(frame)):
-                return "stop"
-        elif len(document.responses) > documents or seen is not None or loop.time() - start > 8:
-            html = await page_text(page)
-            if dd_hard_block(page.url, html):
-                return "stop"
-            if not dd_markers(html):
-                return "solved"
-            if seen is None and loop.time() - start > 8:
-                return "unsolved"
-        await asyncio.sleep(0.5)
-    return "unsolved"
-
-
-async def wait_for_vendor(page, document, markers, deadline):
-    loop = asyncio.get_running_loop()
-    documents = len(document.responses)
-    while loop.time() < deadline:
-        await asyncio.sleep(0.5)
-        if len(document.responses) > documents:
-            return True
-        low = (await page_text(page)).lower()
-        if not any(m in low for m in markers):
-            return True
-    return False
+        return max(0, min(10_000_000, round(float(value or 0) * 1_000_000)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 class Fetcher:
-    def __init__(self, session, proxy, max_pages):
+    def __init__(self, session, proxy, max_pages, solver=None):
         self.session = session
         self.proxy = proxy
         self.slots = asyncio.Semaphore(max_pages)
+        self.solver = solver
 
     async def fetch(self, request):
         async with self.slots:
             loop = asyncio.get_running_loop()
             started = loop.time()
             deadline = started + request.timeout_ms / 1000
-            result = await self._once(request, deadline)
+            # One solver scope per job: both passes share its per-fetch caps
+            # and its spend ledger, which books a task when it is sent, so a
+            # pass that timed out mid-solve still reports what it spent.
+            scope = self.solver.scope() if self.solver is not None and request.solver else None
+            result = await self._once(request, deadline, scope)
             if result["data"]["challenge"] == "unsolved" and not result["no_retry"] and deadline - loop.time() >= 15:
-                result = await self._once(request, deadline)
-            result["data"]["timings"]["total_ms"] = round((loop.time() - started) * 1000)
+                result = await self._once(request, deadline, scope)
+            data = result["data"]
+            if scope is not None:
+                data["solver_cost_micro_usd"] = micro_usd(getattr(scope, "spent_usd", 0))
+                if getattr(scope, "attempts", 0) and not data["solver"] and not result["no_retry"]:
+                    # A paid attempt whose pass gave no outcome (a timeout, a crash).
+                    data["solver"] = "used" if data["challenge"] == "solved" else "needed"
+            data["timings"]["total_ms"] = round((loop.time() - started) * 1000)
             return result
 
-    async def _once(self, request, deadline):
+    async def _once(self, request, deadline, scope):
         loop = asyncio.get_running_loop()
         started_at_ms = int(time.time() * 1000)
         begin = loop.time()
-        marks = {"context": None, "navigated": None, "challenge_ms": 0}
-        state = {"challenge": "none", "no_retry": False, "document": None, "guarded": False, "acted": False,
-                 "setup_failed": False}
+        marks = {"context": None, "navigated": None}
+        state = {"document": None, "guarded": False, "acted": False, "setup_failed": False, "detected": False}
         session = self.session
 
         def remaining():
@@ -629,10 +654,12 @@ class Fetcher:
 
         # Scrapling logs and swallows an exception from page_setup and from
         # page_action and carries on: it would navigate without the redirect
-        # guard, or return a page whose challenge handling never finished. So
-        # each records that it finished, and only a fetch where both did is ok.
+        # guard, or return a page whose waits never finished. So each records
+        # that it finished, and only a fetch where both did is ok. The
+        # anti-bot pass runs between the two (after navigation, before
+        # page_action) and reports through response.meta["antibot"].
         async def setup(page):
-            state.update(document=None, guarded=False, acted=False, setup_failed=False)
+            state.update(document=None, guarded=False, acted=False, setup_failed=False, detected=False)
             marks["context"] = loop.time()
             try:
                 await guard_redirects(page)
@@ -654,56 +681,22 @@ class Fetcher:
             if not state["guarded"]:
                 return  # an unguarded page; the fetch fails below
             document = state["document"]
+            if not request.solve_challenge:
+                # Detection only: the page is reported as challenged, never solved.
+                from scrapling.engines.antibot.detect import detect
+                from scrapling.engines.antibot.runner import read_signal
+
+                last = document.last
+                headers = {k.lower(): v for k, v in document.pairs(last)} if last is not None else {}
+                signal = await read_signal(page, status=last.status if last is not None else None, headers=headers,
+                                           deadline=time.monotonic() + max(0.5, min(5, remaining() - 1)))
+                state["detected"] = detect(signal) is not None
             if request.wait == "networkidle":
                 try:
                     await page.wait_for_load_state("networkidle", timeout=max(1, min(3000, int(remaining() * 1000) - 500)))
                 except Exception:
                     pass
             await settle_navigation(page, document, remaining)
-            challenge_start = loop.time()
-            triggered = False
-            html = await page_text(page)
-            kind = session._detect_cloudflare(html)
-            if kind in CF_INTERSTITIAL or (kind == "embedded" and document.last_header("cf-mitigated").lower() == "challenge"):
-                triggered = True
-                if request.solve_challenge:
-                    # The solver's own waits use the page default timeout (the
-                    # whole budget); its network-idle wait after the click never
-                    # ends on pages with analytics, so bound each wait to 5 s.
-                    page.set_default_timeout(5000)
-                    try:
-                        await asyncio.wait_for(session._cloudflare_solver(page), max(0.1, min(25, remaining() - 1)))
-                    except Exception:
-                        pass  # a solver that runs out of time leaves the page unsolved
-                    page.set_default_timeout(max(1000, int(remaining() * 1000)))
-                    await settle_navigation(page, document, remaining)
-                    html = await page_text(page)
-                if not cf_cleared(html):
-                    state["challenge"] = "unsolved"
-            elif any(document.header(r, "cf-mitigated").lower() == "challenge" for r in document.responses[:-1]):
-                triggered = True  # an interstitial that cleared itself while the page loaded
-            if dd_markers(html) or dd_frame(page) is not None:
-                triggered = True
-                verdict = await wait_for_datadome(page, document, loop.time() + max(0, min(15, remaining() - 1)))
-                if verdict != "solved":
-                    state["challenge"] = "unsolved"
-                    state["no_retry"] = verdict == "stop"
-                await settle_navigation(page, document, remaining)
-                html = await page_text(page)
-            low = html.lower()
-            status = 0
-            if document.last is not None:
-                status = document.last.status
-            markers = [m for m in VENDOR_MARKERS if m in low] + \
-                ([m for m in KASADA_MARKERS if m in low] if status >= 400 else [])
-            if markers:
-                triggered = True
-                if not await wait_for_vendor(page, document, markers, loop.time() + max(0, min(15, remaining() - 1))):
-                    state["challenge"] = "unsolved"
-                await settle_navigation(page, document, remaining)
-            if triggered and state["challenge"] != "unsolved":
-                state["challenge"] = "solved"
-            marks["challenge_ms"] = round((loop.time() - challenge_start) * 1000) if triggered else 0
             # The selector and the extra settle time stay inside the budget; a
             # selector that never appears does not fail the fetch.
             if request.wait_selector:
@@ -720,11 +713,18 @@ class Fetcher:
 
         data = {"outcome": "failed", "error": "navigation_failed", "final_url": "", "status_code": 0, "headers": [],
                 "set_cookie_names": [], "content_type": "", "html": "", "html_truncated": False, "cookies": [],
-                "challenge": "none", "redirects": [], "started_at_ms": started_at_ms,
+                "challenge": "none", "redirects": [], "started_at_ms": started_at_ms, "solver": "", "solver_cost_micro_usd": 0,
                 "timings": {"context_ms": 0, "navigate_ms": 0, "settle_ms": 0, "challenge_ms": 0, "total_ms": 0}}
+        no_retry = False
+        challenge_ms = 0
+        # The session's timeout is the time this pass really has: the fork's
+        # anti-bot deadline (and with it every paid solve) then ends inside
+        # the wait_for below, also on the retry pass.
+        timeout_ms = max(1000, min(request.timeout_ms, int(remaining() * 1000) - 250))
         try:
             response = await asyncio.wait_for(session.fetch(
-                request.url, proxy=self.proxy, timeout=request.timeout_ms, network_idle=False, solve_cloudflare=False,
+                request.url, proxy=self.proxy, timeout=timeout_ms, network_idle=False, solve_cloudflare=False,
+                solve_antibot=request.solve_challenge, captcha_solver=scope if request.solve_challenge else None,
                 load_dom=True, google_search=False, disable_resources=request.block_resources, wait=0,
                 page_setup=setup, page_action=act), max(0.1, remaining()))
         except asyncio.TimeoutError:
@@ -743,6 +743,16 @@ class Fetcher:
             data.update(outcome="failed", error="navigation_failed")
             response = None
         if response is not None:
+            meta = getattr(response, "meta", None) or {}
+            outcome = meta.get("antibot")
+            challenge, no_retry, solver, cost = antibot_result(outcome, request.solve_challenge)
+            if not request.solve_challenge and state["detected"]:
+                challenge = "unsolved"
+            if isinstance(outcome, dict) and outcome.get("layers"):
+                try:
+                    challenge_ms = max(0, round(float(outcome.get("elapsed_s") or 0) * 1000))
+                except (TypeError, ValueError):
+                    challenge_ms = 0
             document = state["document"]
             last = document.last if document else None
             pairs = document.pairs(last) if last is not None else list(response.headers.items())
@@ -764,15 +774,16 @@ class Fetcher:
                                 "http_only": bool(c.get("httpOnly"))})
             data.update(outcome="ok", error="", final_url=response.url, status_code=last.status if last is not None else response.status,
                         headers=headers, set_cookie_names=names, content_type=content_type[:512], html=html,
-                        html_truncated=truncated, cookies=cookies, challenge=state["challenge"], redirects=redirects)
+                        html_truncated=truncated, cookies=cookies, challenge=challenge, redirects=redirects,
+                        solver=solver, solver_cost_micro_usd=cost)
         timings = data["timings"]
         if marks["context"]:
             timings["context_ms"] = round((marks["context"] - begin) * 1000)
             if marks["navigated"]:
-                timings["navigate_ms"] = round((marks["navigated"] - marks["context"]) * 1000)
-                timings["settle_ms"] = max(0, round((loop.time() - marks["navigated"]) * 1000) - marks["challenge_ms"])
-        timings["challenge_ms"] = marks["challenge_ms"]
-        return {"data": data, "no_retry": state["no_retry"]}
+                timings["navigate_ms"] = max(0, round((marks["navigated"] - marks["context"]) * 1000) - challenge_ms)
+                timings["settle_ms"] = max(0, round((loop.time() - marks["navigated"]) * 1000))
+        timings["challenge_ms"] = challenge_ms
+        return {"data": data, "no_retry": no_retry}
 
 
 # ---------------------------------------------------------------- server
@@ -792,6 +803,8 @@ class Server:
         self.fetcher = fetcher
         self.version = version
         self.max_pages = max_pages
+        # Provider names only, so the node can check what the helper built.
+        self.solvers = list(fetcher.solver.providers) if getattr(fetcher, "solver", None) is not None else []
 
     async def handle(self, reader, writer):
         try:
@@ -833,7 +846,7 @@ class Server:
             return 200, {"data": {"status": "ready"}}
         if target == "/v1/capabilities" and method == "GET":
             return 200, {"data": {"web_browser": 1, "engine": ENGINE, "browser_version": self.version,
-                                  "max_pages": self.max_pages}}
+                                  "max_pages": self.max_pages, "solvers": self.solvers}}
         if target == "/v1/fetch":
             if method != "POST":
                 return 405, {"error": {"code": "method_not_allowed"}}
@@ -861,9 +874,15 @@ def watch_stdin(loop, stop):
 async def serve():
     env = os.environ
     bearer = env.pop("WEB_HELPER_BEARER", "")  # never inherited by the driver or the browser
+    solver_config = env.pop("WEB_SOLVER_CONFIG", "")  # likewise
     capacity = int(env["WEB_MAX_PAGES"])
     if len(bearer) != 64 or not 1 <= capacity <= 4:
         raise SystemExit(2)
+    try:
+        solver = solver_router(solver_config)
+    except Exception:
+        raise SystemExit(2) from None
+    del solver_config
     # The node reads the port this helper binds from the first stdout line.
     # Keep a private copy of stdout for it, and send everything else that
     # writes to stdout (the driver, the browser) to stderr.
@@ -879,17 +898,17 @@ async def serve():
             await session.start()
         except Exception as error:
             raise LaunchError(launch_reason(error))
-        await run_session(session, report, bearer, env, capacity)
+        await run_session(session, report, bearer, env, capacity, solver)
     finally:
         report.close()  # if the browser never started: the node reads the marker after EOF
         shutil.rmtree(profile, ignore_errors=True)
 
 
-async def run_session(session, report, bearer, env, capacity):
+async def run_session(session, report, bearer, env, capacity, solver=None):
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
     threading.Thread(target=watch_stdin, args=(loop, stop), daemon=True).start()
-    server = Server(bearer, Fetcher(session, env["WEB_EGRESS_PROXY"], capacity), env["WEB_BROWSER_VERSION"], capacity)
+    server = Server(bearer, Fetcher(session, env["WEB_EGRESS_PROXY"], capacity, solver), env["WEB_BROWSER_VERSION"], capacity)
     listener = await asyncio.start_server(server.handle, "127.0.0.1", 0, limit=MAX_REQUEST_HEAD)
     report.write(PORT_PREFIX + str(listener.sockets[0].getsockname()[1]) + "\n")
     report.close()

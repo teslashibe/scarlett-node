@@ -1,1 +1,3 @@
-scrapling[fetchers]==0.4.15
+# Scrapling 0.4.15 plus the anti-bot handlers and captcha-solver router, built from
+# teslashibe/Scrapling scarlett/antibot (87bbb2a) and pinned by its wheel digest in requirements.lock.
+scrapling[fetchers] @ https://github.com/teslashibe/Scrapling/releases/download/v0.4.15-scarlett.2/scrapling-0.4.15%2Bscarlett.2-py3-none-any.whl

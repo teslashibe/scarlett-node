@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -37,7 +38,7 @@ func (*stubBrowser) Fetch(context.Context, worker.BrowserFetchRequest) (worker.B
 }
 
 func readyBrowser(capacity int) worker.BrowserStatus {
-	return worker.BrowserStatus{Ready: true, Capacity: capacity, Version: "155.0.8059.39", Engine: "scrapling/0.4.15", UserAgent: "synthetic"}
+	return worker.BrowserStatus{Ready: true, Capacity: capacity, Version: "155.0.8059.39", Engine: "scrapling/0.4.15+scarlett.2", UserAgent: "synthetic"}
 }
 
 func browserEntry(t *testing.T, p *servicePool) (coordinator.ServiceHealth, coordinator.BrowserHealth) {
@@ -54,7 +55,7 @@ func TestWebBrowserReadinessInsideWebCapacity(t *testing.T) {
 	t.Cleanup(worker.ResetRelayHaltForTests)
 	p := poolFixture(t, "codex", "x_read", "web")
 	// Off by configuration: disabled, and the other kinds carry no browser.
-	if _, b := browserEntry(t, p); b != (coordinator.BrowserHealth{State: "unavailable", Reason: "disabled"}) {
+	if _, b := browserEntry(t, p); !reflect.DeepEqual(b, coordinator.BrowserHealth{State: "unavailable", Reason: "disabled"}) {
 		t.Fatalf("browser off: %+v", b)
 	}
 	for _, kind := range []string{"codex", "x_read"} {
@@ -70,7 +71,7 @@ func TestWebBrowserReadinessInsideWebCapacity(t *testing.T) {
 	p.browser = tier
 	for _, reason := range []string{"memory_low", "disk_low", "runtime_missing", "runtime_invalid", "browser_downloading", "browser_download_failed", "browser_invalid", "deps_missing", "sandbox_unavailable", "helper_failed"} {
 		tier.set(worker.BrowserStatus{Reason: reason})
-		if _, b := browserEntry(t, p); b != (coordinator.BrowserHealth{State: "unavailable", Reason: reason}) {
+		if _, b := browserEntry(t, p); !reflect.DeepEqual(b, coordinator.BrowserHealth{State: "unavailable", Reason: reason}) {
 			t.Fatalf("%s: %+v", reason, b)
 		}
 		if _, ok := p.acquireAccount("web", "browser"); ok {
@@ -86,9 +87,23 @@ func TestWebBrowserReadinessInsideWebCapacity(t *testing.T) {
 		}
 	}
 	tier.set(readyBrowser(2))
-	if h, b := browserEntry(t, p); b != (coordinator.BrowserHealth{State: "ready", Capacity: 2, Version: "155.0.8059.39"}) || h.Capacity != 4 {
+	if h, b := browserEntry(t, p); !reflect.DeepEqual(b, coordinator.BrowserHealth{State: "ready", Capacity: 2, Version: "155.0.8059.39"}) || h.Capacity != 4 {
 		t.Fatalf("ready browser: %+v in %+v", b, h)
 	}
+	// The operator's solvers are reported by name, known names only, once
+	// each, and only while the browser is ready.
+	solving := readyBrowser(2)
+	solving.Solvers = []string{"2captcha", "capmonster", "anticaptcha", "capmonster", "KEY-0123456789"}
+	tier.set(solving)
+	if _, b := browserEntry(t, p); !reflect.DeepEqual(b.Solvers, []string{"capmonster", "2captcha"}) {
+		t.Fatalf("solvers: %+v", b)
+	}
+	solving.Ready, solving.Reason = false, "helper_failed"
+	tier.set(solving)
+	if _, b := browserEntry(t, p); b.Solvers != nil {
+		t.Fatalf("solvers on an unavailable browser: %+v", b)
+	}
+	tier.set(readyBrowser(2))
 	// A browser lease holds a browser slot inside its web slot.
 	first, ok := p.acquireAccount("web", "browser")
 	second, ok2 := p.acquireAccount("web", "browser")
@@ -131,7 +146,7 @@ func TestWebBrowserReadinessInsideWebCapacity(t *testing.T) {
 	// Web itself unavailable: the browser says so too.
 	tier.set(readyBrowser(2))
 	worker.HaltRelay("test")
-	if h, b := browserEntry(t, p); h.State != "unreachable" || b != (coordinator.BrowserHealth{State: "unavailable", Reason: "web_unavailable"}) {
+	if h, b := browserEntry(t, p); h.State != "unreachable" || !reflect.DeepEqual(b, coordinator.BrowserHealth{State: "unavailable", Reason: "web_unavailable"}) {
 		t.Fatalf("halted relay: %+v %+v", h, b)
 	}
 	if _, ok := p.acquireAccount("web", "browser"); ok {

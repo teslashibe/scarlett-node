@@ -3,7 +3,8 @@
     <runtime>/python/bin/python3.13 -B -m unittest discover -s third_party/web-browser -p 'test_*.py'
 
 They build the real Scrapling session (never started) and drive the fetch
-path with fake pages; no browser, no network.
+path with fake pages and fake anti-bot outcomes; no browser, no network. The
+anti-bot handlers themselves are tested in the Scrapling fork.
 """
 
 import asyncio
@@ -17,6 +18,7 @@ import sys
 import tempfile
 import time
 import unittest
+from importlib import import_module
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -24,13 +26,42 @@ sys.path.insert(0, HERE)
 
 import scarlett_web_helper as helper  # noqa: E402
 from scrapling.engines._browsers import _stealth  # noqa: E402
-from scrapling.engines._browsers._base import StealthySessionMixin  # noqa: E402
 from scrapling.engines._browsers._page import PageInfo  # noqa: E402
+from scrapling.engines.antibot import runner as antibot_runner  # noqa: E402
+from scrapling.engines.antibot.base import Detection  # noqa: E402
 from scrapling.engines.constants import STEALTH_ARGS  # noqa: E402
 
+antibot_detect = import_module("scrapling.engines.antibot.detect")  # the module; the package re-exports the function
+
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
-SOLVED = open(os.path.join(HERE, "testdata", "cf_solved_page.html"), encoding="utf-8").read()
-MANAGED = "<html><head><title>Just a moment...</title></head><body><script>window._cf_chl_opt={cType: 'managed'}</script></body></html>"
+PAGE = "<html><body><p>hello</p></body></html>"
+KEY = "0123456789abcdef0123456789abcdef"
+
+# response.meta["antibot"] as the fork reports it.
+CLEAN = {"vendor": None, "kind": None, "rule": None, "solved": False, "reason": "none", "layers": [], "elapsed_s": 0.4}
+
+
+def layer(vendor, kind, rule, solved, reason, used_solver=None, elapsed=1.0, solver_kind=None):
+    return {"vendor": vendor, "kind": kind, "rule": rule, "solved": solved, "reason": reason, "cookies": [],
+            "used_solver": used_solver, "solver_kind": solver_kind, "elapsed_s": elapsed}
+
+
+def outcome(*layers, solver=None, elapsed=2.5):
+    last = layers[-1]
+    out = {"vendor": last["vendor"], "kind": last["kind"], "rule": last["rule"], "solved": all(x["solved"] for x in layers),
+           "reason": last["reason"], "layers": list(layers), "elapsed_s": elapsed}
+    if solver:
+        out["solver"] = solver
+    return out
+
+
+SOLVED_DD = outcome(layer("datadome", "device_check", "dd.frame_device", True, "solved"))
+SLIDER = outcome(layer("datadome", "captcha", "dd.frame_captcha", False, "slider", solver_kind="datadome_slider"))
+PX_HOLD = outcome(layer("perimeterx", "captcha", "px.hold", False, "unsolved:attempts_exhausted"))
+BANNED = outcome(layer("datadome", "ban", "dd.frame_device", False, "ban"))
+TIMED_OUT = outcome(layer("akamai", "challenge", "akamai.sec_cpt_html", False, "timeout"))
+PAID = outcome(layer("cloudflare", "captcha", "cf.turnstile", True, "solved", used_solver="capmonster"),
+               solver={"solves": 1, "attempts": 1, "cost_usd": 0.0012, "records": []})
 
 
 def run(coro):
@@ -145,6 +176,72 @@ class OptionSetTests(unittest.TestCase):
         self.session._browser_options["args"] = self.session._browser_options["args"][1:]
         self.assertIn("driver-defaults", helper.option_problems(self.session, 3))
 
+    def test_antibot_launch_hardening(self):
+        # solve_antibot is on the session, so the fork rewrites the argv at
+        # start(): headless tells out, one common display and the UA in, and
+        # everything the helper built otherwise unchanged.
+        from scrapling.engines.antibot.headless import canonical_displays, display_policy
+
+        self.assertEqual(display_policy(), "canonical")
+        self.assertIn(canonical_displays()[0].screen_info_switch(), self.session._launch_options()["args"])
+        self.assertIs(self.session._config.solve_antibot, True)
+        self.assertIsNone(self.session._config.captcha_solver)
+        launch = self.session._launch_options()
+        args = launch["args"]
+        for gone in ("--hide-scrollbars", "--force-color-profile=srgb"):
+            self.assertIn(gone, self.args)
+            self.assertNotIn(gone, args)
+        self.assertFalse([a for a in args if a.startswith("--blink-settings=")])
+        for prefix in ("--screen-info=", "--force-device-scale-factor=", "--window-size="):
+            self.assertEqual(len([a for a in args if a.startswith(prefix)]), 1, prefix)
+        self.assertIn("--user-agent=" + UA, args)
+        kept = [a for a in self.args if not helper.antibot_dropped(a)]
+        self.assertEqual(args[:len(kept)], kept)
+        for arg in ("--proxy-server=http://127.0.0.1:2222", "--user-data-dir=" + self.profile, "--remote-debugging-pipe",
+                    "--webrtc-ip-handling-policy=disable_non_proxied_udp", "--disable-quic"):
+            self.assertIn(arg, args)
+        self.assertEqual({k: v for k, v in launch.items() if k != "args"},
+                         {k: v for k, v in self.session._browser_options.items() if k != "args"})
+        self.assertIs(self.session._context_options.get("no_viewport"), True)
+        self.assertEqual(helper.launch_problems(self.session), [])
+
+    def test_launch_problems_are_reported(self):
+        original = self.session._launch_options
+
+        def tampered(extra=(), drop=()):
+            def launch():
+                options = original()
+                options["args"] = [a for a in options["args"] if a not in drop] + list(extra)
+                return options
+            return launch
+        for extra, drop, problem in ((["--no-sandbox"], (), "launch-added"), (["--remote-debugging-port=9222"], (), "launch-forbidden-arg"),
+                                     ([], ("--disable-quic",), "launch-kept"), (["--user-agent=HeadlessChrome"], (), "launch-user-agent")):
+            self.session._launch_options = tampered(extra, drop)
+            self.assertIn(problem, helper.launch_problems(self.session), (extra, drop))
+        self.session._launch_options = original
+        self.session._config.solve_antibot = False
+        self.assertEqual(helper.launch_problems(self.session), ["antibot-launch"])
+
+    def test_datadome_slide_to_target_is_not_dragged(self):
+        from scrapling.engines.antibot import registry
+
+        self.assertIs(registry.get("datadome").drag_simple_slider, False)
+        registry.get("datadome").drag_simple_slider = True
+        try:
+            self.assertIn("datadome-slider", helper.option_problems(self.session, 3))
+        finally:
+            registry.get("datadome").drag_simple_slider = False
+
+    def test_the_operators_own_displays_are_a_problem(self):
+        from scrapling.engines.antibot import headless
+
+        self.assertNotIn("display", helper.option_problems(self.session, 3))
+        headless.set_display_policy("host")
+        try:
+            self.assertIn("display", helper.option_problems(self.session, 3))
+        finally:
+            headless.set_display_policy("canonical")
+
     def test_launch_reason(self):
         self.assertEqual(helper.launch_reason(Exception("chrome: error while loading shared libraries: libnss3.so")), "deps_missing")
         self.assertEqual(helper.launch_reason(Exception("Host system is missing dependencies to run browsers.")), "deps_missing")
@@ -205,19 +302,40 @@ class ProfileTests(unittest.TestCase):
             helper.new_session = fake_session
             tempfile.tempdir = self.root
             os.environ.update({"WEB_HELPER_BEARER": "ab" * 32, "WEB_MAX_PAGES": "1", "WEB_BROWSER_EXECUTABLE": sys.executable,
-                               "WEB_USER_AGENT": UA, "WEB_EGRESS_PROXY": "http://127.0.0.1:1", "WEB_DENY_PROXY": "http://127.0.0.1:2"})
+                               "WEB_USER_AGENT": UA, "WEB_EGRESS_PROXY": "http://127.0.0.1:1", "WEB_DENY_PROXY": "http://127.0.0.1:2",
+                               "WEB_SOLVER_CONFIG": json.dumps({"capmonster": KEY})})
             with self.assertRaises(helper.LaunchError):
                 run(helper.serve())
+            # The bearer and the solver keys never reach the driver or the browser.
+            popped = ("WEB_HELPER_BEARER" not in os.environ, "WEB_SOLVER_CONFIG" not in os.environ)
         finally:
             helper.new_session, env, stdout, tempfile.tempdir = saved
             os.dup2(stdout, 1)
             os.close(stdout)
             os.environ.clear()
             os.environ.update(env)
+        self.assertEqual(popped, (True, True))
         self.assertEqual(len(seen), 1)
         self.assertTrue(os.path.basename(seen[0][0]).startswith(helper.PROFILE_PREFIX))
         self.assertEqual(seen[0][1], [])
         self.assertEqual(os.listdir(self.root), [])
+
+    def test_serve_refuses_a_bad_solver_config(self):
+        saved = (os.environ.copy(), os.dup(1))
+        try:
+            for raw in ("{", json.dumps({"capmonster": 1}), json.dumps({"anticaptcha": KEY}), json.dumps({"max_solves_per_fetch": 2}),
+                        json.dumps({"capmonster": KEY, "max_solves_per_fetch": 9}), json.dumps({"capmonster": "short"})):
+                os.environ.update({"WEB_HELPER_BEARER": "ab" * 32, "WEB_MAX_PAGES": "1", "WEB_SOLVER_CONFIG": raw})
+                with self.assertRaises(SystemExit) as caught:
+                    run(helper.serve())
+                self.assertEqual(caught.exception.code, 2)
+                self.assertNotIn("WEB_SOLVER_CONFIG", os.environ)
+        finally:
+            env, stdout = saved
+            os.dup2(stdout, 1)
+            os.close(stdout)
+            os.environ.clear()
+            os.environ.update(env)
 
 
 class RedirectGuardTests(unittest.TestCase):
@@ -416,37 +534,35 @@ class FakePage:
     def set_default_timeout(self, ms):
         self.default_timeouts.append(ms)
 
+    def set_default_navigation_timeout(self, ms):
+        self.default_timeouts.append(ms)
+
     def locator(self, selector):
         return FakeLocator(self, selector)
 
 
 class FakeScraplingResponse:
-    def __init__(self, page):
+    def __init__(self, page, meta=None):
         self.url = page.url
         self.body = page.html.encode("utf-8")
         self.status = page.status
         self.headers = dict(page.headers)
         self.cookies = tuple(page.cookie_jar)
+        self.meta = meta if meta is not None else {}
 
 
 class FakeSession:
-    """Calls page_setup, navigates, calls page_action and builds the
-    response, in Scrapling's order and, as Scrapling 0.4.15 does, logging and
-    swallowing an exception from page_setup or page_action. Detection is
-    Scrapling's. ScraplingFetchTests drive Scrapling's own fetch instead."""
+    """Calls page_setup, navigates, runs the anti-bot pass (when the fetch
+    asks for it), calls page_action and builds the response, in the fork's
+    order and, as Scrapling does, logging and swallowing an exception from
+    page_setup or page_action. outcomes are the passes' results, one per
+    fetch; a callable gets the page and may change it. ScraplingFetchTests
+    drive Scrapling's own fetch instead."""
 
-    _detect_cloudflare = staticmethod(StealthySessionMixin._detect_cloudflare)
-
-    def __init__(self, pages, solver=None):
+    def __init__(self, pages, outcomes=()):
         self.pages = list(pages)
-        self.solver_calls = 0
-        self.solver = solver
+        self.outcomes = list(outcomes)
         self.fetch_calls = []
-
-    async def _cloudflare_solver(self, page):
-        self.solver_calls += 1
-        if self.solver:
-            await self.solver(page)
 
     async def fetch(self, url, **kwargs):
         self.fetch_calls.append(kwargs)
@@ -456,11 +572,17 @@ class FakeSession:
         except Exception:
             pass
         await page.goto(url)
+        meta = {"proxy": kwargs.get("proxy")}
+        if kwargs.get("solve_antibot"):
+            result = self.outcomes.pop(0) if self.outcomes else CLEAN
+            if callable(result):
+                result = await result(page)
+            meta["antibot"] = result
         try:
             await kwargs["page_action"](page)
         except Exception:
             pass
-        return FakeScraplingResponse(page)
+        return FakeScraplingResponse(page, meta)
 
 
 def request(**overrides):
@@ -469,21 +591,53 @@ def request(**overrides):
     return helper.Request(raw)
 
 
+class FakeRouter:
+    """A SolverRouter stand-in: each job gets a scope, whose ledger the
+    helper reports (spent and attempts as if the pass had paid them)."""
+    providers = ["capmonster", "capsolver"]
+
+    def __init__(self, spent=0.0, attempts=0):
+        self.spent = spent
+        self.attempts = attempts
+        self.scopes = []
+
+    def scope(self):
+        scope = FakeScope(self.spent, self.attempts)
+        self.scopes.append(scope)
+        return scope
+
+    def supports(self, kind):
+        return True
+
+    async def solve_token(self, *args, **kwargs):
+        raise AssertionError("never called by the helper")
+
+    async def recognize(self, *args, **kwargs):
+        raise AssertionError("never called by the helper")
+
+
+class FakeScope(FakeRouter):
+    is_scope = True
+
+    def __init__(self, spent, attempts):
+        super().__init__(spent, attempts)
+        self.spent_usd = spent
+
+
 class FetchTests(unittest.TestCase):
-    def fetch(self, session, req=None):
+    def fetch(self, session, req=None, solver=None):
         async def go():
-            return await helper.Fetcher(session, "http://127.0.0.1:1111", 2).fetch(req or request())
+            return await helper.Fetcher(session, "http://127.0.0.1:1111", 2, solver).fetch(req or request())
         return run(go())["data"]
 
     def test_fetch_options_and_last_document_capture(self):
-        page = FakePage("<html><body><p>hello</p></body></html>", headers=[("content-type", "text/html"), ("x-last", "1"),
-                                                                           ("set-cookie", "sid=1"), ("set-cookie", "__cf_bm=2")])
+        page = FakePage(PAGE, headers=[("content-type", "text/html"), ("x-last", "1"), ("set-cookie", "sid=1"), ("set-cookie", "__cf_bm=2")])
         page.cookie_jar = [{"name": "__cf_bm", "value": "v", "domain": ".example.com", "path": "/", "expires": -1, "secure": True, "httpOnly": True}]
         session = FakeSession([page])
         data = self.fetch(session)
         self.assertEqual(data["outcome"], "ok")
         self.assertEqual(data["status_code"], 200)
-        self.assertEqual(data["challenge"], "none")
+        self.assertEqual((data["challenge"], data["solver"], data["solver_cost_micro_usd"]), ("none", "", 0))
         self.assertIn(["x-last", "1"], data["headers"])
         self.assertEqual(data["set_cookie_names"], ["sid", "__cf_bm"])
         self.assertEqual(data["cookies"][0]["http_only"], True)
@@ -491,48 +645,123 @@ class FetchTests(unittest.TestCase):
         kwargs = session.fetch_calls[0]
         self.assertEqual(kwargs["proxy"], "http://127.0.0.1:1111")
         self.assertIs(kwargs["network_idle"], False)
-        self.assertIs(kwargs["solve_cloudflare"], False)
+        self.assertIs(kwargs["solve_cloudflare"], False)  # the fork's Cloudflare handler does it
+        self.assertIs(kwargs["solve_antibot"], True)
+        self.assertIsNone(kwargs["captcha_solver"])
         self.assertIs(kwargs["google_search"], False)
         self.assertNotIn("extra_flags", kwargs)
         # The redirect guard is on before the page navigates.
         self.assertEqual(page.context.cdp.sent[0][0], "Fetch.enable")
 
-    def test_solver_never_runs_on_a_solved_page(self):
-        page = FakePage(SOLVED)
-        self.assertEqual(StealthySessionMixin._detect_cloudflare(SOLVED), "embedded")  # the script stays
-        session = FakeSession([page])
+    def test_the_solver_goes_only_to_fetches_the_node_allows(self):
+        router = FakeRouter()
+        session = FakeSession([FakePage(PAGE), FakePage(PAGE)])
+        self.fetch(session, request(solver=True), solver=router)
+        self.fetch(session, request(solver=False), solver=router)
+        self.assertEqual(len(router.scopes), 1)  # one scope per job that may use the solver
+        self.assertIs(session.fetch_calls[0]["captcha_solver"], router.scopes[0])
+        self.assertIsNone(session.fetch_calls[1]["captcha_solver"])
+        # No router configured: a request that allows one gets none.
+        session = FakeSession([FakePage(PAGE)])
+        self.fetch(session, request(solver=True))
+        self.assertIsNone(session.fetch_calls[0]["captcha_solver"])
+
+    def test_a_solved_challenge(self):
+        async def solve(page):
+            page.html = PAGE
+            page.emit_document(status=200)
+            return SOLVED_DD
+        page = FakePage("<html><script>var dd={}</script></html>", status=403)
+        session = FakeSession([page], [solve])
         data = self.fetch(session)
-        self.assertEqual(session.solver_calls, 0)
-        self.assertEqual(data["challenge"], "none")
+        self.assertEqual((data["challenge"], data["solver"], data["status_code"]), ("solved", "", 200))
+        self.assertEqual(data["timings"]["challenge_ms"], 2500)
+        self.assertEqual(len(session.fetch_calls), 1)
 
-    def test_solver_runs_on_a_managed_interstitial(self):
-        page = FakePage(MANAGED, status=403, headers=[("content-type", "text/html"), ("cf-mitigated", "challenge")])
+    def test_a_paid_solve_is_used_and_costed(self):
+        router = FakeRouter(spent=0.0012, attempts=1)
+        data = self.fetch(FakeSession([FakePage(PAGE)], [PAID]), request(solver=True), solver=router)
+        self.assertEqual((data["challenge"], data["solver"], data["solver_cost_micro_usd"]), ("solved", "used", 1200))
 
-        async def solve(p):
-            p.html, p.status = "<html><body>welcome</body></html>", 200
-            p.emit_document(status=200)
-        session = FakeSession([page], solver=solve)
-        data = self.fetch(session)
-        self.assertEqual(session.solver_calls, 1)
-        self.assertEqual(data["challenge"], "solved")
-        self.assertEqual(data["status_code"], 200)
-        self.assertIn(5000, page.default_timeouts)  # the solver's own waits are bounded
+    def test_both_passes_share_one_scope_and_its_ledger(self):
+        router = FakeRouter(spent=0.0025, attempts=2)
+        session = FakeSession([FakePage(PAGE), FakePage(PAGE)], [TIMED_OUT, PAID])
+        data = self.fetch(session, request(solver=True), solver=router)
+        self.assertEqual(len(session.fetch_calls), 2)
+        self.assertEqual(len(router.scopes), 1)
+        self.assertIs(session.fetch_calls[1]["captcha_solver"], router.scopes[0])
+        # The scope's ledger, once: never the passes' summaries added up.
+        self.assertEqual((data["challenge"], data["solver"], data["solver_cost_micro_usd"]), ("solved", "used", 2500))
 
-    def test_a_hung_solver_is_bounded_and_unsolved(self):
-        async def hang(p):
-            await asyncio.sleep(3600)
-        session = FakeSession([FakePage(MANAGED)], solver=hang)
+    def test_a_pass_cut_off_mid_solve_still_reports_its_spend(self):
+        class Slow(FakeSession):
+            async def fetch(self, url, **kwargs):
+                self.fetch_calls.append(kwargs)
+                await asyncio.sleep(3600)
+        router = FakeRouter(spent=0.002, attempts=1)  # a task sent before the cut-off may still be billed
+        data = self.fetch(Slow([]), request(solver=True, timeout_ms=1000), solver=router)
+        self.assertEqual((data["outcome"], data["solver"], data["solver_cost_micro_usd"]), ("timeout", "needed", 2000))
+
+    def test_the_retry_pass_gets_only_the_time_left(self):
+        async def slow(page):
+            await asyncio.sleep(1.5)
+            return TIMED_OUT
+        session = FakeSession([FakePage(PAGE), FakePage(PAGE)], [slow, CLEAN])
         started = time.monotonic()
-        data = self.fetch(session, request(timeout_ms=3000))
-        self.assertLess(time.monotonic() - started, 5)
-        self.assertEqual(data["challenge"], "unsolved")
-        self.assertEqual(session.solver_calls, 1)  # under 15 s left: no fresh-context retry
+        self.fetch(session, request(timeout_ms=20000))
+        first, second = (call["timeout"] for call in session.fetch_calls)
+        self.assertTrue(19000 <= first <= 20000, first)
+        # The second pass started at least 1.5 s in: its budget (and the fork's anti-bot deadline inside it) ends
+        # before the job's own deadline.
+        self.assertLessEqual(second, 20000 - 1500 - 250)
+        self.assertLess(time.monotonic() - started, 20)
 
     def test_unsolved_with_time_left_retries_once_in_a_fresh_context(self):
-        session = FakeSession([FakePage(MANAGED), FakePage("<html><body>ok</body></html>")])
-        data = self.fetch(session, request(solve_challenge=False))
+        session = FakeSession([FakePage(PAGE), FakePage(PAGE)], [TIMED_OUT, CLEAN])
+        data = self.fetch(session)
         self.assertEqual(len(session.fetch_calls), 2)
         self.assertEqual(data["challenge"], "none")
+
+    def test_unsolved_without_time_left_is_not_retried(self):
+        session = FakeSession([FakePage(PAGE), FakePage(PAGE)], [TIMED_OUT, CLEAN])
+        data = self.fetch(session, request(timeout_ms=10000))
+        self.assertEqual(len(session.fetch_calls), 1)
+        self.assertEqual(data["challenge"], "unsolved")
+
+    def test_a_ban_or_a_captcha_is_never_retried(self):
+        for result, solver in ((BANNED, ""), (SLIDER, "needed")):
+            session = FakeSession([FakePage(PAGE), FakePage(PAGE)], [result, CLEAN])
+            data = self.fetch(session, request(timeout_ms=40000))
+            self.assertEqual(len(session.fetch_calls), 1, result["reason"])
+            self.assertEqual((data["challenge"], data["solver"]), ("unsolved", solver), result["reason"])
+
+    def test_a_press_and_hold_that_failed_is_retried_and_needs_no_solver(self):
+        session = FakeSession([FakePage(PAGE), FakePage(PAGE)], [PX_HOLD, PX_HOLD])
+        data = self.fetch(session, request(timeout_ms=40000))
+        self.assertEqual(len(session.fetch_calls), 2)
+        self.assertEqual((data["challenge"], data["solver"]), ("unsolved", ""))
+
+    def test_a_missing_or_failed_pass_is_unsolved(self):
+        for meta in (None, antibot_runner.error_outcome(RuntimeError("x"))):
+            async def give(page, meta=meta):
+                return meta
+            data = self.fetch(FakeSession([FakePage(PAGE)], [give]), request(timeout_ms=10000))
+            self.assertEqual(data["challenge"], "unsolved")
+
+    def test_detection_only_when_the_job_turns_solving_off(self):
+        seen = []
+
+        async def signal(page, **kwargs):
+            seen.append(kwargs)
+            return "signal"
+        for found, want in ((Detection("akamai", "challenge", "akamai.sec_cpt", {}), "unsolved"), (None, "none")):
+            session = FakeSession([FakePage(PAGE)])
+            with mock.patch.object(antibot_runner, "read_signal", signal), \
+                    mock.patch.object(antibot_detect, "detect", lambda s, found=found: found):
+                data = self.fetch(session, request(solve_challenge=False, timeout_ms=10000))
+            self.assertIs(session.fetch_calls[0]["solve_antibot"], False)
+            self.assertEqual(data["challenge"], want)
+        self.assertEqual(seen[0]["status"], 200)
 
     def test_selector_and_settle_time_stay_in_budget(self):
         page = FakePage("<html><body><div id=late></div></body></html>")
@@ -564,7 +793,7 @@ class FetchTests(unittest.TestCase):
 
     def test_a_guard_that_cannot_start_closes_the_page_and_fails(self):
         for case in ("session", "enable"):
-            page = FakePage(MANAGED)
+            page = FakePage(PAGE)
             if case == "session":
                 page.context.cdp_error = Exception("Target.attachToTarget: Target closed")
             else:
@@ -575,36 +804,111 @@ class FetchTests(unittest.TestCase):
                              ("failed", "navigation_failed", "", "none"), case)
             self.assertTrue(page.closed, case)
             self.assertEqual(page.navigations, 0, case)  # nothing loaded unguarded
-            self.assertEqual(session.solver_calls, 0, case)
 
     def test_an_unguarded_page_is_never_ok(self):
         # The guard fails and so does closing the page: Scrapling navigates
         # anyway, and the result must still not be a success.
-        page = FakePage(MANAGED)
+        page = FakePage(PAGE)
         page.context.cdp_error = Exception("Target closed")
         page.close_error = Exception("Target closed")
         session = FakeSession([page])
         data = self.fetch(session)
         self.assertEqual(page.navigations, 1)
         self.assertEqual((data["outcome"], data["error"], data["html"]), ("failed", "navigation_failed", ""))
-        self.assertEqual(session.solver_calls, 0)
 
-    def test_challenge_handling_that_does_not_finish_fails(self):
-        class Broken(FakeSession):
-            @staticmethod
-            def _detect_cloudflare(html):
-                raise RuntimeError("detector")
-        page = FakePage("<html><body>hello</body></html>")
-        data = self.fetch(Broken([page]))
+    def test_waits_that_do_not_finish_fail(self):
+        async def broken(*args):
+            raise RuntimeError("settle")
+        page = FakePage(PAGE)
+        with mock.patch.object(helper, "settle_navigation", broken):
+            data = self.fetch(FakeSession([page]))
         self.assertEqual(page.navigations, 1)
         self.assertEqual((data["outcome"], data["error"], data["html"]), ("failed", "navigation_failed", ""))
 
 
+class AntibotResultTests(unittest.TestCase):
+    def test_mapping(self):
+        cases = [
+            (CLEAN, ("none", False, "", 0)),
+            (SOLVED_DD, ("solved", False, "", 0)),
+            (PAID, ("solved", False, "used", 1200)),
+            (SLIDER, ("unsolved", True, "needed", 0)),
+            (BANNED, ("unsolved", True, "", 0)),
+            (TIMED_OUT, ("unsolved", False, "", 0)),
+            # Only a layer the fork names a solver kind for needs one: no provider takes Imperva's GeeTest, a
+            # widgetless incident page, HUMAN's press and hold, or a hard block found inside the captcha frame.
+            (outcome(layer("imperva", "captcha", "imperva.incident", False, "captcha_required:geetest")), ("unsolved", False, "", 0)),
+            (outcome(layer("imperva", "captcha", "imperva.incident", False, "blocked:no_widget")), ("unsolved", False, "", 0)),
+            (outcome(layer("imperva", "captcha", "imperva.incident", False, "captcha_required:hcaptcha", solver_kind="hcaptcha")),
+             ("unsolved", True, "needed", 0)),
+            (PX_HOLD, ("unsolved", False, "", 0)),
+            (outcome(layer("perimeterx", "captcha", "px.hold", False, "timeout")), ("unsolved", False, "", 0)),
+            (outcome(layer("datadome", "captcha", "dd.frame_captcha", False, "ban")), ("unsolved", True, "", 0)),
+            (outcome(layer("cloudflare", "captcha", "cf.turnstile", False, "unsolved:cf.turnstile", solver_kind="turnstile")),
+             ("unsolved", True, "needed", 0)),
+            (outcome(layer("datadome", "captcha", "dd.frame_captcha", False, "ban"), solver={"attempts": 1, "cost_usd": 0.003}),
+             ("unsolved", True, "", 3000)),
+            (outcome(layer("datadome", "captcha", "dd.frame_captcha", False, "solver_error:ERROR_ZERO_BALANCE", used_solver="capsolver"),
+                     solver={"attempts": 1, "cost_usd": 0}), ("unsolved", True, "needed", 0)),
+            (outcome(layer("imperva", "challenge", "imperva.interstitial", True, "solved"),
+                     layer("datadome", "device_check", "dd.frame_device", True, "solved")), ("solved", False, "", 0)),
+            (outcome(layer("akamai", "challenge", "akamai.sec_cpt_html", True, "solved:sec_cpt"),
+                     layer("datadome", "captcha", "dd.frame_captcha", False, "slider", solver_kind="datadome_slider")),
+             ("unsolved", True, "needed", 0)),
+            (antibot_runner.error_outcome(ValueError()), ("unsolved", False, "", 0)),
+            (None, ("unsolved", False, "", 0)),
+            ("junk", ("unsolved", False, "", 0)),
+        ]
+        for meta, want in cases:
+            self.assertEqual(helper.antibot_result(meta, True), want, meta)
+        self.assertEqual(helper.antibot_result(SLIDER, False), ("none", False, "", 0))
+        weird = dict(PAID, solver={"attempts": 1, "cost_usd": "lots"})
+        self.assertEqual(helper.antibot_result(weird, True)[3], 0)
+        for odd in (float("inf"), float("nan"), None, -5):
+            self.assertEqual(helper.antibot_result(dict(PAID, solver={"attempts": 1, "cost_usd": odd}), True)[3], 0, odd)
+        huge = dict(PAID, solver={"attempts": 1, "cost_usd": 1e9})
+        self.assertEqual(helper.antibot_result(huge, True)[3], 10_000_000)
+
+
+class SolverRouterTests(unittest.TestCase):
+    def test_no_config_no_router(self):
+        self.assertIsNone(helper.solver_router(""))
+
+    def test_router_from_node_config(self):
+        import certifi
+        router = helper.solver_router(json.dumps({"capmonster": KEY, "2captcha": "f" * 32, "max_solves_per_fetch": 3, "experimental": True}))
+        self.assertEqual(router.providers, ["2captcha", "capmonster"])
+        self.assertIs(router.allow_proxy, False)
+        self.assertEqual((router.max_solves_per_fetch, router.experimental), (3, True))
+        self.assertNotIn(KEY, repr(router))
+        for solver in router._shared.solvers.values():
+            transport = solver._transport
+            https = [h for h in transport._opener.handlers if h.__class__.__name__ == "HTTPSHandler"]
+            proxies = [h for h in transport._opener.handlers if h.__class__.__name__ == "ProxyHandler"]
+            self.assertEqual(len(https), 1)
+            self.assertEqual(https[0]._context.verify_mode, helper.ssl.CERT_REQUIRED)
+            self.assertTrue(https[0]._context.check_hostname)
+            self.assertTrue(https[0]._context.get_ca_certs() or os.path.exists(certifi.where()))
+            self.assertEqual(proxies, [])  # never HTTP(S)_PROXY from the environment
+
+    def test_bad_configs_never_echo_a_key(self):
+        secret = "s3cr3t-0123456789"
+        for raw in ("{", "[]", json.dumps({"capmonster": 1}), json.dumps({"anticaptcha": secret}),
+                    json.dumps({"capmonster": secret, "proxy": "http://x"}), json.dumps({"capmonster": secret + " x"}),
+                    json.dumps({"capmonster": secret, "max_solves_per_fetch": 0}), json.dumps({"capmonster": secret, "experimental": "yes"}),
+                    json.dumps({"max_solves_per_fetch": 2})):
+            with self.assertRaises(ValueError) as caught:
+                helper.solver_router(raw)
+            self.assertNotIn(secret, str(caught.exception))
+
+
 class ScraplingFetchTests(unittest.TestCase):
     """Scrapling's own AsyncStealthySession.fetch, with its page source and
-    response builder replaced by fakes: it logs and swallows an exception
-    from page_setup and page_action and navigates anyway, and the Fetcher
-    must fail closed regardless."""
+    response builder replaced by fakes and the fork's anti-bot runner
+    replaced by recorders: it runs the pass after navigation and before
+    page_action, passes the per-fetch solver through, logs and swallows an
+    exception from page_setup and page_action and navigates anyway, and the
+    Fetcher must fail closed regardless."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -614,35 +918,86 @@ class ScraplingFetchTests(unittest.TestCase):
         self.session = helper.new_session(sys.executable, UA, "http://127.0.0.1:1111", "http://127.0.0.1:2222", 1, profile)
         self.session._is_alive = True
         self.pages = []
+        self.calls = []
+        self.outcome = CLEAN
 
         @contextlib.asynccontextmanager
         async def page_generator(*args, **kwargs):
             yield PageInfo(page=self.pages.pop(0), state="busy", url="")
         self.session._page_generator = page_generator
 
-        async def build(page, first_response, final_response, selector_config, **kwargs):
-            return FakeScraplingResponse(page)
-        patcher = mock.patch.object(_stealth.ResponseFactory, "from_async_playwright_response", build)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        async def build(page, first_response, final_response, selector_config, meta=None, **kwargs):
+            return FakeScraplingResponse(page, meta)
 
-    def fetch(self, page):
+        async def prepare(page, **kwargs):
+            self.calls.append(("prepare", page.navigations))
+            return {"hardened": True, "errors": 0}
+
+        async def solve(page, *, document, deadline, solver=None, log=None):
+            self.calls.append(("solve", page.navigations, solver, deadline - time.monotonic()))
+            return self.outcome
+        for target, name, value in ((_stealth.ResponseFactory, "from_async_playwright_response", build),
+                                    (antibot_runner, "prepare_page", prepare), (antibot_runner, "solve_page", solve),
+                                    (antibot_runner, "release_page", lambda page: None)):
+            patcher = mock.patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def fetch(self, page, req=None, solver=None):
         self.pages.append(page)
 
         async def go():
-            return await helper.Fetcher(self.session, "http://127.0.0.1:1111", 1).fetch(request())
+            return await helper.Fetcher(self.session, "http://127.0.0.1:1111", 1, solver).fetch(req or request())
         return run(go())["data"]
 
     def test_a_guarded_page_is_ok(self):
-        page = FakePage("<html><body>hello</body></html>")
+        page = FakePage(PAGE)
         data = self.fetch(page)
-        self.assertEqual((data["outcome"], data["status_code"], data["html"]), ("ok", 200, page.html))
+        self.assertEqual((data["outcome"], data["status_code"], data["html"], data["challenge"]), ("ok", 200, page.html, "none"))
         self.assertEqual(page.context.cdp.sent[0][0], "Fetch.enable")
         self.assertEqual(page.navigations, 1)
 
+    def test_the_pass_runs_after_navigation_with_the_fetch_budget_and_solver(self):
+        router = FakeRouter(spent=0.0012, attempts=1)
+        self.outcome = PAID
+        data = self.fetch(FakePage(PAGE), request(solver=True, timeout_ms=20000), solver=router)
+        self.assertEqual(self.calls[0], ("prepare", 0))  # hardened before it navigates
+        name, navigations, solver, budget = self.calls[1]
+        self.assertEqual((name, navigations), ("solve", 1))
+        self.assertIs(solver, router.scopes[0])
+        self.assertTrue(15 < budget <= 18, budget)  # the fetch's 20 s less its reserve
+        self.assertEqual((data["challenge"], data["solver"], data["solver_cost_micro_usd"]), ("solved", "used", 1200))
+        self.calls.clear()
+        self.fetch(FakePage(PAGE), request(solver=False), solver=router)
+        self.assertIsNone(self.calls[1][2])
+
+    def test_an_unsolved_page_is_reported(self):
+        self.outcome = SLIDER
+        data = self.fetch(FakePage(PAGE), request(timeout_ms=40000))
+        self.assertEqual((data["outcome"], data["challenge"], data["solver"]), ("ok", "unsolved", "needed"))
+
+    def test_the_retry_pass_deadline_ends_before_the_jobs(self):
+        """The fork's anti-bot deadline on the retry pass (where paid solves run) is inside the job's deadline."""
+        outcomes = [TIMED_OUT, CLEAN]
+        seen = []
+
+        async def solve(page, *, document, deadline, solver=None, log=None):
+            seen.append(deadline)
+            if len(seen) == 1:
+                await asyncio.sleep(2)
+            return outcomes.pop(0)
+        self.pages.append(FakePage(PAGE))
+        started = time.monotonic()
+        with mock.patch.object(antibot_runner, "solve_page", solve):
+            data = self.fetch(FakePage(PAGE), request(timeout_ms=20000))
+        job_deadline = started + 20
+        self.assertEqual((len(seen), data["challenge"]), (2, "none"))
+        self.assertLess(seen[0], job_deadline)
+        self.assertLess(seen[1], job_deadline - 1)  # inside the job's budget, with the response's reserve
+
     def test_a_guard_that_cannot_start_fails_before_navigation(self):
         for case in ("session", "enable"):
-            page = FakePage("<html><body>hello</body></html>")
+            page = FakePage(PAGE)
             if case == "session":
                 page.context.cdp_error = Exception("Target.attachToTarget: Target closed")
             else:
@@ -652,128 +1007,21 @@ class ScraplingFetchTests(unittest.TestCase):
             self.assertEqual(page.navigations, 0, case)
 
     def test_an_unguarded_page_is_never_ok(self):
-        page = FakePage("<html><body>hello</body></html>")
+        page = FakePage(PAGE)
         page.context.cdp_error = Exception("Target closed")
         page.close_error = Exception("Target closed")
         data = self.fetch(page)
         self.assertEqual(page.navigations, 1)  # Scrapling navigated without the guard
         self.assertEqual((data["outcome"], data["error"], data["html"]), ("failed", "navigation_failed", ""))
 
-    def test_challenge_handling_that_does_not_finish_fails(self):
-        def detector(html):
-            raise RuntimeError("detector")
-        self.session._detect_cloudflare = detector
-        page = FakePage("<html><body>hello</body></html>")
-        data = self.fetch(page)
+    def test_waits_that_do_not_finish_fail(self):
+        async def broken(*args):
+            raise RuntimeError("settle")
+        page = FakePage(PAGE)
+        with mock.patch.object(helper, "settle_navigation", broken):
+            data = self.fetch(page)
         self.assertEqual(page.navigations, 1)
         self.assertEqual((data["outcome"], data["error"], data["html"]), ("failed", "navigation_failed", ""))
-
-
-class DataDomeTests(unittest.TestCase):
-    """The device-check wait ported from wafer: a cookie change counts only
-    once the challenge iframe has gone; t=bv and interactive frames stop."""
-
-    def interstitial(self):
-        page = FakePage("<html><script>var dd={'rt':'i','cid':'x','hsh':'y','s':1}</script>"
-                        "<script src='https://ct.captcha-delivery.com/i.js'></script></html>", status=403)
-        page.cookie_jar = [{"name": "datadome", "value": "first"}]
-        return page
-
-    def test_pending_device_check_is_never_success(self):
-        page = self.interstitial()
-        page.frames.append(FakeFrame("https://geo.captcha-delivery.com/interstitial/?x", page))
-
-        async def go():
-            loop = asyncio.get_running_loop()
-            return await helper.wait_for_datadome(page, helper.Document(page), loop.time() + 2)
-        self.assertEqual(run(go()), "unsolved")
-
-    def test_cookie_change_alone_is_a_rejection_while_the_frame_stays(self):
-        page = self.interstitial()
-        page.frames.append(FakeFrame("https://geo.captcha-delivery.com/interstitial/?x", page))
-        page.cookie_jar = [{"name": "datadome", "value": "first"}]
-
-        async def go():
-            loop = asyncio.get_running_loop()
-
-            async def rotate():
-                await asyncio.sleep(0.3)
-                page.cookie_jar = [{"name": "datadome", "value": "second"}]
-            asyncio.ensure_future(rotate())
-            return await helper.wait_for_datadome(page, helper.Document(page), loop.time() + 2.5)
-        self.assertEqual(run(go()), "unsolved")
-
-    def test_cookie_change_and_frame_gone_is_solved(self):
-        page = self.interstitial()
-        frame = FakeFrame("https://geo.captcha-delivery.com/interstitial/?x", page)
-        page.frames.append(frame)
-
-        async def go():
-            loop = asyncio.get_running_loop()
-
-            async def pass_check():
-                await asyncio.sleep(0.6)
-                page.cookie_jar = [{"name": "datadome", "value": "cleared"}]
-                page.frames.remove(frame)
-                page.html, page.status = "<html><body>article</body></html>", 200
-                page.emit_document(status=200)
-            asyncio.ensure_future(pass_check())
-            return await helper.wait_for_datadome(page, helper.Document(page), loop.time() + 5)
-        self.assertEqual(run(go()), "solved")
-
-    def test_blocked_visitor_stops_at_once(self):
-        page = FakePage("<html><script>var dd={'rt':'c','cid':'x','t':'bv','s':1}</script></html>", status=403)
-
-        async def go():
-            loop = asyncio.get_running_loop()
-            start = loop.time()
-            verdict = await helper.wait_for_datadome(page, helper.Document(page), loop.time() + 10)
-            return verdict, loop.time() - start
-        verdict, took = run(go())
-        self.assertEqual(verdict, "stop")
-        self.assertLess(took, 0.5)
-
-    def test_only_a_captcha_delivery_frame_is_datadome(self):
-        for url in ("https://geo.captcha-delivery.com/interstitial/?x", "https://captcha-delivery.com/c", "https://GEO.Captcha-Delivery.com/captcha/"):
-            self.assertTrue(helper.dd_frame_url(url), url)
-        for url in ("https://buyer.example/x?captcha-delivery.com", "https://buyer.example/captcha-delivery.com/", "https://captcha-delivery.com.buyer.example/",
-                    "https://evilcaptcha-delivery.com/", "http://geo.captcha-delivery.com/", "https://user@buyer.example/#captcha-delivery.com",
-                    "about:blank", "", "https://[::1/"):
-            self.assertFalse(helper.dd_frame_url(url), url)
-
-    def test_a_buyer_frame_naming_datadome_is_never_clicked(self):
-        # The page carries DataDome's markers and a frame whose URL names the
-        # host, with the confirm button shown: the helper waits, never clicks.
-        page = FakePage("<html><script>var dd={'rt':'i'}</script><p>captcha-delivery.com</p></html>", status=200)
-        page.frames.append(FakeFrame("https://buyer.example/x?captcha-delivery.com", page))
-        clicks = []
-        helper_click = helper.dd_click_confirm
-
-        async def recording(p, frame):
-            clicks.append(frame.url)
-            return await helper_click(p, frame)
-        helper.dd_click_confirm = recording
-        try:
-            async def go():
-                loop = asyncio.get_running_loop()
-                return await helper.wait_for_datadome(page, helper.Document(page), loop.time() + 1.5)
-            run(go())
-        finally:
-            helper.dd_click_confirm = helper_click
-        self.assertEqual(clicks, [])
-        self.assertIsNone(helper.dd_frame(page))
-
-    def test_interactive_frame_stops_without_retry(self):
-        page = self.interstitial()
-        page.frames.append(FakeFrame("https://geo.captcha-delivery.com/captcha/?x", page))
-        page.dd_title = "Access is temporarily restricted"
-        session = FakeSession([page, FakePage("<html>never fetched</html>")])
-
-        async def go():
-            return await helper.Fetcher(session, "http://127.0.0.1:1111", 1).fetch(request(timeout_ms=40000))
-        data = run(go())["data"]
-        self.assertEqual(data["challenge"], "unsolved")
-        self.assertEqual(len(session.fetch_calls), 1)  # a stopped DataDome check is not retried
 
 
 class ServerTests(unittest.TestCase):
@@ -802,7 +1050,22 @@ class ServerTests(unittest.TestCase):
 
     def test_capabilities(self):
         status, body = self.call(self.head("GET", "/v1/capabilities"))
-        self.assertEqual(body, {"data": {"web_browser": 1, "engine": "scrapling/0.4.15", "browser_version": "155.0.8059.39", "max_pages": 2}})
+        self.assertEqual(body, {"data": {"web_browser": 1, "engine": "scrapling/0.4.15+scarlett.2", "browser_version": "155.0.8059.39",
+                                         "max_pages": 2, "solvers": []}})
+
+    def test_capabilities_name_the_solvers_never_their_keys(self):
+        class Fetcher:
+            solver = FakeRouter()
+        server = helper.Server("ab" * 32, Fetcher(), "155.0.8059.39", 1)
+        self.server = server
+        status, body = self.call(self.head("GET", "/v1/capabilities"))
+        self.assertEqual(body["data"]["solvers"], ["capmonster", "capsolver"])
+
+    def test_solver_flag_is_a_boolean(self):
+        for value, ok in ((True, True), (False, True), ("yes", False), (1, False)):
+            body = json.dumps({"url": "https://example.com/", "solver": value}).encode()
+            status, _ = self.call(self.head("POST", "/v1/fetch", body, extra="Content-Type: application/json\r\n"))
+            self.assertEqual(status == 200, ok, value)
 
     def test_body_caps_and_validation(self):
         big = b"{" + b" " * helper.MAX_REQUEST_BODY + b"}"
