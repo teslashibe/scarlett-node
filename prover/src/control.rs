@@ -62,6 +62,10 @@ impl Traffic {
             self.saturated.store(true, Ordering::Relaxed);
         }
     }
+    /// Bytes written and read so far.
+    pub fn bytes(&self) -> (u64, u64) {
+        (self.sent.load(Ordering::Relaxed), self.received.load(Ordering::Relaxed))
+    }
     pub fn snapshot(&self) -> TrafficSnapshot {
         TrafficSnapshot {
             verifier_sent_bytes: self.sent.load(Ordering::Relaxed),
@@ -72,9 +76,15 @@ impl Traffic {
     }
 }
 
-struct Metered<S> {
+pub struct Metered<S> {
     inner: S,
     traffic: Traffic,
+}
+
+/// Counts the payload bytes `inner` carries in each direction.
+pub fn metered<S>(inner: S) -> (Metered<S>, Traffic) {
+    let traffic = Traffic::default();
+    (Metered { inner, traffic: traffic.clone() }, traffic)
 }
 impl<S: AsyncRead + Unpin> AsyncRead for Metered<S> {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {

@@ -43,6 +43,9 @@ test("Start requires real runtime, helper, pairing and account capabilities", ()
   ] as const)
     assert.equal(canStart({ ...base, [key]: false }), false);
   assert.equal(canStart({ ...base, accounts: [] }), false);
+  // A web node serves pages without any provider account.
+  assert.equal(canStart({ ...base, accounts: [], web_enabled: true }), true);
+  assert.equal(canStart({ ...base, accounts: [], web_enabled: true, paired: false }), false);
   assert.equal(canStart({ ...base, supervised: true }), false);
 });
 test("Local configuration is not displayed as verified access or points", () => {

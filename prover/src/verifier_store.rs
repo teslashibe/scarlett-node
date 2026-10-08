@@ -15,6 +15,41 @@ pub const MAX_RECORDS: usize = 1024;
 pub const MAX_RECORD_BYTES: u64 = 64 << 20;
 pub const MAX_TOTAL_BYTES: u64 = 256 << 20;
 pub const RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+/// Web receipts are kept ten minutes past expiry, not a day. The coordinator
+/// reads one only before its job's deadline and keeps the signed result
+/// itself; the ten minutes cover clock skew. A day of web pages would fill
+/// the store Codex and X share and refuse every registration.
+pub const WEB_RETENTION_MS: u64 = 10 * 60 * 1000;
+
+fn web(payload: &Value) -> bool {
+    payload["type"] == "web.fetch"
+}
+
+/// How long a receipt with this payload is kept past its expiry.
+pub fn retention_ms(payload: &Value) -> u64 {
+    if web(payload) { WEB_RETENTION_MS } else { RETENTION_MS }
+}
+
+/// The most a web receipt can hold: the final body and every hop's head in
+/// base64, two URLs per hop, a browser hop's User-Agent and cookie names
+/// (which fit in one Cookie header), and the fixed fields around them.
+pub fn web_receipt_bound(max_response_bytes: usize, max_redirects: usize) -> u64 {
+    let base64 = |n: usize| 4 * n.div_ceil(3);
+    let per_hop = base64(crate::webpolicy::MAX_HEAD) + 2 * crate::webpolicy::MAX_URL + crate::webpolicy::MAX_COOKIE + 3 * crate::webpolicy::MAX_COOKIE_PAIRS + 2048 + 1024;
+    (base64(max_response_bytes) + (max_redirects + 1) * per_hop + (64 << 10)) as u64
+}
+
+/// The space an unresolved receipt reserves: a web job's own bound (a page
+/// is far smaller than an X or Codex receipt may grow), otherwise the record
+/// limit.
+fn reserve(payload: &Value, limits: Limits) -> u64 {
+    match (payload["max_response_bytes"].as_u64(), payload["max_redirects"].as_u64()) {
+        (Some(bytes), Some(redirects)) if web(payload) && bytes <= 1 << 30 && redirects <= 16 => {
+            web_receipt_bound(bytes as usize, redirects as usize).min(limits.max_record_bytes)
+        }
+        _ => limits.max_record_bytes,
+    }
+}
 
 #[derive(Clone, Copy, Serialize)]
 pub struct Limits {
@@ -48,6 +83,11 @@ fn unresolved(record: &Record) -> bool {
     if record.expires_ms <= now { return false; }
      matches!(record.status["status"].as_str(), Some("pending" | "running"))
         || record.status["status"] == "x_read" && record.status["complete"] != true && record.status["remaining_attempts"].as_u64().unwrap_or(0) > 0
+        // A web job that can still run a hop may yet store a full page.
+        || record.status["status"] == "web_read"
+            && record.status["complete"] != true
+            && record.status["rejections"].as_array().is_some_and(Vec::is_empty)
+            && record.status["remaining_sessions"].as_u64().unwrap_or(0) > 0
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -154,7 +194,7 @@ impl Store {
                 bail!("invalid verifier receipt identity");
             }
             store.total_bytes += raw.len() as u64;
-            let reservation = if unresolved(&record) { limits.max_record_bytes } else { raw.len() as u64 };
+            let reservation = if unresolved(&record) { reserve(&record.payload, limits).max(raw.len() as u64) } else { raw.len() as u64 };
             store.reserved_bytes += reservation;
             store.reservations.insert(file_name.clone(), reservation);
             store.sizes.insert(file_name, raw.len() as u64);
@@ -170,7 +210,7 @@ impl Store {
         let file_name = name(&record.job_id, &record.attempt);
         let raw = serde_json::to_vec(record)?;
         let old_size = *self.sizes.get(&file_name).unwrap_or(&0);
-        let reservation = if unresolved(record) { self.limits.max_record_bytes } else { raw.len() as u64 };
+        let reservation = if unresolved(record) { reserve(&record.payload, self.limits).max(raw.len() as u64) } else { raw.len() as u64 };
         let old_reservation = *self.reservations.get(&file_name).unwrap_or(&0);
         if raw.len() as u64 > self.limits.max_record_bytes
             || self.total_bytes - old_size + raw.len() as u64 > self.limits.max_total_bytes
@@ -200,6 +240,11 @@ impl Store {
         Ok(())
     }
     fn reserved_bytes(&self) -> u64 { self.reserved_bytes }
+    /// Whether a new session with this payload can be registered: a record
+    /// slot and its reservation are free.
+    pub fn can_reserve(&self, payload: &Value) -> bool {
+        self.sizes.len() < self.limits.max_records && self.reserved_bytes.saturating_add(reserve(payload, self.limits)) <= self.limits.max_total_bytes
+    }
     pub fn capacity(&self) -> Capacity {
         let reserved_bytes = self.reserved_bytes();
         Capacity { limits: self.limits, records: self.sizes.len(), bytes: self.total_bytes, reserved_bytes,
@@ -342,6 +387,56 @@ mod tests {
         store.save(&second).unwrap();
         assert!(store.capacity().can_register);
         store.save(&third).unwrap();
+    }
+    #[test]
+    fn web_receipts_reserve_space_only_while_a_hop_can_still_run() {
+        let dir = Temp::new();
+        let limits = Limits { max_records: 8, max_record_bytes: 1 << 20, max_total_bytes: 4 << 20 };
+        let (mut store, _) = Store::open_with_limits(&dir.0, limits).unwrap();
+        let mut r = record();
+        r.payload = serde_json::json!({"type":"web.fetch"});
+        let web = |remaining: u64, complete: bool, rejections: serde_json::Value| serde_json::json!({"status":"web_read","remaining_sessions":remaining,"complete":complete,"next_url":null,"hops":[],"rejections":rejections});
+        for (status, reserved) in [
+            (web(6, false, serde_json::json!([])), true),
+            (web(0, false, serde_json::json!([])), false),
+            (web(3, true, serde_json::json!([])), false),
+            (web(5, false, serde_json::json!(["tls_failed"])), false),
+        ] {
+            r.status = status;
+            assert_eq!(unresolved(&r), reserved, "{}", r.status);
+            store.save(&r).unwrap();
+            assert_eq!(store.capacity().reserved_bytes == limits.max_record_bytes, reserved);
+        }
+        // Expiry releases the reservation whatever the status says.
+        r.status = web(6, false, serde_json::json!([]));
+        r.expires_ms = 1;
+        assert!(!unresolved(&r));
+        r.in_flight = 1;
+        assert!(unresolved(&r));
+    }
+    #[test]
+    fn web_receipts_reserve_their_bound_and_keep_a_short_retention() {
+        let dir = Temp::new();
+        let limits = Limits { max_records: 16, max_record_bytes: 64 << 20, max_total_bytes: 64 << 20 };
+        let (mut store, _) = Store::open_with_limits(&dir.0, limits).unwrap();
+        let payload = serde_json::json!({"type":"web.fetch","url":"https://example.com/","max_redirects":5,"max_response_bytes":10 << 20});
+        let bound = web_receipt_bound(10 << 20, 5);
+        assert!(bound > 10 << 20 && bound < 16 << 20);
+        let mut r = record();
+        r.payload = payload.clone();
+        r.status = serde_json::json!({"status":"web_read","remaining_sessions":6,"complete":false,"next_url":null,"hops":[],"rejections":[]});
+        assert!(store.can_reserve(&payload));
+        store.save(&r).unwrap();
+        assert_eq!(store.capacity().reserved_bytes, bound);
+        // Codex and X still reserve the record limit, which no longer fits.
+        assert!(!store.can_reserve(&record().payload) && store.can_reserve(&payload));
+        // A web payload without its bounds reserves the record limit.
+        assert_eq!(reserve(&serde_json::json!({"type":"web.fetch"}), limits), limits.max_record_bytes);
+        assert_eq!(retention_ms(&payload), WEB_RETENTION_MS);
+        assert_eq!(retention_ms(&record().payload), RETENTION_MS);
+        drop(store);
+        let (store, _) = Store::open_with_limits(&dir.0, limits).unwrap();
+        assert_eq!(store.capacity().reserved_bytes, bound);
     }
     #[test]
     fn invalid_capacity_limits_fail_closed() {

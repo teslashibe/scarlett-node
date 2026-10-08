@@ -7,7 +7,7 @@ permissions:
 jobs:
   native-windows:
     runs-on: windows-2022
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v5
@@ -29,3 +29,15 @@ jobs:
           workspaces: prover
       - run: cargo test --locked
         working-directory: prover
+      # The web browser tier on Windows: the x-login Node it reuses, the
+      # packaged Python runtime, then a live run against loopback fixtures
+      # with the Windows assertions (no visible window, Job membership,
+      # nothing under the real LOCALAPPDATA\Google).
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22.23.3'
+      - run: node scripts/prepare-x-login-runtime.mjs win32-x64 "$env:RUNNER_TEMP/rt/x-login-runtime"
+      - run: node scripts/prepare-web-runtime.mjs win32-x64 "$env:RUNNER_TEMP/rt" "$env:RUNNER_TEMP/rt/x-login-runtime"
+      - run: go test -tags webbrowser_live -count=1 -v ./internal/webruntime -run TestLive
+        env:
+          SCARLETT_TEST_WEB_RUNTIME: ${{ runner.temp }}/rt

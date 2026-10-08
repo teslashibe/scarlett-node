@@ -236,3 +236,47 @@ func TestProofTrafficCompletionWriteFaultStaysUnknown(t *testing.T) {
 		t.Fatal("lost observation became complete")
 	}
 }
+
+// A web page with five redirects runs six helper hops under one attempt, and
+// the attempt is bound to the account-free web service.
+func TestProofTrafficHoldsSixWebHops(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "attempts")
+	j := open(t, dir)
+	r := fixture()
+	r.ProviderAccountID, r.ProviderService = "web", "web"
+	if err := j.Begin(r); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.BeginProof(r, MaxProofSamples+1); !errors.Is(err, ErrConflict) {
+		t.Fatal("seven-sample bound accepted", err)
+	}
+	for ordinal := 1; ordinal <= MaxProofSamples; ordinal++ {
+		got, err := j.BeginProof(r, MaxProofSamples)
+		if err != nil || got != ordinal {
+			t.Fatalf("reserve %d: %d %v", ordinal, got, err)
+		}
+		if err := j.CompleteProof(r, trafficSample(ordinal, 100, 900)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := j.BeginProof(r, MaxProofSamples); !errors.Is(err, ErrConflict) {
+		t.Fatal("seventh hop reserved", err)
+	}
+	if err := j.FinishProofTraffic(r); err != nil {
+		t.Fatal(err)
+	}
+	j.Close()
+	j = open(t, dir)
+	pending, err := j.Pending()
+	if err != nil || len(pending) != 1 || pending[0].ProviderService != "web" || len(pending[0].ProofTraffic.Samples) != MaxProofSamples {
+		t.Fatal("web proof traffic lost on reopen", pending, err)
+	}
+	if (ProofSample{Ordinal: MaxProofSamples + 1, State: "started"}).valid() {
+		t.Fatal("seventh ordinal valid")
+	}
+	other := fixture()
+	other.JobID, other.ProviderAccountID, other.ProviderService = "synthetic-other", "web", "browser"
+	if err := j.Begin(other); err == nil {
+		t.Fatal("unknown provider service accepted")
+	}
+}

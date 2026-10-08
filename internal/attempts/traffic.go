@@ -9,6 +9,10 @@ import (
 
 const MaxProofBytes uint64 = 1 << 40
 
+// MaxProofSamples bounds the helper runs one attempt records: three X pages,
+// or a web page with up to five redirects (six hops).
+const MaxProofSamples = 6
+
 // ProofTraffic is private operational telemetry, never proof or billing evidence.
 // The enclosing immutable journal identity binds it to one accepted node attempt.
 type ProofTraffic struct {
@@ -30,7 +34,7 @@ type ProofSample struct {
 }
 
 func (s ProofSample) valid() bool {
-	if s.Ordinal < 1 || s.Ordinal > 3 {
+	if s.Ordinal < 1 || s.Ordinal > MaxProofSamples {
 		return false
 	}
 	numbers := s.SentBytes != nil && s.ReceivedBytes != nil && *s.SentBytes <= MaxProofBytes && *s.ReceivedBytes <= MaxProofBytes
@@ -52,7 +56,7 @@ func (s ProofSample) valid() bool {
 }
 
 func (t ProofTraffic) valid(fingerprint string) bool {
-	if t.Schema != 1 || t.LeaseFingerprint != fingerprint || t.Layer != "tcp_payload" || t.MaxSamples < 1 || t.MaxSamples > 3 || len(t.Samples) < 1 || len(t.Samples) > t.MaxSamples {
+	if t.Schema != 1 || t.LeaseFingerprint != fingerprint || t.Layer != "tcp_payload" || t.MaxSamples < 1 || t.MaxSamples > MaxProofSamples || len(t.Samples) < 1 || len(t.Samples) > t.MaxSamples {
 		return false
 	}
 	for i, sample := range t.Samples {
@@ -81,7 +85,7 @@ func (j *Journal) BeginProofContext(ctx context.Context, r Record, maxSamples in
 	if err != nil {
 		return 0, err
 	}
-	if !boundRecord(old, r) || old.State != "started" || maxSamples < 1 || maxSamples > 3 {
+	if !boundRecord(old, r) || old.State != "started" || maxSamples < 1 || maxSamples > MaxProofSamples {
 		return 0, ErrConflict
 	}
 	if old.ProofTraffic == nil {

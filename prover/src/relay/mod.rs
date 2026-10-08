@@ -31,6 +31,12 @@
 //! included, within the allowed lengths.
 //!
 //! Verifiers are operator-run; the policy name pins that assumption.
+//!
+//! Web fetches (policy `web-relay-v1`, see webpolicy.rs) use the same
+//! session for any public https host with nothing hidden, so there is no OT
+//! and no secret for a verifier to misuse. The supplier still checks the
+//! opened record, which shows the verifier used its address for exactly
+//! the canonical request of the hop and nothing else.
 
 pub mod node;
 pub mod ot;

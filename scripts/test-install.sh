@@ -19,6 +19,10 @@ for archive in "$out"/*.tar.gz; do
   [ -x "$bin/scarlett-node" ] && [ -x "$bin/scarlett-prover" ] || exit 1
   SCARLETT_STATE_DIR="$testdir/node-state" "$bin/scarlett-node" status > "$testdir/status"
   grep '"state":"offline"' "$testdir/status" >/dev/null
+  # The installed web runtime extracts with every hash checked and passes its
+  # self-check and driver check here; no browser is downloaded.
+  SCARLETT_STATE_DIR="$testdir/node-state" "$bin/scarlett-node" web-runtime check > "$testdir/web-runtime"
+  grep '"webRuntime":"passed"' "$testdir/web-runtime" >/dev/null
   if "$bin/scarlett-prover" > "$testdir/helper" 2>&1; then echo 'Proof helper did not reject a missing command' >&2; exit 1; fi
   grep 'usage: scarlett-prover' "$testdir/helper" >/dev/null
   printf 'Keep journal and identity\n' > "$testdir/node-state/synthetic-preserve"
@@ -53,6 +57,37 @@ for archive in "$out"/*.tar.gz; do
   rm "$testdir/runtime-missing/x-login-runtime/social-login/node_modules/playwright/package.json"
   if "$testdir/runtime-missing/install.sh" "$root" "$bin" > /dev/null 2>&1; then echo 'Incomplete runtime installed' >&2; exit 1; fi
   rm -rf "$testdir/runtime-missing"
+  # A changed or missing web runtime never installs; with its checksums
+  # rewritten to match, a changed, missing or other-platform archive still
+  # fails the runtime check.
+  platform=$(cat "$bundle/PLATFORM")
+  rewrite_sums() {
+    (cd "$1" && for file in $(awk '{print $2}' SHA256SUMS); do
+      [ -f "$file" ] || continue
+      if command -v sha256sum >/dev/null 2>&1; then sha256sum "$file"; else shasum -a 256 "$file"; fi
+    done > SHA256SUMS.new && mv SHA256SUMS.new SHA256SUMS)
+  }
+  web_check_fails() {
+    if SCARLETT_STATE_DIR="$testdir/web-state-$2" "$bin/scarlett-node" web-runtime check --resources "$1" > /dev/null 2>&1; then echo "Web runtime check accepted a $2 archive" >&2; exit 1; fi
+  }
+  cp -R "$bundle" "$testdir/web-tamper"
+  printf 'x' >> "$testdir/web-tamper/web-runtime-$platform.tar.gz"
+  if "$testdir/web-tamper/install.sh" "$root" "$bin" > /dev/null 2>&1; then echo 'Changed web runtime installed' >&2; exit 1; fi
+  rewrite_sums "$testdir/web-tamper"
+  web_check_fails "$testdir/web-tamper" tampered
+  rm -rf "$testdir/web-tamper"
+  cp -R "$bundle" "$testdir/web-missing"
+  rm "$testdir/web-missing/web-runtime-$platform.tar.gz"
+  if "$testdir/web-missing/install.sh" "$root" "$bin" > /dev/null 2>&1; then echo 'Bundle without its web runtime installed' >&2; exit 1; fi
+  web_check_fails "$testdir/web-missing" missing
+  rm -rf "$testdir/web-missing"
+  cp -R "$bundle" "$testdir/web-platform"
+  case "$platform" in linux-amd64) other=darwin-arm64;; *) other=linux-amd64;; esac
+  mv "$testdir/web-platform/web-runtime-$platform.tar.gz" "$testdir/web-platform/web-runtime-$other.tar.gz"
+  sed "s/$platform/$other/g" "$testdir/web-platform/web-runtime.json" > "$testdir/web-platform/web-runtime.json.new"
+  mv "$testdir/web-platform/web-runtime.json.new" "$testdir/web-platform/web-runtime.json"
+  web_check_fails "$testdir/web-platform" wrong-platform
+  rm -rf "$testdir/web-platform" "$testdir"/web-state-*
   # Reinstallation refuses changed bytes; the active version stays intact.
   printf 'corrupted\n' >> "$bundle/scarlett-node"
   if "$bundle/install.sh" "$root" "$bin" > /dev/null 2>&1; then echo 'Corrupt bundle installed' >&2; exit 1; fi
@@ -70,4 +105,4 @@ for archive in "$out"/*.tar.gz; do
   [ "$(cat "$testdir/unrelated-bin/scarlett-node")" = unrelated ] || exit 1
   rm -rf "$testdir/extracted" "$root" "$bin" "$testdir/node-state" "$testdir/unrelated-bin"
 done
-printf 'Native bundle installation, private local status, helper startup and failure checks passed\n'
+printf 'Native bundle installation, private local status, web runtime, helper startup and failure checks passed\n'

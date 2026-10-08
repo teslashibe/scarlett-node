@@ -29,7 +29,7 @@ func poolFixture(t *testing.T, selected ...string) *servicePool {
 	if e := installFixtureHelper(helper); e != nil {
 		t.Fatal(e)
 	}
-	return newServicePool(config.Config{StateDir: dir, AccountsFile: filepath.Join(dir, "accounts.json"), Services: selected, CodexHome: home, XSession: session, Prover: helper, CodexConcurrency: 2, XConcurrency: 1, MaxInputBytes: 32768, MaxOutputTokens: 2048})
+	return newServicePool(config.Config{StateDir: dir, AccountsFile: filepath.Join(dir, "accounts.json"), Services: selected, CodexHome: home, XSession: session, Prover: helper, CodexConcurrency: 2, XConcurrency: 1, WebConcurrency: 4, MaxInputBytes: 32768, MaxOutputTokens: 2048})
 }
 
 func TestMissingProofHelperNeverAdvertisesConfiguredCapacity(t *testing.T) {
@@ -41,6 +41,12 @@ func TestMissingProofHelperNeverAdvertisesConfiguredCapacity(t *testing.T) {
 		t.Fatal("missing helper accepted work")
 	}
 	for _, s := range p.health() {
+		if s.Kind == "web" {
+			if s.State != "not_added" {
+				t.Fatal("unselected web service reported", s.State)
+			}
+			continue
+		}
 		if s.State != "unreachable" || s.LastErrorCode != "prover_error" {
 			t.Fatal("helper unavailable not reported")
 		}

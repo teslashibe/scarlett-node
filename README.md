@@ -9,7 +9,7 @@
 
 <p align="center">
   A program you run at home, as a desktop app or a headless binary, that earns points on the Scarlett network<br>
-  by proving with TLS proofs that an X read or a Codex run came straight from the provider, unaltered.
+  by proving with TLS proofs that an X read, a Codex run or a public web page came straight from its source, unaltered.
 </p>
 
 <p align="center">
@@ -32,7 +32,9 @@
 
 ## What it is
 
-Scarlett Node is the supplier client for the Scarlett network. You run it on a machine you own, with your own Codex login or X session, and it takes jobs from the network's coordinator: run one Codex request, or fetch one public X read (a search, a profile, a post, a thread). Instead of handing back a result and asking to be believed, the node produces a [TLSNotary](https://tlsnotary.org) proof that the bytes came from `chatgpt.com` or `x.com` in answer to exactly the request the job pinned. The coordinator reads the result from the verifier, not from the node.
+Scarlett Node is the supplier client for the Scarlett network. You run it on a machine you own, with your own Codex login or X session, and it takes jobs from the network's coordinator: run one Codex request, fetch one public X read (a search, a profile, a post, a thread), or fetch one public web page. Instead of handing back a result and asking to be believed, the node produces a [TLSNotary](https://tlsnotary.org) proof that the bytes came from `chatgpt.com` or `x.com` in answer to exactly the request the job pinned, or, for a web page, lets the operator's verifier fetch the page itself through the node's connection. The coordinator reads the result from the verifier, not from the node.
+
+Web pages need no account. They are fetched from the node's own address, so a site sees a home connection (or the residential proxy a cloud node is configured with). Pages behind bot protection can be rendered in a hidden, sandboxed browser that the node downloads and verifies itself; the node then re-fetches the page through the verified relay with the browser's anti-bot clearance cookies, so the buyer gets a TLS-verified copy whenever the site allows it.
 
 The node is outbound-only. It polls the coordinator over HTTPS, opens no inbound port and holds no wallet key. The heartbeat is a long poll: each one asks the coordinator to hold it for up to 20 seconds and is answered the moment a job for this node is funded, so new work reaches an idle node in about one round trip; the node heartbeats again immediately after any answer and pauses only after a failed heartbeat (from one second, doubling to fifteen, with jitter) or when the coordinator asks with `Retry-After`. Provider credentials stay in private files on your machine and reach the Rust proof helper over stdin, never as command arguments or coordinator fields. Only the values of your login token or session cookies are hidden inside the proof; the request and the whole response are revealed to the verifier.
 
@@ -44,21 +46,26 @@ This is an early, runnable protocol proposal. Suppliers earn points only. The co
 flowchart LR
     C["Coordinator"]
     N["Scarlett Node<br/>Go node + Rust prover"]
+    B["Hidden browser<br/>web browser jobs only"]
     V["Verifier<br/>operator-run"]
-    P["Provider<br/>chatgpt.com · x.com"]
+    P["Provider or website<br/>chatgpt.com · x.com · public https"]
 
     C -- "lease: pinned request,<br/>one-use verifier token" --> N
     N -- "/proven" --> C
     N -- "TCP from the node's own address" --> P
     N <-- "MPC-TLS: TLS keys held jointly<br/>~60 MB upload per X read" --> V
-    V -- "keyed relay: verifier is the TLS client,<br/>records pass through the node · 70–90 KB per X read" --> N
-    V -- "verified response, model, usage" --> C
+    V -- "keyed relay: verifier is the TLS client,<br/>records pass through the node" --> N
+    N <-- "browser jobs: render through<br/>the node's filtering egress proxy" --> B
+    N -- "/browser-result: rendered copy,<br/>not TLS-verified" --> C
+    V -- "verified response, model, usage, page" --> C
 ```
 
-1. The node heartbeats to the coordinator and may receive a lease. A lease pins the exact request (a Codex `response.create` payload, or an X GraphQL read with its operation, query ID, variables and features) and carries a single-use verifier token.
-2. The node opens the TCP connection to the provider from its own address and runs the request through the `scarlett-prover` helper with the verifier on the other side of a TLSNotary session.
-3. The verifier checks the proven request against the job, records the full provider response, and the node posts `/proven`. The node never submits the answer itself.
-4. The coordinator reads model, output and usage (Codex) or the verified response (X) from the verifier and settles separately. A stored proof is not a paid receipt.
+1. The node heartbeats to the coordinator and may receive a lease. A lease pins the exact request (a Codex `response.create` payload, an X GraphQL read with its operation, query ID, variables and features, or one canonical `https` URL) and carries a single-use verifier token.
+2. The node opens the TCP connection to the provider or website from its own address and runs the request through the `scarlett-prover` helper with the verifier on the other side of a TLSNotary or keyed-relay session. For a web page the node first resolves the host and refuses private, local and reserved addresses.
+3. The verifier checks the proven request against the job, records the full response, and the node posts `/proven`. The node never submits the answer itself.
+4. The coordinator reads model, output and usage (Codex) or the verified response (X, web) from the verifier and settles separately. A stored proof is not a paid receipt.
+
+A web job comes in two modes. A **relay** job is steps 1–4 with the verifier as the TLS client. When the coordinator sees bot protection on the verified response, or the buyer asks for it, it sends a **browser** job: the node renders the page in its hidden browser, uploads that rendered copy, and at the same time re-fetches the page through the verified relay, sending the browser's User-Agent and only its anti-bot clearance cookies. The coordinator serves the verified re-fetch when it is not blocked and carries the page's content, and otherwise the browser's copy, labelled as not TLS-verified.
 
 For X there are two ways to run step 2. **MPC-TLS** is the standard TLSNotary mode: node and verifier hold the TLS keys jointly, so the verifier can neither read the hidden cookie values nor change what is sent. **Keyed relay** is a lighter mode in which the verifier is the TLS client and holds the session keys, while the node still owns the TCP connection and adds its hidden cookie bits to the one request record. Relay cuts a node's upload per read by roughly three orders of magnitude, and it is on by default; the trade is spelled out under [Security and trust model](#security-and-trust-model).
 
@@ -107,6 +114,20 @@ For X there are two ways to run step 2. **MPC-TLS** is the standard TLSNotary mo
       Pinned x-go runtime snapshot, pinned tlsn fork, pinned open-agent-api release, and checksummed native bundles.
     </td>
   </tr>
+  <tr>
+    <td width="33%" valign="top">
+      <b>Proven web pages</b><br>
+      Any public https page, fetched from the node's own address while the verifier is the TLS client. The node never sees or alters the page. No account needed.
+    </td>
+    <td width="33%" valign="top">
+      <b>Hidden browser for protected pages</b><br>
+      A bundled Scrapling runtime drives the node's own verified Chrome for Testing: headless, sandboxed, a fresh profile per launch and a fresh context per job, never the operator's Chrome.
+    </td>
+    <td width="33%" valign="top">
+      <b>Egress guard</b><br>
+      Every web connection, relay or browser, may reach only public addresses, never the LAN, loopback or link-local ranges. <code>.local</code>, <code>.lan</code>, single-label and other reserved names are refused before any lookup.
+    </td>
+  </tr>
 </table>
 
 ## Quick start
@@ -114,6 +135,8 @@ For X there are two ways to run step 2. **MPC-TLS** is the standard TLSNotary mo
 ### Desktop
 
 Desktop builds are not yet published. Release installers are signed with Scarlett's own pinned self-signed certificates, so they are not notarized by Apple and Windows shows an unknown publisher; see [release signing](desktop/README.md#release-signing). The Mac development app is unsigned and is not a community release, and the Windows installer remains a release gate. To run it from source you need Node 26, Rust 1.95 and the Tauri prerequisites; see [`desktop/README.md`](desktop/README.md#build).
+
+The desktop app serves web pages when it is started with `SCARLETT_DESKTOP_WEB=1` in its environment (on macOS, `launchctl setenv SCARLETT_DESKTOP_WEB 1` before opening it). The browser tier then comes with it on macOS: on first start the node unpacks its runtime and downloads its browser in the background, and the heartbeat reports `browser_downloading` until it is ready. On Windows the browser tier is off by default in this release; `SCARLETT_WEB_BROWSER=on` in the app's environment turns it on (the app passes only `on` or `off` to the node, and only with web).
 
 ### Headless
 
@@ -132,7 +155,15 @@ Bundles ship the Go node, the pinned Rust proof helper, the Codex templates and 
    ./install.sh
    ```
 
-3. Copy [`node.env.example`](packaging/node.env.example) to `~/.config/scarlett-node/node.env`, keep it at mode 0600, and set your services, absolute credential paths, and coordinator and verifier addresses.
+3. Copy [`node.env.example`](packaging/node.env.example) to `~/.config/scarlett-node/node.env`, keep it at mode 0600, and set your services, absolute credential paths, and coordinator and verifier addresses. A web-only node needs no credential path; a web node on a cloud server should also set a residential proxy:
+
+   ```sh
+   SCARLETT_EXECUTOR=services
+   SCARLETT_SERVICES=web
+   SCARLETT_WEB_EGRESS_PROXY=http://user:pass@residential-proxy.example:8080
+   ```
+
+   `scarlett-node web-runtime check` verifies the bundled web runtime without running the node.
 
 4. Export those settings in a shell, pair once with a one-time code from the coordinator, then run.
 
@@ -157,7 +188,7 @@ cargo build --release --manifest-path prover/Cargo.toml
 
 ## Services
 
-Set `SCARLETT_EXECUTOR=services` and choose `SCARLETT_SERVICES=codex`, `x_read` or `codex,x_read`. This is the only mode that uses proven execution for both providers.
+Set `SCARLETT_EXECUTOR=services` and choose one or more of `codex`, `x_read` and `web` in `SCARLETT_SERVICES` (for example `codex,x_read,web`). This is the only mode that uses proven execution for every service.
 
 ### Codex
 
@@ -188,6 +219,32 @@ The coordinator constructs the request; buyers cannot supply URLs, query IDs, fe
 | Reads allowed | Typed jobs use the four catalog reads; the transport allows 14 | Only the four catalog reads; the verifier refuses others |
 | Default | Always served | On; `SCARLETT_X_RELAY=0` turns it off |
 
+### Web pages
+
+A `web` job fetches one public `https` page from the node's own connection, so the site sees the node's IP (a home connection, or a residential proxy in front of a server). It needs no account. The verifier is the TLS client through the node's TCP connection (`scarlett-prover relay-web`, keyed relay with nothing hidden), so the node never sees the page and cannot alter it; buyers receive a Scarlett-signed attestation of what the verifier received. It is not a zero-knowledge proof.
+
+- One `GET` per job, with fixed browser-like headers. Redirects are followed up to five times, each hop a new relay session that the verifier authorizes only for the `https` `Location` of the previous verified redirect.
+- TLS 1.3 with AES-128-GCM and HTTP/1.1 only. Sites that offer only TLS 1.2 fail. No JavaScript runs.
+- Before every hop the node resolves the host itself and refuses the hop if any address is loopback, private, link-local, CGNAT, multicast, reserved, documentation, ULA, 6to4, Teredo, an IPv4-mapped or NAT64 address that carries one of those, or an address on one of the node's own interfaces. The helper then dials exactly the checked address, so a second DNS answer cannot redirect it. `x.com`, `twitter.com` and reserved names such as `.local` are refused before any lookup.
+- `SCARLETT_WEB_CONCURRENCY` (1–32, default 4) bounds simultaneous pages. `SCARLETT_WEB_EGRESS_PROXY=http://[user:pass@]host:port` sends every web connection through a local HTTP `CONNECT` proxy, such as a residential proxy for a cloud server. The proxy must tunnel without intercepting (TLS runs end to end with the verifier). Its address and credentials never leave the node; the heartbeat says only `egress: proxy`.
+- A caught verifier misuse latches the same node-wide relay halt as for X. Web has no MPC fallback, so it stops until `scarlett-node relay-resume`.
+
+Known residual: a site that resolves to the node's own public IP behind NAT (hairpin) is not detected.
+
+### Browser tier
+
+Some sites answer a plain client with a bot check instead of the page, and some pages are empty until JavaScript runs. For those the coordinator sends a web job in **browser mode**, and the node renders the page in a hidden browser it runs itself.
+
+- **What runs.** A pinned, bundled Python runtime with [Scrapling](https://github.com/D4Vinci/Scrapling) (`scrapling/0.4.15`, Patchright driver) ships with the node; the operator installs nothing. The browser is Chrome for Testing at a pinned version, which the node downloads once from Google's fixed URL, checks against a pinned archive digest and a per-file inventory, and keeps in its state directory. It is never the operator's Chrome or Edge and never reads their profiles, extensions or policies.
+- **How a job runs.** The node checks the page's host against the egress guard first, renders the page in a fresh browser context (Scrapling's built-in solver handles a Cloudflare interstitial; other vendors' checks are waited out within the job's budget), and then does two things at once: it uploads the rendered copy to the coordinator (`/browser-result`), and it re-fetches the page through the same verified relay as a relay job, sending the browser's exact User-Agent and only its anti-bot clearance cookies (`cf_clearance`, `datadome`, `_abck` and the rest of a fixed allowlist the verifier also enforces). No other cookie is ever sent, and cookie values are never logged, uploaded or kept after the job.
+- **What the buyer gets.** When the re-fetch is not blocked and carries the page's content, the buyer receives it as a TLS-verified result that lists the cookie names sent. Otherwise the buyer receives the browser's copy, labelled as not TLS-verified: Scarlett signs it as received from the node, but did not see it on the wire.
+- **Invisible and isolated.** New headless mode only. On macOS the browser runs as a background-only app with no window or Dock icon and never takes focus from the operator's front app; on Windows it creates no window and its processes run in a Job object. The Chrome sandbox is always on; the node never starts the browser without it. Every launch uses a fresh profile that the node creates under its state directory and seeds before the browser opens it, so that a page cannot reach the operator's machine: `mailto:`, `news:` and `snews:` links are blocked inside the browser instead of opening the mail or news app (with a web handler the node refuses as a second layer), a redirect to any non-web address fails, other external links stop at Chrome's own dialog, which the hidden browser never shows, and Bluetooth, USB, HID and serial requests and screen capture fail at once, as when a user cancels them. Camera and microphone are fake devices. The profile also has a mock keychain, muted audio, downloads off and every permission prompt denied, and crash dumps stay in node state. HOME, temporary and cache directories point into node state, and the helper inherits only an allowlist of environment variables.
+- **Network.** Every page context goes through a loopback filtering proxy in the node, which applies the same host rules as a relay hop before any DNS lookup (so `.local`, `.lan`, single-label and other reserved names never reach the LAN or mDNS) and the same address guard after it, then dials exactly the checked address. The browser's own background traffic (updates, time, sign-in and the like) goes to a second loopback listener that refuses everything. QUIC is off and WebRTC may not send UDP outside the proxy. With `SCARLETT_WEB_EGRESS_PROXY` set, the filtering proxy chains through it, as the relay does.
+- **Resources.** The helper starts on demand, or early when an offer suggests a browser job may follow, stays warm while jobs flow and stops after `SCARLETT_WEB_BROWSER_IDLE_SECONDS` without work. It runs at low CPU priority, is recycled after 50 pages or when its process tree's memory crosses a threshold scaled by capacity, and is killed above a higher one. It needs at least 8 GiB of physical memory and enough free disk for the runtime and browser.
+- **Platforms.** On by default with web on macOS and Linux. On Windows it ships in the installer but is off by default in this release; `SCARLETT_WEB_BROWSER=on` turns it on. On Linux the browser needs its shared libraries and unprivileged user namespaces for its sandbox; see [`packaging/INSTALL.md`](packaging/INSTALL.md).
+
+The web entry in the heartbeat carries a `browser` object: `ready` with its capacity (1–4, inside web capacity) and Chrome for Testing version, or `unavailable` with one reason: `disabled`, `web_unavailable`, `memory_low`, `disk_low`, `runtime_missing`, `runtime_invalid`, `browser_downloading`, `browser_download_failed`, `browser_invalid`, `deps_missing`, `sandbox_unavailable` or `helper_failed`. A browser job that cannot start reports `web_browser_unavailable`, and one whose browser failed with nothing proven reports `web_browser_failed`; neither changes the web service state.
+
 Other executors exist for fixtures and earlier modes (`gateway`, `codex`, `codex-tlsn`); they are documented in the [reference](docs/REFERENCE.md).
 
 **Warm X clients.** The node keeps one x-go client per X account, built at start and kept across jobs, so a job on a warm account does only its proven reads: x-go's two session-validation reads and two transaction-ID bootstrap fetches, which used to run unproven before every job (about 12 s around a 2 s proof), happen once per account. Each job's pinned exchanges and verifier token travel in its own request context, never in the shared client, and an X API request without a job behind it is refused. `x_read` reports `ready` once a client has validated the session against X, `configured` while one is still being built (or, for up to 15 seconds, after a rest ended or the session file was rewritten), and `auth_required`, `exhausted` or `unreachable` when the build failed, so a job is not needed to find out. The client is replaced in the background when the session file changes or X refuses the session, and a background refresh (`SCARLETT_X_REFRESH_SECONDS`, default 30 minutes) renews its transaction-ID material and asks X once whether the session still holds, without touching the jobs in flight. A check every 15 seconds builds a client for any account that has none (a new account, a new session file, a build that failed earlier) and drops the clients of removed accounts; a job builds a client itself only as a last resort. Details in the [reference](docs/REFERENCE.md).
@@ -201,6 +258,8 @@ Other executors exist for fixtures and earlier modes (`gateway`, `codex`, `codex
 **Keyed relay.** The node still opens the TCP connection, but the verifier is the TLS client and the only party holding the session keys. It decides what is sealed and sent with the node's real cookie and CSRF values. A node serving relay is therefore trusting its verifier with its X account. A dishonest or compromised verifier can make the node send one request of its own choosing per session as that account, read the answer, and learn chosen hidden bits from whether X accepts a distorted record; with the node's traffic to X it could read the values outright. The node cannot prevent this. It detects it afterwards: the verifier must open the request record once the response is complete, and the helper fails with `verifier misused this node's X session` if what it was made to send was not its own request, or if the verifier ended the session without opening the record. The node then logs one `ALERT keyed relay halted` line, stops listing relay in its heartbeat, declines relay offers, and keeps serving MPC-TLS. The halt is recorded in the node's state directory, so a restart does not re-arm relay; `scarlett-node status` shows `relay_halted` and `scarlett-node relay-resume` clears it once the operator has checked the verifier. Detection comes after the request has already been sent. With an honest verifier the account is used only for the four catalog reads; the verifier refuses a relay job for anything else, including the account's own feed and details.
 
 Relay is on by default because every verifier is run by the network operator and the node already trusts it with its session. If you would rather not extend that trust, set `SCARLETT_X_RELAY=0` and the node serves MPC-TLS only. Either way, prefer an account kept for this purpose over a personal one. Keyed relay is new and has not yet been reviewed by an outside cryptographer.
+
+**Web pages.** For a relay web job the verifier is the TLS client and the node only carries ciphertext, so the node can neither read nor change the page, and nothing secret of the operator's is sent: the request carries fixed headers and, for a browser job's re-fetch, only the browser's pinned User-Agent and allowlisted clearance cookies, which the verifier checks. What the buyer gets is Scarlett's signed statement of what its verifier received, not a zero-knowledge proof. A browser job's rendered copy is different: Scarlett did not see it on the wire, so it is labelled not TLS-verified and signed only as received from the node. The site sees the node's address (or its proxy's), and a web job fetches whatever public page a buyer names, so the egress guard, not the buyer, decides what the node may reach: only public addresses, for the relay and for every connection the browser makes.
 
 **Verifier connection.** Both proof helpers encrypt the token and TLSNotary control traffic and verify the verifier's certificate and hostname against the pinned Mozilla roots (or `SCARLETT_VERIFIER_CA_FILE` for a private CA). There is no plaintext fallback, and the verifier address can only come from local configuration, never from a lease.
 
@@ -217,7 +276,7 @@ Settings come from the environment, typically via `~/.config/scarlett-node/node.
 | `SCARLETT_COORDINATOR` | HTTPS origin of the coordinator the node polls |
 | `SCARLETT_PROFILE` | Profile name sent when pairing and heartbeating |
 | `SCARLETT_EXECUTOR` | Execution mode; `services` for proven community work |
-| `SCARLETT_SERVICES` | Which services to serve: `codex`, `x_read` or both |
+| `SCARLETT_SERVICES` | Which services to serve: one or more of `codex`, `x_read` and `web` |
 | `SCARLETT_VERIFIER` | `host:port` of the operator-run TLSNotary verifier |
 | `SCARLETT_VERIFIER_CA_FILE` | Absolute PEM path for a private verifier CA; control connection only |
 | `SCARLETT_COORDINATOR_CA_FILE` | Absolute PEM path adding roots for the coordinator transport only |
@@ -229,6 +288,11 @@ Settings come from the environment, typically via `~/.config/scarlett-node/node.
 | `SCARLETT_CODEX_CONCURRENCY` | Total simultaneous Codex jobs across accounts |
 | `SCARLETT_X_CONCURRENCY` | Total simultaneous X jobs across accounts |
 | `SCARLETT_X_ACCOUNT_CONCURRENCY` | Optional ceiling per authenticated X account, 1–32; CLI default 32 retains the registry limit, desktop sets 1 |
+| `SCARLETT_WEB_CONCURRENCY` | Simultaneous web pages, 1–32 (default 4) |
+| `SCARLETT_WEB_EGRESS_PROXY` | Optional local HTTP `CONNECT` proxy for web targets, `http://[user:pass@]host:port`, such as a residential proxy for a cloud server; never logged or reported |
+| `SCARLETT_WEB_BROWSER` | `on` or `off`: the hidden browser tier for web jobs in browser mode. Default `on` with web on macOS and Linux, `off` on Windows |
+| `SCARLETT_WEB_BROWSER_CONCURRENCY` | Pages the browser renders at once, 1–4 and at most `SCARLETT_WEB_CONCURRENCY`; default 1 below 16 GiB of memory, else 2 |
+| `SCARLETT_WEB_BROWSER_IDLE_SECONDS` | How long an idle browser stays up, 30–3600 (default 120) |
 | `SCARLETT_X_REFRESH_SECONDS` | How often each warm X client refreshes its transaction-ID material and re-checks its session with X in the background (default 1800) |
 | `SCARLETT_STATE_DIR` | Private directory for identity, journal and account health |
 | `SCARLETT_BID` | Standing assignment bid; lower wins |
@@ -250,6 +314,7 @@ scarlett-node status                       # private local JSON observation
 scarlett-node drain                        # stop taking work; persists across restarts
 scarlett-node resume
 scarlett-node relay-resume                 # clear a keyed-relay halt after checking the verifier
+scarlett-node web-runtime check            # verify the bundled web runtime; --with-browser also fetches and probes the browser
 scarlett-node accounts add codex work /absolute/private/codex-home 1
 scarlett-node accounts add x_read research /absolute/private/x-session.json 1
 scarlett-node accounts list

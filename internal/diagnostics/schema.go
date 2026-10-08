@@ -12,7 +12,7 @@ const (
 	Version         = 1
 	MaxAttempts     = 200
 	MaxSpans        = 64
-	MaxExchanges    = 3
+	MaxExchanges    = 6 // three X pages, or six web hops (five redirects)
 	MaxHistoryBytes = 1 << 20
 	MaxAttemptBytes = 8 << 10
 	MaxHelperBytes  = 8 << 10
@@ -93,10 +93,10 @@ type history struct {
 	Attempts  []Record  `json:"attempts"`
 }
 
-var operations = words("search", "profile", "post", "thread", "codex", "other")
-var proofModes = words("relay", "mpc", "none")
-var outcomes = words("success", "running", "interrupted", "cancelled", "error", "auth_required", "capacity_unavailable", "expired", "gateway_error", "invalid_gateway_response", "invalid_lease", "prover_error", "usage_out_of_bounds", "x_error", "x_incomplete", "x_rate_limited", "x_reset_wait", "report_error", "journal_error", "accept_error", "report_pending", "rejected", "cache_hit", "cache_miss", "service_unavailable", "x_request_failed", "execution_uncertain", "relay_misuse")
-var nodePhases = words("worker_acquire", "account_acquire", "accept_http", "worker", "client_acquire", "client_rebuild", "binding_check", "page_wall", "pacing_wait", "quota_wait", "request_encode", "proof_journal_begin", "helper_wall", "helper_stdout_decode", "response_decode", "proof_journal_complete", "journal_lock", "journal_scan", "journal_write", "journal_finish", "journal_ready", "journal_terminal", "report_prepare", "report_http")
+var operations = words("search", "profile", "post", "thread", "codex", "scrape", "other")
+var proofModes = words("relay", "mpc", "browser", "none")
+var outcomes = words("success", "running", "interrupted", "cancelled", "error", "auth_required", "capacity_unavailable", "expired", "gateway_error", "invalid_gateway_response", "invalid_lease", "prover_error", "usage_out_of_bounds", "x_error", "x_incomplete", "x_rate_limited", "x_reset_wait", "report_error", "journal_error", "accept_error", "report_pending", "rejected", "cache_hit", "cache_miss", "service_unavailable", "x_request_failed", "execution_uncertain", "relay_misuse", "web_egress_denied", "web_dns_failed", "web_connect_failed", "web_proxy_failed", "web_fetch_failed", "web_browser_unavailable", "web_browser_failed")
+var nodePhases = words("worker_acquire", "account_acquire", "accept_http", "worker", "client_acquire", "client_rebuild", "binding_check", "page_wall", "pacing_wait", "quota_wait", "request_encode", "proof_journal_begin", "helper_wall", "helper_stdout_decode", "response_decode", "proof_journal_complete", "journal_lock", "journal_scan", "journal_write", "journal_finish", "journal_ready", "journal_terminal", "report_prepare", "report_http", "browser_fetch", "browser_upload")
 
 func init() {
 	for _, phase := range []string{"fixed_gap_wait", "jitter_wait", "quota_spread_wait", "quota_reset_wait"} {

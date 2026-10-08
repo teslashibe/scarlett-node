@@ -97,11 +97,15 @@ func actualServicesCLIHeartbeat(t *testing.T, binary string, empty bool) {
 	})
 	select {
 	case h := <-seen:
+		// Web is always reported, not added here.
+		if len(h.Services) != 3 || h.Services[2].Kind != "web" || h.Services[2].State != "not_added" || h.Services[2].Capacity != 0 {
+			t.Fatal("web service entry missing or added", len(h.Services))
+		}
 		if empty {
-			if h.Capacity != 0 || h.State != "exhausted" || len(h.Services) != 2 || h.Services[0].Capacity != 0 || h.Services[1].Capacity != 0 || h.Services[0].State != "auth_required" || h.Services[1].State != "auth_required" {
+			if h.Capacity != 0 || h.State != "exhausted" || h.Services[0].Capacity != 0 || h.Services[1].Capacity != 0 || h.Services[0].State != "auth_required" || h.Services[1].State != "auth_required" {
 				t.Fatal("blocked account pools inflated capacity")
 			}
-		} else if h.Capacity != 2 || h.State != "available" || len(h.Services) != 2 || h.Services[0].State != "configured" || h.Services[1].State != "configured" {
+		} else if h.Capacity != 2 || h.State != "available" || h.Services[0].State != "configured" || h.Services[1].State != "configured" {
 			t.Fatal("CLI invented readiness or mixed capacities")
 		}
 	case <-time.After(10 * time.Second):

@@ -51,6 +51,15 @@ type Lease struct {
 	VerifierToken string          `json:"verifier_token,omitempty"`
 	XRequest      *XRequest       `json:"x_request,omitempty"`
 	XPayload      json.RawMessage `json:"x_payload,omitempty"`
+	// Set for web jobs: the canonical page to fetch and the exact verifier
+	// web.fetch payload that binds it.
+	WebRequest *WebRequest     `json:"web_request,omitempty"`
+	WebPayload json.RawMessage `json:"web_payload,omitempty"`
+	// WebPrewarmBrowser asks the node to start its browser while it runs a
+	// relay web job, because the page's domain has met bot protection before
+	// and the coordinator may escalate. Relay web offers only; it is outside
+	// web_request, so it never changes the job or its digests.
+	WebPrewarmBrowser bool `json:"web_prewarm_browser,omitempty"`
 	// Community offers grant no provider permission before funded acceptance.
 	AcceptanceRequired bool   `json:"acceptance_required,omitempty"`
 	RequestSHA256      string `json:"request_sha256,omitempty"`
@@ -65,6 +74,29 @@ type XRequest struct {
 	PostID    string `json:"post_id,omitempty"`
 	Count     int    `json:"count,omitempty"`
 	Pages     int    `json:"pages,omitempty"`
+}
+
+// WebRequest is one public https page. The URL is canonical (api/web-vectors.json);
+// redirects are followed only as the verifier authorizes them. Mode is absent
+// for a relay job, so relay leases keep their exact bytes and digests;
+// "browser" renders the page in the node's hidden browser first, and Browser
+// is present exactly then.
+type WebRequest struct {
+	Operation string      `json:"operation"`
+	URL       string      `json:"url"`
+	Mode      string      `json:"mode,omitempty"`
+	Browser   *WebBrowser `json:"browser,omitempty"`
+}
+
+// WebBrowser is the browser phase of a browser web job. Every field is bound
+// into input_sha256 with the rest of web_request.
+type WebBrowser struct {
+	Wait           string `json:"wait"`                    // "load" or "networkidle"
+	WaitMS         int    `json:"wait_ms"`                 // 0-15000 extra settle time
+	WaitSelector   string `json:"wait_selector,omitempty"` // 1-256 printable ASCII bytes
+	TimeoutMS      int    `json:"timeout_ms"`              // 5000-45000 for the browser phase
+	BlockResources bool   `json:"block_resources"`
+	SolveChallenge bool   `json:"solve_challenge"`
 }
 
 // ActiveLease is an already acquired coordinator lease occupying local work.
@@ -108,6 +140,23 @@ type ServiceHealth struct {
 	// Proof modes this node serves for the kind beyond the default. Absent
 	// means MPC-TLS only, which is what every node before this field serves.
 	ProofModes []string `json:"proof_modes,omitempty"`
+	// Egress is how an enabled web service reaches targets: "direct" or
+	// "proxy" (a local HTTP CONNECT proxy). Node-reported, not verified.
+	Egress string `json:"egress,omitempty"`
+	// Browser is the browser tier inside an enabled web entry, and absent
+	// everywhere else. Its capacity is part of the web capacity, never added.
+	Browser *BrowserHealth `json:"browser,omitempty"`
+}
+
+// BrowserHealth is the readiness of the node's hidden browser for web jobs in
+// browser mode. Ready means the runtime and browser were verified and a launch
+// probe passed, not that a browser is running now.
+type BrowserHealth struct {
+	State    string `json:"state"`             // "ready" or "unavailable"
+	Reason   string `json:"reason,omitempty"`  // present exactly when unavailable
+	Capacity int    `json:"capacity"`          // 1-4 when ready, 0 when unavailable
+	InFlight int    `json:"in_flight"`         // 0-Capacity
+	Version  string `json:"version,omitempty"` // Chrome for Testing version, when ready
 }
 
 // Per-operation lanes overlap and must never be added together. Admission
@@ -347,6 +396,8 @@ type Client struct {
 	heartbeatGrace time.Duration
 	// retryWait overrides RetryAfterWait for acceptance retries; tests shorten it.
 	retryWait func(retryAfter time.Duration) time.Duration
+	// uploadBackoff overrides browserUploadBackoff; tests shorten it.
+	uploadBackoff []time.Duration
 	// release holds the coordinator's last release notice; see Release.
 	release *releaseState
 }

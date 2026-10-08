@@ -3,6 +3,8 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -294,5 +296,171 @@ func TestManagedCodexRootIsExplicitServicesOptIn(t *testing.T) {
 	c.Executor = ExecutorCodex
 	if c.Validate() == nil {
 		t.Fatal("managed renewal allowed outside services pool")
+	}
+}
+
+func TestWebServiceConfiguration(t *testing.T) {
+	t.Setenv("SCARLETT_COORDINATOR", "https://example.org")
+	t.Setenv("SCARLETT_PROFILE", "synthetic")
+	t.Setenv("SCARLETT_EXECUTOR", ExecutorServices)
+	t.Setenv("SCARLETT_VERIFIER", "127.0.0.1:7047")
+	t.Setenv("SCARLETT_PROVER", "scarlett-prover")
+	t.Setenv("SCARLETT_X_SESSION", filepath.Join(t.TempDir(), "synthetic-x.json"))
+	// Web alone needs no credential path at all.
+	t.Setenv("SCARLETT_SERVICES", "web")
+	c, err := Load()
+	if err != nil || !c.Enabled("web") || c.Enabled("x_read") || c.WebConcurrency != 4 || c.WebEgressProxy != nil || c.WebEgress() != "direct" {
+		t.Fatal("web-only node", err, c.WebConcurrency)
+	}
+	for services, ok := range map[string]bool{"codex,x_read,web": true, "x_read,web": true, "web,web": false, "web,browser": false, "codex,x_read,web,web": false, "": false} {
+		t.Setenv("SCARLETT_SERVICES", services)
+		if _, err := Load(); (err == nil) != ok {
+			t.Errorf("SCARLETT_SERVICES=%q: %v", services, err)
+		}
+	}
+	t.Setenv("SCARLETT_SERVICES", "web")
+	for value, want := range map[string]int{"1": 1, "32": 32, "0": 0, "33": 0, "four": 0} {
+		t.Setenv("SCARLETT_WEB_CONCURRENCY", value)
+		c, err := Load()
+		if want == 0 {
+			if err == nil {
+				t.Errorf("SCARLETT_WEB_CONCURRENCY=%q accepted", value)
+			}
+			continue
+		}
+		if err != nil || c.WebConcurrency != want {
+			t.Errorf("SCARLETT_WEB_CONCURRENCY=%q: %v %d", value, err, c.WebConcurrency)
+		}
+	}
+	os.Unsetenv("SCARLETT_WEB_CONCURRENCY")
+	for _, tc := range []struct {
+		raw, host, auth string
+		port            int
+	}{
+		{"http://proxy.example:8080", "proxy.example", "", 8080},
+		{"http://proxy.example:8080/", "proxy.example", "", 8080},
+		{"http://127.0.0.1:3128", "127.0.0.1", "", 3128},
+		{"http://[::1]:3128", "::1", "", 3128},
+		{"http://user:p%40ss@proxy.example:8080", "proxy.example", "Basic dXNlcjpwQHNz", 8080},
+		{"http://user@proxy.example:8080", "proxy.example", "Basic dXNlcjo=", 8080},
+	} {
+		t.Setenv("SCARLETT_WEB_EGRESS_PROXY", tc.raw)
+		c, err := Load()
+		if err != nil || c.WebEgressProxy == nil || c.WebEgressProxy.Host != tc.host || c.WebEgressProxy.Port != tc.port || c.WebEgressProxy.Authorization != tc.auth || c.WebEgress() != "proxy" {
+			t.Errorf("%q: %v %+v", tc.raw, err, c.WebEgressProxy)
+		}
+	}
+	for _, bad := range []string{"https://proxy.example:8080", "socks5://proxy.example:1080", "http://proxy.example", "http://proxy.example:0", "http://proxy.example:65536", "http://proxy.example:80a", "http://proxy.example:8080/path", "http://proxy.example:8080?x=1", "http://proxy.example:8080#f", "http://:secret@proxy.example:8080", "proxy.example:8080", "http://pro_xy.example:8080", "http://user:secret@:8080"} {
+		t.Setenv("SCARLETT_WEB_EGRESS_PROXY", bad)
+		_, err := Load()
+		if err == nil {
+			t.Errorf("%q accepted", bad)
+			continue
+		}
+		if strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "proxy.example") {
+			t.Errorf("error repeats the value: %v", err)
+		}
+	}
+	// The proxy belongs to the services executor only.
+	t.Setenv("SCARLETT_WEB_EGRESS_PROXY", "http://proxy.example:8080")
+	t.Setenv("SCARLETT_EXECUTOR", ExecutorGateway)
+	t.Setenv("SCARLETT_GATEWAY", "http://127.0.0.1:8080")
+	os.Unsetenv("SCARLETT_SERVICES")
+	if _, err := Load(); err == nil {
+		t.Fatal("egress proxy accepted outside services mode")
+	}
+}
+
+func TestWebBrowserConfiguration(t *testing.T) {
+	if !WebBrowserDefault("darwin") || !WebBrowserDefault("linux") || WebBrowserDefault("windows") {
+		t.Fatal("browser tier defaults: on for macOS and Linux, off for Windows")
+	}
+	for _, name := range []string{"SCARLETT_WEB_BROWSER", "SCARLETT_WEB_BROWSER_CONCURRENCY", "SCARLETT_WEB_BROWSER_IDLE_SECONDS", "SCARLETT_WEB_CONCURRENCY"} {
+		t.Setenv(name, "")
+		os.Unsetenv(name)
+	}
+	load := func(goos string) (Config, error) {
+		c := Config{Services: []string{"web"}}
+		err := c.loadWebBrowser(goos)
+		return c, err
+	}
+	for goos, want := range map[string]bool{"darwin": true, "linux": true, "windows": false} {
+		c, err := load(goos)
+		if err != nil || c.WebBrowser != want || c.WebBrowserConcurrency != 0 || c.WebBrowserIdle != 120*time.Second {
+			t.Fatalf("%s default: %v %v", goos, c.WebBrowser, err)
+		}
+	}
+	for value, want := range map[string]bool{"on": true, "ON": true, "1": true, "true": true, "off": false, "0": false, "false": false} {
+		t.Setenv("SCARLETT_WEB_BROWSER", value)
+		for _, goos := range []string{"darwin", "windows"} {
+			if c, err := load(goos); err != nil || c.WebBrowser != want {
+				t.Fatalf("SCARLETT_WEB_BROWSER=%q on %s: %v %v", value, goos, c.WebBrowser, err)
+			}
+		}
+	}
+	t.Setenv("SCARLETT_WEB_BROWSER", "maybe")
+	if _, err := load("darwin"); err == nil {
+		t.Fatal("SCARLETT_WEB_BROWSER=maybe accepted")
+	}
+	// The browser needs web: without it the tier is off.
+	t.Setenv("SCARLETT_WEB_BROWSER", "on")
+	if c := (Config{Services: []string{"x_read"}}); c.loadWebBrowser("darwin") != nil || c.WebBrowser {
+		t.Fatal("browser on without web")
+	}
+	os.Unsetenv("SCARLETT_WEB_BROWSER")
+	for value, want := range map[string]int{"1": 1, "4": 4, "0": -1, "5": -1, "two": -1} {
+		t.Setenv("SCARLETT_WEB_BROWSER_CONCURRENCY", value)
+		c, err := load("darwin")
+		if (err == nil) != (want > 0) || want > 0 && c.WebBrowserConcurrency != want {
+			t.Errorf("SCARLETT_WEB_BROWSER_CONCURRENCY=%q: %v %d", value, err, c.WebBrowserConcurrency)
+		}
+	}
+	os.Unsetenv("SCARLETT_WEB_BROWSER_CONCURRENCY")
+	for value, want := range map[string]time.Duration{"30": 30 * time.Second, "3600": time.Hour, "29": 0, "3601": 0, "x": 0} {
+		t.Setenv("SCARLETT_WEB_BROWSER_IDLE_SECONDS", value)
+		c, err := load("darwin")
+		if (err == nil) != (want > 0) || want > 0 && c.WebBrowserIdle != want {
+			t.Errorf("SCARLETT_WEB_BROWSER_IDLE_SECONDS=%q: %v %v", value, err, c.WebBrowserIdle)
+		}
+	}
+	os.Unsetenv("SCARLETT_WEB_BROWSER_IDLE_SECONDS")
+
+	// Through Load: on this host's default, never above web concurrency, and
+	// only with the services executor.
+	t.Setenv("SCARLETT_COORDINATOR", "https://example.org")
+	t.Setenv("SCARLETT_PROFILE", "synthetic")
+	t.Setenv("SCARLETT_EXECUTOR", ExecutorServices)
+	t.Setenv("SCARLETT_VERIFIER", "127.0.0.1:7047")
+	t.Setenv("SCARLETT_PROVER", "scarlett-prover")
+	t.Setenv("SCARLETT_SERVICES", "web")
+	c, err := Load()
+	if err != nil || c.WebBrowser != WebBrowserDefault(runtime.GOOS) {
+		t.Fatal("loaded browser default", err, c.WebBrowser)
+	}
+	t.Setenv("SCARLETT_WEB_BROWSER", "on")
+	t.Setenv("SCARLETT_WEB_CONCURRENCY", "2")
+	t.Setenv("SCARLETT_WEB_BROWSER_CONCURRENCY", "3")
+	if _, err := Load(); err == nil {
+		t.Fatal("browser concurrency above web concurrency accepted")
+	}
+	t.Setenv("SCARLETT_WEB_BROWSER_CONCURRENCY", "2")
+	if c, err := Load(); err != nil || !c.WebBrowser || c.WebBrowserConcurrency != 2 {
+		t.Fatal("browser concurrency at web concurrency", err)
+	}
+	t.Setenv("SCARLETT_WEB_BROWSER", "off")
+	t.Setenv("SCARLETT_WEB_BROWSER_CONCURRENCY", "4")
+	if c, err := Load(); err != nil || c.WebBrowser {
+		t.Fatal("browser off ignores its concurrency", err)
+	}
+	t.Setenv("SCARLETT_EXECUTOR", ExecutorGateway)
+	t.Setenv("SCARLETT_SERVICES", "")
+	t.Setenv("SCARLETT_GATEWAY", "http://127.0.0.1:8088")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SCARLETT_WEB_BROWSER") {
+		t.Fatal("browser settings accepted without the services executor", err)
+	}
+	os.Unsetenv("SCARLETT_WEB_BROWSER")
+	os.Unsetenv("SCARLETT_WEB_BROWSER_CONCURRENCY")
+	if _, err := Load(); err != nil {
+		t.Fatal("gateway node", err)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 
@@ -156,18 +157,39 @@ func isHex(s string) bool {
 	return err == nil
 }
 
+// limitedBuffer keeps the first max bytes written to it and records whether
+// any were dropped.
 type limitedBuffer struct {
 	bytes.Buffer
-	max int
+	max     int
+	dropped bool
 }
 
 func (b *limitedBuffer) Write(p []byte) (int, error) {
-	if room := b.max - b.Len(); room > 0 {
-		if len(p) > room {
-			b.Buffer.Write(p[:room])
-		} else {
-			b.Buffer.Write(p)
+	kept := p
+	if room := max(b.max-b.Len(), 0); len(p) > room {
+		b.dropped = true
+		kept = p[:room]
+	}
+	b.Buffer.Write(kept)
+	return len(p), nil
+}
+
+// ReadFrom shadows the embedded bytes.Buffer's. io.Copy, and so os/exec for a
+// helper's stdout and stderr, prefers ReadFrom and would otherwise bypass the
+// limit entirely.
+func (b *limitedBuffer) ReadFrom(r io.Reader) (int64, error) {
+	var total int64
+	chunk := make([]byte, 32<<10)
+	for {
+		n, err := r.Read(chunk)
+		b.Write(chunk[:n])
+		total += int64(n)
+		if err == io.EOF {
+			return total, nil
+		}
+		if err != nil {
+			return total, err
 		}
 	}
-	return len(p), nil
 }

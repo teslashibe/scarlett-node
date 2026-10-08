@@ -28,7 +28,7 @@ Run `./scarlett-node pair` and enter a one-time coordinator code on stdin. Pairi
 
 For an **unpaid Docker fixture only**, `../scarlett-app/compose.yaml` builds this node twice with `SCARLETT_LOCAL_FIXTURE=1` and `local-fixture` profile. It polls the local app over Docker Desktop host loopback with a per-node seeded credential and standing bid. Each model calls its own isolated gateway container, which read-only mounts just the existing matching account; account credentials are never mounted into the nodes. This fixture is not provider authorization and cannot cap upstream inference usage because the Codex gateway ignores `max_tokens`.
 
-**Independent community services** (`SCARLETT_EXECUTOR=services`): set `SCARLETT_SERVICES=codex`, `x_read` or `codex,x_read`. The node uses proven execution only in this mode. Set `SCARLETT_VERIFIER=host:port` and the local prover binary as above. Codex uses `SCARLETT_CODEX_HOME`; X uses an absolute `SCARLETT_X_SESSION` path to a private 0600 x-go session JSON file. The X session must not contain a proxy override, which would bypass its proof transport. Provider credentials remain on the supplier machine and are sent to the prover through stdin, never as command arguments or coordinator fields. `SCARLETT_CODEX_CONCURRENCY` and `SCARLETT_X_CONCURRENCY` are independent limits from 1 to 32, default 1 each. The legacy shared-concurrency setting does not replace these limits. `SCARLETT_X_REFRESH_SECONDS` (default 1800, 60 to 86400) is how often each warm X client's transaction-ID material is refreshed in the background.
+**Independent community services** (`SCARLETT_EXECUTOR=services`): set `SCARLETT_SERVICES` to one or more of `codex`, `x_read` and `web` (see [Web pages](#web-pages)). The node uses proven execution only in this mode. Set `SCARLETT_VERIFIER=host:port` and the local prover binary as above. Codex uses `SCARLETT_CODEX_HOME`; X uses an absolute `SCARLETT_X_SESSION` path to a private 0600 x-go session JSON file. The X session must not contain a proxy override, which would bypass its proof transport. Provider credentials remain on the supplier machine and are sent to the prover through stdin, never as command arguments or coordinator fields. `SCARLETT_CODEX_CONCURRENCY` and `SCARLETT_X_CONCURRENCY` are independent limits from 1 to 32, default 1 each. The legacy shared-concurrency setting does not replace these limits. `SCARLETT_X_REFRESH_SECONDS` (default 1800, 60 to 86400) is how often each warm X client's transaction-ID material is refreshed in the background.
 
 Services-mode heartbeats report both services independently. A usable credential file initially means `configured`, rather than authenticated readiness. Local proof submission can change it to node-reported `ready`; the coordinator must still verify the proof independently. For `x_read` the node does not wait for a job: an account is `configured` while its warm client is being built and becomes `ready` when that build has validated the session against X, `auth_required` when X refused it, `exhausted` when X rate-limited the build and `unreachable` when X could not be reached or answered the validation with not-found (a rotated query ID, not a refusal), with the same rests a failed job earns. A validated build only promotes `configured` to `ready`; it never clears an authentication failure or ends a rest. An account that goes back to `configured` while its validated client is still installed (a rest ended, or the session file was rewritten with the same content) is reported `ready` again by the next 15-second check, without a request to X. An outcome for a session file that was replaced while X answered is discarded. `configured` accounts stay leasable. X quota/authentication errors suppress X without disabling Codex, and vice versa. Capacity includes separate in-flight counts. Quota/transport cooldowns last 30 seconds; an authentication failure waits for a changed local credential file. No numeric provider quota is guessed. Unknown or unavailable services receive a nonrewardable failure, without a provider call.
 
@@ -52,7 +52,7 @@ An X job containing identical requested reads is rejected before a session is cr
 
 Restart preserves accepted receipts. A proof interrupted in flight becomes `execution_uncertain`, loses its token and cannot be retried as new provider work. Status includes the job/attempt, fence, exact registered request hash, absolute expiry and a `durable` flag; it never includes the token. The coordinator must check those bindings, complete X fulfilment, quoted bounds and separate funding/settlement evidence. A stored proof is not a paid receipt or a points award. Durable X sessions allow 1–3 pinned exchanges and one attempt per exchange; legacy ephemeral tests retain the wider read policy.
 
-The private store has validated limits: `SCARLETT_VERIFIER_MAX_RECORDS` (default 1024, range 1 to 1,000,000), `SCARLETT_VERIFIER_MAX_RECORD_BYTES` (default 67108864, range 1048576 to 67108864), and `SCARLETT_VERIFIER_MAX_TOTAL_BYTES` (default 268435456, at least the per-record limit and at most 1099511627776). Values are decimal integers. Choose the per-record bound to hold the largest allowed request and verified response together; lowering it below an existing receipt prevents startup. Pending proofs reserve their full per-record budget before registration returns a token. Completed proofs release that reservation to their actual encoded size. Expired unspent tokens are revoked during maintenance and release their reservation while the receipt remains available for reconciliation. In-flight proofs keep their reservation through completion. The defaults therefore allow at most four pending durable sessions, fewer when retained receipts use space; the connection limit is a separate ceiling. Raising the record count alone does not raise this storage capacity.
+The private store has validated limits: `SCARLETT_VERIFIER_MAX_RECORDS` (default 1024, range 1 to 1,000,000), `SCARLETT_VERIFIER_MAX_RECORD_BYTES` (default 67108864, range 1048576 to 67108864), and `SCARLETT_VERIFIER_MAX_TOTAL_BYTES` (default 268435456, at least the per-record limit and at most 1099511627776). Values are decimal integers. Choose the per-record bound to hold the largest allowed request and verified response together; lowering it below an existing receipt prevents startup. Pending proofs reserve their full per-record budget before registration returns a token; a pending web fetch reserves only its own receipt bound (the base64 response cap plus every hop's head and URLs, about 14 MiB for a 10 MiB page with five redirects), never more than the per-record budget. Completed proofs release that reservation to their actual encoded size. Expired unspent tokens are revoked during maintenance and release their reservation while the receipt remains available for reconciliation. In-flight proofs keep their reservation through completion. The defaults therefore allow at most four pending durable sessions, fewer when retained receipts use space; the connection limit is a separate ceiling. Raising the record count alone does not raise this storage capacity.
 
 Successful `prove` and `prove-x` summaries report provider transcript `sent_bytes` and `received_bytes`, plus `verifier_sent_bytes` and `verifier_received_bytes` measured below the verifier connection's outer TLS layer. `verifier_transport_layer` is `tcp_payload`: the counters include TLS handshake and record bytes accepted by TCP, excluding IP/TCP headers and retransmissions. Counts saturate at 1 TiB per direction and then set `verifier_bytes_saturated: true`. Use these supplier diagnostics for local bandwidth measurements; billing and points use verified provider evidence.
 
@@ -60,7 +60,7 @@ After funded acceptance, the node retains these verifier counters in optional pr
 
 Authenticated `GET /v1/capacity` on the existing loopback verifier API reports `healthy`, `durable`, configured connection limits, receipt count and storage limits/actual/reserved bytes. `active_connections`, `in_flight_proofs` and `pending_sessions` report control connections, ongoing proofs and unexpired issued tokens. Pause new coordinator dispatch, then wait for all three to reach zero before a verifier restart; an issued token can still start a proof after dispatch is paused. `storage.can_register` indicates room for another worst-case receipt. A full store remains healthy for existing status/recovery reads; storage failures return HTTP 503 with `healthy: false`. The route contains no receipt content, tokens or credentials and requires the verifier key.
 
-Resolved payloads and receipts are removed 24 hours after session expiry by a minute maintenance pass and on restart. Unacknowledged coordinator results must be reconciled within that window. Interrupted proof receipts become `execution_uncertain`, lose their tokens, and retain replay metadata beyond that window. They need an explicit reviewed reconciliation process before removal; capacity pressure never purges them. Corrupt, public, symlinked or oversized files fail startup; a full store refuses more work. Provider credential values never enter the store, but buyer requests and verified response copies do, so preserve its private permissions. Without a state directory the legacy verifier stays ephemeral and reports `durable: false`. Proof connections use verified TLS as described below.
+Resolved payloads and receipts are removed 24 hours after session expiry by a minute maintenance pass and on restart. Unacknowledged coordinator results must be reconciled within that window. Web fetch receipts are removed 10 minutes after session expiry instead: the coordinator reads a web receipt only before its job's deadline and keeps the signed result itself, and a day of web pages would fill the store Codex and X share. Interrupted proof receipts become `execution_uncertain`, lose their tokens, and retain replay metadata beyond that window. They need an explicit reviewed reconciliation process before removal; capacity pressure never purges them. Corrupt, public, symlinked or oversized files fail startup; a full store refuses more work. Provider credential values never enter the store, but buyer requests and verified response copies do, so preserve its private permissions. Without a state directory the legacy verifier stays ephemeral and reports `durable: false`. Proof connections use verified TLS as described below.
 
 Recovery uses the authenticated `GET /api/node/v1/jobs/{job_id}/attempt` contract. Identity must match the exact job/attempt/fence and the response must explicitly promise `replay_safe: true`. Only then may a ready report be retried with its original body. Accepted receipts must match the recorded submission hash; pending proofs stay pending without another provider call. Unsupported endpoints, lost responses and mismatched receipts keep the record unresolved. A missing response is not a payment, proof or points receipt. The production coordinator companion must implement this contract before recovery works there.
 
@@ -251,10 +251,355 @@ no paid demand itself.
 
 Services-mode heartbeats include each enabled service's local `max_input_bytes`.
 For Codex this counts prompt UTF-8 bytes; for X it counts the serialized
-`x_request`, as the worker does. Codex also reports its configured
-`max_output_tokens` and the accepted base-model catalog. X reports neither.
-Disabled services advertise no limits. These reports describe local validation,
-not verified provider access, successful work or payment evidence.
+`x_request`, and for web the serialized `web_request`, as the workers do. Codex
+also reports its configured `max_output_tokens` and the accepted base-model
+catalog. X and web report neither. An enabled web entry also reports `egress`
+(`direct` or `proxy`) and `browser`, the browser tier's readiness (see
+[Browser tier](#browser-tier)). Disabled services report `not_added` and no limits. These
+reports describe local validation, not verified provider access, successful
+work or payment evidence. A heartbeat lists at most three services and a total
+capacity of at most 96 (32 each).
+
+## Web pages
+
+`SCARLETT_SERVICES` may include `web` (alone or with `codex` and `x_read`). Web
+needs no account and no credential path. `SCARLETT_WEB_CONCURRENCY` (1–32,
+default 4) bounds simultaneous pages; the web entry reports it as capacity.
+
+**Lease.** A web lease carries `web_request` (`{"operation":"scrape","url":…}`)
+and `web_payload`, the exact verifier `web.fetch` payload (`api/node-v1.openapi.yaml`,
+fixtures `lease-web-offer.json` and `lease-web.json`). Before acceptance the node
+refuses an offer whose payload is not `proof_mode` `relay` with `proof_policy`
+`web-relay-v1` (or `web-browser-v1` for a browser job while the browser tier is
+ready), or while keyed relay is halted. After acceptance it checks that
+`input_sha256` is the SHA-256 of Go's encoding of `web_request` (at most
+`SCARLETT_MAX_INPUT_BYTES`), that the payload has unique keys, integer numbers,
+exactly its seven fields (eight with `node_headers` for `web-browser-v1`), a
+URL equal to `web_request.url`, 0–5 redirects,
+1–10485760 response bytes and at most the three allowlisted headers in order,
+and that the lease carries no Codex or X fields; otherwise it reports
+`invalid_lease`. Well-formed terms whose URL is not canonical (including an IP
+literal, a reserved name or an X host) are reported `web_egress_denied` without
+any lookup. The job runs until the lease deadline less a 10 s report margin.
+
+A browser-mode lease (`web_request.mode` `browser`) also carries
+`web_request.browser` and a `web-browser-v1` payload; see
+[Browser tier](#browser-tier). A relay offer may carry the lease-level hint
+`web_prewarm_browser: true` (fixture `lease-web-prewarm-offer.json`), which
+is outside `web_request`, never hashed and not part of the accepted terms.
+**Canonical URLs.** The strict rules are shared with the app and the verifier
+through `api/web-vectors.json`: absolute `https`, lowercase ASCII host with at
+least two labels and a letter in the last, port 443 only, no userinfo, no IP
+literal (bracketed, an all-digit last label or one starting with `0x`), no
+reserved name (`localhost`, `local`, `internal`, `home.arpa`, `lan`,
+`localdomain`, `onion`, `invalid`, `test` or a subdomain), no `x.com` or
+`twitter.com` host, fragment dropped, path and query percent-encoded and dot
+segments removed, at most 2048 bytes. A URL is canonical when these rules leave
+it unchanged.
+
+**Hops.** Each hop is one `scarlett-prover relay-web` run under the job's single
+verifier token, at most `max_redirects + 1` of them. For each hop the node:
+
+1. re-checks the hop URL is canonical;
+2. resolves the host with the system resolver (5 s);
+3. checks every returned address with the egress guard, refusing the hop if any
+   is denied;
+4. picks the first IPv4 address, else the first IPv6 address;
+5. runs the helper with stdin `{verifier, verifier_ca_file?, plaintext_fixture?,
+   token, hop, url, ip, port: 443, proxy?, payload, timeout_ms, node_headers?}`,
+   where `timeout_ms` is the smaller of 30 s and the time left and
+   `node_headers` (`{user_agent, cookie?}`) is present only for a browser job's
+   re-fetch. stdout is capped at 64 KiB and stderr at 16 KiB;
+6. reads the one-line summary: `status` `proof_sent`, the same `hop`, a
+   `status_code`, and either `final: true` or a canonical `next_url` for a
+   301, 302, 303, 307 or 308 that the verifier authorized.
+
+The helper never receives page plaintext; the summary carries counters and the
+next URL only. Each hop is one proof-traffic sample (up to six per attempt) and
+one diagnostics exchange (operation `scrape`, proof mode `relay`). No URL, host,
+address, proxy or page content is logged or kept in diagnostics.
+
+**Outcomes.** Failures of the first hop are reported with these codes; once the
+first hop was verified, any later failure other than verifier misuse is
+reported `proven`, because the verifier already holds the verified hops.
+
+| Code | First hop |
+| --- | --- |
+| `web_egress_denied` | The URL failed node validation, or the host resolved to a denied address |
+| `web_dns_failed` | No address within 5 s |
+| `web_connect_failed` | The helper could not open TCP to the checked address (`SCARLETT_WEB_ERROR=connect_failed`); no verifier session was spent |
+| `web_proxy_failed` | The egress proxy was unreachable, refused authentication or did not answer 200 (`SCARLETT_WEB_ERROR=proxy_failed`) |
+| `web_fetch_failed` | The relay session failed after the token was presented, or the helper's summary was invalid |
+| `relay_misuse` | The helper caught the verifier misusing the session; keyed relay halts node-wide, for X and web alike, until `scarlett-node relay-resume` |
+| `expired` | The lease deadline passed first |
+| `prover_error` | The helper could not run |
+| `web_browser_unavailable` | Browser job: the browser tier was not ready or its helper could not start |
+| `web_browser_failed` | Browser job: the browser failed (navigation, TLS, crash, timeout or memory kill) and neither a stored copy nor a verified re-fetch hop exists |
+
+**Readiness.** The web entry is `configured` when enabled with the helper
+present and `ready` after a proven job. It is `unreachable` with
+`last_error_code` `prover_error` while the helper is missing, `relay_misuse`
+while relay is halted and `web_proxy_failed` for 60 s after the egress proxy
+failed. Failures on the target's side (`web_dns_failed`, `web_egress_denied`,
+`web_connect_failed`, `web_fetch_failed`) never change it. Account files, their
+errors and account mode never apply to web, so a desktop node with
+`SCARLETT_DESKTOP_WEB=1` can start with no accounts. The two browser codes
+never change it either.
+
+**Egress guard.** IPv4-mapped IPv6 is judged as its IPv4 address. Denied IPv4:
+0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12,
+192.0.0.0/24, 192.0.2.0/24, 192.31.196.0/24, 192.52.193.0/24, 192.88.99.0/24,
+192.168.0.0/16, 192.175.48.0/24, 198.18.0.0/15, 198.51.100.0/24, 203.0.113.0/24,
+224.0.0.0/4 and 240.0.0.0/4. IPv6 must be in 2000::/3 and outside 2001::/23,
+2001:db8::/32, 2002::/16 and 3fff::/20. NAT64 prefixes are discovered from the
+AAAA answers for `ipv4only.arpa` (RFC 7050) at start and every 10 minutes; an
+address inside one is judged by the IPv4 address it embeds. Without discovery
+64:ff9b::/96 is denied like any address outside 2000::/3. Every address on a
+local interface (refreshed each minute) is denied, and scoped addresses never
+pass. Only port 443 is dialled. The node's own public address behind NAT
+(hairpin) is not detected.
+
+**Proxy egress.** `SCARLETT_WEB_EGRESS_PROXY=http://[user:pass@]host:port`
+(services executor only; port required, no path, query or fragment) makes the
+helper send `CONNECT <checked-ip>:443` to the proxy, with
+`Proxy-Authorization: Basic …` when credentials are given, and require a `200`.
+DNS is still resolved and checked on the node. The proxy must be a
+non-intercepting tunnel. The value is never logged, printed in errors or
+status, or sent to the coordinator; the heartbeat reports only `egress: proxy`.
+The browser tier's filtering proxy chains through the same proxy, sending
+`CONNECT <checked-ip>:<port>` for both its forms. The browser download itself
+uses ordinary system networking, never the egress proxy.
+
+## Browser tier
+
+Web jobs in browser mode render the page in a hidden browser on the node before
+the proven re-fetch. Contract: `api/node-v1.openapi.yaml` (`WebRequest.mode`,
+`WebBrowser`, `BrowserHealth`, `/browser-result`, `BrowserResult`) and
+`api/web-vectors.json` version 2.
+
+**Settings.** `SCARLETT_WEB_BROWSER` is `on` or `off` (also `1`/`0`,
+`true`/`false`); it defaults to `on` with web on macOS and Linux and to `off`
+on Windows in this release. Without web the tier is off whatever it says.
+`SCARLETT_WEB_BROWSER_CONCURRENCY` (1–4) sets the pages rendered at once and
+may not exceed `SCARLETT_WEB_CONCURRENCY`; unset, the runtime uses 1 below
+16 GiB of physical memory and 2 otherwise, never more than web capacity.
+`SCARLETT_WEB_BROWSER_IDLE_SECONDS` (30–3600, default 120) is the idle stop.
+All three need the services executor. A desktop node started with
+`SCARLETT_DESKTOP_WEB=1` inherits the defaults; the desktop app passes an
+explicit `SCARLETT_WEB_BROWSER` of `on` or `off` from its own environment to
+the node, and only together with web.
+
+**What ships and what is fetched.** The node bundle and the desktop app carry
+`web-runtime-<platform>.tar.gz` and `web-runtime.json` beside
+`x-login-runtime/`: a pinned CPython 3.13.16 (python-build-standalone
+`20261003`) with `scrapling[fetchers]==0.4.15`, Patchright and Playwright
+1.63.0 from a hash-locked, wheels-only lock, and the node's helper
+`scarlett_web_helper`. The helper's driver reuses the x-login runtime's Node
+22.23.3. The resource directory is found as for X login:
+`SCARLETT_X_LOGIN_RESOURCE_DIR` when set (the desktop sets it), else the
+installed layout beside the executable. The archive is extracted into
+`<state>/web-runtime/<digest>/` after its manifest, sizes and digests are
+checked. The browser is Chrome for Testing 155.0.8059.39, downloaded by the node
+from its fixed `storage.googleapis.com` URL over HTTPS with the system roots,
+checked against a pinned zip digest and a per-file inventory (exact paths,
+sizes, digests, modes and links), and extracted into
+`<state>/web-browser-bin/<digest>/`. Older browser versions are removed once
+the current one passes its launch probe. `scarlett-node web-runtime check
+[--resources DIR] [--with-browser]` runs the same verification without a node
+and prints `{"webRuntime":"passed"}`.
+
+**Lease.** `web_request` gains `mode: "browser"` and `browser`
+(`{wait, wait_ms, wait_selector?, timeout_ms, block_resources,
+solve_challenge}`), all bound into `input_sha256`. Mode, the `web-browser-v1`
+policy, `browser` and `node_headers` go together. Bounds: `wait` is `load` or
+`networkidle` (load, then at most 3 s more for the network to go quiet),
+`wait_ms` 0–15000, `wait_selector` 1–256 printable ASCII bytes, `timeout_ms`
+5000–45000. A `web-browser-v1` payload has exactly the two headers `accept`
+and `accept-language` with their default values in that order, no
+`user-agent`, `node_headers` exactly `["user-agent","cookie"]`, five
+redirects and 10485760 response bytes; anything else is `invalid_lease`. The
+pre-warm hint on a browser lease is `invalid_lease`, and an offer carrying it
+is refused before acceptance.
+
+**Admission.** A browser offer is taken only while the tier is `ready`, holds
+one browser slot inside its web slot, and starts the helper in the background
+while the node accepts. A relay offer with `web_prewarm_browser` starts the
+helper too when the tier is ready, so an escalation that follows finds it warm.
+
+**Run.** The report deadline is the lease deadline less 10 s. The browser
+phase ends 15 s before it and gets the smaller of `timeout_ms` and the time
+left; under 5 s the job is `expired`. Then:
+
+1. The page's host is resolved and checked with the egress guard before any
+   browser work: `web_dns_failed` or `web_egress_denied`.
+2. The browser renders the page in a fresh context: `web_browser_unavailable`
+   if it could not run at all, `web_browser_failed` if it failed.
+3. The final document must be an absolute `http` or `https` URL of at most
+   2048 bytes and not an X host; otherwise the browser copy is dropped.
+4. As soon as the browser returns, two things run at once. The **upload**
+   posts the rendered copy to `/api/node/v1/jobs/{job_id}/browser-result`. The
+   **re-fetch** is the relay hop loop above with the same token, each hop
+   carrying `node_headers`: the pinned User-Agent and a Cookie built from the
+   browser's cookies (below). The re-fetch is skipped when the browser could not
+   clear a bot challenge.
+5. The node reports once both are done, or at the report deadline: `/proven`
+   when the upload was stored or the verifier holds at least one re-fetch hop,
+   otherwise `/fail` with the first code from steps 1–2, then the re-fetch's
+   first-hop code. Verifier misuse in the re-fetch is reported `relay_misuse`
+   and halts relay as always.
+
+**Upload.** The body is gzip JSON (`Content-Encoding: gzip`), at most
+12582912 bytes compressed and 16777216 decompressed, encoded with HTML escaping
+off. When the decompressed body would exceed 16711680 bytes, `html` is cut on a
+code point boundary and `html_truncated` set; `html` is capped at 10485760
+bytes either way. `html_bytes` and `html_sha256` are computed on the string
+sent. Response headers are lowercased and kept only as token names of at most 64
+bytes with printable values of at most 4096 bytes (128 pairs and 65536 bytes in
+total), never `set-cookie` or `cookie`; `set_cookie_names` carries names only.
+`started_at_ms` and `duration_ms` come from the node's clock around the browser
+phase. The upload uses the node's coordinator transport and version headers but
+its own client without the 10 s timeout: each try runs under the report
+deadline, starts only while `max(15 s, size / 250 kB/s)` remains, and there are
+at most three, retried only after a transport error, 429 or 5xx. A repeat of the
+same body is answered 200; a 409 is final.
+
+**Clearance cookies.** The Cookie for a re-fetch hop holds only cookies whose
+names are on the allowlist the verifier enforces: exactly `cf_clearance`,
+`__cf_bm`, `_cfuvid`, `datadome`, `_abck`, `bm_sz`, `ak_bmsc`, `bm_sv`,
+`pxcts`, `reese84`, `aws-waf-token`, or a name starting with `_px`,
+`incap_ses_`, `visid_incap_` or `nlbi_` followed by at least one more byte.
+Each must match the hop's host (host-only, or a domain cookie for the host or
+a parent) and path, be unexpired, and have a valid name and value; secure
+cookies are sent only over `https`. Longer paths come first, then the browser's
+order, capped at 50 pairs and 4096 bytes, in the grammar
+`name=value; name=value`. A hop with no matching cookie sends no Cookie line.
+The verifier records the cookie names and a SHA-256 of the value, never the
+value. Cookie values reach the node only over loopback from the helper, live
+for one job and are never logged, uploaded, stored or reported.
+
+**User-Agent.** The browser and every re-fetch hop send exactly
+`Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36`
+on macOS, with `Windows NT 10.0; Win64; x64` or `X11; Linux x86_64` in place of
+the platform on Windows and Linux. The verifier accepts only these for the
+pinned browser major.
+
+**Isolation.** New headless mode only, and never the operator's browser. The
+Chrome sandbox stays on; where Linux blocks unprivileged user namespaces the
+tier reports `sandbox_unavailable` instead of running without it. Each launch
+gets a fresh profile under `<state>/web-browser/tmp/` (wiped before every
+start), which the helper creates and seeds before the browser opens it, and
+each job a fresh browser context with no permissions, downloads off, muted
+audio, a mock keychain and basic password store, and invalid certificates
+refused. The helper
+inherits only an allowlist of environment variables, with HOME, the temporary
+and cache directories and the crash-dump location inside node state and no
+display, D-Bus or proxy variables. On macOS the node unregisters its browser
+from LaunchServices after each stop and before removing an old version; the
+one file outside node state it can leave is
+`~/Library/Preferences/com.google.chrome.for.testing.plist`, which is shared
+with any Chrome for Testing the operator runs and is therefore never deleted.
+On Windows the helper runs in a Job object with no window and below-normal
+priority; on macOS and Linux at nice 10.
+
+**Operating-system reach.** A page must not open an app, show a system prompt
+or crash the browser on the operator's machine, with or without a click (the
+Cloudflare solver's click is a real user gesture). The helper passes the
+browser's whole argv itself, Patchright's defaults unchanged, so that the
+browser starts on the profile it seeded; its `Default/Preferences` holds:
+
+- The URL blocklist preference (the one the `URLBlocklist` policy sets) with
+  `mailto:*`, `news:*` and `snews:*`, Chrome's always-allowed external
+  schemes. Chrome 155 still hands `mailto:` to the OS mail client without a
+  prompt, and without a gesture once per start. A blocked navigation fails in
+  the browser before Chrome's external-protocol code runs. The preference is
+  read from the profile like any other, so no administrator rights are
+  needed; command-line policies exist only on Android, and no switch turns
+  external protocols off.
+- Protocol handlers for `mailto:` and `news:`, the second layer, pointing at
+  `https://scarlett-blocked.invalid/?u=%s` and usable in the job contexts
+  (which are off-the-record children of the profile). A registered handler
+  takes precedence over the OS handler, so the link becomes an https
+  navigation that the egress proxy refuses by name before any lookup. Chrome
+  for Testing never registers itself with the OS as a default handler.
+- The "don't allow sites to ask" setting for Bluetooth, USB, HID and serial
+  devices. `requestDevice` and `requestPort` reject with `NotFoundError` (HID
+  resolves with an empty list) before any scan; a scan made a macOS Bluetooth
+  privacy request and crashed the browser.
+- Screen capture off (the setting behind the `ScreenCaptureAllowed` policy):
+  `getDisplayMedia` rejects with `NotAllowedError` before its picker, which
+  made Screen Recording privacy requests.
+
+Camera and microphone are fake devices (`--use-fake-device-for-media-stream`),
+so `getUserMedia` is refused without a device or a prompt. The helper also
+fails any document response that redirects to a scheme other than http(s): a
+3xx is followed like a typed navigation, which skips Chrome's anti-flood check
+for external protocols. If that check cannot be set up on a page, the helper
+closes the page before it navigates and the fetch fails; a fetch whose
+challenge handling did not finish fails too, never reported as a success.
+Every other external scheme (`tel:`, `sms:`, `facetime:`, `itms-apps:`,
+`intent:`, an app's own scheme) reaches Chrome's external-protocol dialog,
+which the hidden browser never shows, so nothing is opened; blocking those
+too would make their frames load an error page, which a normal Chrome does not
+do. `file:` and `chrome:` navigations from a page are refused by Chrome
+itself, and `javascript:`, `data:` and `blob:` stay in the browser.
+
+What a page can still tell: Bluetooth reports `getAvailability()` false and
+its refusal reads "User or their enterprise policy has disabled Web
+Bluetooth." rather than the cancelled-chooser text; screen capture reads
+"Permission denied" rather than "Permission denied by user"; a frame sent to
+`mailto:`, `news:` or `snews:` loads an error page, as with a webmail handler
+that is unreachable. The redirect check covers the page's main frame and its
+same-process frames; a redirect in a cross-site frame, a pop-up or a service
+worker reaches the blocklist, the handlers and the dialog instead.
+
+**Network.** Every page context uses a loopback filtering proxy in the node.
+It accepts `CONNECT host:443` and absolute-form `http://host[:80]` requests
+only, applies the canonical host rules and reserved names before any lookup,
+resolves with a 5 s limit, refuses the request if any address fails the
+egress guard, and dials exactly the checked address. The browser's own
+background traffic is sent to a second loopback listener that answers 403 to
+everything and never dials or resolves. QUIC is disabled, WebRTC may not send
+UDP outside the proxy, and multicast DNS candidates are off. Tunnels are capped
+at `32 × capacity + 16` per helper, 60 s idle and 128 MiB each. Hosts are never
+logged; only counters are kept.
+
+**Lifecycle.** At start, with web and the tier on, the node prepares in the
+background: memory check, cleanup of crash dumps and partial downloads, runtime
+extraction and full verification, browser download and verification, then one
+launch-and-close probe. The helper starts on demand, or early for a browser
+offer or the pre-warm hint, stays warm while jobs flow and stops after the idle
+time (30 s after a pre-warm that served nothing). It is recycled after 50 pages,
+or when the memory of its whole process tree passes `1.25 GiB + 0.75 GiB ×
+capacity`, and killed 1.5 GiB above that. Three start failures within ten
+minutes make it `helper_failed` for ten minutes. A full verification of the
+runtime and browser repeats every six hours while no helper is warm.
+
+**Readiness.** The enabled web entry always carries `browser`:
+`{"state":"ready","capacity":N,"in_flight":M,"version":"155.0.8059.39"}`, with
+capacity 1–4 and at most the web capacity, or
+`{"state":"unavailable","reason":R,"capacity":0,"in_flight":0}`. A browser job
+also counts in the web entry's `in_flight`.
+
+| Reason | Meaning |
+| --- | --- |
+| `disabled` | `SCARLETT_WEB_BROWSER=off` (the Windows default in this release) |
+| `web_unavailable` | Web itself is not offerable: helper missing, relay halted or proxy rest |
+| `memory_low` | Under 8 GiB of physical memory |
+| `disk_low` | Not enough free disk to extract, download or start (1.5 GiB before a download or extraction, 512 MiB at helper start) |
+| `runtime_missing` | No runtime archive in the resource directory |
+| `runtime_invalid` | The archive or the extracted runtime failed verification |
+| `browser_downloading` | The browser download is in progress |
+| `browser_download_failed` | The download failed; it is retried with backoff |
+| `browser_invalid` | The extracted browser failed verification |
+| `deps_missing` | Linux shared libraries are missing |
+| `sandbox_unavailable` | Linux unprivileged user namespaces are blocked |
+| `helper_failed` | Three helper start failures within ten minutes, or any state the node cannot name |
+
+**Diagnostics.** A browser job is recorded as operation `scrape` with proof
+mode `browser`; the browser phase and the upload are node spans
+`browser_fetch` and `browser_upload` (exchange 0), and the re-fetch hops are
+exchanges 1–6 as for a relay job. No URL, host, header, cookie or page content
+is kept.
 
 The coordinator must reject incompatible new assignments and check limits again
 before funded acceptance. Legacy heartbeats can still report health, but cannot

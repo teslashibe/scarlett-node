@@ -25,6 +25,9 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		}
 	}
+	if strings.HasPrefix(mode, "web") {
+		fakeWebProver(mode)
+	}
 	if strings.HasPrefix(mode, "x") {
 		fakeXProver(mode)
 	}

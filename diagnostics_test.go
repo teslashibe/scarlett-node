@@ -131,3 +131,37 @@ func TestDiagnosticsCommandMissingHistoryIsSafe(t *testing.T) {
 		t.Fatal("missing history did not return an empty local snapshot", err)
 	}
 }
+
+// A browser web job is recorded as scrape in browser mode, with its browser
+// phase and upload as node spans and nothing from the page or its URL.
+func TestDiagnosticsRecordBrowserWebJobs(t *testing.T) {
+	store := diagnostics.New(privateTestDir(t))
+	raw, err := os.ReadFile("api/fixtures/lease-web-browser.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var l coordinator.Lease
+	if err := json.Unmarshal(raw, &l); err != nil {
+		t.Fatal(err)
+	}
+	a := beginLeaseDiagnostics(store, l)
+	ctx := a.Context(context.Background())
+	diagnostics.Start(ctx, "browser_fetch", 0)("success")
+	diagnostics.Start(ctx, "browser_upload", 0)("web_browser_failed")
+	a.Finish("web_browser_failed")
+	records := store.Snapshot().Attempts
+	if len(records) != 1 || records[0].Operation != "scrape" || records[0].ProofMode != "browser" || records[0].Pages != 1 || records[0].Outcome != "web_browser_failed" || len(records[0].Spans) != 2 || records[0].Spans[0].Phase != "browser_fetch" || records[0].Spans[1].Outcome != "web_browser_failed" {
+		t.Fatalf("browser diagnostics %+v", records)
+	}
+	encoded, _ := json.Marshal(store.Snapshot())
+	if bytes.Contains(encoded, []byte("example.com")) {
+		t.Fatal("page URL entered diagnostics")
+	}
+	l.WebRequest = &coordinator.WebRequest{Operation: "scrape", URL: "https://example.com/"}
+	l.Attempt = "44444444-4444-4444-8444-444444444444"
+	relay := beginLeaseDiagnostics(store, l)
+	relay.Finish("")
+	if records = store.Snapshot().Attempts; len(records) != 2 || records[1].ProofMode != "relay" && records[0].ProofMode != "relay" {
+		t.Fatal("relay web job mode", records)
+	}
+}

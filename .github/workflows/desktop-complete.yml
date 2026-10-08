@@ -8,6 +8,7 @@ on:
       - 'go.*'
       - 'prover/**'
       - 'third_party/**'
+      - 'scripts/*web-runtime*'
       - '.github/workflows/desktop-complete.yml'
       - '.github/workflows/desktop-release.yml'
   workflow_dispatch:

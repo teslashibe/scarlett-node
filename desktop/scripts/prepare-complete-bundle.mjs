@@ -83,6 +83,10 @@ const sidecars = [['scarlett-node',node], ['scarlett-prover',prover], ['open-age
 // The login helper is a complete runtime resource, verified before COMPONENTS
 // inventories it and before signing modifies native payload bytes.
 execFileSync(process.execPath, [join(desktop, '..', 'scripts', 'prepare-x-login-runtime.mjs'), platform, join(runtime, 'x-login-runtime')], {stdio:'inherit'});
+// The web browser runtime is one verified archive plus web-runtime.json; its
+// driver reuses the x-login runtime's Node, and the node downloads the pinned
+// browser itself, so nothing here is a new Mach-O or PE for the signers.
+execFileSync(process.execPath, [join(desktop, '..', 'scripts', 'prepare-web-runtime.mjs'), platform, runtime, join(runtime, 'x-login-runtime')], {stdio:'inherit'});
 const files = [];
 function record(directory) {
   for (const name of readdirSync(directory).sort()) {

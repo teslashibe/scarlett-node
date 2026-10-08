@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -42,14 +43,17 @@ func start(args []string) error {
 	if len(args) > 0 && args[0] == "accounts" {
 		return accountsCommand(args[1:], os.Stdin, os.Stdout)
 	}
+	if len(args) > 0 && args[0] == "web-runtime" {
+		return webRuntimeCommand(args[1:], os.Stdout)
+	}
 	if len(args) != 1 {
-		return errors.New("usage: scarlett-node pair|run|status|diagnostics|drain|resume|relay-resume|accounts")
+		return errors.New("usage: scarlett-node pair|run|status|diagnostics|drain|resume|relay-resume|accounts|web-runtime")
 	}
 	if args[0] == "status" || args[0] == "diagnostics" || args[0] == "drain" || args[0] == "resume" || args[0] == "relay-resume" {
 		return localCommand(args[0], os.Stdout)
 	}
 	if args[0] != "pair" && args[0] != "run" {
-		return errors.New("usage: scarlett-node pair|run|status|diagnostics|drain|resume|relay-resume|accounts")
+		return errors.New("usage: scarlett-node pair|run|status|diagnostics|drain|resume|relay-resume|accounts|web-runtime")
 	}
 	c, err := config.Load()
 	if err != nil {
@@ -132,6 +136,24 @@ const capacityRest = 30 * time.Second
 // accounts, which have their own quota.
 func restsNode(pooled bool, code string) bool {
 	return code == "capacity_unavailable" && !pooled
+}
+
+// webWorker builds the web worker for one lease; tests replace it to inject a
+// resolver, egress guard, browser tier or upload.
+var webWorker = func(c config.Config) worker.Web { return worker.Web{Config: c} }
+
+// nodeBrowser holds this process's browser tier while run serves web with the
+// browser on; it is empty otherwise.
+var nodeBrowser atomic.Value
+
+type browserHolder struct{ tier worker.BrowserTier }
+
+func setNodeBrowser(tier worker.BrowserTier) { nodeBrowser.Store(browserHolder{tier}) }
+
+// currentBrowser is the running browser tier, or nil.
+func currentBrowser() worker.BrowserTier {
+	held, _ := nodeBrowser.Load().(browserHolder)
+	return held.tier
 }
 
 // heartbeatWatchInterval is how often the node rechecks, while the coordinator
@@ -438,6 +460,20 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			stopKeeping()
 			worker.DefaultXClients().Stop()
 		}()
+		if c.Enabled("web") {
+			// NAT64 prefixes and local addresses are kept fresh off the job path.
+			go worker.KeepWebEgressFresh(workCtx)
+		}
+		if c.Enabled("web") && c.WebBrowser {
+			// The tier prepares its runtime and browser in the background and
+			// reports browser_downloading and the like until it is ready. It
+			// stops after the workers, whose deferred wait runs first.
+			tier, stopBrowser := startBrowserTier(workCtx, c)
+			defer stopBrowser()
+			services.browser = tier
+			setNodeBrowser(tier)
+			defer setNodeBrowser(nil)
+		}
 	}
 	slots := make(chan struct{}, capacity)
 	var running sync.WaitGroup
@@ -680,6 +716,9 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 				endAccountAcquire := diagnostics.Start(attemptCtx, "account_acquire", 0)
 				if l.ServiceType == "x_read" && l.XRequest != nil {
 					account, serviceAvailable = services.acquireAccount(l.ServiceType, l.XRequest.Operation)
+				} else if l.ServiceType == "web" && l.WebRequest != nil && l.WebRequest.Mode == "browser" {
+					// A browser job holds a browser slot inside its web slot.
+					account, serviceAvailable = services.acquireAccount(l.ServiceType, "browser")
 				} else {
 					account, serviceAvailable = services.acquireAccount(l.ServiceType)
 				}
@@ -721,7 +760,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 				var err error
 				if !serviceAvailable {
 					code = "service_unavailable"
-					if l.AcceptanceRequired && (l.ServiceType == "codex" || l.ServiceType == "x_read") {
+					if l.AcceptanceRequired && (l.ServiceType == "codex" || l.ServiceType == "x_read" || l.ServiceType == "web") {
 						// No selected valid profile: leave the unaccepted offer to
 						// expire rather than funding it through rejectLease.
 						err = errors.New("provider offer has no locally eligible account")
@@ -780,6 +819,11 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	// Decline a proof mode this node does not serve before accepting funds for it.
 	if l.ServiceType == "x_read" && !worker.XOfferServable(c, l.XPayload) {
 		return "invalid_lease", errors.New("x_read offer asks for a proof mode this node does not serve")
+	}
+	// For a browser offer, or a relay offer with the pre-warm hint, this also
+	// starts the browser while the node accepts.
+	if l.ServiceType == "web" && !worker.WebOfferServable(c, l, currentBrowser()) {
+		return "invalid_lease", errors.New("web offer asks for a proof mode this node does not serve")
 	}
 	record, err := attemptRecord(l)
 	if err != nil {
@@ -850,6 +894,15 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 			code = "service_unavailable"
 		} else if c.Executor == config.ExecutorServices && l.ServiceType == "x_read" {
 			code = worker.X{Config: c}.Run(ctx, l)
+		} else if c.Executor == config.ExecutorServices && l.ServiceType == "web" {
+			w := webWorker(c)
+			if w.Browser == nil {
+				w.Browser = currentBrowser()
+			}
+			if w.Upload == nil && client != nil {
+				w.Upload = client.UploadBrowserResult
+			}
+			code = w.Run(ctx, l)
 		} else {
 			code, detail = worker.Prover{Config: c}.Run(ctx, l)
 		}

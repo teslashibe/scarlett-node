@@ -32,6 +32,8 @@ type accountLease struct {
 	xStamp     string
 	xIdentity  string
 	quotaUntil time.Time
+	// browser marks a web lease that holds a browser slot too.
+	browser bool
 }
 type accountStatus struct {
 	ID        string    `json:"id"`
@@ -187,7 +189,9 @@ func (p *servicePool) refreshAccounts(now time.Time) bool {
 		}
 		p.accountMode = true
 		for kind, old := range p.entries {
-			p.entries[kind] = &serviceEntry{enabled: old.enabled, capacity: old.capacity}
+			if kind != "web" {
+				p.entries[kind] = &serviceEntry{enabled: old.enabled, capacity: old.capacity}
+			}
 		}
 	}
 	if e != nil || p.healthError {
@@ -247,6 +251,9 @@ func (p *servicePool) refreshAccounts(now time.Time) bool {
 	p.refreshXIdentities(now)
 	p.refreshXRecovery()
 	for kind, s := range p.entries {
+		if kind == "web" {
+			continue
+		}
 		s.inFlight = 0
 		available := 0
 		s.state = "auth_required"
@@ -390,6 +397,10 @@ func (p *servicePool) acquireAccount(kind string, operation ...string) (*account
 	defer p.mu.Unlock()
 	now := time.Now()
 	p.refresh(now)
+	if kind == "web" {
+		// A browser-mode web lease asks for operation "browser".
+		return p.acquireWebLocked(len(operation) == 1 && operation[0] == "browser")
+	}
 	s := p.entries[kind]
 	if s == nil || !s.enabled || p.healthError || p.accountsError {
 		return nil, false
@@ -521,6 +532,13 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 	delete(l.account.xLeases, l)
 	if s.inFlight > 0 {
 		s.inFlight--
+	}
+	if l.kind == "web" {
+		if l.browser && p.browserInFlight > 0 {
+			p.browserInFlight--
+		}
+		p.settleWeb(code)
+		return
 	}
 	if l.xIdentity != "" && p.xInFlight[l.xIdentity] > 0 {
 		p.xInFlight[l.xIdentity]--
@@ -760,6 +778,9 @@ func (p *servicePool) cooldown(lease *accountLease) func(time.Duration) {
 func (p *servicePool) blockAccounts() {
 	p.accountsError = true
 	for kind, s := range p.entries {
+		if kind == "web" {
+			continue // No account file governs web.
+		}
 		inFlight := 0
 		for _, a := range p.accounts {
 			if a.spec.Service == kind {

@@ -183,14 +183,47 @@ paths:
       responses:
         '200': {description: Accepted and committed once}
         '409': {description: Expired, conflicting body or fenced; not rewardable}
+  /api/node/v1/jobs/{job_id}/browser-result:
+    post:
+      security: [{nodeBearer: []}]
+      parameters: [{$ref: '#/components/parameters/JobID'}]
+      summary: Upload the page the node's browser rendered for a browser web job
+      description: >-
+        One upload per attempt, for the job's current accepted lease on this node, before
+        /proven or /fail is committed and before the lease deadline. The body is gzip JSON
+        (Content-Encoding gzip required), at most 12582912 bytes compressed and 16777216
+        decompressed; the node shrinks html until the decompressed body is at most 16711680
+        bytes. The coordinator stores the compressed body as received. The same attempt sending
+        the same decompressed bytes again gets 200; a different body gets 409 result_conflict.
+        Scarlett did not see this page on the wire, so content served from it is labelled not
+        TLS-verified. A /proven for a browser job is accepted when this upload is stored or the
+        verifier holds at least one verified hop of the proven re-fetch.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BrowserResult'}
+      responses:
+        '200': {description: Stored, including an identical replay}
+        '400': {description: invalid_result}
+        '401': {description: Invalid or revoked node credential}
+        '404': {description: Not this node's job}
+        '409': {description: result_conflict, fenced, expired or already_reported}
+        '413': {description: Body too large}
+        '415': {description: Not gzip}
+        '429': {description: Rate limited}
+        '503':
+          description: network_unavailable
+          headers:
+            Retry-After: {$ref: '#/components/headers/RetryAfter'}
   /api/node/v1/jobs/{job_id}/proven:
     post:
       security: [{nodeBearer: []}]
       parameters: [{$ref: '#/components/parameters/JobID'}]
       summary: Report that a proof was sent to the assigned verifier
       description: >-
-        The node does not submit the answer. The coordinator reads Codex model/output/usage or X fulfilment/response copies
-        from the assigned verifier after this call. A supplier copy of the output is not accepted. X bootstrap authentication reads are unproven and do not count as paid exchanges. An empty first search page may fulfil one pinned exchange; missing cursors cannot fulfil later requested pages.
+        The node does not submit the answer. The coordinator reads Codex model/output/usage, X fulfilment/response copies
+        or web hops from the assigned verifier after this call (for a browser web job, also the stored browser-result upload). A supplier copy of the output is not accepted. X bootstrap authentication reads are unproven and do not count as paid exchanges. An empty first search page may fulfil one pinned exchange; missing cursors cannot fulfil later requested pages.
       requestBody:
         required: true
         content:
@@ -284,7 +317,7 @@ components:
     Heartbeat:
       type: object
       required: [version, node_id, profile, state, wait_seconds]
-      description: Legacy nodes share catalog capacity. Services-mode nodes report independently enabled Codex/X capacities and states; all health is node-reported, not verifier acceptance or payment evidence.
+      description: Legacy nodes share catalog capacity. Services-mode nodes report independently enabled Codex, X and web capacities and states; all health is node-reported, not verifier acceptance or payment evidence.
       properties:
         version: {type: string, enum: [node-v1]}
         node_id: {type: string}
@@ -292,19 +325,19 @@ components:
         state: {type: string, enum: [available, exhausted], description: exhausted means the node's gateway recently had no capacity; the coordinator offers it no lease until it reports available again.}
         wait_seconds: {type: integer, minimum: 0, maximum: 20, description: "How long the coordinator may hold this heartbeat open while it has nothing to offer. The node sends 20; the coordinator clamps the value to [0, 20] and answers early the moment an offer exists. Zero asks for an immediate answer."}
         bid: {type: integer, minimum: 0, maximum: 1000000000, description: Standing assignment bid. Lower wins, then least assigned work, then node_id. Missing is treated as 100. Not an on-chain quote.}
-        capacity: {type: integer, minimum: 0, maximum: 64, description: "Legacy typed reports use the exact sum of service capacities. Enriched readiness reports use the shared physical ceiling: the sum of configured_capacity where present and ordinary capacity otherwise. Generic runnable capacity may be zero while an exact operation is runnable. Legacy untyped reports require positive capacity; omitted legacy capacity defaults to 1. Physical capacity alone never grants operation readiness."}
+        capacity: {type: integer, minimum: 0, maximum: 96, description: "Legacy typed reports use the exact sum of service capacities. Enriched readiness reports use the shared physical ceiling: the sum of configured_capacity where present and ordinary capacity otherwise. Generic runnable capacity may be zero while an exact operation is runnable. Legacy untyped reports require positive capacity; omitted legacy capacity defaults to 1. Physical capacity alone never grants operation readiness."}
         services:
           type: array
-          maxItems: 2
-          description: Each kind is unique; disabled kinds have zero capacity and in-flight count
+          maxItems: 3
+          description: Each kind (codex, x_read, web) is unique; disabled kinds report not_added with zero capacity and in-flight count
           items: {$ref: '#/components/schemas/ServiceHealth'}
     ServiceHealth:
       type: object
       additionalProperties: false
       required: [kind, state, capacity, in_flight]
       properties:
-        kind: {type: string, enum: [codex, x_read]}
-        state: {type: string, enum: [not_added, configured, ready, exhausted, auth_required, unreachable], description: "configured means a local credential file is usable (for x_read: the account's warm client is still being built, or a rest just ended and the next 15-second check has not yet confirmed the installed client); ready means local execution reported proof sent, not verifier acceptance, or for x_read that a client build validated the session against X; an x_read build that X refuses, rate-limits or cannot reach reports auth_required, exhausted or unreachable without waiting for a job"}
+        kind: {type: string, enum: [codex, x_read, web]}
+        state: {type: string, enum: [not_added, configured, ready, exhausted, auth_required, unreachable], description: "configured means a local credential file is usable (for x_read: the account's warm client is still being built, or a rest just ended and the next 15-second check has not yet confirmed the installed client); ready means local execution reported proof sent, not verifier acceptance, or for x_read that a client build validated the session against X; an x_read build that X refuses, rate-limits or cannot reach reports auth_required, exhausted or unreachable without waiting for a job. web has no accounts: configured means enabled with the proof helper present, ready means the last web job ended proven, and unreachable carries last_error_code relay_misuse (keyed relay halted), prover_error (helper missing) or web_proxy_failed (a 60-second rest after the egress proxy failed). Target-side web failures, and the browser codes web_browser_unavailable and web_browser_failed, never change the web state; browser readiness is reported in browser."}
         capacity: {type: integer, minimum: 0, maximum: 32}
         in_flight: {type: integer, minimum: 0, maximum: 32}
         configured_capacity: {type: integer, minimum: 0, maximum: 32, description: "Optional physical service ceiling including retained in-flight work and distinct usable authenticated account lanes, at least capacity. Never provider quota or global independence across nodes."}
@@ -332,7 +365,7 @@ components:
               runnable_capacity: {type: integer, minimum: 0, maximum: 32}
               next_ready_at: {type: string, format: date-time, description: "Optional bounded UTC eligibility hint; elapsed time alone does not authorize an offer."}
         last_error_code: {type: string, description: Bounded failure code only, never raw provider errors or credentials}
-        max_input_bytes: {type: integer, minimum: 1, maximum: 65536, description: Local Codex prompt UTF-8 bytes or serialized x_request UTF-8 bytes; omitted by legacy nodes}
+        max_input_bytes: {type: integer, minimum: 1, maximum: 65536, description: Local Codex prompt UTF-8 bytes, serialized x_request UTF-8 bytes or serialized web_request UTF-8 bytes; omitted by legacy nodes and disabled kinds}
         max_output_tokens: {type: integer, minimum: 1, maximum: 8192, description: Codex local output reservation limit; absent for X}
         models:
           type: array
@@ -361,6 +394,40 @@ components:
             job to a node that does not list relay, and should omit proof_mode on mpc jobs so
             nodes that predate the field still accept them.
           items: {type: string, enum: [mpc, relay]}
+        egress:
+          type: string
+          enum: [direct, proxy]
+          description: "web only; required for an enabled web entry. proxy means the node dials targets through a local HTTP CONNECT proxy (SCARLETT_WEB_EGRESS_PROXY). Node-reported, not verified."
+        browser:
+          $ref: '#/components/schemas/BrowserHealth'
+    BrowserHealth:
+      type: object
+      additionalProperties: false
+      required: [state, capacity, in_flight]
+      description: >-
+        web only; required on an enabled web entry and forbidden elsewhere. Readiness of the
+        node's hidden browser for web jobs in browser mode. ready means the bundled runtime and
+        the pinned Chrome for Testing were verified and a launch probe passed, not that a browser
+        is running. Browser capacity sits inside web capacity: a browser lease also counts in the
+        web entry's in_flight, and capacity is never more than the web capacity.
+      properties:
+        state: {type: string, enum: [ready, unavailable]}
+        reason:
+          type: string
+          enum: [disabled, web_unavailable, memory_low, disk_low, runtime_missing, runtime_invalid, browser_downloading, browser_download_failed, browser_invalid, deps_missing, sandbox_unavailable, helper_failed]
+          description: >-
+            Required exactly when unavailable. disabled: SCARLETT_WEB_BROWSER=off (the Windows
+            default in this release). web_unavailable: web is not configured or ready, or keyed
+            relay is halted. memory_low: under 8 GiB of physical RAM. disk_low: not enough free disk
+            to extract, download or start. runtime_missing / runtime_invalid: the bundled runtime
+            archive is absent or failed verification. browser_downloading / browser_download_failed
+            / browser_invalid: the pinned browser download is in progress, failed (retrying with
+            backoff) or failed verification. deps_missing: Linux shared libraries are missing.
+            sandbox_unavailable: Linux unprivileged user namespaces are blocked; the browser never
+            runs unsandboxed. helper_failed: three helper start failures within 10 minutes.
+        capacity: {type: integer, minimum: 0, maximum: 4, description: "1-4 when ready, 0 when unavailable"}
+        in_flight: {type: integer, minimum: 0, maximum: 4, description: At most capacity}
+        version: {type: string, maxLength: 64, description: Chrome for Testing version; present exactly when ready}
     ActiveLease:
       type: object
       additionalProperties: false
@@ -397,9 +464,15 @@ components:
       type: object
       description: >-
         Job ID and signed_job_id are issued/committed server-side before lease; client does not
-        cryptographically verify signed_job_id yet. codex_payload and verifier_token are set only
-        for proven Codex jobs. The node proves that request to the locally configured verifier;
-        the coordinator reads the answer from the verifier, not from this node.
+        cryptographically verify signed_job_id yet. codex_payload, x_payload and web_payload carry the
+        exact verifier request of a Codex, x_read or web job; verifier_token arrives only in the funded
+        acceptance reply. The node proves that request to the locally configured verifier; the
+        coordinator reads the answer from the verifier, not from this node. A web lease fetches one
+        public https page: the node resolves the host itself, refuses private and reserved addresses,
+        and opens the connection from its own address while the verifier is the TLS client. A web
+        lease in browser mode first renders the page in the node's hidden browser, uploads that copy
+        (browser-result), and re-fetches the page through the same verified relay with the browser's
+        User-Agent and anti-bot clearance cookies.
       required: [version, job_id, signed_job_id, profile, input_sha256, attempt, fence, lease_deadline, settlement_deadline]
       oneOf:
         - required: [model_id, prompt, max_input_tokens, max_output_tokens]
@@ -415,13 +488,20 @@ components:
             prompt: {type: string, maxLength: 0}
             max_input_tokens: {type: integer, maximum: 0}
             max_output_tokens: {type: integer, maximum: 0}
+        - required: [service_type, web_request, web_payload]
+          properties:
+            service_type: {type: string, enum: [web]}
+            model_id: {type: string, maxLength: 0}
+            prompt: {type: string, maxLength: 0}
+            max_input_tokens: {type: integer, maximum: 0}
+            max_output_tokens: {type: integer, maximum: 0}
       properties:
         version: {type: string, enum: [node-v1]}
         acceptance_required: {type: boolean, description: Required true for community provider work; token-free offers need funded acceptance before execution}
         request_sha256: {type: string, pattern: '^[0-9a-f]{64}$', description: Canonical exact verifier request digest}
         job_id: {type: string}
         signed_job_id: {type: string, description: Legacy commitment field; community offers bind the immutable reviewed terms digest, not an on-chain signature.}
-        service_type: {type: string, enum: [codex, x_read], description: Required in services mode; omitted by legacy Codex leases}
+        service_type: {type: string, enum: [codex, x_read, web], description: Required in services mode; omitted by legacy Codex leases}
         profile: {type: string}
         model_id: {type: string, description: 'A catalog base model or its gateway alias with a reasoning effort (-low, -medium, -high, -xhigh, -max) and/or the fast tier (-fast, -fast-<effort>). Proven Codex leases must name a base model.'}
         prompt: {type: string}
@@ -441,6 +521,15 @@ components:
           description: Single-use token for the verifier configured in SCARLETT_VERIFIER. Not a login secret.
         x_request: {$ref: '#/components/schemas/XRequest'}
         x_payload: {$ref: '#/components/schemas/XPayload'}
+        web_request: {$ref: '#/components/schemas/WebRequest'}
+        web_payload: {$ref: '#/components/schemas/WebPayload'}
+        web_prewarm_browser:
+          type: boolean
+          description: >-
+            Relay web offers only, forbidden on browser offers and other services. The page's domain
+            has met bot protection before, so the node starts its browser while it runs the relay job
+            in case the coordinator escalates. Outside web_request: never hashed into input_sha256
+            and not part of the accepted terms.
     XRequest:
       type: object
       additionalProperties: false
@@ -489,6 +578,124 @@ components:
               features: {type: object}
               field_toggles: {type: object}
               cursor_from: {type: integer, minimum: 0, maximum: 1}
+    WebRequest:
+      type: object
+      additionalProperties: false
+      required: [operation, url]
+      description: >-
+        One public https page. url is canonical per api/web-vectors.json (lowercase host, port 443
+        only, no userinfo, IP literal, fragment, reserved name or x.com/twitter.com host).
+        input_sha256 is the SHA-256 of this object serialized by Go encoding/json, so it also
+        binds mode and the browser options. mode is absent for a relay job; browser is present
+        exactly when mode is browser, which requires web_payload proof_policy web-browser-v1.
+      properties:
+        operation: {type: string, enum: [scrape]}
+        url: {type: string, maxLength: 2048, pattern: '^https://'}
+        mode: {type: string, enum: [browser]}
+        browser: {$ref: '#/components/schemas/WebBrowser'}
+    WebBrowser:
+      type: object
+      additionalProperties: false
+      required: [wait, wait_ms, timeout_ms, block_resources, solve_challenge]
+      description: The browser phase of a browser web job.
+      properties:
+        wait: {type: string, enum: [load, networkidle], description: "networkidle waits for load, then up to 3 seconds more for the network to go quiet"}
+        wait_ms: {type: integer, minimum: 0, maximum: 15000, description: Extra settle time}
+        wait_selector: {type: string, minLength: 1, maxLength: 256, pattern: '^[\x20-\x7E]+$', description: "CSS selector waited for (attached) inside the budget; one that never appears does not fail the fetch"}
+        timeout_ms: {type: integer, minimum: 5000, maximum: 45000, description: Budget for the browser phase}
+        block_resources: {type: boolean}
+        solve_challenge: {type: boolean, description: Run the built-in Cloudflare solver on a Cloudflare interstitial}
+    WebPayload:
+      type: object
+      additionalProperties: false
+      required: [type, proof_mode, proof_policy, url, max_redirects, max_response_bytes, headers]
+      description: >-
+        Exact verifier web.fetch policy with unique JSON keys and integer numbers. The verifier is
+        the TLS client through the node's connection; each redirect hop is a new session under the
+        same token, authorized only for the canonical https Location of the previous verified 3xx.
+        The node never receives page plaintext. Unknown fields are refused. web-relay-v1 has no
+        node_headers. web-browser-v1 (browser mode) has exactly the headers accept and
+        accept-language with their default values, in that order, node_headers exactly
+        [user-agent, cookie], max_redirects 5 and max_response_bytes 10485760; the node supplies
+        the browser's pinned User-Agent and, optionally, a Cookie of anti-bot clearance cookies
+        only, which the verifier checks against the same pins and allowlist (api/web-vectors.json).
+      properties:
+        type: {type: string, enum: [web.fetch]}
+        proof_mode: {type: string, enum: [relay]}
+        proof_policy: {type: string, enum: [web-relay-v1, web-browser-v1]}
+        url: {type: string, maxLength: 2048, pattern: '^https://', description: Equal to web_request.url}
+        max_redirects: {type: integer, minimum: 0, maximum: 5}
+        max_response_bytes: {type: integer, minimum: 1, maximum: 10485760}
+        headers:
+          type: array
+          maxItems: 3
+          description: Allowlisted request headers, each at most once, in the order user-agent, accept, accept-language
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, value]
+            properties:
+              name: {type: string, enum: [user-agent, accept, accept-language]}
+              value: {type: string, minLength: 1, maxLength: 512}
+        node_headers:
+          type: array
+          minItems: 2
+          maxItems: 2
+          description: web-browser-v1 only, exactly [user-agent, cookie]
+          items: {type: string, enum: [user-agent, cookie]}
+    BrowserResult:
+      type: object
+      additionalProperties: false
+      required: [version, attempt, fence, request_sha256, url, final_url, status_code, headers, set_cookie_names, content_type, html, html_bytes, html_sha256, html_truncated, challenge, redirects, browser, started_at_ms, duration_ms]
+      description: >-
+        Decompressed body of a browser-result upload. Integers only and no unknown fields.
+        attempt, fence and request_sha256 must equal the job's current accepted lease for this
+        node, and url its web_request.url. Cookie values never appear; set_cookie_names carries
+        names only.
+      properties:
+        version: {type: string, enum: [node-v1]}
+        attempt: {type: string, format: uuid}
+        fence: {type: string, format: uuid}
+        request_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
+        url: {type: string, maxLength: 2048}
+        final_url: {type: string, maxLength: 2048, description: Absolute http or https URL of the last main-frame document; never an x.com or twitter.com host}
+        status_code: {type: integer, minimum: 100, maximum: 999}
+        headers:
+          type: array
+          maxItems: 128
+          description: "Last main-frame document's response headers as [name, value] pairs: lowercase token names of at most 64 bytes, printable ASCII values of at most 4096 bytes, at most 65536 bytes in total, never set-cookie or cookie"
+          items:
+            type: array
+            minItems: 2
+            maxItems: 2
+            items: {type: string}
+        set_cookie_names: {type: array, maxItems: 50, items: {type: string}}
+        content_type: {type: string}
+        html: {type: string, description: "The rendered DOM for an HTML document, else empty; valid UTF-8, cut on a code point boundary"}
+        html_bytes: {type: integer, minimum: 0, maximum: 10485760, description: UTF-8 length of html}
+        html_sha256: {type: string, pattern: '^[0-9a-f]{64}$', description: SHA-256 of the UTF-8 bytes of html}
+        html_truncated: {type: boolean}
+        challenge: {type: string, enum: [none, solved, unsolved]}
+        redirects:
+          type: array
+          maxItems: 20
+          items:
+            type: object
+            additionalProperties: false
+            required: [url, status_code]
+            properties:
+              url: {type: string, maxLength: 2048}
+              status_code: {type: integer, minimum: 100, maximum: 999}
+        browser:
+          type: object
+          additionalProperties: false
+          required: [engine, version, user_agent]
+          properties:
+            engine: {type: string, enum: [scrapling/0.4.15]}
+            version: {type: string, description: Chrome for Testing version}
+            user_agent: {type: string, description: The pinned User-Agent the browser sent}
+        started_at_ms: {type: integer, minimum: 0, description: "Unix milliseconds when the browser phase started; the coordinator accepts accepted_at - 5000 to received_at"}
+        duration_ms: {type: integer, minimum: 0}
     Result:
       type: object
       description: >-
@@ -541,4 +748,4 @@ components:
         version: {type: string, enum: [node-v1]}
         attempt: {type: string}
         fence: {type: string}
-        code: {type: string, enum: [invalid_lease, expired, gateway_error, capacity_unavailable, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds, prover_error, execution_uncertain, auth_required, service_unavailable, x_rate_limited, x_incomplete, x_request_failed, relay_misuse], description: relay_misuse means the node caught its verifier sealing something other than the node's own request in a keyed-relay session, or closing the session without opening the record; the node then stops serving relay until its operator clears the halt. execution_uncertain means a provider call might have occurred before interruption and must not automatically requeue paid work. Transport failure alone does not prove a call never ran; capacity_unavailable must not authorize an ambiguous provider retry.}
+        code: {type: string, enum: [invalid_lease, expired, gateway_error, capacity_unavailable, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds, prover_error, execution_uncertain, auth_required, service_unavailable, x_rate_limited, x_incomplete, x_request_failed, relay_misuse, web_egress_denied, web_dns_failed, web_connect_failed, web_proxy_failed, web_fetch_failed, web_browser_unavailable, web_browser_failed], description: relay_misuse means the node caught its verifier sealing something other than the node's own request in a keyed-relay session, or closing the session without opening the record; the node then stops serving relay until its operator clears the halt. execution_uncertain means a provider call might have occurred before interruption and must not automatically requeue paid work. Transport failure alone does not prove a call never ran; capacity_unavailable must not authorize an ambiguous provider retry. Web codes describe the first hop only (a later hop failing after a verified first hop is reported proven); web_egress_denied means the page host resolved to a private, reserved or local address, or its URL failed node validation; web_dns_failed means the host did not resolve within 5 seconds; web_connect_failed means the node could not open TCP to the checked address, before any verifier session; web_proxy_failed means the local CONNECT proxy was unreachable, refused authentication or did not answer 200; web_fetch_failed means the verified session failed after the token was presented (TLS, framing, size or a verifier refusal). For browser web jobs, web_browser_unavailable means the browser tier was not ready or its helper could not start, and web_browser_failed means the browser failed (navigation, TLS, crash, timeout or a memory kill) with no browser copy stored and no verified re-fetch hop; neither changes the web state.}

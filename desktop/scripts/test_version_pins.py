@@ -58,6 +58,31 @@ SITES = [
 ]
 
 
+# The web browser runtime pins: CPython, its python-build-standalone release,
+# Scrapling, and Chrome for Testing. scripts/prepare-web-runtime.mjs and
+# chrome-for-testing.json are canonical; every other copy must agree.
+WEB_SITES = [
+    ('scripts/prepare-web-runtime.mjs', r"python = '(\d+\.\d+\.\d+)'", 'python'),
+    ('scripts/prepare-web-runtime.mjs', r"release = '(\d{8})'", 'pbs'),
+    ('scripts/prepare-web-runtime.mjs', r"scrapling = '(\d+\.\d+\.\d+)'", 'scrapling'),
+    ('scripts/prepare-web-runtime.mjs', r"browsers\.version !== '(\d+\.\d+\.\d+\.\d+)'", 'cft'),
+    ('scripts/verify-web-runtime.mjs', r"pythonVersion !== '(\d+\.\d+\.\d+)'", 'python'),
+    ('scripts/verify-web-runtime.mjs', r"scraplingVersion !== '(\d+\.\d+\.\d+)'", 'scrapling'),
+    ('scripts/verify-web-runtime.mjs', r"browserVersion !== '(\d+\.\d+\.\d+\.\d+)'", 'cft'),
+    ('third_party/web-browser/requirements.in', r'^scrapling\[fetchers\]==(\d+\.\d+\.\d+)$', 'scrapling'),
+    ('third_party/web-browser/requirements.lock', r'^scrapling==(\d+\.\d+\.\d+) ', 'scrapling'),
+    ('third_party/web-browser/scarlett_web_helper.py', r'^SCRAPLING_VERSION = "(\d+\.\d+\.\d+)"$', 'scrapling'),
+    ('third_party/web-browser/NOTICE.md', r'^\| scrapling \| (\d+\.\d+\.\d+) \|', 'scrapling'),
+    ('third_party/web-browser/NOTICE.md', r'CPython, from python-build-standalone release `(\d{8})`', 'pbs'),
+    ('third_party/web-browser/NOTICE.md', r'\| (\d+\.\d+\.\d+) \| PSF License', 'python'),
+    ('third_party/web-browser/NOTICE.md', r'Chrome for Testing (\d+\.\d+\.\d+\.\d+) is downloaded', 'cft'),
+    ('internal/webruntime/archive.go', r'pythonVersion\s+= "(\d+\.\d+\.\d+)"', 'python'),
+    ('internal/webruntime/archive.go', r'scraplingVersion\s+= "(\d+\.\d+\.\d+)"', 'scrapling'),
+    ('internal/webruntime/useragent.go', r'PinnedVersion = "(\d+\.\d+\.\d+\.\d+)"', 'cft'),
+    ('internal/webruntime/useragent.go', r'Engine = "scrapling/(\d+\.\d+\.\d+)"', 'scrapling'),
+]
+
+
 def text(path):
     return (ROOT / path).read_text(encoding='utf-8')
 
@@ -97,6 +122,26 @@ class VersionPinTests(unittest.TestCase):
         assembled = re.findall(r"^MODEL_API_COMMIT = '([0-9a-f]{40})'", text(SCRIPTS + 'release-manifest.py'), re.MULTILINE)
         self.assertEqual(len(accepted), 1)
         self.assertEqual(assembled, accepted)
+
+    def test_web_runtime_pins_agree(self):
+        prepare = text('scripts/prepare-web-runtime.mjs')
+        pins = {
+            'python': re.search(r"python = '([^']+)'", prepare).group(1),
+            'pbs': re.search(r"release = '([^']+)'", prepare).group(1),
+            'scrapling': re.search(r"scrapling = '([^']+)'", prepare).group(1),
+            'cft': json.loads(text('third_party/web-browser/chrome-for-testing.json'))['version'],
+        }
+        self.assertEqual(pins, {'python': '3.13.16', 'pbs': '20261003', 'scrapling': '0.4.15', 'cft': '155.0.8059.39'})
+        for path, pattern, component in WEB_SITES:
+            with self.subTest(path=path, pattern=pattern):
+                found = re.findall(pattern, text(path), re.MULTILINE)
+                self.assertTrue(found, 'pin copy missing')
+                self.assertEqual(set(found), {pins[component]})
+        major = pins['cft'].split('.')[0]
+        self.assertEqual(re.findall(r'PinnedMajor\s+= (\d+)', text('internal/webruntime/useragent.go')), [major])
+        for platform, entry in json.loads(text('third_party/web-browser/chrome-for-testing.json'))['platforms'].items():
+            with self.subTest(platform=platform):
+                self.assertIn('/' + pins['cft'] + '/', entry['url'])
 
     def test_desktop_version_agrees_across_manifests(self):
         tauri = json.loads(text('desktop/src-tauri/tauri.conf.json'))['version']

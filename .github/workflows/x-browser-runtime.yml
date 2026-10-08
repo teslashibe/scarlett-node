@@ -10,6 +10,10 @@ on:
       - 'scripts/verify-social-login.mjs'
       - 'internal/xloginruntime/**'
       - 'packaging/x-login*'
+      - 'internal/webruntime/**'
+      - 'third_party/web-browser/**'
+      - 'scripts/*web-runtime*'
+      - 'scripts/pin-chrome-for-testing.mjs'
       - '.github/workflows/x-browser-runtime.yml'
   workflow_dispatch:
 permissions:
@@ -17,7 +21,7 @@ permissions:
 jobs:
   chromium-fixtures:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
@@ -40,3 +44,18 @@ jobs:
       - run: go test -race ./internal/xloginruntime
       - name: Go to browser-service contract
         run: SCARLETT_TEST_X_LOGIN_NODE="$(command -v node)" go test -race -run TestBrowserLoginRuntimeContract -count=1 .
+      - run: node --test scripts/verify-web-runtime.test.mjs scripts/pin-chrome-for-testing.test.mjs
+      # The web browser runtime exactly as the headless bundle ships it: the
+      # x-login Node it reuses, then the hash-locked Python runtime archive.
+      - run: node scripts/prepare-x-login-runtime.mjs linux-x64 "$RUNNER_TEMP/rt/x-login-runtime"
+      - run: node scripts/prepare-web-runtime.mjs linux-x64 "$RUNNER_TEMP/rt" "$RUNNER_TEMP/rt/x-login-runtime"
+      - name: Web browser helper tests with the packaged Python
+        run: |
+          mkdir "$RUNNER_TEMP/web-python"
+          tar -xzf "$RUNNER_TEMP/rt/web-runtime-linux-amd64.tar.gz" -C "$RUNNER_TEMP/web-python"
+          "$RUNNER_TEMP/web-python/python/bin/python3.13" -B -m unittest discover -s third_party/web-browser -p 'test_*.py'
+      # Chrome for Testing's sandbox needs unprivileged user namespaces, which
+      # Ubuntu 24.04's AppArmor restricts by default.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Live browser tier against loopback fixtures
+        run: SCARLETT_TEST_WEB_RUNTIME="$RUNNER_TEMP/rt" go test -tags webbrowser_live -count=1 -v ./internal/webruntime -run TestLive
