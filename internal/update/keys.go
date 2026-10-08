@@ -6,7 +6,10 @@ package update
 // releaseMinisignKeys are the updater's trusted minisign public keys
 // (identities.json updater.minisign, primary first). With none, this build
 // trusts no update signature: it reports updates and links the download page.
-var releaseMinisignKeys = []string{}
+var releaseMinisignKeys = []string{
+	"RWQYPQvwfniyo1DM1fK0WdWgblVeY1/36T4n9ETOD3FLFTzco6C6ZMcP", // primary A3B2787EF00B3D18
+	"RWTolBOWK+uAuz10qcmgFOI1dSeHMhN7rvBh8K9XaB1IoATG8qQaVJ2W", // backup BB80EB2B961394E8
+}
 
 // Pinned self-signed code-signing certificates. An update must carry exactly
 // these, and on macOS the same designated requirement as the running app.
