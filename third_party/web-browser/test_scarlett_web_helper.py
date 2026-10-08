@@ -7,6 +7,7 @@ path with fake pages; no browser, no network.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -16,12 +17,15 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import scarlett_web_helper as helper  # noqa: E402
+from scrapling.engines._browsers import _stealth  # noqa: E402
 from scrapling.engines._browsers._base import StealthySessionMixin  # noqa: E402
+from scrapling.engines._browsers._page import PageInfo  # noqa: E402
 from scrapling.engines.constants import STEALTH_ARGS  # noqa: E402
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
@@ -296,6 +300,9 @@ class FakeRequest:
         self.resource_type = "document"
         self.frame = frame
 
+    def is_navigation_request(self):
+        return True
+
 
 class FakeResponse:
     def __init__(self, page, status, url, headers):
@@ -309,8 +316,9 @@ class FakeResponse:
 
 
 class FakeCDP:
-    def __init__(self):
+    def __init__(self, failing=()):
         self.sent, self.handlers = [], {}
+        self.failing = set(failing)
 
     def on(self, event, handler):
         self.handlers[event] = handler
@@ -319,6 +327,8 @@ class FakeCDP:
         self.handlers[event](params)
 
     async def send(self, method, params=None):
+        if method in self.failing:
+            raise Exception("Protocol error (%s): Target closed" % method)
         self.sent.append((method, params))
         return {}
 
@@ -327,12 +337,16 @@ class FakeContext:
     def __init__(self, page):
         self.page = page
         self.cdp = None
+        self.cdp_error = None  # raised by new_cdp_session
+        self.cdp_failing = ()  # CDP methods whose send raises
 
     async def cookies(self):
         return list(self.page.cookie_jar)
 
     async def new_cdp_session(self, page):
-        self.cdp = FakeCDP()
+        if self.cdp_error:
+            raise self.cdp_error
+        self.cdp = FakeCDP(self.cdp_failing)
         return self.cdp
 
 
@@ -358,15 +372,40 @@ class FakePage:
         self.default_timeouts = []
         self.dd_title = ""
         self.timeline = []  # (delay, callable) applied while the page is waited on
+        self.closed = False
+        self.close_error = None  # raised by close
+        self.navigations = 0
 
     def on(self, event, handler):
         self.handlers.append(handler)
 
+    def remove_listener(self, event, handler):
+        self.handlers.remove(handler)
+
     def emit_document(self, status=None, url=None, headers=None):
         response = FakeResponse(self, status or self.status, url or self.url, headers or self.headers)
-        for handler in self.handlers:
-            handler(response)
+        for handler in list(self.handlers):
+            result = handler(response)
+            if asyncio.iscoroutine(result):  # as Playwright runs async listeners
+                asyncio.ensure_future(result)
         return response
+
+    async def goto(self, url, referer=None):
+        if self.closed:
+            raise Exception("Page.goto: Target page, context or browser has been closed")
+        self.navigations += 1
+        return self.emit_document()
+
+    async def close(self):
+        if self.close_error:
+            raise self.close_error
+        self.closed = True
+
+    def is_closed(self):
+        return self.closed
+
+    async def wait_for_timeout(self, ms):
+        await asyncio.sleep(ms / 1000)
 
     async def content(self):
         return self.html
@@ -391,8 +430,10 @@ class FakeScraplingResponse:
 
 
 class FakeSession:
-    """Calls page_setup, emits the main document, calls page_action and
-    builds the response, in Scrapling's order. Detection is Scrapling's."""
+    """Calls page_setup, navigates, calls page_action and builds the
+    response, in Scrapling's order and, as Scrapling 0.4.15 does, logging and
+    swallowing an exception from page_setup or page_action. Detection is
+    Scrapling's. ScraplingFetchTests drive Scrapling's own fetch instead."""
 
     _detect_cloudflare = staticmethod(StealthySessionMixin._detect_cloudflare)
 
@@ -410,9 +451,15 @@ class FakeSession:
     async def fetch(self, url, **kwargs):
         self.fetch_calls.append(kwargs)
         page = self.pages.pop(0)
-        await kwargs["page_setup"](page)
-        page.emit_document()
-        await kwargs["page_action"](page)
+        try:
+            await kwargs["page_setup"](page)
+        except Exception:
+            pass
+        await page.goto(url)
+        try:
+            await kwargs["page_action"](page)
+        except Exception:
+            pass
         return FakeScraplingResponse(page)
 
 
@@ -514,6 +561,112 @@ class FetchTests(unittest.TestCase):
         page = FakePage('{"a":1}', headers=[("content-type", "application/json")])
         data = self.fetch(FakeSession([page]))
         self.assertEqual((data["html"], data["content_type"]), ("", "application/json"))
+
+    def test_a_guard_that_cannot_start_closes_the_page_and_fails(self):
+        for case in ("session", "enable"):
+            page = FakePage(MANAGED)
+            if case == "session":
+                page.context.cdp_error = Exception("Target.attachToTarget: Target closed")
+            else:
+                page.context.cdp_failing = ("Fetch.enable",)
+            session = FakeSession([page])
+            data = self.fetch(session)
+            self.assertEqual((data["outcome"], data["error"], data["html"], data["challenge"]),
+                             ("failed", "navigation_failed", "", "none"), case)
+            self.assertTrue(page.closed, case)
+            self.assertEqual(page.navigations, 0, case)  # nothing loaded unguarded
+            self.assertEqual(session.solver_calls, 0, case)
+
+    def test_an_unguarded_page_is_never_ok(self):
+        # The guard fails and so does closing the page: Scrapling navigates
+        # anyway, and the result must still not be a success.
+        page = FakePage(MANAGED)
+        page.context.cdp_error = Exception("Target closed")
+        page.close_error = Exception("Target closed")
+        session = FakeSession([page])
+        data = self.fetch(session)
+        self.assertEqual(page.navigations, 1)
+        self.assertEqual((data["outcome"], data["error"], data["html"]), ("failed", "navigation_failed", ""))
+        self.assertEqual(session.solver_calls, 0)
+
+    def test_challenge_handling_that_does_not_finish_fails(self):
+        class Broken(FakeSession):
+            @staticmethod
+            def _detect_cloudflare(html):
+                raise RuntimeError("detector")
+        page = FakePage("<html><body>hello</body></html>")
+        data = self.fetch(Broken([page]))
+        self.assertEqual(page.navigations, 1)
+        self.assertEqual((data["outcome"], data["error"], data["html"]), ("failed", "navigation_failed", ""))
+
+
+class ScraplingFetchTests(unittest.TestCase):
+    """Scrapling's own AsyncStealthySession.fetch, with its page source and
+    response builder replaced by fakes: it logs and swallows an exception
+    from page_setup and page_action and navigates anyway, and the Fetcher
+    must fail closed regardless."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        profile = os.path.join(tmp.name, helper.PROFILE_PREFIX + "x")
+        helper.seed_profile(profile)
+        self.session = helper.new_session(sys.executable, UA, "http://127.0.0.1:1111", "http://127.0.0.1:2222", 1, profile)
+        self.session._is_alive = True
+        self.pages = []
+
+        @contextlib.asynccontextmanager
+        async def page_generator(*args, **kwargs):
+            yield PageInfo(page=self.pages.pop(0), state="busy", url="")
+        self.session._page_generator = page_generator
+
+        async def build(page, first_response, final_response, selector_config, **kwargs):
+            return FakeScraplingResponse(page)
+        patcher = mock.patch.object(_stealth.ResponseFactory, "from_async_playwright_response", build)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fetch(self, page):
+        self.pages.append(page)
+
+        async def go():
+            return await helper.Fetcher(self.session, "http://127.0.0.1:1111", 1).fetch(request())
+        return run(go())["data"]
+
+    def test_a_guarded_page_is_ok(self):
+        page = FakePage("<html><body>hello</body></html>")
+        data = self.fetch(page)
+        self.assertEqual((data["outcome"], data["status_code"], data["html"]), ("ok", 200, page.html))
+        self.assertEqual(page.context.cdp.sent[0][0], "Fetch.enable")
+        self.assertEqual(page.navigations, 1)
+
+    def test_a_guard_that_cannot_start_fails_before_navigation(self):
+        for case in ("session", "enable"):
+            page = FakePage("<html><body>hello</body></html>")
+            if case == "session":
+                page.context.cdp_error = Exception("Target.attachToTarget: Target closed")
+            else:
+                page.context.cdp_failing = ("Fetch.enable",)
+            data = self.fetch(page)
+            self.assertEqual((data["outcome"], data["error"], data["html"]), ("failed", "navigation_failed", ""), case)
+            self.assertEqual(page.navigations, 0, case)
+
+    def test_an_unguarded_page_is_never_ok(self):
+        page = FakePage("<html><body>hello</body></html>")
+        page.context.cdp_error = Exception("Target closed")
+        page.close_error = Exception("Target closed")
+        data = self.fetch(page)
+        self.assertEqual(page.navigations, 1)  # Scrapling navigated without the guard
+        self.assertEqual((data["outcome"], data["error"], data["html"]), ("failed", "navigation_failed", ""))
+
+    def test_challenge_handling_that_does_not_finish_fails(self):
+        def detector(html):
+            raise RuntimeError("detector")
+        self.session._detect_cloudflare = detector
+        page = FakePage("<html><body>hello</body></html>")
+        data = self.fetch(page)
+        self.assertEqual(page.navigations, 1)
+        self.assertEqual((data["outcome"], data["error"], data["html"]), ("failed", "navigation_failed", ""))
 
 
 class DataDomeTests(unittest.TestCase):

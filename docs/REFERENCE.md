@@ -533,13 +533,15 @@ Camera and microphone are fake devices (`--use-fake-device-for-media-stream`),
 so `getUserMedia` is refused without a device or a prompt. The helper also
 fails any document response that redirects to a scheme other than http(s): a
 3xx is followed like a typed navigation, which skips Chrome's anti-flood check
-for external protocols. Every other external scheme (`tel:`, `sms:`,
-`facetime:`, `itms-apps:`, `intent:`, an app's own scheme) reaches Chrome's
-external-protocol dialog, which the hidden browser never shows, so nothing is
-opened; blocking those too would make their frames load an error page, which
-a normal Chrome does not do. `file:` and `chrome:` navigations from a page are
-refused by Chrome itself, and `javascript:`, `data:` and `blob:` stay in the
-browser.
+for external protocols. If that check cannot be set up on a page, the helper
+closes the page before it navigates and the fetch fails; a fetch whose
+challenge handling did not finish fails too, never reported as a success.
+Every other external scheme (`tel:`, `sms:`, `facetime:`, `itms-apps:`,
+`intent:`, an app's own scheme) reaches Chrome's external-protocol dialog,
+which the hidden browser never shows, so nothing is opened; blocking those
+too would make their frames load an error page, which a normal Chrome does not
+do. `file:` and `chrome:` navigations from a page are refused by Chrome
+itself, and `javascript:`, `data:` and `blob:` stay in the browser.
 
 What a page can still tell: Bluetooth reports `getAvailability()` false and
 its refusal reads "User or their enterprise policy has disabled Web

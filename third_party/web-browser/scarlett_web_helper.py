@@ -431,7 +431,8 @@ async def guard_redirects(page):
     check) never hands the browser an external protocol. Covers the page's
     target: the main frame and same-process frames; for cross-site frames,
     pop-ups and service workers the seeded handlers and Chrome's own dialog
-    remain (PROFILE_PREFS)."""
+    remain (PROFILE_PREFS). If it raises, the Fetcher closes the page before
+    it navigates and fails the fetch."""
     cdp = await page.context.new_cdp_session(page)
 
     async def paused(event):
@@ -619,21 +620,39 @@ class Fetcher:
         started_at_ms = int(time.time() * 1000)
         begin = loop.time()
         marks = {"context": None, "navigated": None, "challenge_ms": 0}
-        state = {"challenge": "none", "no_retry": False, "document": None}
+        state = {"challenge": "none", "no_retry": False, "document": None, "guarded": False, "acted": False,
+                 "setup_failed": False}
         session = self.session
 
         def remaining():
             return deadline - loop.time()
 
+        # Scrapling logs and swallows an exception from page_setup and from
+        # page_action and carries on: it would navigate without the redirect
+        # guard, or return a page whose challenge handling never finished. So
+        # each records that it finished, and only a fetch where both did is ok.
         async def setup(page):
+            state.update(document=None, guarded=False, acted=False, setup_failed=False)
             marks["context"] = loop.time()
-            await guard_redirects(page)
+            try:
+                await guard_redirects(page)
+            except Exception:
+                # Close the page so nothing loads unguarded; the fetch fails.
+                state["setup_failed"] = True
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                raise
             document = Document(page)
             state["document"] = document
             page.on("response", document.on_response)
+            state["guarded"] = True
 
         async def act(page):
             marks["navigated"] = loop.time()
+            if not state["guarded"]:
+                return  # an unguarded page; the fetch fails below
             document = state["document"]
             if request.wait == "networkidle":
                 try:
@@ -697,6 +716,7 @@ class Fetcher:
                 await asyncio.sleep(max(0, min(request.wait_ms / 1000, remaining() - 1)))
             await settle_navigation(page, document, remaining)
             await document.settle(min(1, remaining() - 0.5))
+            state["acted"] = True
 
         data = {"outcome": "failed", "error": "navigation_failed", "final_url": "", "status_code": 0, "headers": [],
                 "set_cookie_names": [], "content_type": "", "html": "", "html_truncated": False, "cookies": [],
@@ -718,6 +738,9 @@ class Fetcher:
                 data.update(outcome="timeout", error="timeout")
             elif "crash" in text.lower() or "has been closed" in text:
                 data["error"] = "crashed"
+            response = None
+        if state["setup_failed"] or (response is not None and not (state["guarded"] and state["acted"])):
+            data.update(outcome="failed", error="navigation_failed")
             response = None
         if response is not None:
             document = state["document"]
