@@ -38,7 +38,7 @@ func (*stubBrowser) Fetch(context.Context, worker.BrowserFetchRequest) (worker.B
 }
 
 func readyBrowser(capacity int) worker.BrowserStatus {
-	return worker.BrowserStatus{Ready: true, Capacity: capacity, Version: "155.0.8059.39", Engine: "scrapling/0.4.15+scarlett.1", UserAgent: "synthetic"}
+	return worker.BrowserStatus{Ready: true, Capacity: capacity, Version: "155.0.8059.39", Engine: "scrapling/0.4.15+scarlett.2", UserAgent: "synthetic"}
 }
 
 func browserEntry(t *testing.T, p *servicePool) (coordinator.ServiceHealth, coordinator.BrowserHealth) {

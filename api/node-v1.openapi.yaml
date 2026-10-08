@@ -701,7 +701,7 @@ components:
           additionalProperties: false
           required: [engine, version, user_agent]
           properties:
-            engine: {type: string, enum: [scrapling/0.4.15+scarlett.1], description: "Scrapling 0.4.15 plus the anti-bot handlers, from teslashibe/Scrapling release v0.4.15-scarlett.1"}
+            engine: {type: string, enum: [scrapling/0.4.15+scarlett.2], description: "Scrapling 0.4.15 plus the anti-bot handlers, from teslashibe/Scrapling release v0.4.15-scarlett.2"}
             version: {type: string, description: Chrome for Testing version}
             user_agent: {type: string, description: The pinned User-Agent the browser sent}
         started_at_ms: {type: integer, minimum: 0, description: "Unix milliseconds when the browser phase started; the coordinator accepts accepted_at - 5000 to received_at"}

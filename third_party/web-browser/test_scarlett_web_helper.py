@@ -41,9 +41,9 @@ KEY = "0123456789abcdef0123456789abcdef"
 CLEAN = {"vendor": None, "kind": None, "rule": None, "solved": False, "reason": "none", "layers": [], "elapsed_s": 0.4}
 
 
-def layer(vendor, kind, rule, solved, reason, used_solver=None, elapsed=1.0):
+def layer(vendor, kind, rule, solved, reason, used_solver=None, elapsed=1.0, solver_kind=None):
     return {"vendor": vendor, "kind": kind, "rule": rule, "solved": solved, "reason": reason, "cookies": [],
-            "used_solver": used_solver, "elapsed_s": elapsed}
+            "used_solver": used_solver, "solver_kind": solver_kind, "elapsed_s": elapsed}
 
 
 def outcome(*layers, solver=None, elapsed=2.5):
@@ -56,7 +56,8 @@ def outcome(*layers, solver=None, elapsed=2.5):
 
 
 SOLVED_DD = outcome(layer("datadome", "device_check", "dd.frame_device", True, "solved"))
-SLIDER = outcome(layer("datadome", "captcha", "dd.frame_captcha", False, "slider"))
+SLIDER = outcome(layer("datadome", "captcha", "dd.frame_captcha", False, "slider", solver_kind="datadome_slider"))
+PX_HOLD = outcome(layer("perimeterx", "captcha", "px.hold", False, "unsolved:attempts_exhausted"))
 BANNED = outcome(layer("datadome", "ban", "dd.frame_device", False, "ban"))
 TIMED_OUT = outcome(layer("akamai", "challenge", "akamai.sec_cpt_html", False, "timeout"))
 PAID = outcome(layer("cloudflare", "captcha", "cf.turnstile", True, "solved", used_solver="capmonster"),
@@ -177,8 +178,12 @@ class OptionSetTests(unittest.TestCase):
 
     def test_antibot_launch_hardening(self):
         # solve_antibot is on the session, so the fork rewrites the argv at
-        # start(): headless tells out, the host's screen and the UA in, and
+        # start(): headless tells out, one common display and the UA in, and
         # everything the helper built otherwise unchanged.
+        from scrapling.engines.antibot.headless import canonical_displays, display_policy
+
+        self.assertEqual(display_policy(), "canonical")
+        self.assertIn(canonical_displays()[0].screen_info_switch(), self.session._launch_options()["args"])
         self.assertIs(self.session._config.solve_antibot, True)
         self.assertIsNone(self.session._config.captcha_solver)
         launch = self.session._launch_options()
@@ -216,6 +221,26 @@ class OptionSetTests(unittest.TestCase):
         self.session._launch_options = original
         self.session._config.solve_antibot = False
         self.assertEqual(helper.launch_problems(self.session), ["antibot-launch"])
+
+    def test_datadome_slide_to_target_is_not_dragged(self):
+        from scrapling.engines.antibot import registry
+
+        self.assertIs(registry.get("datadome").drag_simple_slider, False)
+        registry.get("datadome").drag_simple_slider = True
+        try:
+            self.assertIn("datadome-slider", helper.option_problems(self.session, 3))
+        finally:
+            registry.get("datadome").drag_simple_slider = False
+
+    def test_the_operators_own_displays_are_a_problem(self):
+        from scrapling.engines.antibot import headless
+
+        self.assertNotIn("display", helper.option_problems(self.session, 3))
+        headless.set_display_policy("host")
+        try:
+            self.assertIn("display", helper.option_problems(self.session, 3))
+        finally:
+            headless.set_display_policy("canonical")
 
     def test_launch_reason(self):
         self.assertEqual(helper.launch_reason(Exception("chrome: error while loading shared libraries: libnss3.so")), "deps_missing")
@@ -567,7 +592,19 @@ def request(**overrides):
 
 
 class FakeRouter:
+    """A SolverRouter stand-in: each job gets a scope, whose ledger the
+    helper reports (spent and attempts as if the pass had paid them)."""
     providers = ["capmonster", "capsolver"]
+
+    def __init__(self, spent=0.0, attempts=0):
+        self.spent = spent
+        self.attempts = attempts
+        self.scopes = []
+
+    def scope(self):
+        scope = FakeScope(self.spent, self.attempts)
+        self.scopes.append(scope)
+        return scope
 
     def supports(self, kind):
         return True
@@ -577,6 +614,14 @@ class FakeRouter:
 
     async def recognize(self, *args, **kwargs):
         raise AssertionError("never called by the helper")
+
+
+class FakeScope(FakeRouter):
+    is_scope = True
+
+    def __init__(self, spent, attempts):
+        super().__init__(spent, attempts)
+        self.spent_usd = spent
 
 
 class FetchTests(unittest.TestCase):
@@ -613,7 +658,8 @@ class FetchTests(unittest.TestCase):
         session = FakeSession([FakePage(PAGE), FakePage(PAGE)])
         self.fetch(session, request(solver=True), solver=router)
         self.fetch(session, request(solver=False), solver=router)
-        self.assertIs(session.fetch_calls[0]["captcha_solver"], router)
+        self.assertEqual(len(router.scopes), 1)  # one scope per job that may use the solver
+        self.assertIs(session.fetch_calls[0]["captcha_solver"], router.scopes[0])
         self.assertIsNone(session.fetch_calls[1]["captcha_solver"])
         # No router configured: a request that allows one gets none.
         session = FakeSession([FakePage(PAGE)])
@@ -633,8 +679,42 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(len(session.fetch_calls), 1)
 
     def test_a_paid_solve_is_used_and_costed(self):
-        data = self.fetch(FakeSession([FakePage(PAGE)], [PAID]), request(solver=True), solver=FakeRouter())
+        router = FakeRouter(spent=0.0012, attempts=1)
+        data = self.fetch(FakeSession([FakePage(PAGE)], [PAID]), request(solver=True), solver=router)
         self.assertEqual((data["challenge"], data["solver"], data["solver_cost_micro_usd"]), ("solved", "used", 1200))
+
+    def test_both_passes_share_one_scope_and_its_ledger(self):
+        router = FakeRouter(spent=0.0025, attempts=2)
+        session = FakeSession([FakePage(PAGE), FakePage(PAGE)], [TIMED_OUT, PAID])
+        data = self.fetch(session, request(solver=True), solver=router)
+        self.assertEqual(len(session.fetch_calls), 2)
+        self.assertEqual(len(router.scopes), 1)
+        self.assertIs(session.fetch_calls[1]["captcha_solver"], router.scopes[0])
+        # The scope's ledger, once: never the passes' summaries added up.
+        self.assertEqual((data["challenge"], data["solver"], data["solver_cost_micro_usd"]), ("solved", "used", 2500))
+
+    def test_a_pass_cut_off_mid_solve_still_reports_its_spend(self):
+        class Slow(FakeSession):
+            async def fetch(self, url, **kwargs):
+                self.fetch_calls.append(kwargs)
+                await asyncio.sleep(3600)
+        router = FakeRouter(spent=0.002, attempts=1)  # a task sent before the cut-off may still be billed
+        data = self.fetch(Slow([]), request(solver=True, timeout_ms=1000), solver=router)
+        self.assertEqual((data["outcome"], data["solver"], data["solver_cost_micro_usd"]), ("timeout", "needed", 2000))
+
+    def test_the_retry_pass_gets_only_the_time_left(self):
+        async def slow(page):
+            await asyncio.sleep(1.5)
+            return TIMED_OUT
+        session = FakeSession([FakePage(PAGE), FakePage(PAGE)], [slow, CLEAN])
+        started = time.monotonic()
+        self.fetch(session, request(timeout_ms=20000))
+        first, second = (call["timeout"] for call in session.fetch_calls)
+        self.assertTrue(19000 <= first <= 20000, first)
+        # The second pass started at least 1.5 s in: its budget (and the fork's anti-bot deadline inside it) ends
+        # before the job's own deadline.
+        self.assertLessEqual(second, 20000 - 1500 - 250)
+        self.assertLess(time.monotonic() - started, 20)
 
     def test_unsolved_with_time_left_retries_once_in_a_fresh_context(self):
         session = FakeSession([FakePage(PAGE), FakePage(PAGE)], [TIMED_OUT, CLEAN])
@@ -654,6 +734,12 @@ class FetchTests(unittest.TestCase):
             data = self.fetch(session, request(timeout_ms=40000))
             self.assertEqual(len(session.fetch_calls), 1, result["reason"])
             self.assertEqual((data["challenge"], data["solver"]), ("unsolved", solver), result["reason"])
+
+    def test_a_press_and_hold_that_failed_is_retried_and_needs_no_solver(self):
+        session = FakeSession([FakePage(PAGE), FakePage(PAGE)], [PX_HOLD, PX_HOLD])
+        data = self.fetch(session, request(timeout_ms=40000))
+        self.assertEqual(len(session.fetch_calls), 2)
+        self.assertEqual((data["challenge"], data["solver"]), ("unsolved", ""))
 
     def test_a_missing_or_failed_pass_is_unsolved(self):
         for meta in (None, antibot_runner.error_outcome(RuntimeError("x"))):
@@ -749,13 +835,26 @@ class AntibotResultTests(unittest.TestCase):
             (SLIDER, ("unsolved", True, "needed", 0)),
             (BANNED, ("unsolved", True, "", 0)),
             (TIMED_OUT, ("unsolved", False, "", 0)),
-            (outcome(layer("imperva", "challenge", "imperva.interstitial", False, "captcha_required:geetest")), ("unsolved", True, "needed", 0)),
+            # Only a layer the fork names a solver kind for needs one: no provider takes Imperva's GeeTest, a
+            # widgetless incident page, HUMAN's press and hold, or a hard block found inside the captcha frame.
+            (outcome(layer("imperva", "captcha", "imperva.incident", False, "captcha_required:geetest")), ("unsolved", False, "", 0)),
+            (outcome(layer("imperva", "captcha", "imperva.incident", False, "blocked:no_widget")), ("unsolved", False, "", 0)),
+            (outcome(layer("imperva", "captcha", "imperva.incident", False, "captcha_required:hcaptcha", solver_kind="hcaptcha")),
+             ("unsolved", True, "needed", 0)),
+            (PX_HOLD, ("unsolved", False, "", 0)),
+            (outcome(layer("perimeterx", "captcha", "px.hold", False, "timeout")), ("unsolved", False, "", 0)),
+            (outcome(layer("datadome", "captcha", "dd.frame_captcha", False, "ban")), ("unsolved", True, "", 0)),
+            (outcome(layer("cloudflare", "captcha", "cf.turnstile", False, "unsolved:cf.turnstile", solver_kind="turnstile")),
+             ("unsolved", True, "needed", 0)),
+            (outcome(layer("datadome", "captcha", "dd.frame_captcha", False, "ban"), solver={"attempts": 1, "cost_usd": 0.003}),
+             ("unsolved", True, "", 3000)),
             (outcome(layer("datadome", "captcha", "dd.frame_captcha", False, "solver_error:ERROR_ZERO_BALANCE", used_solver="capsolver"),
                      solver={"attempts": 1, "cost_usd": 0}), ("unsolved", True, "needed", 0)),
             (outcome(layer("imperva", "challenge", "imperva.interstitial", True, "solved"),
                      layer("datadome", "device_check", "dd.frame_device", True, "solved")), ("solved", False, "", 0)),
             (outcome(layer("akamai", "challenge", "akamai.sec_cpt_html", True, "solved:sec_cpt"),
-                     layer("datadome", "captcha", "dd.frame_captcha", False, "slider")), ("unsolved", True, "needed", 0)),
+                     layer("datadome", "captcha", "dd.frame_captcha", False, "slider", solver_kind="datadome_slider")),
+             ("unsolved", True, "needed", 0)),
             (antibot_runner.error_outcome(ValueError()), ("unsolved", False, "", 0)),
             (None, ("unsolved", False, "", 0)),
             ("junk", ("unsolved", False, "", 0)),
@@ -859,13 +958,13 @@ class ScraplingFetchTests(unittest.TestCase):
         self.assertEqual(page.navigations, 1)
 
     def test_the_pass_runs_after_navigation_with_the_fetch_budget_and_solver(self):
-        router = FakeRouter()
+        router = FakeRouter(spent=0.0012, attempts=1)
         self.outcome = PAID
         data = self.fetch(FakePage(PAGE), request(solver=True, timeout_ms=20000), solver=router)
         self.assertEqual(self.calls[0], ("prepare", 0))  # hardened before it navigates
         name, navigations, solver, budget = self.calls[1]
         self.assertEqual((name, navigations), ("solve", 1))
-        self.assertIs(solver, router)
+        self.assertIs(solver, router.scopes[0])
         self.assertTrue(15 < budget <= 18, budget)  # the fetch's 20 s less its reserve
         self.assertEqual((data["challenge"], data["solver"], data["solver_cost_micro_usd"]), ("solved", "used", 1200))
         self.calls.clear()
@@ -876,6 +975,25 @@ class ScraplingFetchTests(unittest.TestCase):
         self.outcome = SLIDER
         data = self.fetch(FakePage(PAGE), request(timeout_ms=40000))
         self.assertEqual((data["outcome"], data["challenge"], data["solver"]), ("ok", "unsolved", "needed"))
+
+    def test_the_retry_pass_deadline_ends_before_the_jobs(self):
+        """The fork's anti-bot deadline on the retry pass (where paid solves run) is inside the job's deadline."""
+        outcomes = [TIMED_OUT, CLEAN]
+        seen = []
+
+        async def solve(page, *, document, deadline, solver=None, log=None):
+            seen.append(deadline)
+            if len(seen) == 1:
+                await asyncio.sleep(2)
+            return outcomes.pop(0)
+        self.pages.append(FakePage(PAGE))
+        started = time.monotonic()
+        with mock.patch.object(antibot_runner, "solve_page", solve):
+            data = self.fetch(FakePage(PAGE), request(timeout_ms=20000))
+        job_deadline = started + 20
+        self.assertEqual((len(seen), data["challenge"]), (2, "none"))
+        self.assertLess(seen[0], job_deadline)
+        self.assertLess(seen[1], job_deadline - 1)  # inside the job's budget, with the response's reserve
 
     def test_a_guard_that_cannot_start_fails_before_navigation(self):
         for case in ("session", "enable"):
@@ -932,7 +1050,7 @@ class ServerTests(unittest.TestCase):
 
     def test_capabilities(self):
         status, body = self.call(self.head("GET", "/v1/capabilities"))
-        self.assertEqual(body, {"data": {"web_browser": 1, "engine": "scrapling/0.4.15+scarlett.1", "browser_version": "155.0.8059.39",
+        self.assertEqual(body, {"data": {"web_browser": 1, "engine": "scrapling/0.4.15+scarlett.2", "browser_version": "155.0.8059.39",
                                          "max_pages": 2, "solvers": []}})
 
     def test_capabilities_name_the_solvers_never_their_keys(self):

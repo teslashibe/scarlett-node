@@ -8,8 +8,9 @@ uses the node's filtering egress proxy; the browser's own background traffic
 goes to the node's deny listener.
 
 Bot protection is handled by the Scrapling build the runtime pins
-(0.4.15+scarlett.1, teslashibe/Scrapling): with solve_antibot on the session
-the browser launches as the real machine, and after each navigation the page
+(0.4.15+scarlett.2, teslashibe/Scrapling): with solve_antibot on the session
+the browser launches as one ordinary desktop browser (a common display, never
+the operator's own monitors), and after each navigation the page
 is checked for DataDome, HUMAN (PerimeterX), Akamai, Imperva, AWS WAF, Kasada
 and Cloudflare and their challenges are solved within the fetch's budget. The
 outcome is response.meta["antibot"]. When the operator configured captcha
@@ -37,7 +38,7 @@ import threading
 import time
 from urllib.parse import urljoin, urlsplit
 
-SCRAPLING_VERSION = "0.4.15+scarlett.1"
+SCRAPLING_VERSION = "0.4.15+scarlett.2"
 PORT_PREFIX = "SCARLETT_WEB_HELPER_PORT="
 ENGINE = "scrapling/" + SCRAPLING_VERSION
 MAX_REQUEST_BODY = 65536
@@ -129,8 +130,8 @@ PROFILE_PREFIX = "scarlett-profile-"
 # The launch switches the anti-bot launch hardening may drop from the
 # helper's argv (display-only headless tells: window placement, colour
 # profile, scrollbars, font hinting, compositor threading, a touch pointer),
-# and the only switches it may add: the host's real screen, scale and window,
-# a wide-gamut colour profile and the User-Agent.
+# and the only switches it may add: the common display's screen, scale and
+# window, a wide-gamut colour profile and the User-Agent.
 ANTIBOT_DROPPED = ("--window-position=0,0", "--force-color-profile=srgb", "--hide-scrollbars", "--font-render-hinting=none",
                    "--disable-threaded-animation", "--disable-threaded-scrolling", "--start-maximized")
 ANTIBOT_DROPPED_PREFIXES = ("--blink-settings=", "--window-size=", "--screen-info=", "--force-device-scale-factor=")
@@ -139,9 +140,15 @@ ANTIBOT_ADDED_PREFIXES = ("--screen-info=", "--force-device-scale-factor=", "--w
 # Captcha-solver providers and the options the node may set (WEB_SOLVER_CONFIG).
 SOLVER_PROVIDERS = ("capmonster", "capsolver", "2captcha")
 SOLVER_OPTIONS = ("max_solves_per_fetch", "experimental")
-# A page left at one of these needs a captcha solver to get further.
-SOLVER_REASONS = ("slider", "slider_failed", "slider_unreadable", "captcha", "captcha_required", "solver_error",
-                  "awswaf_images")
+# What the hardened browser shows pages as its screen: one common display for
+# the platform. "host" would show every monitor of the operator's desk, its
+# layout and menu bar and Dock settings to any page a buyer points it at.
+DISPLAY_POLICY = "canonical"
+# DataDome's slide-to-target slider is not dragged: one live drag (2026-10-08)
+# ended in DataDome's hard-block page, which then holds for the operator's IP.
+# The slider ends as "slider" with no solver need, and the job's fresh-context
+# retry gets its chance instead.
+DATADOME_DRAG_SLIDER = False
 TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9a-z-]{1,64}$")
 SELECTOR = re.compile(r"^[\x20-\x7e]{1,256}$")
 URL_STRIP = re.compile(r"[\t\n\r]")
@@ -200,9 +207,13 @@ def new_session(executable, user_agent, proxy, deny_proxy, max_pages, profile):
     pass is on for the session, so the browser launches hardened (the fork
     rewrites the launch argv at start(); launch_problems checks the result);
     each fetch still turns the pass on or off and picks its solver."""
+    from scrapling.engines.antibot import registry
+    from scrapling.engines.antibot.headless import set_display_policy
     from scrapling.fetchers import AsyncStealthySession
     from scrapling.engines.toolbelt.proxy_rotation import ProxyRotator
 
+    set_display_policy(DISPLAY_POLICY)
+    registry.get("datadome").drag_simple_slider = DATADOME_DRAG_SLIDER
     session = AsyncStealthySession(
         headless=True, executable_path=executable, useragent=user_agent, locale="en-US", google_search=False,
         retries=1, block_webrtc=True, hide_canvas=False, allow_webgl=True, max_pages=max_pages, timeout=30000,
@@ -266,6 +277,14 @@ def option_problems(session, capacity):
         problems.append("max_pages")
     if not logging.getLogger("scrapling").disabled:
         problems.append("logger")
+    from scrapling.engines.antibot import registry
+    from scrapling.engines.antibot.headless import canonical_displays, display_policy
+
+    if display_policy() != DISPLAY_POLICY or not any(
+            d.screen_info_switch() in (session._launch_options().get("args") or ()) for d in canonical_displays()):
+        problems.append("display")
+    if getattr(registry.get("datadome"), "drag_simple_slider", None) is not DATADOME_DRAG_SLIDER:
+        problems.append("datadome-slider")
     return problems + launch_problems(session)
 
 
@@ -276,9 +295,9 @@ def antibot_dropped(arg):
 def launch_problems(session):
     """What the browser really starts with. With solve_antibot on the session
     the fork rewrites the argv at start(): it may drop only the headless tells
-    (ANTIBOT_DROPPED) and append only the host's screen, scale, window, colour
-    profile and User-Agent; every other launch option, the deny proxy, the
-    sandbox, the seeded profile and the pipe stay as built."""
+    (ANTIBOT_DROPPED) and append only the common display's screen, scale,
+    window, colour profile and User-Agent; every other launch option, the deny
+    proxy, the sandbox, the seeded profile and the pipe stay as built."""
     problems = []
     config = session._config
     if not (config.solve_antibot and config.headless and not config.cdp_url and session._antibot_hardened_launch()):
@@ -549,18 +568,20 @@ async def guard_redirects(page):
 
 
 def solver_state(outcome):
-    """'used' when an operator-paid solve cleared the page, 'needed' when the
-    page stopped at a captcha that takes a solver (none configured, none
-    allowed for this fetch, or the solver failed), else ''."""
+    """'used' when an operator-paid solve cleared the page; 'needed' when the
+    page stopped where a captcha solver can act (the fork names the kind on
+    the layer: none was configured or allowed for this fetch, the provider
+    does not offer it, or its answer was rejected) or after a paid solve
+    that did not clear it; else ''. A ban never needs a solver, and nor does
+    a press-and-hold, a block or a widget no provider takes."""
     layers = [layer for layer in outcome.get("layers") or () if isinstance(layer, dict)]
     used = bool((outcome.get("solver") or {}).get("attempts")) or any(layer.get("used_solver") for layer in layers)
     if outcome.get("solved"):
         return "used" if used else ""
     last = layers[-1] if layers else {}
-    reason = str(outcome.get("reason") or "")
-    if used or last.get("kind") == "captcha" or reason.split(":", 1)[0] in SOLVER_REASONS or reason.endswith(":captcha"):
-        return "needed"
-    return ""
+    if last.get("kind") == "ban" or last.get("reason") == "ban" or outcome.get("reason") == "ban":
+        return ""
+    return "needed" if used or last.get("solver_kind") else ""
 
 
 def antibot_result(outcome, solving):
@@ -573,10 +594,7 @@ def antibot_result(outcome, solving):
         return "none", False, "", 0
     if not isinstance(outcome, dict):
         return "unsolved", False, "", 0
-    try:
-        cost = max(0, min(10_000_000, round(float((outcome.get("solver") or {}).get("cost_usd") or 0) * 1_000_000)))
-    except (TypeError, ValueError, OverflowError):
-        cost = 0
+    cost = micro_usd((outcome.get("solver") or {}).get("cost_usd"))
     solver = solver_state(outcome)
     if outcome.get("vendor") is None and outcome.get("reason") == "none":
         return "none", False, solver, cost
@@ -585,6 +603,14 @@ def antibot_result(outcome, solving):
     banned = outcome.get("kind") == "ban" or outcome.get("reason") == "ban" or \
         any(isinstance(layer, dict) and layer.get("kind") == "ban" for layer in outcome.get("layers") or ())
     return "unsolved", banned or solver != "", solver, cost
+
+
+def micro_usd(value):
+    """USD as whole micro-dollars, clamped to 0..10 USD; junk is 0."""
+    try:
+        return max(0, min(10_000_000, round(float(value or 0) * 1_000_000)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 class Fetcher:
@@ -599,15 +625,23 @@ class Fetcher:
             loop = asyncio.get_running_loop()
             started = loop.time()
             deadline = started + request.timeout_ms / 1000
-            result = await self._once(request, deadline)
+            # One solver scope per job: both passes share its per-fetch caps
+            # and its spend ledger, which books a task when it is sent, so a
+            # pass that timed out mid-solve still reports what it spent.
+            scope = self.solver.scope() if self.solver is not None and request.solver else None
+            result = await self._once(request, deadline, scope)
             if result["data"]["challenge"] == "unsolved" and not result["no_retry"] and deadline - loop.time() >= 15:
-                spent = result["data"]["solver_cost_micro_usd"]
-                result = await self._once(request, deadline)
-                result["data"]["solver_cost_micro_usd"] += spent
-            result["data"]["timings"]["total_ms"] = round((loop.time() - started) * 1000)
+                result = await self._once(request, deadline, scope)
+            data = result["data"]
+            if scope is not None:
+                data["solver_cost_micro_usd"] = micro_usd(getattr(scope, "spent_usd", 0))
+                if getattr(scope, "attempts", 0) and not data["solver"] and not result["no_retry"]:
+                    # A paid attempt whose pass gave no outcome (a timeout, a crash).
+                    data["solver"] = "used" if data["challenge"] == "solved" else "needed"
+            data["timings"]["total_ms"] = round((loop.time() - started) * 1000)
             return result
 
-    async def _once(self, request, deadline):
+    async def _once(self, request, deadline, scope):
         loop = asyncio.get_running_loop()
         started_at_ms = int(time.time() * 1000)
         begin = loop.time()
@@ -683,10 +717,14 @@ class Fetcher:
                 "timings": {"context_ms": 0, "navigate_ms": 0, "settle_ms": 0, "challenge_ms": 0, "total_ms": 0}}
         no_retry = False
         challenge_ms = 0
+        # The session's timeout is the time this pass really has: the fork's
+        # anti-bot deadline (and with it every paid solve) then ends inside
+        # the wait_for below, also on the retry pass.
+        timeout_ms = max(1000, min(request.timeout_ms, int(remaining() * 1000) - 250))
         try:
             response = await asyncio.wait_for(session.fetch(
-                request.url, proxy=self.proxy, timeout=request.timeout_ms, network_idle=False, solve_cloudflare=False,
-                solve_antibot=request.solve_challenge, captcha_solver=self.solver if request.solver else None,
+                request.url, proxy=self.proxy, timeout=timeout_ms, network_idle=False, solve_cloudflare=False,
+                solve_antibot=request.solve_challenge, captcha_solver=scope if request.solve_challenge else None,
                 load_dom=True, google_search=False, disable_resources=request.block_resources, wait=0,
                 page_setup=setup, page_action=act), max(0.1, remaining()))
         except asyncio.TimeoutError:

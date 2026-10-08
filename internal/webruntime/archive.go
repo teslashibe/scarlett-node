@@ -25,7 +25,7 @@ import (
 
 const (
 	pythonVersion    = "3.13.16"
-	scraplingVersion = "0.4.15+scarlett.1"
+	scraplingVersion = "0.4.15+scarlett.2"
 	driverNodeVer    = "22.23.3"
 	maxPinsBytes     = 64 << 10
 	maxManifestBytes = 4 << 20

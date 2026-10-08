@@ -7,7 +7,7 @@ The node's web browser tier runs `scarlett_web_helper.py` inside a bundled Pytho
 | Component | Version | Licence |
 |---|---|---|
 | CPython, from python-build-standalone release `20261003` (`install_only_stripped`) | 3.13.16 | PSF License (`python/lib/python3.13/LICENSE.txt`; Windows `python/LICENSE.txt`); the python-build-standalone build scripts are MPL-2.0 |
-| scrapling | 0.4.15+scarlett.1 | BSD-3-Clause; its `NOTICE` (in `scrapling-0.4.15+scarlett.1.dist-info/licenses/`) lists the Apache-2.0 and MIT code it adapts |
+| scrapling | 0.4.15+scarlett.2 | BSD-3-Clause; its `NOTICE` (in `scrapling-0.4.15+scarlett.2.dist-info/licenses/`) lists the Apache-2.0 and MIT code it adapts |
 | patchright | 1.63.0 | Apache-2.0 |
 | playwright | 1.63.0 | Apache-2.0 |
 | curl-cffi | 0.16.3 | MIT |
@@ -38,7 +38,7 @@ Chrome for Testing 155.0.8059.39 is downloaded by the node from `storage.googlea
 
 ## The Scrapling build
 
-The runtime installs Scrapling from Scarlett's fork, [teslashibe/Scrapling](https://github.com/teslashibe/Scrapling), release `v0.4.15-scarlett.1`: upstream 0.4.15 plus the anti-bot handlers (`scrapling/engines/antibot/`) and the captcha-solver router, built from branch `scarlett/antibot` at commit `d55626a61239993be136f7056d4b8ddbc5fb0898`. `requirements.lock` pins the release's wheel by its sha256, so the build installs those exact bytes. The fork stays under Scrapling's BSD-3-Clause licence. Its `NOTICE`, shipped in the wheel's `dist-info/licenses/`, credits the code the handlers adapt: Averyy/wafer (Apache-2.0; the full licence text is `wafer-LICENSE.txt` here), Crawl4AI (Apache-2.0), Hyper Solutions hyper-sdk-py (MIT), SeleniumBase (MIT) and xKiian/awswaf (MIT).
+The runtime installs Scrapling from Scarlett's fork, [teslashibe/Scrapling](https://github.com/teslashibe/Scrapling), release `v0.4.15-scarlett.2`: upstream 0.4.15 plus the anti-bot handlers (`scrapling/engines/antibot/`) and the captcha-solver router, built from branch `scarlett/antibot` at commit `87bbb2aa9a3b5fc1b15ce935d17cdcad9fd136d7`. `requirements.lock` pins the release's wheel by its sha256, so the build installs those exact bytes. The fork stays under Scrapling's BSD-3-Clause licence. Its `NOTICE`, shipped in the wheel's `dist-info/licenses/`, credits the code the handlers adapt: Averyy/wafer (Apache-2.0; the full licence text is `wafer-LICENSE.txt` here), Crawl4AI (Apache-2.0), Hyper Solutions hyper-sdk-py (MIT), SeleniumBase (MIT) and xKiian/awswaf (MIT).
 
 ## Code adapted from other projects
 

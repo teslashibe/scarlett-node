@@ -132,7 +132,7 @@ class VersionPinTests(unittest.TestCase):
             'scrapling': re.search(r"scrapling = '([^']+)'", prepare).group(1),
             'cft': json.loads(text('third_party/web-browser/chrome-for-testing.json'))['version'],
         }
-        self.assertEqual(pins, {'python': '3.13.16', 'pbs': '20261003', 'scrapling': '0.4.15+scarlett.1', 'cft': '155.0.8059.39'})
+        self.assertEqual(pins, {'python': '3.13.16', 'pbs': '20261003', 'scrapling': '0.4.15+scarlett.2', 'cft': '155.0.8059.39'})
         for path, pattern, component in WEB_SITES:
             with self.subTest(path=path, pattern=pattern):
                 found = [f.replace('%2B', '+') for f in re.findall(pattern, text(path), re.MULTILINE)]

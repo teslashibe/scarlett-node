@@ -598,8 +598,8 @@ pyee==13.0.1 \
     # via
     #   patchright
     #   playwright
-scrapling @ https://github.com/teslashibe/Scrapling/releases/download/v0.4.15-scarlett.1/scrapling-0.4.15%2Bscarlett.1-py3-none-any.whl \
-    --hash=sha256:85b7bed683aed37041e1788a0b679c0cf1c802937ed17eb4510e6336ead5b415
+scrapling @ https://github.com/teslashibe/Scrapling/releases/download/v0.4.15-scarlett.2/scrapling-0.4.15%2Bscarlett.2-py3-none-any.whl \
+    --hash=sha256:5d40dc781964909f633654b789af520d8d42a9b4e5ef8e313670ecad9d4aa72b
     # via -r requirements.in
 tld==0.13.2 \
     --hash=sha256:9b8fdbdb880e7ba65b216a4937f2c94c49a7226723783d5838fc958ac76f4e0c \

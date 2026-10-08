@@ -13,7 +13,7 @@ import {dirname, isAbsolute, join, relative, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {verify, maxArchiveBytes, cftName} from './verify-web-runtime.mjs';
 
-const release = '20261003', python = '3.13.16', scrapling = '0.4.15+scarlett.1', nodeVersion = '22.23.3';
+const release = '20261003', python = '3.13.16', scrapling = '0.4.15+scarlett.2', nodeVersion = '22.23.3';
 // Node-style platform → [python-build-standalone triple, asset sha256, Go platform].
 export const pins = {
  'darwin-arm64': ['aarch64-apple-darwin', '9e01f63bbb08576cd9c8bc2d0564d098cb30c8453a0cd4bcf6aef458f6d2a147', 'darwin-arm64'],

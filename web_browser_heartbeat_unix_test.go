@@ -37,7 +37,7 @@ type scriptedBrowser struct {
 const syntheticUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
 
 func (s *scriptedBrowser) Status() worker.BrowserStatus {
-	return worker.BrowserStatus{Ready: true, Capacity: 1, Version: "155.0.8059.39", Engine: "scrapling/0.4.15+scarlett.1", UserAgent: syntheticUA}
+	return worker.BrowserStatus{Ready: true, Capacity: 1, Version: "155.0.8059.39", Engine: "scrapling/0.4.15+scarlett.2", UserAgent: syntheticUA}
 }
 func (s *scriptedBrowser) Prewarm() {
 	s.mu.Lock()

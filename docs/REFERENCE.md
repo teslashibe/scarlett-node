@@ -392,11 +392,11 @@ the node, and only together with web.
 **What ships and what is fetched.** The node bundle and the desktop app carry
 `web-runtime-<platform>.tar.gz` and `web-runtime.json` beside
 `x-login-runtime/`: a pinned CPython 3.13.16 (python-build-standalone
-`20261003`) with Scrapling `0.4.15+scarlett.1`, Patchright and Playwright
+`20261003`) with Scrapling `0.4.15+scarlett.2`, Patchright and Playwright
 1.63.0 from a hash-locked, wheels-only lock, and the node's helper
 `scarlett_web_helper`. The Scrapling wheel is the asset of release
-`v0.4.15-scarlett.1` on [teslashibe/Scrapling](https://github.com/teslashibe/Scrapling)
-(branch `scarlett/antibot`, commit `d55626a`), named in
+`v0.4.15-scarlett.2` on [teslashibe/Scrapling](https://github.com/teslashibe/Scrapling)
+(branch `scarlett/antibot`, commit `87bbb2a`), named in
 `third_party/web-browser/requirements.lock` by URL and sha256; `pip
 --require-hashes --only-binary=:all:` installs those exact bytes and nothing is
 built from source. The helper's driver reuses the x-login runtime's Node
@@ -458,22 +458,29 @@ left; under 5 s the job is `expired`. Then:
 `solve_antibot` on, so the browser launches hardened: the fork drops the
 display-only headless switches the helper's argv carries
 (`--hide-scrollbars`, `--force-color-profile=srgb`, the touch-pointer
-`--blink-settings`, window placement and the like) and adds the host's
-`--screen-info`, scale, window size, a wide-gamut colour profile on a P3 Mac,
-and `--user-agent` with the pinned value. Nothing else changes: the deny
+`--blink-settings`, window placement and the like) and adds `--screen-info`,
+scale and window size for one common display (a 14" MacBook Pro screen on
+macOS, a 1080p screen elsewhere), a wide-gamut colour profile on macOS, and
+`--user-agent` with the pinned value. Pages see that display in every frame,
+never the operator's own monitors, their layout or the menu bar and Dock
+settings, and the helper's self-check fails if the fork would describe the
+host's displays instead. Nothing else changes: the deny
 proxy, the sandbox, the seeded profile, the pipe and every other switch are
 as built, and the helper's self-check fails if the launch argv differs from
 that in any other way. Each page is hardened in every frame and worker before
 it navigates. After navigation the page is read without touching its own
 JavaScript world and checked for DataDome, HUMAN (PerimeterX), Akamai,
 Imperva, AWS WAF, Kasada and Cloudflare; a detected vendor's handler runs
-until the browser budget less a tenth (1–3 s), and a solved page is checked
-again, up to three layers. Handlers navigate only within the page's origin
+until the pass's budget less a tenth (1–3 s), and a solved page is checked
+again, up to three layers; until a new document loads, that check keeps the
+status and headers the page was detected with, so a block page that never
+changed is never reported solved. Handlers navigate only within the page's origin
 and the vendor's own challenge frames and type only into vendor widgets. The
 outcome maps to `challenge`: nothing detected is `none`, every layer solved is
 `solved`, anything else `unsolved`. A hard ban, and anything a captcha solver
 touched or needs, is not retried in a fresh context; other unsolved pages are,
-once, with at least 15 s left.
+once, with at least 15 s left. The retry pass gets only the time left of the
+browser budget, so its handlers and any paid solve end inside it.
 
 **Captcha solvers.** Optional and paid by the operator.
 `SCARLETT_WEB_SOLVERS` lists providers (`capmonster`, `capsolver`,
@@ -493,19 +500,38 @@ start and passes them to each helper in `WEB_SOLVER_CONFIG`, which the helper
 removes from its environment before the driver or the browser start. The
 helper reaches the providers directly over TLS verified against certifi's
 roots, never through the page's proxy or `SCARLETT_WEB_EGRESS_PROXY`, and
-never hands a provider a proxy; a provider sees the challenge's site key and
-page URL, or the puzzle images, and nothing else. Routing is by challenge
+never hands a provider a proxy. For a token (Turnstile, hCaptcha, AWS WAF) a
+provider sees the challenge's site key and the page's address cut to
+`scheme://host/path`, never its query string, fragment or credentials (the
+AWS WAF task also carries the challenge's own `gokuProps` and script URLs);
+for a recognition task (DataDome's jigsaw slider, AWS WAF's image grid) it
+sees only the puzzle images and the question. Nothing else. DataDome's
+slide-to-target slider is not dragged (a live drag ended in DataDome's
+hard-block page, which then holds for the operator's IP): it ends the pass
+as unsolved with no solver need, and the fresh-context retry runs.
+Routing is by challenge
 type with fallback: tokens (Turnstile, reCAPTCHA, GeeTest, AWS WAF) go to
 CapMonster Cloud first, image and slider recognition to CapSolver, and
 FunCaptcha to 2Captcha, each falling back to the next configured provider; a
 provider that reports a bad key, an empty balance or throttling rests for a
-while. The helper reports each fetch's estimated spend; the node adds it to
+while. Spend is counted when a task is sent to a provider, at its estimated
+price (the provider's own figure replaces it when it reports one), so a task
+abandoned at the deadline or lost to network errors still counts; only
+failures providers do not bill (a refused task, an unsolvable challenge) are
+refunded, and a provider that fails after accepting a task is not followed by
+another for the same challenge. Both passes of a fetch share one budget
+(`SCARLETT_WEB_SOLVER_MAX_SOLVES_PER_FETCH` covers the retry too) and one
+ledger, and the helper reports that ledger's total for the fetch, also when
+the fetch timed out. The node adds it to
 the day's total in `<state>/web-browser/solver-spend.json` (private) and,
 once the cap is reached, sends the helper `"solver": false` until the next UTC
 day. The helper's `/v1/capabilities` names the providers it built, and a
 helper that built anything but the configured set never becomes ready. The
 browser upload carries `solver: "used"` when a paid solve cleared the page and
-`"needed"` when the page stopped at a captcha that takes a solver; the
+`"needed"` when the page stopped at a captcha a provider can take (a
+Turnstile gate, Imperva's hCaptcha, an AWS WAF captcha, DataDome's jigsaw
+slider) or after a paid solve that did not clear it; a ban, a press-and-hold,
+a block and widgets no provider takes never set it. The
 coordinator remembers such a domain and offers its browser jobs to nodes that
 report `solvers` first. The desktop app does not configure solvers yet; a
 keychain-backed setting is the planned next step.

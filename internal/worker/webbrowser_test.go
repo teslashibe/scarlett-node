@@ -57,7 +57,7 @@ func (f *fakeBrowser) prewarmCount() int {
 }
 
 func readyStatus() BrowserStatus {
-	return BrowserStatus{Ready: true, Capacity: 2, Version: "155.0.8059.39", Engine: "scrapling/0.4.15+scarlett.1", UserAgent: darwinUA}
+	return BrowserStatus{Ready: true, Capacity: 2, Version: "155.0.8059.39", Engine: "scrapling/0.4.15+scarlett.2", UserAgent: darwinUA}
 }
 
 const secretCookie = "synthetic-clearance-value"
@@ -486,7 +486,7 @@ func TestRunBrowserUploadsAndRefetches(t *testing.T) {
 	if len(body.Headers) != 1 || body.Headers[0] != [2]string{"content-type", "text/html; charset=utf-8"} || strings.Join(body.SetCookieNames, ",") != "cf_clearance,__cf_bm" || len(body.Redirects) != 1 {
 		t.Fatalf("upload headers %v %v", body.Headers, body.SetCookieNames)
 	}
-	if body.Browser != (coordinator.BrowserInfo{Engine: "scrapling/0.4.15+scarlett.1", Version: "155.0.8059.39", UserAgent: darwinUA}) || body.StartedAtMS < started.UnixMilli() || body.StartedAtMS > time.Now().UnixMilli() || body.DurationMS < 0 || body.DurationMS > took.Milliseconds() {
+	if body.Browser != (coordinator.BrowserInfo{Engine: "scrapling/0.4.15+scarlett.2", Version: "155.0.8059.39", UserAgent: darwinUA}) || body.StartedAtMS < started.UnixMilli() || body.StartedAtMS > time.Now().UnixMilli() || body.DurationMS < 0 || body.DurationMS > took.Milliseconds() {
 		t.Fatalf("upload browser %+v %d %d", body.Browser, body.StartedAtMS, body.DurationMS)
 	}
 	// No cookie value is ever uploaded or printed.

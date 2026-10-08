@@ -87,7 +87,7 @@ func TestRuntimeBrowserWithoutArchive(t *testing.T) {
 			break
 		}
 	}
-	if s.Ready || s.Reason != "runtime_missing" && s.Reason != "memory_low" || s.UserAgent == "" || s.Engine != "scrapling/0.4.15+scarlett.1" {
+	if s.Ready || s.Reason != "runtime_missing" && s.Reason != "memory_low" || s.UserAgent == "" || s.Engine != "scrapling/0.4.15+scarlett.2" {
 		t.Fatalf("status without an archive: %+v", s)
 	}
 	if _, err := tier.Fetch(context.Background(), worker.BrowserFetchRequest{URL: "https://example.com/", Wait: "load", TimeoutMS: 5000}); !errors.Is(err, worker.ErrBrowserUnavailable) {

@@ -39,7 +39,7 @@ type BrowserStatus struct {
 	Reason   string
 	Capacity int
 	// Version is the Chrome for Testing version, Engine the helper engine
-	// ("scrapling/0.4.15+scarlett.1") and UserAgent the pinned User-Agent the
+	// ("scrapling/0.4.15+scarlett.2") and UserAgent the pinned User-Agent the
 	// browser sends, which the proven re-fetch repeats.
 	Version, Engine, UserAgent string
 	// Solvers are the operator's captcha-solver providers the browser may
