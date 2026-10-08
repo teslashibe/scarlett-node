@@ -28,7 +28,7 @@ func fakeWebProver(mode string) {
 	data, _ := io.ReadAll(os.Stdin)
 	d := json.NewDecoder(bytes.NewReader(data))
 	d.DisallowUnknownFields()
-	if d.Decode(&in) != nil || len(os.Args) != 2 || os.Args[1] != "relay-web" || in.Verifier != "verifier:7047" || len(in.Token) != 64 || in.Port != 443 || len(in.Payload) == 0 || in.TimeoutMS < 1000 || in.TimeoutMS > 30000 {
+	if d.Decode(&in) != nil || len(os.Args) != 2 || os.Args[1] != "relay-web" || in.Verifier != "verifier:7047" || len(in.Token) != 64 || in.Port != 443 || len(in.Payload) == 0 || in.TimeoutMS < 1000 || in.TimeoutMS > 280000 {
 		fmt.Fprintln(os.Stderr, "bad relay-web input")
 		os.Exit(2)
 	}
@@ -86,6 +86,20 @@ func fakeWebProver(mode string) {
 			os.Exit(1)
 		}
 		redirect("https://www.example.com/")
+	case "web-busy":
+		// The verifier is at its web session limit for the first two tries.
+		if raw, _ := os.ReadFile(os.Getenv("SCARLETT_FAKE_WEB_LOG")); bytes.Count(raw, []byte("\n")) < 3 {
+			fail("verifier_busy")
+		}
+	case "web-busy-always":
+		fail("verifier_busy")
+	case "web-too-large":
+		fail("page_too_large")
+	case "web-later-too-large":
+		if in.Hop > 0 {
+			fail("page_too_large")
+		}
+		redirect("https://www.example.com/")
 	case "web-connect":
 		fail("connect_failed")
 	case "web-proxy":
@@ -124,7 +138,7 @@ func webFixtureLease(t *testing.T) coordinator.Lease {
 	if err := json.Unmarshal(raw, &l); err != nil {
 		t.Fatal(err)
 	}
-	l.LeaseDeadline = time.Now().Add(118 * time.Second)
+	l.LeaseDeadline = time.Now().Add(298 * time.Second)
 	l.SettlementDeadline = l.LeaseDeadline
 	return l
 }
@@ -207,10 +221,13 @@ func TestValidateWebLease(t *testing.T) {
 		"header value long": func(l *coordinator.Lease) {
 			*l = webLease(t, func(p *webPlan) { p.Headers[0].Value = strings.Repeat("a", 513) })
 		},
-		"max_redirects 6":      func(l *coordinator.Lease) { *l = webLease(t, func(p *webPlan) { p.MaxRedirects = 6 }) },
-		"max_redirects -1":     func(l *coordinator.Lease) { *l = webLease(t, func(p *webPlan) { p.MaxRedirects = -1 }) },
-		"response bytes 0":     func(l *coordinator.Lease) { *l = webLease(t, func(p *webPlan) { p.MaxResponseBytes = 0 }) },
-		"response bytes large": func(l *coordinator.Lease) { *l = webLease(t, func(p *webPlan) { p.MaxResponseBytes = 10<<20 + 1 }) },
+		"max_redirects 6":  func(l *coordinator.Lease) { *l = webLease(t, func(p *webPlan) { p.MaxRedirects = 6 }) },
+		"max_redirects -1": func(l *coordinator.Lease) { *l = webLease(t, func(p *webPlan) { p.MaxRedirects = -1 }) },
+		"response bytes 0": func(l *coordinator.Lease) { *l = webLease(t, func(p *webPlan) { p.MaxResponseBytes = 0 }) },
+		"response bytes large": func(l *coordinator.Lease) {
+			*l = webLease(t, func(p *webPlan) { p.MaxResponseBytes = coordinator.PageMax + 1 })
+		},
+		"response bytes small": func(l *coordinator.Lease) { *l = webLease(t, func(p *webPlan) { p.MaxResponseBytes = 10 << 20 }) },
 		"proof mode":           func(l *coordinator.Lease) { *l = webLease(t, func(p *webPlan) { p.ProofMode = "mpc" }) },
 		"proof policy":         func(l *coordinator.Lease) { *l = webLease(t, func(p *webPlan) { p.ProofPolicy = "x-relay-v1" }) },
 		"payload type":         func(l *coordinator.Lease) { *l = webLease(t, func(p *webPlan) { p.Type = "x.read" }) },
@@ -309,6 +326,7 @@ func staticEgress() *WebEgress { return NewWebEgressWith(nil, nil) }
 
 type webRun struct {
 	code   string
+	report WebReport
 	inputs []webHopInput
 	asked  []string
 }
@@ -319,8 +337,8 @@ func runWeb(t *testing.T, mode string, l coordinator.Lease, c config.Config, ans
 	t.Setenv("SCARLETT_FAKE_PROVER", mode)
 	t.Setenv("SCARLETT_FAKE_WEB_LOG", log)
 	r := &fakeResolver{answers: answers}
-	code := Web{Config: c, Resolver: r.resolve, Egress: staticEgress()}.Run(context.Background(), l)
-	run := webRun{code: code, asked: r.asked}
+	report := Web{Config: c, Resolver: r.resolve, Egress: staticEgress(), busyWait: func(int) time.Duration { return 10 * time.Millisecond }}.Report(context.Background(), l)
+	run := webRun{code: report.Code, report: report, asked: r.asked}
 	raw, err := os.ReadFile(log)
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
@@ -355,7 +373,7 @@ func TestWebRunHops(t *testing.T) {
 		}
 		in := run.inputs[0]
 		// The checked IPv4 address, never a hostname-only dial.
-		if in.IP != "93.184.215.14" || in.Port != 443 || in.URL != "https://example.com/" || in.Hop != 0 || in.Proxy != nil || !bytes.Equal(in.Payload, webFixtureLease(t).WebPayload) || in.Token != strings.Repeat("ab", 32) || in.TimeoutMS != 30000 {
+		if in.IP != "93.184.215.14" || in.Port != 443 || in.URL != "https://example.com/" || in.Hop != 0 || in.Proxy != nil || !bytes.Equal(in.Payload, webFixtureLease(t).WebPayload) || in.Token != strings.Repeat("ab", 32) || in.TimeoutMS != 280000 {
 			t.Fatalf("unexpected hop input %+v", in)
 		}
 	})
@@ -556,5 +574,64 @@ func TestParseWebSummaryStatusRange(t *testing.T) {
 		if (err == nil) != tc.ok || tc.ok && !out.final {
 			t.Fatalf("status %s: %+v %v", tc.status, out, err)
 		}
+	}
+}
+
+// A verifier at its web session limit answers verifier_busy: the hop is
+// repeated after 1, 2, 4 and then every 5 seconds while a second of its
+// budget would remain, and never reported as a job code.
+func TestWebRunRetriesABusyVerifier(t *testing.T) {
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	run := runWeb(t, "web-busy", webFixtureLease(t), webConfig(), publicAnswers)
+	if run.code != "" || len(run.inputs) != 3 {
+		t.Fatal("busy verifier not retried", run.code, len(run.inputs))
+	}
+	for i, in := range run.inputs {
+		if in.Hop != 0 || in.URL != "https://example.com/" || in.TimeoutMS > 280000 {
+			t.Fatalf("retry %d input %+v", i, in)
+		}
+	}
+	// Busy for the whole budget: the hop fails as a fetch failure once less
+	// than a second would remain after the next wait.
+	l := webFixtureLease(t)
+	l.LeaseDeadline = time.Now().Add(webReportMargin + 2*time.Second)
+	l.SettlementDeadline = l.LeaseDeadline
+	log := filepath.Join(t.TempDir(), "relay-web.log")
+	t.Setenv("SCARLETT_FAKE_PROVER", "web-busy-always")
+	t.Setenv("SCARLETT_FAKE_WEB_LOG", log)
+	started := time.Now()
+	w := Web{Config: webConfig(), Resolver: (&fakeResolver{answers: publicAnswers}).resolve, Egress: staticEgress(), busyWait: func(int) time.Duration { return 300 * time.Millisecond }}
+	if code := w.Run(context.Background(), l); code != "web_fetch_failed" || time.Since(started) > 3*time.Second {
+		t.Fatal("always busy", code, time.Since(started))
+	}
+	raw, _ := os.ReadFile(log)
+	if tries := bytes.Count(raw, []byte("\n")); tries < 2 || tries > 5 {
+		t.Fatal("tries", tries)
+	}
+	got := []time.Duration{}
+	for try := range 6 {
+		got = append(got, webBusyBackoff[min(try, len(webBusyBackoff)-1)])
+	}
+	if fmt.Sprint(got) != "[1s 2s 4s 5s 5s 5s]" {
+		t.Fatal("backoff", got)
+	}
+}
+
+// A first hop over the page ceiling fails as page_too_large at the wire
+// stage, at least one byte over (the coordinator reads the verifier's own
+// count); a later hop over it leaves the job proven, as any later failure.
+func TestWebRunPageTooLarge(t *testing.T) {
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	run := runWeb(t, "web-too-large", webFixtureLease(t), webConfig(), publicAnswers)
+	if run.report != (WebReport{Code: "page_too_large", Stage: "wire", ObservedBytes: coordinator.PageMax + 1}) || len(run.inputs) != 1 {
+		t.Fatalf("%+v", run.report)
+	}
+	if run = runWeb(t, "web-later-too-large", webFixtureLease(t), webConfig(), publicAnswers); run.report != (WebReport{}) || len(run.inputs) != 2 {
+		t.Fatalf("later hop: %+v", run.report)
+	}
+	if maxWebResponseBytes != 67108864 || webHopLimit != 280*time.Second {
+		t.Fatal("limits")
 	}
 }
