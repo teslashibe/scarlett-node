@@ -21,7 +21,7 @@ func TestStateRoundTripsAndRefusesUnknownFields(t *testing.T) {
 		t.Fatal("missing state is not a fresh one")
 	}
 	_, err = f.Update(func(s *State) error {
-		s.Pending = &Pending{Phase: PhaseStaged, From: "0.1.13", To: "0.1.14", Kind: "mac-app", Staged: "/tmp/x/Scarlett Node.app", App: "/Applications/Scarlett Node.app", DrainOwner: "none", StartedAt: time.Now().UTC()}
+		s.Pending = &Pending{Phase: PhaseStaged, From: "0.1.13", To: "0.1.14", Kind: "mac-app", Staged: "/tmp/x/Scarlett Node.app", App: "/Applications/Scarlett Node.app", DrainOwner: "none", StartedAt: time.Now().Unix()}
 		s.MarkFailed("0.1.12")
 		s.MarkFailed("0.1.12")
 		return nil
@@ -37,9 +37,9 @@ func TestStateRoundTripsAndRefusesUnknownFields(t *testing.T) {
 		`{"schema":2}`,
 		`{"schema":1,"token":"x"}`,
 		`{"schema":1,"installed":"latest"}`,
-		`{"schema":1,"pending":{"phase":"exploded","from":"0.1.1","to":"0.1.2","kind":"mac-app","drain_owner":"none","started_at":"2026-10-08T00:00:00Z"}}`,
-		`{"schema":1,"pending":{"phase":"staged","from":"0.1.1","to":"0.1.2","kind":"mac-app","staged":"relative/path","drain_owner":"none","started_at":"2026-10-08T00:00:00Z"}}`,
-		`{"schema":1,"pending":{"phase":"staged","from":"0.1.1","to":"0.1.2","kind":"mac-app","drain_owner":"none","reason":"Bad Reason","started_at":"2026-10-08T00:00:00Z"}}`,
+		`{"schema":1,"pending":{"phase":"exploded","from":"0.1.1","to":"0.1.2","kind":"mac-app","drain_owner":"none","started_at":1791480419}}`,
+		`{"schema":1,"pending":{"phase":"staged","from":"0.1.1","to":"0.1.2","kind":"mac-app","staged":"relative/path","drain_owner":"none","started_at":1791480419}}`,
+		`{"schema":1,"pending":{"phase":"staged","from":"0.1.1","to":"0.1.2","kind":"mac-app","drain_owner":"none","reason":"Bad Reason","started_at":1791480419}}`,
 		`{"schema":1}{}`,
 	} {
 		if _, err := DecodeState([]byte(bad)); err == nil {
@@ -67,5 +67,19 @@ func TestRolloutOffsetIsStableAndInsideTheWindow(t *testing.T) {
 	}
 	if len(spread) < 4 {
 		t.Fatal("nodes are not spread across the window")
+	}
+}
+
+// The desktop shell (updater.rs) round-trips this exact document; both sides
+// must accept it.
+func TestStateMatchesTheDesktopShellSchema(t *testing.T) {
+	raw := `{"schema":1,"installed":"0.1.13","high_water":"0.1.13","announced":"0.1.13","snooze":{"version":"0.1.14","until":1791480419},"first_seen":{"version":"0.1.14","at":1791480000},"postponed":2,"failed":["0.1.12"],"pending":{"phase":"staged","from":"0.1.13","to":"0.1.14","kind":"mac-app","staged":"/x/Scarlett Node.app","app":"/Applications/Scarlett Node.app","drain_owner":"none","resume_serving":true,"app_pid":42,"started_at":1791480419}}`
+	s, err := DecodeState([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := json.Marshal(s)
+	if string(out) != raw {
+		t.Fatalf("round trip changed the document:\n%s", out)
 	}
 }

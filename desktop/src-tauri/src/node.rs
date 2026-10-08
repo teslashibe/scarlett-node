@@ -775,7 +775,7 @@ impl Node {
         private_dir_with_helper(&self.state, &self.binary)?;
         Ok(())
     }
-    fn command(&self, args: &[&str]) -> Result<Command> {
+    pub(crate) fn command(&self, args: &[&str]) -> Result<Command> {
         self.prepare()?;
         if !regular(&self.binary) {
             return Err(Error::RuntimeUnavailable);
@@ -851,7 +851,38 @@ impl Node {
         if let Some(ca) = &self.endpoints.coordinator_ca {
             cmd.env("SCARLETT_COORDINATOR_CA_FILE", ca);
         }
+        // Updater rehearsals: honoured only by debug apps, and only by a node
+        // built with the rehearsal tag (never a release).
+        if cfg!(debug_assertions) {
+            for name in ["SCARLETT_SIGNING_REHEARSAL", "SCARLETT_UPDATER_REHEARSAL_TRUST"] {
+                if let Some(value) = std::env::var_os(name) {
+                    cmd.env(name, value);
+                }
+            }
+        }
         Ok(cmd)
+    }
+    /// One bounded helper call for the updater.
+    pub(crate) async fn helper_call(
+        &self,
+        args: &[&str],
+        input: Option<Vec<u8>>,
+        seconds: u64,
+        limit: usize,
+    ) -> Result<Vec<u8>> {
+        self.call_bounded(args, input, seconds, limit).await
+    }
+    /// The bundled node binary, which the updater copies to run its guard.
+    pub(crate) fn binary(&self) -> &Path {
+        &self.binary
+    }
+    /// A provider login is in progress; an update waits for it.
+    pub(crate) async fn login_in_progress(&self) -> bool {
+        self.login.lock().await.is_some() || self.x_login.lock().await.is_some()
+    }
+    /// Whether the operator's pause (the node's drain marker) is set.
+    pub(crate) fn drain_marker(&self) -> bool {
+        regular(&self.state.join("drain"))
     }
     async fn call(&self, args: &[&str], input: Option<Vec<u8>>, seconds: u64) -> Result<Vec<u8>> {
         self.call_bounded(args, input, seconds, OUTPUT_LIMIT).await

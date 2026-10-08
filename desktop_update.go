@@ -221,7 +221,7 @@ func stageDesktop(ctx context.Context, dir string, state update.StateFile, mode 
 		return stageEvent{}, err
 	}
 	emit(stageEvent{Phase: "verifying", Version: target.Version})
-	pending := &update.Pending{Phase: update.PhaseStaged, From: coordinator.NodeRelease, To: target.Version, App: app, DrainOwner: "none", StartedAt: time.Now().UTC()}
+	pending := &update.Pending{Phase: update.PhaseStaged, From: coordinator.NodeRelease, To: target.Version, App: app, DrainOwner: "none", StartedAt: time.Now().Unix()}
 	switch runtime.GOOS {
 	case "darwin":
 		pending.Kind = "mac-app"

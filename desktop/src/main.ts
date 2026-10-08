@@ -4,6 +4,7 @@ import { layout, revealControl } from "./layout.ts";
 import { api } from "./api.ts";
 import { scheduleXLoginExpiry } from "./x-login-expiry.ts";
 import { accountRemovalConfirmation } from "./account-removal.ts";
+import { failureNotice, updatedBanner, updateSummary, updateToast, validVersion, type UpdateAction, type UpdateStatus } from "./update.ts";
 import { availableXSlots, diagnosticsNote, localCapacity, renderDiagnostics, xDiagnostics, type Diagnostics } from "./diagnostics.ts";
 import {
   accountHealth,
@@ -17,7 +18,6 @@ import {
   externalRuntime,
   drainingAccounts,
   journalNote,
-  updateNotice,
   needsXReimport,
   relayState,
   statusPredates,
@@ -25,6 +25,7 @@ import {
   xLoginMessage,
   type XLoginStatus,
   type Account,
+  type Preferences,
   type ClaudeStatus,
   type Snapshot,
 } from "./model.ts";
@@ -54,6 +55,11 @@ let mutationEpoch = 0;
 let claudePolling = false;
 let browserProfilesAvailable = false;
 let preferencesAvailable = false;
+// The saved settings the form does not edit (update mode, resume on launch).
+let savedPreferences: Preferences | undefined;
+let updateStatus: UpdateStatus | undefined;
+let updatePolling = false;
+let acknowledged = false;
 let autostartAvailable = false;
 // The X account being re-imported through the form below, if any, and the
 // form values it replaced.
@@ -255,6 +261,7 @@ async function refresh(afterMutation = false) {
   // Model connection controls are hidden in the X-only desktop UI.
   if (!$("local-api-panel").closest<HTMLElement>("section")!.hidden) void refreshClaude();
   void refreshDiagnostics();
+  void refreshUpdate();
   if (polling) {
     if (!afterMutation) return;
     await polling;
@@ -265,6 +272,11 @@ async function refresh(afterMutation = false) {
       const status = await api.status();
       // A poll begun before a mutation must not restore the old registry rows.
       if (epoch === mutationEpoch) render(status);
+      // The first full render tells the updater this version's window works.
+      if (!acknowledged) {
+        acknowledged = true;
+        void api.updateAck().catch(() => undefined);
+      }
     } catch (e) {
       if (epoch === mutationEpoch) notice(errorMessage(e), true);
     }
@@ -316,26 +328,138 @@ async function act(fn: () => Promise<void>, success: string) {
     await refresh(true);
   }
 }
-// "Later" hides an available update until a newer one appears. A required
-// update cannot be dismissed: the node gets no new jobs until it is installed.
+// "Later" hides an available update (for 24 hours, saved natively). A
+// required update cannot be dismissed: the node gets no new jobs until it is
+// installed. All update text is inserted with textContent.
 let dismissedUpdate = "";
+let toastVersion: string | undefined;
 function renderUpdate(s: Snapshot) {
-  const update = updateNotice(s);
-  const toast = $("update-toast");
-  toast.hidden = !update || (update.level === "available" && dismissedUpdate === update.latest);
-  if (!update) return;
-  setText($("update-text"), update.text);
-  toast.className = update.level === "required" ? "update-toast danger" : "update-toast";
-  toast.setAttribute("role", update.level === "required" ? "alert" : "status");
-  $("update-dismiss").hidden = update.level === "required";
+  const toast = updateToast(updateStatus, s, dismissedUpdate);
+  const element = $("update-toast");
+  element.hidden = !toast;
+  if (toast) {
+    toastVersion = toast.version;
+    setText($("update-text"), toast.title);
+    setText($("update-detail"), toast.detail);
+    $("update-detail").hidden = !toast.detail;
+    const list = document.createElement("ul");
+    for (const highlight of toast.highlights) {
+      const item = document.createElement("li");
+      item.textContent = highlight;
+      list.append(item);
+    }
+    if (list.innerHTML !== $("update-highlights").innerHTML) $("update-highlights").replaceChildren(...list.childNodes);
+    const actions = toast.buttons.map((b) => `${b.action}:${b.label}`).join("|");
+    if ($("update-actions").dataset.actions !== actions) {
+      $("update-actions").dataset.actions = actions;
+      $("update-actions").replaceChildren(...toast.buttons.map((b, i) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = b.label;
+        if (i > 0) button.className = "quiet";
+        button.addEventListener("click", () => updateAction(b.action));
+        return button;
+      }));
+    }
+    element.className = toast.level === "required" ? "update-toast danger" : "update-toast";
+    element.setAttribute("role", toast.level === "required" ? "alert" : "status");
+  }
+  const banner = updatedBanner(updateStatus);
+  $("updated-banner").hidden = !banner;
+  if (banner) {
+    setText($("updated-title"), banner.title);
+    const list = document.createElement("ul");
+    for (const highlight of banner.highlights) {
+      const item = document.createElement("li");
+      item.textContent = highlight;
+      list.append(item);
+    }
+    if (list.innerHTML !== $("updated-highlights").innerHTML) $("updated-highlights").replaceChildren(...list.childNodes);
+    $("updated-automatic").hidden = !banner.offerAutomatic;
+  }
+  const failure = failureNotice(updateStatus);
+  $("update-failure").hidden = !failure;
+  if (failure) {
+    setText($("failure-title"), failure.title);
+    setText($("failure-detail"), failure.detail);
+  }
+  setText($("update-summary"), updateSummary(updateStatus));
+  for (const id of ["update-mode-notify", "update-mode-automatic"]) {
+    const input = $<HTMLInputElement>(id);
+    input.disabled = busy || !updateStatus;
+    if (updateStatus) input.checked = input.value === updateStatus.mode;
+  }
+  $("update-check").toggleAttribute("disabled", busy || !updateStatus || ["downloading", "verifying", "draining", "installing"].includes(updateStatus.phase));
 }
-$("update-download").addEventListener("click", () => {
+function updateAction(action: UpdateAction) {
+  const version = toastVersion;
+  switch (action) {
+    case "install":
+      void act(() => api.updateInstall(), "Downloading and checking the update. Accepted jobs finish before it installs");
+      break;
+    case "retry":
+      void act(() => api.updateInstall(), "Trying the update again");
+      break;
+    case "download":
+      void act(() => api.open("update"), "Opened the download page in your browser");
+      break;
+    case "notes":
+      void act(() => api.open("changelog", validVersion(version) ? version : undefined), "Opened the changelog in your browser");
+      break;
+    case "cancel":
+      void act(() => api.updateCancel(), "Update cancelled");
+      break;
+    case "later":
+      dismissedUpdate = version ?? "";
+      $("update-toast").hidden = true;
+      if (updateStatus) void api.updateLater().catch(() => undefined).finally(() => void refreshUpdate());
+      break;
+  }
+}
+// Update status polls on its own, like diagnostics, and also arrives as an
+// event whenever it changes.
+async function refreshUpdate() {
+  if (updatePolling) return;
+  updatePolling = true;
+  try { updateStatus = await api.updateStatus(); }
+  catch { /* an older shell without the updater keeps the download link */ }
+  finally { updatePolling = false; }
+  if (snapshot) render(snapshot);
+}
+$("updated-notes").addEventListener("click", () => {
+  const version = updateStatus?.updated?.version;
+  void act(() => api.open("changelog", validVersion(version) ? version : undefined), "Opened the changelog in your browser");
+});
+$("updated-automatic").addEventListener("click", () => {
+  void act(async () => {
+    await api.setUpdateMode("automatic");
+    await api.updateDismiss("updated");
+  }, "Automatic updates are on. Scarlett installs new versions when accepted jobs finish");
+});
+$("updated-dismiss").addEventListener("click", () => {
+  $("updated-banner").hidden = true;
+  void api.updateDismiss("updated").catch(() => undefined).finally(() => void refreshUpdate());
+});
+$("failure-download").addEventListener("click", () => {
   void act(() => api.open("update"), "Opened the download page in your browser");
 });
-$("update-dismiss").addEventListener("click", () => {
-  dismissedUpdate = snapshot ? (updateNotice(snapshot)?.latest ?? "") : "";
-  $("update-toast").hidden = true;
+$("failure-dismiss").addEventListener("click", () => {
+  $("update-failure").hidden = true;
+  void api.updateDismiss("failure").catch(() => undefined).finally(() => void refreshUpdate());
 });
+$("update-check").addEventListener("click", () => {
+  void act(() => api.updateCheck(), "Checking for updates");
+});
+$("update-changelog").addEventListener("click", () => {
+  void act(() => api.open("changelog"), "Opened the changelog in your browser");
+});
+for (const id of ["update-mode-notify", "update-mode-automatic"])
+  $(id).addEventListener("change", () => {
+    const mode = $<HTMLInputElement>(id).value as "notify" | "automatic";
+    void act(() => api.setUpdateMode(mode), mode === "automatic"
+      ? "Automatic updates are on. Scarlett installs new versions when accepted jobs finish"
+      : "Scarlett will tell you when an update is available");
+  });
 for (const id of ["setup", "dashboard", "settings"] as const)
   $(id).addEventListener("click", () => {
     void act(() => api.open(id), "Opened in your browser");
@@ -453,6 +577,7 @@ window.addEventListener("pagehide", () => {
 });
 async function loadPreferences() {
   const settings = await api.preferences();
+  savedPreferences = settings;
   $<HTMLInputElement>("api-port").value = String(settings.local_api_port);
   $<HTMLInputElement>("saved-api-port").value = String(settings.local_api_port);
   $<HTMLInputElement>("background").checked = settings.background;
@@ -472,7 +597,9 @@ $("preferences-form").addEventListener("submit", event => {
   if (!Number.isInteger(port) || port < 1024 || port > 65535) { notice("Choose a local port between 1024 and 65535", true); return; }
   if (!Number.isInteger(xConcurrency) || xConcurrency < 1 || xConcurrency > 8) { notice("Choose an X job limit between 1 and 8", true); return; }
   void act(async () => {
-    await api.savePreferences({schema: 1, local_api_port: port, background, x_concurrency: xConcurrency});
+    const current = await api.preferences().catch(() => savedPreferences);
+    await api.savePreferences({schema: 1, local_api_port: port, background, x_concurrency: xConcurrency,
+      updates: current?.updates ?? "notify", resume_serving: current?.resume_serving ?? false});
     if (!snapshot?.local_api?.running) $<HTMLInputElement>("api-port").value = String(port);
   }, background
     ? "Preferences saved. Closing the window keeps Scarlett running"
@@ -494,6 +621,17 @@ setInterval(() => {
   if (!busy) void refresh();
 }, 3000);
 
+void listen<UpdateStatus>("update-status", (event) => {
+  updateStatus = event.payload;
+  if (snapshot) render(snapshot);
+});
+void listen<string>("autostart-error", (event) =>
+  notice("Scarlett could not start the node again. " + errorMessage(event.payload), true),
+);
+// A scheduled automatic install counts down each second.
+setInterval(() => {
+  if (snapshot && updateStatus?.phase === "scheduled") renderUpdate(snapshot);
+}, 1000);
 void listen<string>("shutdown-error", (event) =>
   notice(
     "Scarlett could not stop safely. " + errorMessage(event.payload),

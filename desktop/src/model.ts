@@ -1,4 +1,4 @@
-export type Preferences = { schema: 1; local_api_port: number; background: boolean; x_concurrency: number };
+export type Preferences = { schema: 1; local_api_port: number; background: boolean; x_concurrency: number; updates: "notify" | "automatic"; resume_serving: boolean };
 export type Account = {
   id: string;
   service: "codex" | "x_read";

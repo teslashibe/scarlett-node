@@ -133,8 +133,18 @@ input.locked { color: var(--faint); border-color: var(--border); }
 .relay-banner.danger p { color: #dcb5ad; }
 .update-toast { position: fixed; right: 20px; bottom: 20px; z-index: 20; max-width: 420px; display: flex; flex-direction: column; gap: 12px; padding: 16px 18px; border: 1px solid #665126; background: #19150f; border-radius: 10px; box-shadow: 0 10px 30px rgba(0, 0, 0, .45); }
 .update-toast p { color: #f3dec1; font-size: 13px; line-height: 1.45; }
+.update-toast .update-title { font-weight: 600; }
+.update-toast .update-detail { margin-top: 4px; color: #c9bba3; font-size: 12px; }
 .update-toast.danger { border-color: #71372f; background: #1d1210; }
 .update-toast.danger p { color: #ffc4ba; }
+.update-toast.danger .update-detail { color: #dcb5ad; }
+.update-highlights { margin: 8px 0 0; padding-left: 18px; color: var(--body); font-size: 12px; line-height: 1.55; }
+.update-highlights:empty { display: none; }
+.updated-banner { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 14px 18px; border: 1px solid var(--border-strong); background: var(--surface); border-radius: 10px; }
+.updated-banner h2 { font-size: 14px; color: var(--text); }
+.updated-banner .actions { margin-top: 10px; }
+button.dismiss { padding: 4px 8px; border-color: transparent; color: var(--muted); font-weight: 400; }
+.subsection h3 { font-size: 13px; color: var(--text); margin-bottom: 4px; }
 .reimport { padding: 12px 14px; margin: 0 0 16px; border: 1px solid #665126; background: #211b10; border-radius: 8px; }
 .reimport strong { font-size: 13px; color: #f3dec1; }
 .reimport p { margin: 6px 0 10px; color: #c9bba3; font-size: 12px; }

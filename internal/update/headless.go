@@ -201,7 +201,7 @@ func (h *Headless) Apply(ctx context.Context, opts ApplyOptions) error {
 	}
 	previous := h.Layout.Current
 	if _, err = h.State.Update(func(s *State) error {
-		s.Pending = &Pending{Phase: PhaseHandoff, From: h.Running, To: target.Version, Kind: "headless", Staged: bundle, App: h.Layout.Root, Previous: previous, DrainOwner: owner, StartedAt: h.Now().UTC()}
+		s.Pending = &Pending{Phase: PhaseHandoff, From: h.Running, To: target.Version, Kind: "headless", Staged: bundle, App: h.Layout.Root, Previous: previous, DrainOwner: owner, StartedAt: h.Now().Unix()}
 		return nil
 	}); err != nil {
 		return err
@@ -235,14 +235,14 @@ func (h *Headless) due(version string) (time.Time, error) {
 	}
 	s, err := h.State.Update(func(s *State) error {
 		if s.FirstSeen == nil || s.FirstSeen.Version != version {
-			s.FirstSeen = &Seen{Version: version, At: h.Now().UTC()}
+			s.FirstSeen = &Seen{Version: version, At: h.Now().Unix()}
 		}
 		return nil
 	})
 	if err != nil {
 		return time.Time{}, err
 	}
-	return s.FirstSeen.At.Add(RolloutOffset(nodeID, version)), nil
+	return time.Unix(s.FirstSeen.At, 0).Add(RolloutOffset(nodeID, version)), nil
 }
 
 func (h *Headless) finish(owner, phase, reason, version string, failed bool) error {

@@ -29,7 +29,7 @@ func newGuardFixture(t *testing.T, phaseAfterLaunch string) *guardFixture {
 	}
 	f := &guardFixture{state: StateFile{Path: filepath.Join(dir, "update-state.json")}}
 	if err := f.state.Write(State{Schema: 1, Installed: "0.1.13", HighWater: "0.1.13", Pending: &Pending{Phase: PhaseHandoff, From: "0.1.13", To: "0.1.14", Kind: "mac-app",
-		Staged: "/tmp/stage/Scarlett Node.app", App: "/Applications/Scarlett Node.app", DrainOwner: "updater", ResumeServing: true, AppPID: 4242, StartedAt: time.Now().UTC()}}); err != nil {
+		Staged: "/tmp/stage/Scarlett Node.app", App: "/Applications/Scarlett Node.app", DrainOwner: "updater", ResumeServing: true, AppPID: 4242, StartedAt: time.Now().Unix()}}); err != nil {
 		t.Fatal(err)
 	}
 	g := NewGuard(f.state, filepath.Join(dir, "updates"))

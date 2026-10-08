@@ -3,6 +3,7 @@ import { mockIPC } from "@tauri-apps/api/mocks";
 import type { InvokeArgs } from "@tauri-apps/api/core";
 import type { Account, ClaudeStatus, Preferences, Snapshot, XLoginStatus } from "../src/model.ts";
 import type { Diagnostics } from "../src/diagnostics.ts";
+import type { UpdateStatus } from "../src/update.ts";
 
 // This page is served by Vite for visual checks and is not a production entry.
 // Every native command and event stays inside this synthetic fixture.
@@ -10,12 +11,13 @@ if (!import.meta.env.DEV || !["127.0.0.1", "localhost", "[::1]"].includes(locati
   throw new Error("The synthetic Node preview requires a local Vite development server");
 }
 
-const scenarios = ["ready", "unpaired", "relay-halted", "auth-required", "pending-login", "running-local-api"] as const;
+const scenarios = ["ready", "unpaired", "relay-halted", "auth-required", "pending-login", "running-local-api",
+  "available", "required", "downloading", "draining", "updated", "rolled-back"] as const;
 type Scenario = typeof scenarios[number];
 const requested = new URLSearchParams(location.search).get("scenario");
 const scenario: Scenario = scenarios.includes(requested as Scenario) ? requested as Scenario : "ready";
 const at = (secondsAgo = 0) => new Date(Date.now() - secondsAgo * 1000).toISOString();
-let preferences: Preferences = { schema: 1, local_api_port: 8088, background: true, x_concurrency: 2 };
+let preferences: Preferences = { schema: 1, local_api_port: 8088, background: true, x_concurrency: 2, updates: "notify", resume_serving: true };
 let autostart = false;
 let claude: ClaudeStatus = { available: true, connected: false, pending: false };
 let challenge: XLoginStatus | undefined;
@@ -78,6 +80,30 @@ if (scenario === "running-local-api") {
   claude.connected = true;
 }
 
+const previewNotes = { title: "Faster X proofs", date: "2026-10-12", highlights: [
+  "Relay proofs finish about a second sooner on busy nodes",
+  "Paused nodes show how many accepted jobs are still finishing",
+  "The changelog link opens the release's own entry",
+] };
+const update: UpdateStatus = { version: "0.1.13", mode: "notify", phase: "idle", required: false, can_install: true, snoozed: false, stale: false, checked_at: Date.now() - 60_000 };
+if (scenario === "available") Object.assign(update, { phase: "available", latest: "0.1.14", notes: previewNotes });
+if (scenario === "required") {
+  Object.assign(update, { phase: "available", latest: "0.1.14", notes: previewNotes, required: true });
+  Object.assign(observation, { latest_release: "0.1.14", update_available: true, update_required: true });
+}
+if (scenario === "downloading") Object.assign(update, { phase: "downloading", latest: "0.1.14", notes: previewNotes, progress: 45 });
+if (scenario === "draining") {
+  Object.assign(update, { phase: "draining", latest: "0.1.14", notes: previewNotes, in_flight: 2 });
+  observation.drain_requested = true;
+  observation.in_flight = 2;
+}
+if (scenario === "updated") update.updated = { version: "0.1.13", notes: { title: "Automatic updates", date: "2026-10-09", highlights: [
+  "Turn on Install updates automatically and Scarlett installs new versions when accepted jobs finish",
+  "The node starts again when Scarlett opens if it was running when it closed",
+  "Updates downloaded by the app no longer need approving again on Mac or Windows",
+] }, offer_automatic: true };
+if (scenario === "rolled-back") update.failure = { version: "0.1.14", reason: "node_exited", rolled_back: true };
+
 const diagnostics: Diagnostics = {
   available: true,
   snapshot: {
@@ -139,6 +165,14 @@ mockIPC((command, payload) => {
     case "desktop_diagnostics": return structuredClone(diagnostics);
     case "claude_status": return structuredClone(claude);
     case "open_network": case "quit_desktop": return null;
+    case "update_status": update.mode = preferences.updates; return structuredClone(update);
+    case "update_check": update.checked_at = Date.now(); return null;
+    case "update_install": Object.assign(update, { phase: "downloading", progress: 0 }); return null;
+    case "update_cancel": Object.assign(update, { phase: "available", progress: null, in_flight: null }); return null;
+    case "update_later": update.snoozed = !update.required; return null;
+    case "update_ack": return null;
+    case "update_dismiss": if (text(data, "notice") === "updated") update.updated = null; else update.failure = null; return null;
+    case "set_update_mode": preferences.updates = text(data, "mode") === "automatic" ? "automatic" : "notify"; return null;
     case "pair_node": if (!text(data, "code")) throw "invalid_input"; snapshot.paired = true; return null;
     case "control_node": {
       const action = text(data, "action");

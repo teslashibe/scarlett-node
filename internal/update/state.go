@@ -48,23 +48,23 @@ type Pending struct {
 	// DrainOwner is updater when the updater paused new work and must resume
 	// it, operator when the operator had already paused, else none.
 	DrainOwner    string    `json:"drain_owner"`
-	ResumeServing bool      `json:"resume_serving"`
-	AppPID        int       `json:"app_pid,omitempty"`
-	GuardPID      int       `json:"guard_pid,omitempty"`
-	StartedAt     time.Time `json:"started_at"`
-	Reason        string    `json:"reason,omitempty"`
+	ResumeServing bool   `json:"resume_serving"`
+	AppPID        int    `json:"app_pid,omitempty"`
+	GuardPID      int    `json:"guard_pid,omitempty"`
+	StartedAt     int64  `json:"started_at"` // Unix seconds
+	Reason        string `json:"reason,omitempty"`
 }
 
 // Snooze hides an optional update until a time.
 type Snooze struct {
-	Version string    `json:"version"`
-	Until   time.Time `json:"until"`
+	Version string `json:"version"`
+	Until   int64  `json:"until"` // Unix seconds
 }
 
 // Seen records when this device first saw a release, for the staged rollout.
 type Seen struct {
-	Version string    `json:"version"`
-	At      time.Time `json:"at"`
+	Version string `json:"version"`
+	At      int64  `json:"at"` // Unix seconds
 }
 
 // State is the private update-state.json.
