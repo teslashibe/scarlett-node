@@ -323,8 +323,10 @@ document.addEventListener('click', async () => {
 		t.Fatalf("a gesture-gated API was granted: %+v", act)
 	}
 	// What a cancelled chooser returns: NotFoundError, an empty HID list,
-	// NotAllowedError for screen capture.
-	if act.Bluetooth != "refused NotFoundError" || act.HID != "resolved 0" || act.USB != "refused NotFoundError" ||
+	// NotAllowedError for screen capture. Linux Chrome ships Web Bluetooth
+	// disabled, so there requestDevice rejects at once with TypeError.
+	bluetoothOK := act.Bluetooth == "refused NotFoundError" || (runtime.GOOS == "linux" && act.Bluetooth == "refused TypeError")
+	if !bluetoothOK || act.HID != "resolved 0" || act.USB != "refused NotFoundError" ||
 		act.Serial != "refused NotFoundError" || act.Display != "refused NotAllowedError" {
 		t.Fatalf("a device chooser or screen capture did not fail at once: %+v", act)
 	}
