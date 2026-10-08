@@ -1,0 +1,16 @@
+[Unit]
+Description=Scarlett node update check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/scarlett-node/node.env
+# Installs only with SCARLETT_AUTO_UPDATE=install in node.env; otherwise it
+# logs what is available. Accepted jobs always finish before an install.
+ExecStart=%h/.local/bin/scarlett-node update --auto
+UMask=0077
+NoNewPrivileges=true
+# Draining waits up to 30 minutes for accepted jobs, then the download,
+# install and health check.
+TimeoutStartSec=50min

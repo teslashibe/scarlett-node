@@ -505,12 +505,28 @@ def main(argv=None):
         build.add_argument('--headless-' + platform, type=Path)
     build.add_argument('--signatures', type=Path)
     build.add_argument('--output', required=True, type=Path)
+    check = commands.add_parser('verify-signatures', help='check updater signatures over downloaded release inputs')
+    check.add_argument('--version', required=True)
+    check.add_argument('--inputs', required=True, type=Path)
+    check.add_argument('--signatures', required=True, type=Path)
     history = commands.add_parser('changelog', help='write the cumulative changelog.json for a version')
     history.add_argument('--version', required=True)
     history.add_argument('--output', required=True, type=Path)
     args = parser.parse_args(argv)
     if args.command == 'check-version':
         print('Release version %s matches the reviewed desktop version and has release notes' % check_version(args.version))
+        return
+    if args.command == 'verify-signatures':
+        check_version(args.version)
+        files = {}
+        for platform in PLATFORMS:
+            installer, _, _ = platform_inputs(args.inputs / ('signed-' + platform), platform)
+            files[installer_name(args.version, platform)] = installer
+        for platform in HEADLESS_PLATFORMS:
+            item = headless_input(args.inputs / ('headless-' + platform), args.version, platform)
+            files[item['filename']] = item['path']
+        key_id, _ = verify_signatures(args.signatures, args.version, files, signing_identities.load())
+        print('Updater signatures for %d files verified with pinned key %s' % (len(files), key_id))
         return
     if args.command == 'changelog':
         if args.output.exists():

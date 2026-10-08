@@ -7,6 +7,13 @@
 # while the signing step runs, and are removed by an always() cleanup. Nothing
 # here adds a trust root, uses a cache or publishes: the assembled release is an
 # artifact for the owner to review before the download publisher runs.
+#
+# The same run builds the headless bundles (Mac legs of sign, and
+# headless_linux) and, in updater_sign, signs all six files for the in-app
+# updater with the minisign key (`tauri signer sign --app-version`). That key
+# reaches one step of one Linux job. Until the release-signing environment has
+# SCARLETT_UPDATER_MINISIGN_KEY, the release is assembled without updater
+# signatures and installed apps offer the download page instead.
 name: desktop release
 on:
   workflow_dispatch:
@@ -203,9 +210,125 @@ jobs:
           name: signed-${{ matrix.platform }}
           path: ${{ runner.temp }}/signed/
           if-no-files-found: error
+      - name: Build and test the headless Mac bundle
+        # The prover and Go builds are warm from the runtime build above.
+        if: runner.os == 'macOS'
+        run: |
+          scripts/package.sh "$RELEASE_VERSION" "$RUNNER_TEMP/headless"
+          scripts/test-install.sh "$RUNNER_TEMP/headless"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: runner.os == 'macOS'
+        with:
+          name: headless-${{ matrix.platform }}
+          path: ${{ runner.temp }}/headless/
+          if-no-files-found: error
+
+  headless_linux:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require the reviewed version on main
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          python3 desktop/scripts/release-manifest.py check-version "$RELEASE_VERSION"
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 26
+          package-manager-cache: false
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.95 --profile minimal
+      - name: Build and test the headless Linux bundle
+        run: |
+          scripts/package.sh "$RELEASE_VERSION" "$RUNNER_TEMP/headless"
+          scripts/test-install.sh "$RUNNER_TEMP/headless"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: headless-linux-amd64
+          path: ${{ runner.temp }}/headless/
+          if-no-files-found: error
+
+  updater_sign:
+    needs: [sign, headless_linux]
+    if: github.ref == 'refs/heads/main'
+    environment: release-signing
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require the reviewed version on main
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          python3 desktop/scripts/release-manifest.py check-version "$RELEASE_VERSION"
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 26
+          package-manager-cache: false
+      - name: Install the pinned Tauri CLI
+        run: npm --prefix desktop ci --ignore-scripts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: '{signed,headless}-*'
+          path: ${{ runner.temp }}/inputs
+
+      # The updater key appears only in this step.
+      - name: Sign the installers and headless bundles for the updater
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.SCARLETT_UPDATER_MINISIGN_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.SCARLETT_UPDATER_MINISIGN_PASSWORD }}
+        run: |
+          mkdir "$RUNNER_TEMP/updater-signatures"
+          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
+            echo '::warning::SCARLETT_UPDATER_MINISIGN_KEY is not set; this release has no updater signatures'
+            exit 0
+          fi
+          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ]]; then
+            echo 'The updater key is set without its password' >&2
+            exit 1
+          fi
+          files=("$RUNNER_TEMP"/inputs/signed-*/*.dmg "$RUNNER_TEMP"/inputs/signed-*/*.exe "$RUNNER_TEMP"/inputs/headless-*/*.tar.gz)
+          if [[ ${#files[@]} -ne 6 ]]; then
+            echo 'Expected three installers and three headless bundles' >&2
+            exit 1
+          fi
+          for file in "${files[@]}"; do
+            case "$file" in
+              *.dmg) name="Scarlett-Node-$RELEASE_VERSION-$(basename "$(dirname "$file")" | sed 's/^signed-//').dmg";;
+              *.exe) name="Scarlett-Node-$RELEASE_VERSION-windows-amd64.exe";;
+              *) name=$(basename "$file");;
+            esac
+            # Sign under the published name: the signature binds it.
+            cp "$file" "$RUNNER_TEMP/updater-signatures/$name"
+            (cd desktop && npx --no-install tauri signer sign --app-version "$RELEASE_VERSION" "$RUNNER_TEMP/updater-signatures/$name" > /dev/null)
+            rm "$RUNNER_TEMP/updater-signatures/$name"
+          done
+      - name: Verify the updater signatures against the pinned keys
+        run: |
+          if compgen -G "$RUNNER_TEMP/updater-signatures/*.sig" > /dev/null; then
+            python3 desktop/scripts/release-manifest.py verify-signatures --version "$RELEASE_VERSION" \
+              --inputs "$RUNNER_TEMP/inputs" --signatures "$RUNNER_TEMP/updater-signatures"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: updater-signatures
+          path: ${{ runner.temp }}/updater-signatures/
+          if-no-files-found: ignore
 
   assemble:
-    needs: sign
+    needs: [sign, headless_linux, updater_sign]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -221,17 +344,29 @@ jobs:
           python3 desktop/scripts/release-manifest.py check-version "$RELEASE_VERSION"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: signed-*
+          pattern: '{signed,headless}-*'
           path: ${{ runner.temp }}/signed
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: updater-signatures
+          path: ${{ runner.temp }}/updater
       - name: Assemble the release from pinned signing evidence
         run: |
           model_api=$(git ls-remote https://github.com/teslashibe/open-agent-api.git 'refs/tags/v0.1.32^{}' | cut -f1)
+          signatures=()
+          if compgen -G "$RUNNER_TEMP/updater/updater-signatures/*.sig" > /dev/null; then
+            signatures=(--signatures "$RUNNER_TEMP/updater/updater-signatures")
+          fi
           python3 desktop/scripts/release-manifest.py assemble --version "$RELEASE_VERSION" --channel stable \
             --node-commit "$GITHUB_SHA" --model-api-commit "$model_api" \
             --workflow-run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" \
             --darwin-arm64 "$RUNNER_TEMP/signed/signed-darwin-arm64" \
             --darwin-amd64 "$RUNNER_TEMP/signed/signed-darwin-amd64" \
             --windows-amd64 "$RUNNER_TEMP/signed/signed-windows-amd64" \
+            --headless-linux-amd64 "$RUNNER_TEMP/signed/headless-linux-amd64" \
+            --headless-darwin-arm64 "$RUNNER_TEMP/signed/headless-darwin-arm64" \
+            --headless-darwin-amd64 "$RUNNER_TEMP/signed/headless-darwin-amd64" \
+            "${signatures[@]}" \
             --output "$RUNNER_TEMP/scarlett-node-release-$RELEASE_VERSION"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

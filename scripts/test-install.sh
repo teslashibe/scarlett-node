@@ -19,6 +19,12 @@ for archive in "$out"/*.tar.gz; do
   [ -x "$bin/scarlett-node" ] && [ -x "$bin/scarlett-prover" ] || exit 1
   SCARLETT_STATE_DIR="$testdir/node-state" "$bin/scarlett-node" status > "$testdir/status"
   grep '"state":"offline"' "$testdir/status" >/dev/null
+  # The installed binary reports its release for the updater's health check;
+  # outside an install.sh layout the updater refuses to change anything.
+  "$bin/scarlett-node" update version | grep '"release":"' >/dev/null
+  if "$bundle/scarlett-node" update check > "$testdir/update" 2>&1; then echo 'Updater ran outside an installation' >&2; exit 1; fi
+  grep 'install.sh' "$testdir/update" >/dev/null
+  [ -f "$root/current/scarlett-node-update.service" ] && [ -f "$root/current/scarlett-node-update.timer" ] || exit 1
   # The installed web runtime extracts with every hash checked and passes its
   # self-check and driver check here; no browser is downloaded.
   SCARLETT_STATE_DIR="$testdir/node-state" "$bin/scarlett-node" web-runtime check > "$testdir/web-runtime"

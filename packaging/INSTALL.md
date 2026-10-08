@@ -19,4 +19,18 @@ For the default Linux installation, copy `scarlett-node.service` to `~/.config/s
 
 Every setting, readiness state and failure code is described in the operator guide at <https://network.scarlett.ai/docs/>, including running a web node on a cloud server through `SCARLETT_WEB_EGRESS_PROXY`.
 
-Before an upgrade, request drain, wait for zero in-flight work and stop the node. Install the new bundle, then restart using the same state directory. Drain persists; use `scarlett-node resume` when ready. To roll back, rerun the previous version's `install.sh` with the same installation paths. Keep the identity and attempt journal throughout upgrades and rollbacks; unresolved attempts must reconcile with the coordinator before further work. Local status is an observation, not proof acceptance or payment settlement.
+## Updates
+
+`scarlett-node update check` reports the installed and latest release, whether the coordinator still offers this version new jobs, and the release's highlights with a link to the changelog at <https://network.scarlett.ai/changelog/>. `scarlett-node update apply` installs the latest release:
+
+1. It downloads the signed bundle for this platform from `https://network.scarlett.ai/downloads/` (or your `SCARLETT_COORDINATOR` origin; HTTPS only) and checks its length, SHA-256 and minisign signature against the keys built into the node. Nothing runs before all three pass.
+2. If the node is serving, it pauses new work (`drain`) and waits until no accepted job is in flight. It never stops accepted work; after 30 minutes it resumes and gives up.
+3. It runs the new bundle's own `install.sh`, which checks every file again and switches `current` atomically.
+4. It starts the new binary, then restarts `scarlett-node.service` when that user service is active and waits up to three minutes for the node to report running on the new release. If either check fails, it reinstalls the previous version with that version's `install.sh`, restarts it and records the failed version.
+5. It resumes new work if it was the one that paused it.
+
+Pass `--bin DIR` when you installed with a custom bin directory. `scarlett-node update rollback` reinstalls the version that was active before the last update. The updater works only for installations made by this `install.sh`; it refuses anywhere else.
+
+Automatic updates are opt-in. Copy `scarlett-node-update.service` and `scarlett-node-update.timer` to `~/.config/systemd/user/`, run `systemctl --user daemon-reload`, then `systemctl --user enable --now scarlett-node-update.timer`. The timer checks about once an hour. With `SCARLETT_AUTO_UPDATE=install` in `node.env` it installs as above: a required update (one the coordinator no longer gives new jobs) installs at the next check, and an optional one at this node's fixed place in a four-hour rollout window, so the network never drains at once. Without it (the default `notify`), the timer only logs what is available (`journalctl --user -u scarlett-node-update`). On macOS, run `scarlett-node update apply` yourself or from your own supervisor.
+
+To update by hand instead, drain, wait for zero in-flight work and stop the node, run the new bundle's `install.sh`, then restart with the same state directory. Drain persists; use `scarlett-node resume` when ready. To roll back by hand, rerun the previous version's `install.sh` with the same installation paths. Keep the identity and attempt journal throughout upgrades and rollbacks; unresolved attempts must reconcile with the coordinator before further work. Local status is an observation, not proof acceptance or payment settlement.

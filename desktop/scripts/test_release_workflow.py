@@ -14,6 +14,8 @@ RELEASE = WORKFLOWS / 'desktop-release.yml'
 COMPLETE = WORKFLOWS / 'desktop-complete.yml'
 USES = re.compile(r'^\s*(?:- )?uses: (\S+)@(\S+?)(?: # (v\d+\.\d+\.\d+))?$', re.MULTILINE)
 SECRETS = {'SCARLETT_MAC_P12_BASE64', 'SCARLETT_MAC_P12_PASSWORD', 'SCARLETT_WINDOWS_PFX_BASE64', 'SCARLETT_WINDOWS_PFX_PASSWORD'}
+UPDATER_SECRETS = {'TAURI_SIGNING_PRIVATE_KEY': 'SCARLETT_UPDATER_MINISIGN_KEY',
+                   'TAURI_SIGNING_PRIVATE_KEY_PASSWORD': 'SCARLETT_UPDATER_MINISIGN_PASSWORD'}
 
 
 def steps(text):
@@ -73,14 +75,18 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertRegex(trigger, r'^  workflow_dispatch:\n')
         self.assertEqual(re.findall(r'^  ([a-z_]+):', trigger, re.MULTILINE), ['workflow_dispatch'])
         jobs = re.findall(r'^  ([a-z_]+):\n((?:    .*\n|\s*\n)+)', self.release.split('\njobs:\n', 1)[1], re.MULTILINE)
-        self.assertEqual([name for name, _ in jobs], ['sign', 'assemble'])
+        self.assertEqual([name for name, _ in jobs], ['sign', 'headless_linux', 'updater_sign', 'assemble'])
         for name, body in jobs:
             with self.subTest(job=name):
                 self.assertIn("\n    if: github.ref == 'refs/heads/main'\n", '\n' + body)
                 self.assertIn('test "$GITHUB_REF" = refs/heads/main', body)
-        self.assertIn('\n    environment: release-signing\n', '\n' + jobs[0][1])
-        self.assertEqual(self.release.count('environment:'), 1)
-        self.assertIn('\n    needs: sign\n', '\n' + jobs[1][1])
+        body = dict(jobs)
+        for name in ('sign', 'updater_sign'):
+            self.assertIn('\n    environment: release-signing\n', '\n' + body[name])
+        self.assertEqual(self.release.count('environment:'), 2)
+        self.assertNotIn('environment:', body['headless_linux'] + body['assemble'])
+        self.assertIn('\n    needs: [sign, headless_linux]\n', '\n' + body['updater_sign'])
+        self.assertIn('\n    needs: [sign, headless_linux, updater_sign]\n', '\n' + body['assemble'])
         self.assertIn('\n    timeout-minutes: 90\n', '\n' + jobs[0][1])
         for runner, platform in (('macos-15', 'darwin-arm64'), ('macos-15-intel', 'darwin-amd64'), ('windows-2025', 'windows-amd64')):
             self.assertIn('- runner: %s\n            platform: %s\n' % (runner, platform), self.release)
@@ -97,36 +103,62 @@ class ReleaseWorkflowTests(unittest.TestCase):
             self.assertNotIn('actions/cache', text)
             self.assertNotIn('rust-cache', text)
             self.assertNotRegex(text, r'cache: (?!false)')
-        self.assertIn('cache: false', self.step_using('actions/setup-go'))
-        self.assertIn('package-manager-cache: false', self.step_using('actions/setup-node'))
+        for body in self.steps_using('actions/setup-go'):
+            self.assertIn('cache: false', body)
+        for body in self.steps_using('actions/setup-node'):
+            self.assertIn('package-manager-cache: false', body)
         self.assertNotIn('cache-dependency-path', self.release)
 
-    def step_using(self, action):
+    def steps_using(self, action):
         found = [body for _, body in steps(self.release) if 'uses: ' + action + '@' in body]
-        self.assertEqual(len(found), 1, action)
-        return found[0]
+        self.assertTrue(found, action)
+        return found
 
     def test_checkouts_do_not_persist_credentials(self):
         checkouts = [body for _, body in steps(self.release) if 'uses: actions/checkout@' in body]
-        self.assertEqual(len(checkouts), 2)
+        self.assertEqual(len(checkouts), 4)
         for body in checkouts:
             self.assertIn('persist-credentials: false', body)
 
     def test_secrets_reach_only_the_import_steps(self):
         with_secrets = [(job, body) for job, body in steps(self.release) if 'secrets.' in body]
-        self.assertEqual([re.search(r'name: (.+)', body).group(1) for _, body in with_secrets],
-                         ['Import the Mac signing key into a temporary keychain', 'Import the Windows signing key without export rights'])
-        self.assertTrue(all(job == 'sign' for job, _ in with_secrets))
+        self.assertEqual([(job, re.search(r'name: (.+)', body).group(1)) for job, body in with_secrets],
+                         [('sign', 'Import the Mac signing key into a temporary keychain'),
+                          ('sign', 'Import the Windows signing key without export rights'),
+                          ('updater_sign', 'Sign the installers and headless bundles for the updater')])
         referenced = set(re.findall(r'\$\{\{ secrets\.([A-Z0-9_]+) \}\}', self.release))
-        self.assertEqual(referenced, SECRETS)
+        self.assertEqual(referenced, SECRETS | set(UPDATER_SECRETS.values()))
         # Every secret reference is an env value on those steps, never script text.
-        self.assertEqual(self.release.count('${{ secrets.'), 4)
+        self.assertEqual(self.release.count('${{ secrets.'), 6)
         for name in SECRETS:
             self.assertIn('          %s: ${{ secrets.%s }}\n' % (name, name), self.release)
+        # The updater key reaches only the tauri signer, in one Linux job.
+        for variable, secret in UPDATER_SECRETS.items():
+            self.assertIn('          %s: ${{ secrets.%s }}\n' % (variable, secret), with_secrets[2][1])
+        self.assertIn('npx --no-install tauri signer sign --app-version "$RELEASE_VERSION"', with_secrets[2][1])
+        jobs = dict(re.findall(r'^  ([a-z_]+):\n((?:    .*\n|\s*\n)+)', self.release.split('\njobs:\n', 1)[1], re.MULTILINE))
+        self.assertIn('runs-on: ubuntu-latest', jobs['updater_sign'])
+        for name in UPDATER_SECRETS:
+            self.assertNotIn(name, self.complete)
         outside = '\n'.join(line for line in self.release.splitlines() if not line.startswith('      '))
         self.assertNotIn('${{ secrets.', outside)
         self.assertNotIn('secrets: inherit', self.release)
         self.assertNotIn('GITHUB_TOKEN', self.release)
+
+    def test_release_builds_headless_bundles_and_assembles_updater_signatures(self):
+        mac = named(self.release, 'Build and test the headless Mac bundle')
+        linux = named(self.release, 'Build and test the headless Linux bundle')
+        for body in (mac, linux):
+            self.assertIn('scripts/package.sh "$RELEASE_VERSION" "$RUNNER_TEMP/headless"', body)
+            self.assertIn('scripts/test-install.sh "$RUNNER_TEMP/headless"', body)
+        self.assertIn("if: runner.os == 'macOS'", mac)
+        verify = named(self.release, 'Verify the updater signatures against the pinned keys')
+        self.assertNotIn('secrets.', verify)
+        self.assertIn('release-manifest.py verify-signatures', verify)
+        assemble = named(self.release, 'Assemble the release from pinned signing evidence')
+        for platform in ('linux-amd64', 'darwin-arm64', 'darwin-amd64'):
+            self.assertIn('--headless-%s "$RUNNER_TEMP/signed/headless-%s"' % (platform, platform), assemble)
+        self.assertIn('signatures=(--signatures "$RUNNER_TEMP/updater/updater-signatures")', assemble)
 
     def test_scripts_never_interpolate_expressions(self):
         for workflow in (self.release, self.complete):
