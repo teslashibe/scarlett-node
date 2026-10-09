@@ -23,6 +23,8 @@ import {
   X_SESSION_EXPIRED,
   webServingNote,
   webServingSaved,
+  accountsEmptyText,
+  servingNote,
   type Snapshot,
 } from "../src/model.ts";
 const base: Snapshot = {
@@ -279,4 +281,14 @@ test("Serve web pages applies on the next start and says so while the node runs"
   // With web on (the default) a paired node with no X account can start.
   assert.equal(canStart({ ...base, accounts: [], web_enabled: true }), true);
   assert.equal(canStart({ ...base, accounts: [], web_enabled: false }), false);
+});
+test("With web on, the no-account copy does not say an X account is needed to earn", () => {
+  const web = { ...base, accounts: [], web_enabled: true };
+  assert.equal(accountsEmptyText(web), "Web pages need no account. Connect an X account to serve X jobs too");
+  assert.equal(servingNote(web), "Serve web pages, and X network jobs with the accounts connected to this device");
+  // Web off, or a node that has not said: the X-only wording is unchanged.
+  for (const s of [{ ...base, accounts: [], web_enabled: false }, { ...base, accounts: [] }]) {
+    assert.equal(accountsEmptyText(s), "Connect an X account to start serving work");
+    assert.equal(servingNote(s), "Serve X network jobs with the accounts connected to this device");
+  }
 });

@@ -136,6 +136,18 @@ export function webServingSaved(enabled: boolean, running: boolean): string {
   if (running) return `Web pages turned ${enabled ? "on" : "off"}. Stop and start the node to apply it`;
   return enabled ? "Web pages turned on. The node serves them when it starts" : "Web pages turned off";
 }
+// With web on, a node with no X account still starts and serves web pages,
+// so the copy must not say an X account is needed to earn.
+export function accountsEmptyText(s: Snapshot): string {
+  return s.web_enabled === true
+    ? "Web pages need no account. Connect an X account to serve X jobs too"
+    : "Connect an X account to start serving work";
+}
+export function servingNote(s: Snapshot): string {
+  return s.web_enabled === true
+    ? "Serve web pages, and X network jobs with the accounts connected to this device"
+    : "Serve X network jobs with the accounts connected to this device";
+}
 export function codexAccountLimitReached(s: Snapshot): boolean {
   return (
     s.accounts.filter((a) => a.service === "codex").length >=

@@ -25,6 +25,8 @@ import {
   xLoginMessage,
   webServingNote,
   webServingSaved,
+  accountsEmptyText,
+  servingNote,
   type XLoginStatus,
   type Account,
   type Preferences,
@@ -104,6 +106,7 @@ function render(s: Snapshot) {
   setText($("metric-jobs"), String(s.observation?.in_flight ?? "Unknown"));
   setText($("metric-pending"), String(s.observation?.unresolved_attempts ?? "Unknown"));
   $("accounts-empty").hidden = accounts.length > 0 || draining.length > 0;
+  setText($("accounts-empty"), accountsEmptyText(s));
   $("x-profile").toggleAttribute("disabled", busy || !browserProfilesAvailable);
   $("x-consent").toggleAttribute("disabled", busy || !browserProfilesAvailable);
   $("x-import").toggleAttribute("disabled", busy || !s.accounts_available || !browserProfilesAvailable || !$<HTMLSelectElement>("x-profile").value || !$<HTMLInputElement>("x-consent").checked);
@@ -158,7 +161,7 @@ function render(s: Snapshot) {
         ? "The proof helper is missing. New work is disabled"
         : local?.running
           ? "Quit and reopen Scarlett before starting X network jobs"
-          : journalNote(s) || "Serve X network jobs with the accounts connected to this device";
+          : journalNote(s) || servingNote(s);
   $("start").toggleAttribute("disabled", busy || !canStart(s));
   const controllable = s.supervised || externalRuntime(s);
   const paused = s.observation?.drain_requested;
