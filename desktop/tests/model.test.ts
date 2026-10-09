@@ -331,7 +331,8 @@ test("The web tiles show what the running node serves, not only the saved settin
   assert.deepEqual(webServing({ ...webNode(readyWeb), supervised: false, web_enabled: false }), { value: "On", note: "Serving on this device" });
 });
 test("Web off reads as off, and a pending change says how to apply it", () => {
-  const off: ServiceHealth = { kind: "web", state: "not_added", capacity: 0, in_flight: 0, browser: { state: "unavailable", reason: "disabled" } };
+  // A node without web reports no egress or browser for it (services.go health).
+  const off: ServiceHealth = { kind: "web", state: "not_added", capacity: 0, in_flight: 0 };
   const savedOff = { ...webNode(off), web_enabled: false };
   assert.deepEqual(webServing(savedOff), { value: "Off", note: "Turn on in Device settings" });
   assert.equal(availableWebSlots(savedOff), 0);
@@ -346,10 +347,19 @@ test("A stopped node shows the saved web setting and frees no slots", () => {
     const on = webNode(readyWeb, { state });
     assert.deepEqual(webServing(on), { value: "On", note: "Serves pages when the node runs" });
     assert.equal(availableWebSlots(on), 0);
-    assert.deepEqual(hiddenBrowser(on), { value: "Off", note: "Starts with the node" });
+    // The running node checks memory, disk and the download first, so a
+    // stopped one promises nothing about the browser.
+    assert.deepEqual(hiddenBrowser({ ...on, web_browser: true }), { value: "Off", note: "Checked when the node runs" });
+    assert.deepEqual(hiddenBrowser(on), { value: "Off", note: "Checked when the node runs" });
+    // Windows by default, or SCARLETT_WEB_BROWSER=off: the same words the
+    // running node's "disabled" reason gets, so Start changes nothing.
+    const relayOnly = { ...on, web_browser: false };
+    assert.deepEqual(hiddenBrowser(relayOnly), { value: "Off", note: "Relay pages only on this device" });
+    assert.deepEqual(hiddenBrowser(relayOnly), hiddenBrowser(webNode({ ...readyWeb, browser: { state: "unavailable", reason: "disabled" } })));
     const off = { ...on, web_enabled: false };
     assert.deepEqual(webServing(off), { value: "Off", note: "Turn on in Device settings" });
     assert.deepEqual(hiddenBrowser(off), { value: "Off", note: "Web pages are off" });
+    assert.deepEqual(hiddenBrowser({ ...off, web_browser: false }), { value: "Off", note: "Web pages are off" });
   }
   // Never started: no status at all.
   const fresh: Snapshot = { ...base, accounts: [], web_enabled: true };
@@ -373,6 +383,25 @@ test("A paused node or web service says why it takes no new pages", () => {
     assert.equal(availableWebSlots(paused), 0);
     assert.deepEqual(hiddenBrowser(paused), { value: "Paused", note: "Waiting for web pages" });
   }
+});
+test("A full receipt journal pauses web without turning a node with web off on", () => {
+  // The node rewrites every service, web off included, to exhausted while its
+  // receipt journal is full; only an enabled web entry carries egress and browser.
+  const full = { journal_full: true };
+  const on = webNode({ ...readyWeb, state: "exhausted" }, full);
+  assert.deepEqual(webServing(on), { value: "Paused", note: "Receipt journal full" });
+  assert.equal(availableWebSlots(on), 0);
+  assert.deepEqual(hiddenBrowser(on), { value: "Ready", note: "For pages behind bot checks" });
+  const off = { ...webNode({ kind: "web", state: "exhausted", capacity: 0, in_flight: 0 }, full), web_enabled: false };
+  assert.deepEqual(webServing(off), { value: "Off", note: "Turn on in Device settings" });
+  assert.equal(availableWebSlots(off), 0);
+  assert.deepEqual(hiddenBrowser(off), { value: "Off", note: "Web pages are off" });
+  // Turned on while a node without web runs with a full journal.
+  assert.deepEqual(webServing({ ...off, web_enabled: true, web_restart_pending: true }), { value: "Off", note: "Stop and start the node to turn on" });
+  // Draining says so first; the journal clears as accepted work finishes.
+  assert.deepEqual(webServing(webNode({ ...readyWeb, state: "exhausted" }, { ...full, drain_requested: true })), { value: "Paused", note: "Finishing accepted work" });
+  // With room again the web entry's own state decides.
+  assert.deepEqual(webServing(webNode(readyWeb, { journal_full: false })), { value: "On", note: "Serving on this device" });
 });
 test("Hidden browser states use plain words for every reason the node reports", () => {
   const reasons = ["disabled", "memory_low", "disk_low", "runtime_missing", "runtime_invalid", "browser_downloading",

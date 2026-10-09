@@ -81,13 +81,30 @@ export function outcomeCounts(records: DiagnosticsRecord[]): {outcome: string; c
   for (const record of records) counts.set(record.outcome, (counts.get(record.outcome) ?? 0) + 1);
   return [...counts].sort(([a], [b]) => a.localeCompare(b)).map(([outcome, count]) => ({outcome, count}));
 }
-// The node keeps attempts for 24 hours, at most this many (MaxAttempts).
+// The node keeps attempts for 24 hours, at most this many (schema.go
+// MaxAttempts), and drops its oldest sooner to keep its own size estimate
+// under MaxHistoryBytes. One attempt never estimates above MaxAttemptBytes.
 export const MAX_RETAINED_ATTEMPTS = 200;
+export const MAX_HISTORY_BYTES = 1 << 20;
+export const MAX_ATTEMPT_BYTES = 8 << 10;
+// The node's per-attempt estimate (quota.go estimatedBytes): 700 bytes, 144
+// per span and 512 per X quota snapshot. This app never receives the
+// snapshots, so it counts the most an attempt keeps, one per page; web pages
+// keep none.
+export function historyBytes(attempts: DiagnosticsRecord[]): number {
+  return attempts.reduce((sum, r) => sum + 700 + 144 * r.spans.length + (r.operation === "scrape" ? 0 : 512 * r.pages), 0);
+}
+// Once the node has dropped an attempt for size, what it keeps stays within
+// one attempt of the bound until old attempts age out. A busy web node fills
+// it with about 175 pages, well before 200 attempts.
+export function historyMayBeTruncated(attempts: DiagnosticsRecord[]): boolean {
+  return attempts.length >= MAX_RETAINED_ATTEMPTS || historyBytes(attempts) >= MAX_HISTORY_BYTES - MAX_ATTEMPT_BYTES;
+}
 const DAY_MS = 24 * 60 * 60 * 1000;
 // Web pages this node served and reported, from its local attempt history. A
-// full history has dropped its oldest attempts, so the count then covers only
-// the time since the oldest one kept. Pass the history before xDiagnostics
-// hides model attempts, since those count toward the limit too.
+// history that may have dropped attempts counts only from the oldest one kept,
+// and says so. Pass the history before xDiagnostics hides model attempts,
+// since those count toward the limits too.
 export function webPagesServed(value: Diagnostics | undefined, now = Date.now()): Metric {
   if (!value) return { value: "—", note: "Checking local history" };
   const snapshot = value.snapshot;
@@ -97,7 +114,7 @@ export function webPagesServed(value: Diagnostics | undefined, now = Date.now())
   const served = recent.filter((r) => r.operation === "scrape" && r.outcome === "success");
   const browser = served.filter((r) => r.proof_mode === "browser").length;
   const oldest = Math.min(...recent.map(started));
-  const period = snapshot.attempts.length >= MAX_RETAINED_ATTEMPTS && Number.isFinite(oldest)
+  const period = historyMayBeTruncated(snapshot.attempts) && Number.isFinite(oldest)
     ? `Since ${new Date(oldest).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
     : "Last 24 hours";
   return { value: String(served.length), note: browser ? `${period} · ${browser} in the browser` : period };

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { diagnosticsNote, duration, groupTitle, localCapacity, MAX_RETAINED_ATTEMPTS, outcomeCounts, phase, recentAttempts, summaryCells, timelineAxes, webPagesServed, xDiagnostics, type Diagnostics, type DiagnosticsRecord } from "../src/diagnostics.ts";
+import { diagnosticsNote, duration, groupTitle, historyBytes, historyMayBeTruncated, localCapacity, MAX_ATTEMPT_BYTES, MAX_HISTORY_BYTES, MAX_RETAINED_ATTEMPTS, outcomeCounts, phase, recentAttempts, summaryCells, timelineAxes, webPagesServed, xDiagnostics, type Diagnostics, type DiagnosticsRecord, type DiagnosticsSpan } from "../src/diagnostics.ts";
 import type { AccountHealth, Snapshot } from "../src/model.ts";
 
 const record: DiagnosticsRecord = {
@@ -225,6 +225,43 @@ test("A full local history says which window the web page count covers", () => {
   assert.equal(served.note, `Since ${since} · 20 in the browser`);
   // The count is taken before model attempts are hidden from the display.
   assert.equal(webPagesServed(xDiagnostics(history(attempts)), NOW).note.startsWith("Last 24 hours"), true);
+});
+// A relay page on a busy node records about 37 spans (journal, accept, helper
+// and report), so the node's size bound fills before its attempt limit.
+const spans = (count: number): DiagnosticsSpan[] =>
+  Array.from({length: count}, (_, i) => ({phase: "journal_write", source: "node" as const, exchange: 0, start_ms: i, duration_ms: 1, outcome: "success"}));
+const busy = (count: number, everyMinutes: number) =>
+  Array.from({length: count}, (_, i) => ({...web((count - i) * everyMinutes, i % 9 ? "relay" : "browser"), id: `busy-${i}`.padEnd(64, "0"), spans: spans(37)}));
+test("A busy web node's history counts from the oldest page kept", () => {
+  // The Go store keeps 174 such pages (1,048,440 of 1,048,576 estimated
+  // bytes) and drops older ones (TestDesktopSeesWhenHistoryWasTrimmedForSize).
+  const attempts = busy(174, 3.5);
+  assert.ok(attempts.length < MAX_RETAINED_ATTEMPTS && historyMayBeTruncated(attempts));
+  const served = webPagesServed(history(attempts), NOW);
+  assert.equal(served.value, "174");
+  const since = new Date(NOW - 174 * 3.5 * 60_000).toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+  assert.equal(served.note, `Since ${since} · 20 in the browser`);
+  // A history with room left has dropped nothing in the last day.
+  assert.equal(webPagesServed(history(busy(120, 3.5)), NOW).note, "Last 24 hours · 14 in the browser");
+  // X attempts can hold quota snapshots this app never sees: one per page.
+  const x = (i: number): DiagnosticsRecord => ({...record, id: `x-${i}`.padEnd(64, "0"), pages: 3, spans: spans(37), started_at: new Date(NOW - i * 60_000).toISOString()});
+  const mixed = [...busy(160, 3.5), ...Array.from({length: 12}, (_, i) => x(i))];
+  assert.equal(historyBytes(mixed), 172 * (700 + 37 * 144) + 12 * 3 * 512);
+  assert.ok(historyMayBeTruncated(mixed));
+  assert.ok(!historyMayBeTruncated(mixed.slice(0, 165)));
+});
+test("The history bounds match what the node writes", () => {
+  const schema = readFileSync(new URL("../../internal/diagnostics/schema.go", import.meta.url), "utf8");
+  const quota = readFileSync(new URL("../../internal/diagnostics/quota.go", import.meta.url), "utf8");
+  const constant = (name: string) => schema.match(new RegExp(`\\b${name}\\s+=\\s+([^\\n/]+)`))?.[1].trim();
+  assert.equal(constant("MaxAttempts"), String(MAX_RETAINED_ATTEMPTS));
+  assert.equal(constant("MaxHistoryBytes"), "1 << 20");
+  assert.equal(MAX_HISTORY_BYTES, 1 << 20);
+  assert.equal(constant("MaxAttemptBytes"), "8 << 10");
+  assert.equal(MAX_ATTEMPT_BYTES, 8 << 10);
+  assert.match(quota, /const quotaSnapshotBytes = 512\n/);
+  assert.match(quota, /return 700 \+ len\(r\.Spans\)\*144 \+ len\(r\.QuotaSnapshots\)\*quotaSnapshotBytes\n/);
+  assert.equal(historyBytes([{...web(1), spans: spans(2)}]), 700 + 2 * 144);
 });
 test("Web pages served is unknown when local history cannot be read", () => {
   assert.deepEqual(webPagesServed(undefined, NOW), {value: "—", note: "Checking local history"});

@@ -53,6 +53,9 @@ export type Snapshot = {
   web_enabled?: boolean;
   // The running node was started with the other web setting.
   web_restart_pending?: boolean;
+  // Whether a node this app starts with web runs the hidden browser:
+  // SCARLETT_WEB_BROWSER, else the node's platform default (off on Windows).
+  web_browser?: boolean;
   observation?: {
     state?: string;
     updated_at?: string;
@@ -156,8 +159,12 @@ const webEntry = (s: Snapshot): ServiceHealth | undefined =>
 // setting while it is stopped. A running node without a web entry is unknown.
 function webOn(s: Snapshot): boolean | undefined {
   if (!nodeLive(s)) return s.web_enabled;
-  const state = webEntry(s)?.state;
-  return state === undefined ? undefined : state !== "not_added";
+  const web = webEntry(s);
+  if (web?.state === undefined) return undefined;
+  // A full receipt journal marks every service exhausted, web off included
+  // (main.go). Only an enabled web service reports its egress and browser.
+  if (s.observation?.journal_full === true) return web.egress !== undefined || web.browser !== undefined;
+  return web.state !== "not_added";
 }
 // Why an enabled web service is not taking new pages (services.go refreshWeb).
 const WEB_PAUSED: Record<string, string> = {
@@ -177,6 +184,7 @@ export function webServing(s: Snapshot): Metric {
   const web = webEntry(s)!;
   if (s.observation?.drain_requested || s.observation?.state === "draining")
     return { value: "Paused", note: "Finishing accepted work" };
+  if (s.observation?.journal_full === true) return { value: "Paused", note: "Receipt journal full" };
   if (web.state !== "configured" && web.state !== "ready" && web.state !== "exhausted")
     return { value: "Paused", note: WEB_PAUSED[web.last_error_code ?? ""] ?? "Not taking new pages" };
   return { value: "On", note: s.web_restart_pending ? "Stop and start the node to turn off" : "Serving on this device" };
@@ -206,12 +214,14 @@ const BROWSER_UNAVAILABLE: Record<string, Metric> = {
   helper_failed: { value: "Unavailable", note: "Browser failed · retrying shortly" },
 };
 // The hidden browser renders web jobs that need one, such as pages behind a
-// bot check. It runs only inside a running node that serves web pages.
+// bot check. It runs only inside a running node that serves web pages, and
+// that node checks memory, disk and the download before it is ready.
 export function hiddenBrowser(s: Snapshot): Metric {
   const on = webOn(s);
   if (on === undefined) return { value: "Unknown", note: "Waiting for node status" };
   if (!on) return { value: "Off", note: "Web pages are off" };
-  if (!nodeLive(s)) return { value: "Off", note: "Starts with the node" };
+  if (!nodeLive(s))
+    return s.web_browser === false ? BROWSER_UNAVAILABLE.disabled : { value: "Off", note: "Checked when the node runs" };
   const browser = webEntry(s)?.browser;
   if (browser?.state === "ready") return { value: "Ready", note: "For pages behind bot checks" };
   if (browser?.state === "unavailable")

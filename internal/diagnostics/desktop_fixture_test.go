@@ -162,3 +162,93 @@ func TestDesktopPacingDiagnosticsFixture(t *testing.T) {
 	}
 	t.Logf("diagnostics-v%d: %d synthetic attempts (%d legacy, %d paced), %d bytes", snapshot.Version, len(snapshot.Attempts), legacy, paced, len(fixture))
 }
+
+// desktopBytes is the desktop app's estimate of one retained attempt
+// (desktop/src/diagnostics.ts historyBytes). The app never receives quota
+// snapshots, so it counts one per page for every attempt but a web page.
+func desktopBytes(r Record) int {
+	total := 700 + 144*len(r.Spans)
+	if r.Operation != "scrape" {
+		total += quotaSnapshotBytes * r.Pages
+	}
+	return total
+}
+
+// The desktop app says how far back its web page count goes once the node may
+// have dropped attempts it still had to keep for 24 hours. Busy web pages fill
+// MaxHistoryBytes long before MaxAttempts, so the app must also tell a history
+// the node trimmed for size: from the first such drop until old attempts age
+// out, its estimate stays within one attempt of the bound.
+func TestDesktopSeesWhenHistoryWasTrimmedForSize(t *testing.T) {
+	for _, mix := range []struct {
+		name  string
+		xEach int
+	}{{"web pages", 0}, {"web pages and X searches", 5}} {
+		t.Run(mix.name, func(t *testing.T) {
+			s := New(privateDir(t))
+			base := time.Date(2026, 10, 9, 0, 0, 0, 0, time.UTC)
+			now := base
+			s.wallNow = func() time.Time { return now }
+			s.monoNow = func() time.Time { return now }
+			// What the next snapshot would export, read in place: copying
+			// every snapshot makes this test slow under the race detector.
+			retained := func() (kept, bytes int) {
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				for _, a := range s.attempts {
+					bytes += desktopBytes(a.record)
+				}
+				return len(s.attempts), bytes
+			}
+			check := func(begun int) {
+				t.Helper()
+				kept, bytes := retained()
+				if kept < begun && kept < MaxAttempts && bytes < MaxHistoryBytes-MaxAttemptBytes {
+					t.Fatalf("after %d attempts the node kept %d (%d estimated bytes), which the desktop would read as a whole day", begun, kept, bytes)
+				}
+			}
+			for i := range 400 {
+				now = base.Add(time.Duration(i) * 90 * time.Second)
+				x := mix.xEach > 0 && i%mix.xEach == 0
+				meta := Metadata{ID: fmt.Sprintf("desktop-trim-%03d", i), Operation: "scrape", Pages: 1, ProofMode: "relay"}
+				if x {
+					meta.Operation, meta.Pages = "search", 3
+				}
+				a := s.Begin(meta)
+				if a == nil {
+					t.Fatalf("collector rejected attempt %d", i)
+				}
+				check(i + 1)
+				ctx := a.Context(context.Background())
+				for range 37 {
+					end := Start(ctx, "journal_write", 0)
+					now = now.Add(time.Millisecond)
+					end("success")
+				}
+				if x {
+					for exchange := 1; exchange <= 3; exchange++ {
+						ObserveQuota(ctx, QuotaSnapshot{
+							ObservedAt: now.Add(-time.Millisecond), CapturedAt: now, NextEligibleAt: now.Add(time.Second),
+							Exchange: exchange, Operation: "search", Mode: "conservative", Limit: 100, Remaining: 50,
+							Reset: now.Add(time.Minute), Complete: true, Authoritative: true,
+						})
+					}
+				}
+				a.Finish("success")
+				check(i + 1)
+			}
+			snapshot := s.Snapshot().Attempts
+			bytes := 0
+			for _, r := range snapshot {
+				bytes += desktopBytes(r)
+			}
+			if kept, inPlace := retained(); len(snapshot) != kept || bytes != inPlace {
+				t.Fatalf("snapshot exports %d attempts (%d bytes), store holds %d (%d bytes)", len(snapshot), bytes, kept, inPlace)
+			}
+			if len(snapshot) >= MaxAttempts {
+				t.Fatalf("kept %d attempts; this test needs the size bound to bind first", len(snapshot))
+			}
+			t.Logf("kept %d of 400 attempts, %d estimated bytes for the desktop", len(snapshot), bytes)
+		})
+	}
+}

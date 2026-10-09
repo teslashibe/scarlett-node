@@ -229,6 +229,9 @@ pub struct Snapshot {
     /// The running node was started with the other web setting; it changes
     /// on the next Stop and Start.
     pub web_restart_pending: bool,
+    /// Whether a node this app starts with web runs the hidden browser tier,
+    /// so a stopped node's dashboard can say so.
+    pub web_browser: bool,
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
@@ -680,6 +683,12 @@ fn web_browser_setting(value: Option<&str>) -> Option<&'static str> {
         Some("off") => Some("off"),
         _ => None,
     }
+}
+/// The browser tier a node this app starts with web runs with. The child's
+/// environment is cleared, so this is the setting passed on, else the node's
+/// platform default (internal/config WebBrowserDefault: off on Windows).
+fn web_browser_on(setting: Option<&str>) -> bool {
+    setting.map_or(!cfg!(windows), |value| value == "on")
 }
 /// The web entry's browser tier readiness, reduced to its known scalar fields.
 fn browser_health(value: &Value) -> Option<Value> {
@@ -1567,6 +1576,7 @@ impl Node {
         }
         s.relay_halt_marker = self.relay_halt_marker();
         s.web_enabled = self.web.load(Ordering::SeqCst);
+        s.web_browser = web_browser_on(self.web_browser);
         let mut run = self.running.lock().await;
         if let Some(p) = run.as_mut() {
             s.supervised = p.try_wait().ok().flatten().is_none();
@@ -2817,6 +2827,16 @@ esac
         ] {
             assert_eq!(web_browser_setting(value), want, "{value:?}");
         }
+        // The dashboard's stopped-node browser tile follows the same rule,
+        // with the node's own platform default when nothing is passed on.
+        assert!(web_browser_on(Some("on")));
+        assert!(!web_browser_on(Some("off")));
+        assert_eq!(web_browser_on(None), !cfg!(windows));
+        assert!(
+            include_str!("../../../internal/config/config.go").contains(
+                r#"func WebBrowserDefault(goos string) bool { return goos != "windows" }"#
+            )
+        );
     }
     #[cfg(unix)]
     #[tokio::test]
@@ -2838,6 +2858,7 @@ esac
         node.start().await.unwrap();
         let snapshot = node.snapshot().await;
         assert!(snapshot.web_enabled && snapshot.supervised && !snapshot.web_restart_pending);
+        assert_eq!(snapshot.web_browser, !cfg!(windows));
         let service = &snapshot.observation.unwrap()["services"][0];
         assert_eq!(service["kind"], "web");
         assert_eq!(service["egress"], "direct");

@@ -2,7 +2,7 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
 import type { InvokeArgs } from "@tauri-apps/api/core";
 import type { Account, ClaudeStatus, Preferences, Snapshot, XLoginStatus } from "../src/model.ts";
-import type { Diagnostics, DiagnosticsRecord } from "../src/diagnostics.ts";
+import { historyBytes, MAX_HISTORY_BYTES, type Diagnostics, type DiagnosticsRecord, type DiagnosticsSpan } from "../src/diagnostics.ts";
 import type { UpdateStatus } from "../src/update.ts";
 
 // This page is served by Vite for visual checks and is not a production entry.
@@ -13,7 +13,7 @@ if (!import.meta.env.DEV || !["127.0.0.1", "localhost", "[::1]"].includes(locati
 
 const scenarios = ["ready", "unpaired", "relay-halted", "auth-required", "pending-login", "running-local-api",
   "available", "required", "downloading", "draining", "updated", "rolled-back",
-  "web-only", "web-off", "browser-downloading", "history-full"] as const;
+  "web-only", "web-off", "browser-downloading", "browser-off", "history-full"] as const;
 type Scenario = typeof scenarios[number];
 const requested = new URLSearchParams(location.search).get("scenario");
 const scenario: Scenario = scenarios.includes(requested as Scenario) ? requested as Scenario : "ready";
@@ -32,6 +32,7 @@ const snapshot: Snapshot = {
   supervised: true,
   login_pending: false,
   relay_halt_marker: false,
+  web_browser: true,
   accounts: [
     { id: "research-codex", service: "codex", concurrency: 2 },
     { id: "research-x", service: "x_read", concurrency: 1, username: "researchdesk" },
@@ -94,9 +95,14 @@ if (scenario === "web-off") {
   preferences.serve_web = false;
   webRunning = false;
   observation.in_flight = 1;
-  Object.assign(webService, { state: "not_added", capacity: 0, in_flight: 0, egress: undefined, browser: { state: "unavailable", reason: "disabled", capacity: 0, in_flight: 0 } });
+  Object.assign(webService, { state: "not_added", capacity: 0, in_flight: 0, egress: undefined, browser: undefined });
 }
 if (scenario === "browser-downloading") webService.browser = { state: "unavailable", reason: "browser_downloading", capacity: 0, in_flight: 0 };
+// Windows by default, or SCARLETT_WEB_BROWSER=off: relay pages only, also after Stop.
+if (scenario === "browser-off") {
+  snapshot.web_browser = false;
+  webService.browser = { state: "unavailable", reason: "disabled", capacity: 0, in_flight: 0 };
+}
 
 const previewNotes = { title: "Faster X proofs", date: "2026-10-12", highlights: [
   "Relay proofs finish about a second sooner on busy nodes",
@@ -136,6 +142,30 @@ const webAttempt = (index: number, secondsAgo: number, browser = false, outcome 
     { phase: "report_http", source: "node", exchange: 0, start_ms: 1423, duration_ms: 25, outcome: "success" },
   ],
 });
+// A relay page as a busy node records it: journal, accept, helper and report
+// spans, 37 in all. A browser page renders and uploads first.
+const busySpans = (browser: boolean): DiagnosticsSpan[] => {
+  const shift = browser ? 5210 : 0;
+  const span = (phase: string, source: "node" | "helper", exchange: number, start_ms: number, duration_ms: number): DiagnosticsSpan =>
+    ({ phase, source, exchange, start_ms: source === "node" && start_ms >= 249 ? start_ms + shift : start_ms, duration_ms, outcome: "success" });
+  return [
+    span("worker_acquire", "node", 0, 0, 0), span("account_acquire", "node", 0, 0, 4), span("journal_lock", "node", 0, 4, 0), span("journal_scan", "node", 0, 4, 1),
+    span("journal_write", "node", 0, 5, 13), span("accept_http", "node", 0, 18, 231),
+    ...(browser ? [span("browser_fetch", "node", 0, 0, 4900), span("browser_upload", "node", 0, 4900, 310)].map((s) => ({ ...s, start_ms: s.start_ms + 249 })) : []),
+    span("worker", "node", 0, 249, 1150), span("page_wall", "node", 1, 249, 1150),
+    span("request_encode", "node", 1, 347, 0), span("proof_journal_begin", "node", 1, 347, 13), span("journal_lock", "node", 0, 347, 0), span("journal_write", "node", 0, 348, 12),
+    span("helper_wall", "node", 1, 360, 1000), span("helper_total", "helper", 1, 0, 980), span("x_tcp_connect", "helper", 1, 0, 28), span("control_config", "helper", 1, 28, 0),
+    span("verifier_tcp_connect", "helper", 1, 28, 120), span("verifier_tls", "helper", 1, 148, 110), span("relay_session", "helper", 1, 258, 180), span("relay_authorization", "helper", 1, 258, 180),
+    span("x_tls_ready", "helper", 1, 258, 180), span("ot_ready", "helper", 1, 258, 1), span("request_sent", "helper", 1, 440, 0), span("response_first_byte", "helper", 1, 610, 0),
+    span("response_complete", "helper", 1, 700, 0), span("proof_finalize", "helper", 1, 700, 250), span("proof_journal_complete", "node", 1, 1360, 21), span("journal_lock", "node", 0, 1381, 0),
+    span("journal_write", "node", 0, 1381, 15), span("journal_lock", "node", 0, 1396, 0), span("journal_write", "node", 0, 1396, 14), span("report_prepare", "node", 0, 1410, 0),
+    span("journal_lock", "node", 0, 1410, 0), span("journal_write", "node", 0, 1410, 13), span("report_http", "node", 0, 1423, 25), span("journal_lock", "node", 0, 1448, 0),
+    span("journal_write", "node", 0, 1448, 10),
+  ];
+};
+const busyAttempt = (index: number, secondsAgo: number, browser: boolean): DiagnosticsRecord => ({
+  ...webAttempt(index, secondsAgo, browser), duration_ms: 1460 + (browser ? 5210 : 0), spans: busySpans(browser),
+});
 const diagnostics: Diagnostics = {
   available: true,
   snapshot: {
@@ -173,11 +203,16 @@ const diagnostics: Diagnostics = {
   },
 };
 
-// Web pages in the last day, one failed. A full history keeps only its newest
-// 200 attempts, so the served count then starts at the oldest one kept.
+// Web pages in the last day, one failed. A busy node keeps only as many
+// attempts as fit its size bound, about 175 pages of 37 spans, so the served
+// count then starts at the oldest one kept.
 const history = diagnostics.snapshot!;
 if (scenario === "history-full")
-  for (let i = 0; i < 197; i++) history.attempts.push(webAttempt(100 + i, 5 * 3600 - i * 90, i % 9 === 0));
+  for (let i = 0; ; i++) {
+    const next = busyAttempt(100 + i, 60 + i * 90, i % 9 === 0);
+    if (historyBytes([...history.attempts, next]) > MAX_HISTORY_BYTES) break;
+    history.attempts.push(next);
+  }
 else
   history.attempts.push(webAttempt(1, 3000, true), webAttempt(2, 1800), webAttempt(3, 900, false, "web_fetch_failed"), webAttempt(4, 600, true), webAttempt(5, 300), webAttempt(6, 12));
 history.attempts.sort((a, b) => Date.parse(a.started_at) - Date.parse(b.started_at));
