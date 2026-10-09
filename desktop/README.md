@@ -419,6 +419,93 @@ When an Apple Developer ID and a commercial Windows certificate arrive, run the
 `developer-id` and `authenticode` schemes, which are kept and tested. The Mac
 designated requirement then changes, so users grant Full Disk Access once more.
 
+## Local release when Actions is unavailable
+
+When GitHub Actions cannot run (for example, the account is out of minutes), the
+release owner can build and sign the Mac installers on their own Mac with
+`desktop/scripts/local-release.sh`. It repeats the release workflow's macOS
+`sign` job using the release commit's own scripts. It never publishes, tags or
+pushes.
+
+```sh
+git fetch origin
+desktop/scripts/local-release.sh 0.1.12 darwin-arm64 /absolute/new/work/darwin-arm64 \
+  > /absolute/darwin-arm64.log 2>&1
+```
+
+The script:
+
+1. Fetches the release commit (`SCARLETT_RELEASE_COMMIT`, which must be on
+   `origin/main`; default `origin/main`) at depth 1 into a new repository under
+   the work directory, so local edits never reach the build.
+2. Runs `release-manifest.py check-version`, then checks the toolchains: Node 26,
+   the Go version in `go.mod` exactly (through `GOTOOLCHAIN`), Rust 1.95 from
+   rustup, and Python 3.11 or newer, all native to the target architecture.
+3. Runs `build-complete-runtime.sh`, `npm ci --ignore-scripts` and
+   `tauri build --bundles app --no-sign` with the generated complete config.
+   `CARGO_TARGET_DIR` applies to the Tauri build only; the prover builds in the
+   clean checkout because `build-complete-runtime.sh` reads it from there.
+4. Copies `~/.scarlett-signing/macos.p12` (`SCARLETT_MAC_P12`) into a private
+   directory and reads its export passphrase from the login keychain item
+   `scarlett-signing`/`macos-export` (`SCARLETT_MAC_P12_SERVICE`,
+   `SCARLETT_MAC_P12_ACCOUNT`; `macos-key` protects the PEM key instead). The
+   passphrase goes to
+   `import-macos-identity.sh` only through `SCARLETT_MAC_P12_PASSWORD`, as in the
+   workflow, and is never printed, written or put on this script's command lines.
+   The importer creates a temporary keychain, deletes the PKCS#12 copy and checks
+   the SHA-1 pinned in `identities.json`. An exit trap deletes the keychain and
+   checks that it has left the user search list. Because the signer changes that
+   list while it works, parallel local releases take turns through a lock
+   directory in `$TMPDIR`.
+5. Signs a copy of the app with `sign-macos-bundle.py` (`self-signed-stable`),
+   requires the original search list afterwards and copies `COMPONENTS.json`
+   next to the DMG.
+6. Runs `smoke-macos-dmg.sh --verify-only`, which checks the DMG digest against
+   the evidence and the DMG, app and sidecars against their pinned designated
+   requirements, then applies the assembler's per-platform checks
+   (`release-manifest.py` `verify_platform`) to the output.
+
+The work directory then holds `signed-<platform>/` (the DMG, its
+`.evidence.json` and `COMPONENTS.json`, exactly what the workflow uploads as
+`signed-<platform>`) and `LOCAL-BUILD.json`, which records the commit, toolchains
+and host.
+
+The launch half of the smoke still needs a disposable Mac. It creates app state
+for `ai.scarlett.node` in the user's Library and uses the app's single-instance
+socket (`/tmp/ai_scarlett_node_si.sock`), so on a Mac where Scarlett Node is
+installed or running it would hand off to, or share state with, the real app.
+On a disposable Mac or macOS user, run the full `smoke-macos-dmg.sh` on the
+signed DMG as the workflow does. It refuses to launch unless `GITHUB_ACTIONS=true`,
+which acknowledges that the machine is disposable.
+
+`darwin-amd64` needs an Intel Mac. Run the same command there with x86_64
+Node 26, Go and Rust 1.95, building both Mac platforms from the same
+`SCARLETT_RELEASE_COMMIT`. Rosetta on Apple Silicon does not work. Run under
+`arch -x86_64` with x86_64 Node, Go, a separate `RUSTUP_HOME` whose default host
+is `x86_64-apple-darwin`, and a universal `python3`, the toolchain and
+architecture checks pass. The build then stops at the 10-second provider version
+check in `prepare-complete-bundle.mjs` (`ETIMEDOUT`). Rosetta translates each
+newly extracted executable on its first launch, once per file: about 32 seconds
+for Codex and 16 seconds for Claude in the 0.1.12 rehearsal. A fresh extraction
+never starts translated. Passing would mean relaxing a reviewed release check,
+and the Intel app still would not have run on Intel hardware.
+
+Windows cannot be built here. `sign-windows-bundle.py` needs Windows SignTool and
+the current-user certificate store, and it installs the NSIS installer it signs
+for acceptance, so it runs only on a native Windows host.
+
+Assembly and publication are not part of the local path yet.
+`release-manifest.py assemble` requires all three platforms and a GitHub Actions
+run URL for `provenance.json`. The download publisher accepts one to three
+artifacts, but every publication replaces the live `manifest.json`. The publisher
+and the download page both derive each installer's name and path from the one
+manifest `version`. A Mac-only 0.1.13 would therefore remove the 0.1.12 Windows
+download. Publishing a platform subset needs a per-artifact version: the
+download page must accept it first, then the publisher must carry a retained
+artifact (for example `v0.1.12`'s Windows installer and its signing record) into
+the new manifest without copying it, and then the assembler must accept a
+platform subset and a local-build provenance record in place of the workflow run.
+
 ## X browser login helper
 
 Complete native preparation includes the pinned helper runtime and verifies its

@@ -451,12 +451,14 @@ class SmokeEvidenceGateTests(unittest.TestCase):
                          'designatedRequirement': identities.designated_requirement('ai.scarlett.node', sha1),
                          'sha256': signing.digest(self.dmg)}
 
-    def smoke(self, evidence):
+    def smoke(self, evidence, verify_only=False, ci=True):
         if evidence is not None:
             self.dmg.with_suffix('.evidence.json').write_text(json.dumps(evidence))
-        environment = {k: v for k, v in signing.os.environ.items() if not k.startswith('SCARLETT_')}
-        environment['GITHUB_ACTIONS'] = 'true'
-        result = subprocess.run(['/bin/bash', str(Path(__file__).with_name('smoke-macos-dmg.sh')), str(self.dmg), str(self.work)],
+        environment = {k: v for k, v in signing.os.environ.items() if not k.startswith('SCARLETT_') and k != 'GITHUB_ACTIONS'}
+        if ci:
+            environment['GITHUB_ACTIONS'] = 'true'
+        mode = ['--verify-only'] if verify_only else []
+        result = subprocess.run(['/bin/bash', str(Path(__file__).with_name('smoke-macos-dmg.sh'))] + mode + [str(self.dmg), str(self.work)],
                                 capture_output=True, text=True, env=environment, timeout=60)
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertFalse(self.work.exists(), 'nothing may be mounted or copied for a refused disk image')
@@ -467,6 +469,14 @@ class SmokeEvidenceGateTests(unittest.TestCase):
 
     def test_changed_disk_image_refused(self):
         self.assertIn('differs from its signing evidence', self.smoke(dict(self.evidence, sha256='0' * 64)))
+
+    def test_launch_outside_ci_refused(self):
+        self.assertIn('run it only on a disposable CI runner', self.smoke(self.evidence, ci=False))
+
+    def test_verify_only_keeps_the_evidence_gates_outside_ci(self):
+        # local-release.sh verifies on a developer Mac: no CI guard, same checks, no launch.
+        self.assertIn('no neighbouring signing evidence', self.smoke(None, verify_only=True, ci=False))
+        self.assertIn('differs from its signing evidence', self.smoke(dict(self.evidence, sha256='0' * 64), verify_only=True, ci=False))
 
     def test_unpinned_or_other_scheme_refused(self):
         other = 'f' * 40
