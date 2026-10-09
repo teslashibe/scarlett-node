@@ -173,3 +173,64 @@ class SigningIdentityTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class UpdaterKeyTests(unittest.TestCase):
+    """The auto-updater's minisign pins (identities.json updater.minisign)."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.folder = Path(self.temporary.name)
+        updater = identities.updater_signatures
+        self.lines = [updater.public_line_for_tests(bytes([n]) * 32, bytes([n + 1]) * 8) for n in (1, 3, 5)]
+        self.keys = [updater.parse_public_key(line) for line in self.lines]
+
+    def section(self, *indexes, roles=('primary', 'backup')):
+        return {'minisign': [{'role': role, 'keyId': self.keys[i]['keyId'], 'publicKey': self.lines[i]}
+                             for role, i in zip(roles, indexes)]}
+
+    def test_updater_pins_are_a_primary_then_a_backup(self):
+        base = committed()
+        for section in ({'minisign': []}, self.section(0), self.section(0, 1)):
+            identities.validate(dict(copy.deepcopy(base), updater=section))
+        for section in (self.section(0, 1, 2, roles=('primary', 'backup', 'backup')), self.section(0, roles=('backup',)),
+                        self.section(0, 0), {'minisign': [{'role': 'primary', 'keyId': self.keys[1]['keyId'], 'publicKey': self.lines[0]}]},
+                        {'minisign': [{'role': 'primary', 'keyId': 'X', 'publicKey': 'not a key'}]}, {}, {'minisign': {}}):
+            with self.subTest(section=section):
+                with self.assertRaises(ValueError):
+                    identities.validate(dict(copy.deepcopy(base), updater=section))
+        without = copy.deepcopy(base)
+        del without['updater']
+        with self.assertRaises(ValueError):
+            identities.validate(without)
+
+    def test_go_pins_are_generated_from_the_identities(self):
+        loaded = identities.load({})
+        self.assertEqual(identities.GO_PINS.read_text(), identities.go_pins(loaded))
+        generated = identities.go_pins(dict(copy.deepcopy(committed()), updater=self.section(0, 1)))
+        self.assertIn('\t"%s", // primary %s\n' % (self.lines[0], self.keys[0]['keyId']), generated)
+        self.assertIn('\t"%s", // backup %s\n' % (self.lines[1], self.keys[1]['keyId']), generated)
+        self.assertIn('releaseMacCertificateSHA1       = "%s"' % REVIEWED['macos'][0], generated)
+
+    def test_set_updater_keys_accepts_only_public_key_files(self):
+        updater = identities.updater_signatures
+        primary = self.folder / 'updater-minisign.key.pub'
+        # The base64-wrapped file `tauri signer generate` writes.
+        box = 'untrusted comment: minisign public key: %s\n%s\n' % (self.keys[0]['keyId'], self.lines[0])
+        primary.write_text(__import__('base64').b64encode(box.encode()).decode())
+        self.assertEqual(updater.parse_public_key(primary.read_text())['keyId'], self.keys[0]['keyId'])
+        secret = self.folder / 'updater-minisign.key'
+        secret.write_text('secret material')
+        saved_identities, saved_pins = identities.DEFAULT.read_text(), identities.GO_PINS.read_text()
+        try:
+            with self.assertRaises(ValueError):
+                identities.set_updater_keys(secret)
+            self.assertEqual(identities.DEFAULT.read_text(), saved_identities)
+            keys = identities.set_updater_keys(primary)
+            self.assertEqual(keys, [{'role': 'primary', 'keyId': self.keys[0]['keyId'], 'publicKey': self.lines[0]}])
+            self.assertIn(self.lines[0], identities.GO_PINS.read_text())
+            self.assertEqual(identities.load({})['updater']['minisign'], keys)
+        finally:
+            identities.DEFAULT.write_text(saved_identities)
+            identities.GO_PINS.write_text(saved_pins)

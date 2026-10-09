@@ -20,13 +20,13 @@ func TestDesktopPreferencesPersistPrivatelyWithoutChangingDefaultsOnReads(t *tes
 	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil {
 		t.Fatal(err)
 	}
-	if out.String() != "{\"schema\":1,\"local_api_port\":8088,\"background\":false,\"x_concurrency\":2}\n" {
+	if out.String() != "{\"schema\":1,\"local_api_port\":8088,\"background\":false,\"x_concurrency\":2,\"updates\":\"notify\",\"resume_serving\":false}\n" {
 		t.Fatal("unexpected defaults")
 	}
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
 		t.Fatal("read wrote preferences")
 	}
-	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":3}`
+	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":3,"updates":"automatic","resume_serving":true}`
 	out.Reset()
 	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(value), &out); err != nil {
 		t.Fatal(err)
@@ -93,7 +93,7 @@ func TestDesktopPreferencesMigrateExistingSettingsAndBoundXConcurrency(t *testin
 	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(out.String()) != `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":2}` {
+	if strings.TrimSpace(out.String()) != `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":2,"updates":"notify","resume_serving":false}` {
 		t.Fatal("old preferences did not retain values with default concurrency")
 	}
 	stored, err := os.ReadFile(path)
@@ -118,7 +118,7 @@ func TestSavedThroughputPreferencesRetainDesktop013RollbackRepresentation(t *tes
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "preferences.json")
-	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":4}`
+	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":4,"updates":"notify","resume_serving":false}`
 	var out bytes.Buffer
 	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(value), &out); err != nil {
 		t.Fatal(err)
@@ -141,5 +141,46 @@ func TestSavedThroughputPreferencesRetainDesktop013RollbackRepresentation(t *tes
 	}
 	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err == nil {
 		t.Fatal("corrupt capacity extension did not fail closed")
+	}
+}
+
+// Update and resume-on-launch settings live in their own extension, so a
+// rollback to 0.1.12 or earlier still reads preferences.json unchanged.
+func TestLifecyclePreferencesDefaultToNotifyAndRoundTrip(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "private")
+	if err := localfs.EnsureDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "preferences.json")
+	var out bytes.Buffer
+	value := `{"schema":1,"local_api_port":8088,"background":false,"x_concurrency":2,"updates":"automatic","resume_serving":true}`
+	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(value), &out); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil || string(raw) != `{"schema":1,"local_api_port":8088,"background":false}` {
+		t.Fatal("lifecycle settings leaked into the rollback-readable file")
+	}
+	raw, err = os.ReadFile(filepath.Join(dir, "lifecycle-preferences-v1.json"))
+	if err != nil || string(raw) != `{"schema":1,"updates":"automatic","resume_serving":true}` {
+		t.Fatalf("unexpected lifecycle extension %q", raw)
+	}
+	out.Reset()
+	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil || strings.TrimSpace(out.String()) != value {
+		t.Fatal("lifecycle settings did not survive reopen")
+	}
+	for _, invalid := range []string{
+		`{"schema":1,"local_api_port":8088,"background":false,"x_concurrency":2,"updates":"silent","resume_serving":false}`,
+		`{"schema":1,"local_api_port":8088,"background":false,"x_concurrency":2,"updates":"","resume_serving":false}`,
+	} {
+		if desktopCommand([]string{"preferences-set", path}, strings.NewReader(invalid), &out) == nil {
+			t.Fatal("invalid update mode accepted")
+		}
+	}
+	if err := localfs.WriteAtomic(filepath.Join(dir, "lifecycle-preferences-v1.json"), []byte(`{"schema":1,"updates":"always"}`), true); err != nil {
+		t.Fatal(err)
+	}
+	if desktopCommand([]string{"preferences-get", path}, nil, &out) == nil {
+		t.Fatal("corrupt lifecycle extension did not fail closed")
 	}
 }

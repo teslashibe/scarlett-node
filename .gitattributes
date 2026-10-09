@@ -10,3 +10,6 @@ desktop/tests/fixtures/pacing-diagnostics-v1.json text eol=lf
 # The wire fixtures are pinned by sha256 (the app and the verifier share them),
 # so a Windows checkout must not rewrite their line endings.
 api/fixtures/** -text
+
+# Signed test vectors: a changed byte breaks the signature.
+internal/update/testdata/** -text

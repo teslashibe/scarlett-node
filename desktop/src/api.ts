@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Snapshot, BrowserProfile, Preferences, ClaudeStatus, XLoginStatus } from "./model.ts";
 import type { Diagnostics } from "./diagnostics.ts";
+import type { UpdateStatus } from "./update.ts";
 export const api = {
   preferences: () => invoke<Preferences>("desktop_preferences"),
   savePreferences: (data: Preferences) => invoke<void>("save_desktop_preferences", { data }),
@@ -10,8 +11,17 @@ export const api = {
   status: () => invoke<Snapshot>("desktop_status"),
   diagnostics: () => invoke<Diagnostics>("desktop_diagnostics"),
   claudeStatus: () => invoke<ClaudeStatus>("claude_status"),
-  open: (destination: "setup" | "dashboard" | "settings" | "update") =>
-    invoke<void>("open_network", { destination }),
+  open: (destination: "setup" | "dashboard" | "settings" | "update" | "changelog", version?: string) =>
+    invoke<void>("open_network", { destination, version }),
+  updateStatus: () => invoke<UpdateStatus>("update_status"),
+  updateCheck: () => invoke<void>("update_check"),
+  // "Update now": the same verified, drain-safe install as automatic mode.
+  updateInstall: () => invoke<void>("update_install"),
+  updateCancel: () => invoke<void>("update_cancel"),
+  updateLater: () => invoke<void>("update_later"),
+  updateAck: () => invoke<void>("update_ack"),
+  updateDismiss: (notice: "updated" | "failure") => invoke<void>("update_dismiss", { notice }),
+  setUpdateMode: (mode: "notify" | "automatic") => invoke<void>("set_update_mode", { mode }),
   pair: (code: string) => invoke<void>("pair_node", { code }),
   control: (action: "start" | "pause" | "resume" | "stop") =>
     invoke<void>("control_node", { action }),

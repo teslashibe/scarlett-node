@@ -17,13 +17,25 @@ pub struct Data {
     pub background: bool,
     #[serde(default = "default_x_concurrency")]
     pub x_concurrency: u8,
+    /// "notify" (default) or "automatic"; see updater.rs.
+    #[serde(default = "default_updates")]
+    pub updates: String,
+    /// Start the node when the app opens; follows the last Start/Stop.
+    #[serde(default)]
+    pub resume_serving: bool,
 }
 pub const fn default_x_concurrency() -> u8 {
     2
 }
+pub fn default_updates() -> String {
+    "notify".into()
+}
 impl Data {
     pub fn validate(&self) -> Result<()> {
-        if self.schema != 1 || self.local_api_port < 1024 || !(1..=8).contains(&self.x_concurrency)
+        if self.schema != 1
+            || self.local_api_port < 1024
+            || !(1..=8).contains(&self.x_concurrency)
+            || !matches!(self.updates.as_str(), "notify" | "automatic")
         {
             return Err(Error::InvalidInput);
         }
@@ -79,7 +91,12 @@ mod tests {
             serde_json::from_str(r#"{"schema":1,"local_api_port":18088,"background":true}"#)
                 .unwrap();
         assert_eq!(legacy.x_concurrency, 2);
+        assert_eq!(legacy.updates, "notify");
+        assert!(!legacy.resume_serving);
         assert!(legacy.validate().is_ok());
+        let mut silent = legacy.clone();
+        silent.updates = "silent".into();
+        assert_eq!(silent.validate(), Err(Error::InvalidInput));
         for limit in [0, 9, u8::MAX] {
             let mut invalid = legacy.clone();
             invalid.x_concurrency = limit;
@@ -107,6 +124,8 @@ mod tests {
                 local_api_port: 8088,
                 background: false,
                 x_concurrency: 2,
+                updates: "notify".into(),
+                resume_serving: false,
             }),
             background: AtomicBool::new(false),
         };
@@ -117,6 +136,8 @@ mod tests {
                 local_api_port: 18088,
                 background: true,
                 x_concurrency: 3,
+                updates: "automatic".into(),
+                resume_serving: true,
             })
             .unwrap();
         assert!(prefs.background());

@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for Scarlett node updates every hour
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1h
+RandomizedDelaySec=20min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

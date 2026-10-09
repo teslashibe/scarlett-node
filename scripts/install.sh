@@ -19,8 +19,8 @@ case "$version" in ''|*[!A-Za-z0-9._-]*|.*|-*) echo 'Invalid bundle version' >&2
 [ -d "$bundle/x-login-runtime" ] && [ ! -L "$bundle/x-login-runtime" ] || { echo 'Invalid runtime directory' >&2; exit 1; }
 [ -f "$bundle/SHA256SUMS" ] && [ ! -L "$bundle/SHA256SUMS" ] || exit 1
 # Check only the fixed bundle files; a checksum manifest may not read other paths.
-awk 'NF != 2 || length($1) != 64 || $1 ~ /[^0-9a-f]/ || $2 !~ /^(scarlett-node|scarlett-prover|codex_profile\.json|codex_scaffold\.json|install\.sh|node\.env\.example|scarlett-node\.service|INSTALL\.md|VERSION|PLATFORM|x-login-runtime\/node|x-login-runtime\/manifest\.json|verify-x-login-runtime\.mjs|web-runtime-(linux-amd64|darwin-arm64|darwin-amd64)\.tar\.gz|web-runtime\.json)$/ || seen[$2]++ {bad=1} END {exit bad || NR!=15}' "$bundle/SHA256SUMS" || { echo 'Invalid bundle checksums' >&2; exit 1; }
-for file in scarlett-node scarlett-prover codex_profile.json codex_scaffold.json install.sh node.env.example scarlett-node.service INSTALL.md VERSION PLATFORM x-login-runtime/node x-login-runtime/manifest.json verify-x-login-runtime.mjs "web-runtime-$platform.tar.gz" web-runtime.json; do
+awk 'NF != 2 || length($1) != 64 || $1 ~ /[^0-9a-f]/ || $2 !~ /^(scarlett-node|scarlett-prover|codex_profile\.json|codex_scaffold\.json|install\.sh|node\.env\.example|scarlett-node\.service|scarlett-node-update\.service|scarlett-node-update\.timer|INSTALL\.md|VERSION|PLATFORM|x-login-runtime\/node|x-login-runtime\/manifest\.json|verify-x-login-runtime\.mjs|web-runtime-(linux-amd64|darwin-arm64|darwin-amd64)\.tar\.gz|web-runtime\.json)$/ || seen[$2]++ {bad=1} END {exit bad || NR!=17}' "$bundle/SHA256SUMS" || { echo 'Invalid bundle checksums' >&2; exit 1; }
+for file in scarlett-node scarlett-prover codex_profile.json codex_scaffold.json install.sh node.env.example scarlett-node.service scarlett-node-update.service scarlett-node-update.timer INSTALL.md VERSION PLATFORM x-login-runtime/node x-login-runtime/manifest.json verify-x-login-runtime.mjs "web-runtime-$platform.tar.gz" web-runtime.json; do
   [ -f "$bundle/$file" ] && [ ! -L "$bundle/$file" ] || { echo 'Invalid bundle file' >&2; exit 1; }
 done
 (cd "$bundle" && if command -v sha256sum >/dev/null 2>&1; then sha256sum -c SHA256SUMS; else shasum -a 256 -c SHA256SUMS; fi) >/dev/null
@@ -51,14 +51,14 @@ done
 if [ -e "$target" ] || [ -L "$target" ]; then
   [ -d "$target" ] && [ ! -L "$target" ] && cmp -s "$bundle/SHA256SUMS" "$target/SHA256SUMS" || { echo 'Version already installed with different contents' >&2; exit 1; }
   [ -d "$target/x-login-runtime" ] && [ ! -L "$target/x-login-runtime" ] || exit 1
-  for file in scarlett-node scarlett-prover codex_profile.json codex_scaffold.json install.sh node.env.example scarlett-node.service INSTALL.md VERSION PLATFORM x-login-runtime/node x-login-runtime/manifest.json verify-x-login-runtime.mjs "web-runtime-$platform.tar.gz" web-runtime.json; do
+  for file in scarlett-node scarlett-prover codex_profile.json codex_scaffold.json install.sh node.env.example scarlett-node.service scarlett-node-update.service scarlett-node-update.timer INSTALL.md VERSION PLATFORM x-login-runtime/node x-login-runtime/manifest.json verify-x-login-runtime.mjs "web-runtime-$platform.tar.gz" web-runtime.json; do
     [ -f "$target/$file" ] && [ ! -L "$target/$file" ] || { echo 'Invalid installed bundle file' >&2; exit 1; }
   done
   (cd "$target" && if command -v sha256sum >/dev/null 2>&1; then sha256sum -c SHA256SUMS; else shasum -a 256 -c SHA256SUMS; fi) >/dev/null
   "$bundle/x-login-runtime/node" "$bundle/verify-x-login-runtime.mjs" "$target/x-login-runtime" "$platform" >/dev/null
 else
   stage=$(mktemp -d "$root/versions/.install.XXXXXX")
-  for file in scarlett-node scarlett-prover codex_profile.json codex_scaffold.json install.sh node.env.example scarlett-node.service INSTALL.md VERSION PLATFORM SHA256SUMS verify-x-login-runtime.mjs "web-runtime-$platform.tar.gz" web-runtime.json; do cp "$bundle/$file" "$stage/$file"; done
+  for file in scarlett-node scarlett-prover codex_profile.json codex_scaffold.json install.sh node.env.example scarlett-node.service scarlett-node-update.service scarlett-node-update.timer INSTALL.md VERSION PLATFORM SHA256SUMS verify-x-login-runtime.mjs "web-runtime-$platform.tar.gz" web-runtime.json; do cp "$bundle/$file" "$stage/$file"; done
   cp -R "$bundle/x-login-runtime" "$stage/x-login-runtime"
   chmod 0755 "$stage/scarlett-node" "$stage/scarlett-prover" "$stage/install.sh"
   mv "$stage" "$target"

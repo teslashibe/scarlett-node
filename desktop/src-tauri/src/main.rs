@@ -4,11 +4,13 @@ mod diagnostics;
 mod local_api;
 mod node;
 mod preferences;
+mod updater;
 #[cfg(windows)]
 mod windows_autostart;
 use local_api::LocalApi;
 use node::{Error, Node};
 use preferences::{Data as PreferenceData, Preferences};
+use updater::Updater;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -261,6 +263,7 @@ async fn control_node(
     node: State<'_, Arc<Node>>,
     action: String,
     api: State<'_, Arc<LocalApi>>,
+    preferences: State<'_, Arc<Preferences>>,
     runtime: State<'_, RuntimeControl>,
 ) -> node::Result<()> {
     local_window(&window)?;
@@ -268,8 +271,130 @@ async fn control_node(
     if action == "start" && api.snapshot().await.running {
         return Err(Error::ModeConflict);
     }
-    node.control(&action).await
+    node.control(&action).await?;
+    // The node starts again when the app opens if the operator's last choice
+    // was Start. Quitting and updates leave the choice unchanged.
+    if matches!(action.as_str(), "start" | "stop") {
+        let resume = action == "start";
+        let mut data = preferences.snapshot()?;
+        if data.resume_serving != resume {
+            data.resume_serving = resume;
+            node.save_preferences(&data).await?;
+            preferences.updated(data)?;
+        }
+    }
+    Ok(())
 }
+#[tauri::command]
+async fn update_status(
+    window: WebviewWindow,
+    updater: State<'_, Arc<Updater>>,
+) -> node::Result<updater::Status> {
+    local_window(&window)?;
+    Ok(updater.status().await)
+}
+#[tauri::command]
+fn update_check(window: WebviewWindow, updater: State<'_, Arc<Updater>>) -> node::Result<()> {
+    local_window(&window)?;
+    updater.wake();
+    Ok(())
+}
+/// "Update now": the same verified, drain-safe install as automatic mode.
+#[tauri::command]
+fn update_install(window: WebviewWindow, updater: State<'_, Arc<Updater>>) -> node::Result<()> {
+    local_window(&window)?;
+    updater.install_now();
+    Ok(())
+}
+#[tauri::command]
+async fn update_cancel(
+    window: WebviewWindow,
+    updater: State<'_, Arc<Updater>>,
+) -> node::Result<()> {
+    local_window(&window)?;
+    updater.cancel().await;
+    Ok(())
+}
+#[tauri::command]
+async fn update_later(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    updater: State<'_, Arc<Updater>>,
+) -> node::Result<()> {
+    local_window(&window)?;
+    updater.later(&app_shell(&app)).await
+}
+/// The window finished its first render (post-update health).
+#[tauri::command]
+fn update_ack(window: WebviewWindow, updater: State<'_, Arc<Updater>>) -> node::Result<()> {
+    local_window(&window)?;
+    updater.ack();
+    Ok(())
+}
+#[tauri::command]
+async fn update_dismiss(
+    window: WebviewWindow,
+    app: tauri::AppHandle,
+    updater: State<'_, Arc<Updater>>,
+    notice: String,
+) -> node::Result<()> {
+    local_window(&window)?;
+    updater.dismiss(&app_shell(&app), &notice).await
+}
+#[tauri::command]
+async fn set_update_mode(
+    window: WebviewWindow,
+    node: State<'_, Arc<Node>>,
+    preferences: State<'_, Arc<Preferences>>,
+    updater: State<'_, Arc<Updater>>,
+    runtime: State<'_, RuntimeControl>,
+    mode: String,
+) -> node::Result<()> {
+    local_window(&window)?;
+    let _guard = runtime.0.lock().await;
+    let mut data = preferences.snapshot()?;
+    data.updates = mode;
+    data.validate()?;
+    node.save_preferences(&data).await?;
+    preferences.updated(data)?;
+    updater.wake();
+    Ok(())
+}
+
+/// The updater's view of this app.
+struct AppShell {
+    app: tauri::AppHandle,
+}
+fn app_shell(app: &tauri::AppHandle) -> AppShell {
+    AppShell { app: app.clone() }
+}
+impl updater::Shell for AppShell {
+    fn window_attentive(&self) -> bool {
+        self.app
+            .get_webview_window("main")
+            .is_some_and(|w| w.is_visible().unwrap_or(false) && w.is_focused().unwrap_or(false))
+    }
+    fn exit_for_update(&self) {
+        let done = self.app.state::<ShutdownState>().0.clone();
+        done.store(true, Ordering::SeqCst);
+        self.app.exit(0);
+    }
+    fn quit(&self) {
+        let done = self.app.state::<ShutdownState>().0.clone();
+        quit(self.app.clone(), done);
+    }
+    fn changed(&self, status: &updater::Status) {
+        let _ = self.app.emit_to("main", "update-status", status);
+        if let Some(item) = self.app.try_state::<TrayUpdate>() {
+            let text = match &status.latest {
+                Some(latest) => format!("Update available ({latest})…"),
+                None => "Check for updates…".into(),
+            };
+            let _ = item.0.set_text(text);
+        }
+    }
+}
+struct TrayUpdate(tauri::menu::MenuItem<tauri::Wry>);
 #[tauri::command]
 async fn connect_x(
     window: WebviewWindow,
@@ -398,9 +523,17 @@ fn open_network(
     window: WebviewWindow,
     node: State<'_, Arc<Node>>,
     destination: String,
+    version: Option<String>,
 ) -> node::Result<()> {
     local_window(&window)?;
-    let url = node.network_url(&destination)?;
+    // Links are built here from fixed origins; the renderer names only a
+    // destination and, for the changelog, a version that is validated.
+    let url = match (destination.as_str(), version) {
+        ("changelog", Some(version)) => updater::changelog_url(&version)?,
+        ("changelog", None) => updater::CHANGELOG.to_owned(),
+        (_, None) => node.network_url(&destination)?,
+        _ => return Err(Error::InvalidInput),
+    };
     window
         .app_handle()
         .opener()
@@ -516,7 +649,15 @@ fn main() {
             desktop_preferences,
             save_desktop_preferences,
             desktop_autostart,
-            set_desktop_autostart
+            set_desktop_autostart,
+            update_status,
+            update_check,
+            update_install,
+            update_cancel,
+            update_later,
+            update_ack,
+            update_dismiss,
+            set_update_mode
         ])
         .setup(move |app| {
             let state = app.path().app_data_dir()?;
@@ -556,6 +697,44 @@ fn main() {
             app.state::<Arc<Node>>()
                 .set_x_concurrency(x_concurrency)
                 .map_err(|_| "invalid desktop X concurrency")?;
+            let updater = Arc::new(Updater::new(
+                app.package_info().version.to_string(),
+                app.path().app_data_dir()?,
+                app.state::<Arc<Node>>().inner().clone(),
+                app.state::<Arc<LocalApi>>().inner().clone(),
+                app.state::<Arc<Preferences>>().inner().clone(),
+            ));
+            app.manage(updater.clone());
+            let launch = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let shell: Arc<dyn updater::Shell> = Arc::new(app_shell(&launch));
+                // Finish or report an update first, then start serving again
+                // if the node was serving when Scarlett last closed.
+                let resume = updater.on_launch(shell.clone()).await;
+                let wanted = launch
+                    .state::<Arc<Preferences>>()
+                    .snapshot()
+                    .is_ok_and(|p| p.resume_serving);
+                if resume || wanted {
+                    let node = launch.state::<Arc<Node>>().inner().clone();
+                    let api = launch.state::<Arc<LocalApi>>().inner().clone();
+                    let started = {
+                        let runtime = launch.state::<RuntimeControl>();
+                        let _guard = runtime.0.lock().await;
+                        if api.snapshot().await.running {
+                            Err(Error::ModeConflict)
+                        } else {
+                            node.start().await
+                        }
+                    };
+                    if let Err(error) = started
+                        && error != Error::AlreadyRunning
+                    {
+                        let _ = launch.emit_to("main", "autostart-error", error);
+                    }
+                }
+                updater.run(shell).await;
+            });
             let login_node = app.state::<Arc<Node>>().inner().clone();
             tauri::async_runtime::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -590,8 +769,11 @@ fn main() {
                 tray::TrayIconBuilder,
             };
             let show = MenuItem::with_id(app, "show", "Open Scarlett", true, None::<&str>)?;
+            let check =
+                MenuItem::with_id(app, "update", "Check for updates…", true, None::<&str>)?;
             let close = MenuItem::with_id(app, "quit", "Quit Scarlett", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &close])?;
+            let menu = Menu::with_items(app, &[&show, &check, &close])?;
+            app.manage(TrayUpdate(check.clone()));
             let mut rgba = vec![0; 32 * 32 * 4];
             for y in 0..32 {
                 for x in 0..32 {
@@ -609,6 +791,10 @@ fn main() {
                 .show_menu_on_left_click(true)
                 .on_menu_event(move |app, event| match event.id.as_ref() {
                     "show" => open_window(app),
+                    "update" => {
+                        open_window(app);
+                        app.state::<Arc<Updater>>().wake();
+                    }
                     "quit" => quit(app.clone(), tray_done.clone()),
                     _ => {}
                 })

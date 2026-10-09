@@ -12,6 +12,8 @@ export const layout = `
 </header>
 <main id="main" tabindex="-1">
   <p id="notice" role="status" aria-live="polite" hidden></p>
+  <section id="updated-banner" class="updated-banner" aria-labelledby="updated-title" hidden><div class="updated-copy"><h2 id="updated-title"></h2><ul id="updated-highlights" class="update-highlights"></ul><div class="actions"><button id="updated-notes" type="button" class="quiet">See what's new ↗</button><button id="updated-automatic" type="button" class="quiet" hidden>Turn on automatic updates</button></div></div><button id="updated-dismiss" type="button" class="quiet dismiss" aria-label="Dismiss update notice">✕</button></section>
+  <section id="update-failure" class="relay-banner danger" aria-labelledby="failure-title" hidden><div><h2 id="failure-title"></h2><p id="failure-detail"></p></div><div class="actions"><button id="failure-retry" type="button" hidden>Try again</button><button id="failure-download" type="button">Download manually ↗</button><button id="failure-dismiss" type="button" class="quiet">Dismiss</button></div></section>
   <section class="node-overview" aria-labelledby="status">
     <div class="overview-copy">
       <p class="eyebrow">THIS DEVICE</p>
@@ -94,7 +96,8 @@ export const layout = `
         <summary aria-label="Device settings"><span><h2 id="preferences-heading">Device settings</h2><span class="section-description">Job limits and startup preferences</span></span></summary>
         <div class="disclosure-body">
           <form id="preferences-form"><div class="form-grid"><label>Maximum simultaneous X jobs<input id="x-concurrency" type="number" min="1" max="8" value="2" required></label><label hidden>Saved local API port<input id="saved-api-port" type="number" min="1024" max="65535" required></label></div><p class="muted">Each verified X account runs one job at a time. The total is limited by ready accounts and this setting. Changes apply after you stop and start the node; accepted jobs finish before it stops</p><label class="check"><input id="background" type="checkbox">Keep running when the window closes</label><p class="muted">When off, closing the window drains accepted jobs and quits Scarlett. When on, use the menu bar or tray to reopen or quit</p><button type="submit">Save device preferences</button></form>
-          <div class="subsection"><label class="check"><input id="autostart" type="checkbox" disabled>Open Scarlett when I log in</label><p class="muted">Opening Scarlett does not start network jobs. You choose when to start them</p></div>
+          <div class="subsection"><label class="check"><input id="autostart" type="checkbox" disabled>Open Scarlett when I log in</label><p class="muted">If the node was running when Scarlett closed, it starts again when Scarlett opens. Stop it to keep it stopped</p></div>
+          <div class="subsection" role="radiogroup" aria-labelledby="updates-heading"><h3 id="updates-heading">Updates</h3><label class="check"><input id="update-mode-notify" name="update-mode" type="radio" value="notify" disabled>Notify me when an update is available</label><label class="check"><input id="update-mode-automatic" name="update-mode" type="radio" value="automatic" disabled>Install updates automatically</label><p class="muted">Scarlett downloads and checks each update, waits for accepted jobs to finish, installs it and restarts the node. Required updates install as soon as they are ready</p><p id="update-summary" class="muted" role="status">Checking for updates</p><div class="actions"><button id="update-check" type="button" class="quiet">Check for updates</button><button id="update-changelog" type="button" class="quiet">Changelog ↗</button></div></div>
         </div>
       </details>
     </section>
@@ -106,7 +109,7 @@ export const layout = `
     </section>
   </div>
   <footer><span>Suppliers earn points only · local status does not confirm an award</span><button id="settings" class="quiet header-link">Manage node access ↗</button></footer>
-  <aside id="update-toast" class="update-toast" aria-live="polite" hidden><p id="update-text"></p><div class="actions"><button id="update-download" type="button">Download update ↗</button><button id="update-dismiss" type="button" class="quiet">Later</button></div></aside>
+  <aside id="update-toast" class="update-toast" aria-labelledby="update-text" hidden><div><p id="update-text" class="update-title"></p><p id="update-detail" class="update-detail"></p><ul id="update-highlights" class="update-highlights"></ul></div><div id="update-actions" class="actions"></div></aside>
 </main>
 <dialog id="remove-account-dialog" aria-labelledby="remove-account-heading" aria-describedby="remove-account-detail"><h2 id="remove-account-heading"></h2><p id="remove-account-detail">This account will stop receiving new work when the node picks up the change. Accepted jobs keep their original account and finish. Saved credentials remain on this device.</p><div class="actions"><button id="remove-account-cancel" type="button" class="secondary">Keep account</button><button id="remove-account-confirm" type="button">Remove account</button></div></dialog>`;
 

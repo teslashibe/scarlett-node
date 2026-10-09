@@ -31,6 +31,14 @@
     "allow-save-desktop-preferences",
     "allow-desktop-autostart",
     "allow-set-desktop-autostart",
+    "allow-update-status",
+    "allow-update-check",
+    "allow-update-install",
+    "allow-update-cancel",
+    "allow-update-later",
+    "allow-update-ack",
+    "allow-update-dismiss",
+    "allow-set-update-mode",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -30,6 +31,9 @@ func desktopCommand(args []string, owner io.Reader, out io.Writer) error {
 	}
 	if len(args) == 2 && (args[0] == "preferences-get" || args[0] == "preferences-set") {
 		return desktopPreferencesCommand(args[0], args[1], owner, out)
+	}
+	if len(args) >= 1 && strings.HasPrefix(args[0], "update-") {
+		return desktopUpdateCommand(args, owner, out)
 	}
 	if len(args) == 2 && args[0] == "private-dir" {
 		if !filepath.IsAbs(args[1]) || filepath.Clean(args[1]) != args[1] {
@@ -117,7 +121,7 @@ func desktopCommand(args []string, owner io.Reader, out io.Writer) error {
 		}
 		return err
 	}
-	return errors.New("usage: scarlett-node desktop private-dir PATH|private-dir-new PATH|bearer PATH|run|api PORT")
+	return errors.New("usage: scarlett-node desktop private-dir PATH|private-dir-new PATH|bearer PATH|run|api PORT|update-check|update-stage MODE|update-state-get|update-state-set|update-guard")
 }
 
 func desktopBearer(path string) (string, error) {

@@ -107,8 +107,8 @@ For X there are two ways to run step 2. **MPC-TLS** is the standard TLSNotary mo
       MPC-TLS or keyed relay per job. Relay brings node upload per read from about 60 MB down to under 100 KB.
     </td>
     <td width="33%" valign="top">
-      <b>Drain, upgrade, resume</b><br>
-      Stop taking new work, let accepted jobs finish, swap the binary, resume. Identity and journal are preserved across upgrades and rollbacks.
+      <b>Signed updates, never mid-job</b><br>
+      Opt-in automatic updates: verify the signed release, let accepted jobs finish, swap, restart, roll back if the new version fails. Identity and journal are preserved.
     </td>
     <td width="33%" valign="top">
       <b>Pinned supply chain</b><br>
@@ -141,7 +141,7 @@ The desktop app serves web pages when it is started with `SCARLETT_DESKTOP_WEB=1
 
 ### Headless
 
-Bundles ship the Go node, the pinned Rust proof helper, the Codex templates and a Linux user-service template. Supported targets are Linux amd64 on Ubuntu 24.04, macOS arm64 and macOS amd64. Full steps, including upgrade and rollback, are in [`packaging/INSTALL.md`](packaging/INSTALL.md).
+Bundles ship the Go node, the pinned Rust proof helper, the Codex templates and a Linux user-service template. Supported targets are Linux amd64 on Ubuntu 24.04, macOS arm64 and macOS amd64. Full steps, including upgrade and rollback, are in [`packaging/INSTALL.md`](packaging/INSTALL.md). `scarlett-node update check` and `scarlett-node update apply` install signed releases in place; the optional `scarlett-node-update.timer` with `SCARLETT_AUTO_UPDATE=install` does it automatically. Release notes for every version are at <https://network.scarlett.ai/changelog/>.
 
 1. Download the bundle for your platform and its checksum from the reviewed repository release or CI artifact, then verify it.
 

@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "version": "0.1.13",
+  "date": "2026-10-09",
+  "title": "Automatic updates",
+  "highlights": [
+    "Turn on Install updates automatically and Scarlett installs new versions when accepted jobs finish",
+    "The node starts again when Scarlett opens if it was running when it closed",
+    "Updates downloaded by the app no longer need approving again on Mac or Windows"
+  ]
+}

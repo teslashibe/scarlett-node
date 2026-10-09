@@ -25,7 +25,7 @@ Then run `npm run tauri build -- --bundles app` from `desktop` on Mac. The sidec
 
 Run `npm run dev` from `desktop`, then open `http://127.0.0.1:1420/tests/preview.html`. This development page renders the desktop UI with synthetic accounts and intercepts every native command. It does not read installed node state or contact providers, and it is excluded from the production bundle.
 
-Use `?scenario=ready`, `unpaired`, `relay-halted`, `auth-required`, `pending-login` or `running-local-api` to check the main states. Controls update only the fixture. Check the default 960 × 760 window and the minimum 640 × 560 window, including keyboard expansion, account re-import and login verification.
+Use `?scenario=ready`, `unpaired`, `relay-halted`, `auth-required`, `pending-login` or `running-local-api` to check the main states, and `available`, `required`, `downloading`, `draining`, `updated` or `rolled-back` for the update notices. Controls update only the fixture. Check the default 960 × 760 window and the minimum 640 × 560 window, including keyboard expansion, account re-import and login verification.
 
 ## Native dependency contract
 
@@ -110,7 +110,19 @@ original bytes and signing status; they add no Scarlett publisher signature.
 The signing options follow [Microsoft's SignTool reference](https://learn.microsoft.com/en-us/windows/win32/seccrypto/signtool)
 and [Tauri's custom Windows signing support](https://v2.tauri.app/distribute/sign/windows/#custom-sign-command).
 
-Tests use synthetic credentials and disposable temporary directories/fake executables. Launching the app does not itself start provider work: Start remains explicit. Real account/canary testing and production validation belong to the release owner.
+Tests use synthetic credentials and disposable temporary directories/fake executables. Launching the app starts provider work only when the operator's last choice was Start (`resume_serving`, saved by Start and cleared by Stop; quitting and updates leave it unchanged), so a reboot with "Open Scarlett when I log in" brings the node back. A saved Pause (the drain marker) is respected: the node starts paused. Real account/canary testing and production validation belong to the release owner.
+
+## Updates
+
+Device settings → Updates chooses **Notify me when an update is available** (the default) or **Install updates automatically** (`updates` in the private `lifecycle-preferences-v1.json`, beside `preferences.json`, so 0.1.12 and earlier still read their own file on rollback). The app checks a minute after it opens, every six hours (±15 %), within about a minute of the coordinator announcing a release to a running node, and on **Check for updates** (Settings or the tray menu, which also shows "Update available (x.y.z)…").
+
+- Notify mode: a toast "Scarlett Node x.y.z is available" with the release title, up to three highlights, **Update now**, **What's new ↗** (the version's entry on <https://network.scarlett.ai/changelog/>) and **Later** (24 hours). Nothing downloads until Update now, which runs the same verified, drain-safe install as automatic mode.
+- Automatic mode: no available toast. The update downloads in the background (4 MiB/s while serving), installs at this node's slot in a four-hour rollout window, or as soon as it is ready when required or when the node is not serving. With the window visible and focused, a one-minute "Installing … when current jobs finish" notice offers **Install later** (an hour, three times; ten minutes once for a required update).
+- Required updates (below the coordinator's minimum) show a persistent alert in both modes.
+- During an install: "Downloading x.y.z · n %", "Finishing N accepted jobs before updating" (new jobs paused, accepted jobs never interrupted) and "Installing and restarting…", with **Cancel** until the hand-off.
+- After an update, a dismissible "Updated to Scarlett Node x.y.z" banner shows the release's highlights (compiled in from `release-notes/<version>.json`, no network needed) and **See what's new ↗**, once per version; the first manual install of a version with the updater also offers **Turn on automatic updates**. A version that fails to start is rolled back and the restored app explains why, with **Download manually ↗**.
+
+The renderer has fixed commands only (`update_status`, `update_check`, `update_install`, `update_cancel`, `update_later`, `update_ack`, `update_dismiss`, `set_update_mode`); every link is built natively from a validated version. Verification, staging, hand-off, health and rollback are in `src-tauri/src/updater.rs` and the node's `internal/update` (see `docs/REFERENCE.md`, "Updater"). Debug builds accept `SCARLETT_DESKTOP_UPDATE_FIRST_CHECK_SECONDS` and pass `SCARLETT_SIGNING_REHEARSAL`/`SCARLETT_UPDATER_REHEARSAL_TRUST` to a node built with `-tags rehearsal`, for loopback rehearsals with throwaway keys; release builds ignore all three.
 
 ## Complete runtime package
 
@@ -368,12 +380,22 @@ unsigned app, imports the key (the secrets are visible to that step alone), sign
 removes the key in an `always()` cleanup and, on Mac, runs
 `smoke-macos-dmg.sh`: it checks the DMG digest against the signer's evidence,
 verifies the DMG and the packaged app and sidecars against their pinned designated
-requirements, then launches the app from the DMG. The `assemble` job has no
+requirements, then launches the app from the DMG. The Mac legs and a
+`headless_linux` job also build and test the headless bundles. `updater_sign`
+(ubuntu-latest, `release-signing`) signs the three installers and three bundles
+with the updater's minisign key (`SCARLETT_UPDATER_MINISIGN_KEY` and
+`SCARLETT_UPDATER_MINISIGN_PASSWORD`, visible to that one step) through the
+pinned `tauri signer sign --app-version`, then verifies every signature against
+the pinned keys; without the secret the release simply has no updater signatures.
+The `assemble` job has no
 secrets. It runs `release-manifest.py`, which checks every evidence file and component manifest against
-`identities.json` and the installer SHA-256, then writes `release/`
-(`manifest.json`, `provenance.json` and `Scarlett-Node-<version>-{darwin-arm64.dmg,
-darwin-amd64.dmg,windows-amd64.exe}`, the set the publisher accepts) beside
-`SHA256SUMS` and `evidence/`.
+`identities.json` and the installer SHA-256, verifies the updater signatures,
+then writes `release/` (`manifest.json` with `notes` and, when signed, `updates`;
+`provenance.json`; `changelog.json`; `Scarlett-Node-<version>-{darwin-arm64.dmg,
+darwin-amd64.dmg,windows-amd64.exe}` and the signed headless bundles, the set the
+publisher accepts) beside `SHA256SUMS`, `evidence/` (including
+`release-notes.md` for the GitHub release) and, when unsigned, `headless/`.
+The release runbook is [`docs/RELEASE.md`](../docs/RELEASE.md).
 
 On Windows the key is imported by `desktop/scripts/import-windows-identity.ps1`
 with `Import-PfxCertificate` and no `-Exportable`. It then requires exactly the

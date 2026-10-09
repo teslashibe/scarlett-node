@@ -1,4 +1,5 @@
 """Contracts for assembling the publishable release from signed platform outputs."""
+import base64
 import contextlib
 import hashlib
 import importlib.util
@@ -10,11 +11,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('release_manifest', Path(__file__).with_name('release-manifest.py'))
 release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
 identities = release.signing_identities
+updater = release.updater_signatures
 PINS = identities.load({})
 VERSION = json.loads((release.REPOSITORY / 'desktop/src-tauri/tauri.conf.json').read_text())['version']
 NODE = 'a1' * 20
@@ -116,10 +119,14 @@ class ReleaseManifestTests(ReleaseFixture):
         manifest, provenance = self.assemble()
         names = {p: 'Scarlett-Node-%s-%s' % (VERSION, p) for p in release.PLATFORMS}
         installers = {names['darwin-arm64'] + '.dmg', names['darwin-amd64'] + '.dmg', names['windows-amd64'] + '.exe'}
-        self.assertEqual({p.name for p in (self.output / 'release').iterdir()}, installers | {'manifest.json', 'provenance.json'})
+        self.assertEqual({p.name for p in (self.output / 'release').iterdir()},
+                         installers | {'manifest.json', 'provenance.json', 'changelog.json'})
         self.assertEqual({p.name for p in self.output.iterdir()}, {'release', 'SHA256SUMS', 'evidence'})
         self.assertEqual({p.name for p in (self.output / 'evidence').iterdir()},
-                         {'%s.%s' % (p, kind) for p in release.PLATFORMS for kind in ('evidence.json', 'COMPONENTS.json')})
+                         {'%s.%s' % (p, kind) for p in release.PLATFORMS for kind in ('evidence.json', 'COMPONENTS.json')} |
+                         {'release-notes.md'})
+        # Without updater signatures there is nothing for installed apps to install.
+        self.assertNotIn('updates', manifest)
         self.assertEqual(json.loads((self.output / 'release/manifest.json').read_text()), manifest)
         self.assertEqual(json.loads((self.output / 'release/provenance.json').read_text()), provenance)
         files = {name: release.digest(self.output / 'release' / name) for name in installers}
@@ -359,3 +366,124 @@ class ReleaseManifestTests(ReleaseFixture):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ReleaseNotesTests(ReleaseFixture):
+    def test_notes_feed_the_manifest_changelog_and_release_body(self):
+        manifest, _ = self.assemble()
+        notes = release.load_notes(VERSION)
+        self.assertEqual(manifest['notes'], {'title': notes['title'], 'date': notes['date'], 'highlights': notes['highlights'],
+                                             'changelog': 'https://network.scarlett.ai/changelog/#v' + VERSION,
+                                             'release': 'https://github.com/teslashibe/scarlett-node/releases/tag/v' + VERSION})
+        history = json.loads((self.output / 'release/changelog.json').read_text())
+        versions = [entry['version'] for entry in history['releases']]
+        self.assertEqual(versions[0], VERSION)
+        self.assertEqual(versions, sorted(versions, key=release.version_key, reverse=True))
+        self.assertTrue(all(release.version_key(v) <= release.version_key(VERSION) for v in versions))
+        body = (self.output / 'evidence/release-notes.md').read_text()
+        for highlight in notes['highlights']:
+            self.assertIn('- ' + highlight, body)
+        self.assertIn('https://network.scarlett.ai/changelog/#v' + VERSION, body)
+
+    def test_every_seeded_note_follows_the_rules(self):
+        files = sorted(release.RELEASE_NOTES.glob('*.json'))
+        self.assertTrue({'0.1.11.json', '0.1.12.json', '0.1.13.json'} <= {p.name for p in files})
+        for path in files:
+            with self.subTest(path=path.name):
+                release.load_notes(path.name[:-len('.json')])
+
+    def test_note_rules(self):
+        good = {'schemaVersion': 1, 'version': '1.2.3', 'date': '2026-10-09', 'title': 'Title', 'highlights': ['One']}
+        release.check_notes(dict(good), '1.2.3')
+        release.check_notes(dict(good, details='https://network.scarlett.ai/docs/changelog#x'), '1.2.3')
+        for change in ({'version': '1.2.4'}, {'date': '10/09/2026'}, {'title': ''}, {'title': 'x' * 81}, {'title': '<b>x</b>'},
+                       {'title': ' padded'}, {'highlights': []}, {'highlights': ['a', 'b', 'c', 'd']}, {'highlights': ['x' * 161]},
+                       {'highlights': ['bell\u0007']}, {'details': 'https://evil.example/'}, {'details': 'javascript:alert(1)'},
+                       {'changelog': 'https://evil.example/'}, {'schemaVersion': 2}):
+            with self.subTest(change=change):
+                with self.assertRaises(ValueError):
+                    release.check_notes(dict(good, **change), '1.2.3')
+
+    def test_a_release_needs_notes_for_its_version(self):
+        with mock.patch.object(release, 'RELEASE_NOTES', self.folder / 'no-notes'):
+            (self.folder / 'no-notes').mkdir()
+            with self.assertRaisesRegex(ValueError, 'Release record|regular files|notes'):
+                release.check_version(VERSION)
+
+
+class SignedUpdateTests(ReleaseFixture):
+    def setUp(self):
+        super().setUp()
+        self.secret, self.keynum = b'\x11' * 32, b'\x22' * 8
+        self.key = updater.parse_public_key(updater.public_line_for_tests(self.secret, self.keynum))
+        patcher = mock.patch.object(release.signing_identities, 'updater_keys', lambda _: [self.key])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.headless = {}
+        for platform in release.HEADLESS_PLATFORMS:
+            directory = self.folder / ('headless-' + platform)
+            directory.mkdir()
+            name = release.headless_name(VERSION, platform)
+            (directory / name).write_bytes(b'synthetic bundle ' + platform.encode())
+            (directory / (name + '.sha256')).write_text('%s  %s\n' % (release.digest(directory / name), name))
+            self.headless[platform] = directory
+        self.signatures = self.folder / 'signatures'
+        self.signatures.mkdir()
+        for path in self.signed_files():
+            self.sign(path, None)
+
+    def signed_files(self):
+        files = [next(p for p in self.inputs[platform].iterdir() if p.suffix in ('.dmg', '.exe')) for platform in release.PLATFORMS]
+        return [(f, release.installer_name(VERSION, platform)) for f, platform in zip(files, release.PLATFORMS)] + \
+            [(self.headless[p] / release.headless_name(VERSION, p), release.headless_name(VERSION, p)) for p in release.HEADLESS_PLATFORMS]
+
+    def sign(self, path, name, version=VERSION, secret=None, keynum=None):
+        if isinstance(path, tuple):
+            path, name = path
+        value = updater.sign_for_tests(secret or self.secret, keynum or self.keynum, updater.blake2b_file(path), name, version)
+        (self.signatures / (name + '.sig')).write_text(value)
+
+    def test_signed_release_lists_updates_and_publishes_headless_bundles(self):
+        manifest, _ = self.assemble(headless=self.headless, signatures=self.signatures)
+        updates = manifest['updates']
+        self.assertEqual((updates['schemaVersion'], updates['keyId']), (1, self.key['keyId']))
+        for artifact in manifest['artifacts']:
+            entry = updates['desktop'][artifact['platform']]
+            self.assertEqual(entry['filename'], artifact['filename'])
+            self.assertEqual(updater.verify(entry['signature'], updater.blake2b_file(self.output / 'release' / artifact['filename']),
+                                            artifact['filename'], VERSION, [self.key]), self.key['keyId'])
+        self.assertEqual(set(updates['headless']), set(release.HEADLESS_PLATFORMS))
+        for platform, entry in updates['headless'].items():
+            name = release.headless_name(VERSION, platform)
+            self.assertEqual((entry['filename'], entry['path']), (name, '/downloads/v%s/%s' % (VERSION, name)))
+            self.assertEqual((entry['bytes'], entry['sha256']), ((self.output / 'release' / name).stat().st_size,
+                                                                  release.digest(self.output / 'release' / name)))
+        self.assertIn(release.headless_name(VERSION, 'linux-amd64'), (self.output / 'SHA256SUMS').read_text())
+        self.assertLess((self.output / 'release/manifest.json').stat().st_size, 16384)
+
+    def test_unsigned_headless_bundles_stay_out_of_the_publication(self):
+        manifest, _ = self.assemble(headless=self.headless)
+        self.assertNotIn('updates', manifest)
+        self.assertEqual({p.name for p in (self.output / 'headless').iterdir()},
+                         {release.headless_name(VERSION, p) for p in release.HEADLESS_PLATFORMS})
+        self.assertFalse(any(p.name.endswith('.tar.gz') for p in (self.output / 'release').iterdir()))
+
+    def test_bad_signatures_never_assemble(self):
+        windows = release.installer_name(VERSION, 'windows-amd64')
+        installer = next(p for p in self.inputs['windows-amd64'].iterdir() if p.suffix == '.exe')
+        linux = release.headless_name(VERSION, 'linux-amd64')
+        for label, change, pattern in (
+            ('other key', lambda: self.sign(installer, windows, secret=b'\x33' * 32, keynum=b'\x44' * 8), 'pinned key'),
+            ('other version', lambda: self.sign(installer, windows, version='9.9.9'), 'another file or version'),
+            ('crossed file', lambda: self.sign(installer, linux), 'another file|does not match'),
+            ('missing', lambda: (self.signatures / (windows + '.sig')).unlink(), 'exactly'),
+            ('garbage', lambda: (self.signatures / (windows + '.sig')).write_text('bm90IGEgc2lnbmF0dXJl'), 'signature'),
+        ):
+            with self.subTest(label=label):
+                change()
+                self.rejected(pattern, headless=self.headless, signatures=self.signatures)
+                for path in self.signed_files():
+                    self.sign(path, None)
+        with mock.patch.object(release.signing_identities, 'updater_keys', lambda _: []):
+            self.rejected('pinned updater keys', headless=self.headless, signatures=self.signatures)
+        self.rejected('all three', headless={'linux-amd64': self.headless['linux-amd64']}, signatures=self.signatures)

@@ -23,5 +23,19 @@
     "sha256": "040353aabcc26f03d2f584af857d78afaf7d278ab1927f80f05b4c85eee831fa",
     "notAfter": "2046-09-28T21:16:51Z",
     "timestampUrl": "http://timestamp.digicert.com"
+  },
+  "updater": {
+    "minisign": [
+      {
+        "role": "primary",
+        "keyId": "A3B2787EF00B3D18",
+        "publicKey": "RWQYPQvwfniyo1DM1fK0WdWgblVeY1/36T4n9ETOD3FLFTzco6C6ZMcP"
+      },
+      {
+        "role": "backup",
+        "keyId": "BB80EB2B961394E8",
+        "publicKey": "RWTolBOWK+uAuz10qcmgFOI1dSeHMhN7rvBh8K9XaB1IoATG8qQaVJ2W"
+      }
+    ]
   }
 }
