@@ -43,7 +43,7 @@ func codexAdmissionValid(home string, deadline time.Time) bool {
 }
 
 func codexAdmissionWindow(now time.Time) time.Time {
-	return now.Add(coordinator.MaxOfferLifetime)
+	return now.Add(coordinator.MaxCodexOfferLifetime)
 }
 
 // Legacy codex-tlsn nodes serve only funded Codex offers, and submitLease

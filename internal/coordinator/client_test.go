@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	yaml "go.yaml.in/yaml/v2"
 )
 
 func TestPollChallenge(t *testing.T) {
@@ -101,6 +103,7 @@ func TestWireFixtures(t *testing.T) {
 		{"lease-offer.json", &Lease{}},
 		{"lease-acceptance.json", &LeaseAcceptance{}},
 		{"lease-x.json", &Lease{}},
+		{"lease-x-pages10.json", &Lease{}},
 		{"lease-web-offer.json", &Lease{}},
 		{"lease-web.json", &Lease{}},
 		{"heartbeat-web.json", &Heartbeat{}},
@@ -150,6 +153,42 @@ func TestWireFixtures(t *testing.T) {
 				t.Fatalf("fixture and Go wire fields differ: %s", tc.file)
 			}
 		})
+	}
+}
+
+// The spec's X page bounds are the node's: one exchange and one attempt for
+// each of up to MaxXSearchPages pages.
+func TestOpenAPIXPageBounds(t *testing.T) {
+	raw, err := os.ReadFile("../../api/node-v1.openapi.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spec struct {
+		Components struct {
+			Schemas struct {
+				XRequest struct {
+					Properties struct {
+						Pages struct{ Minimum, Maximum int } `yaml:"pages"`
+					} `yaml:"properties"`
+				} `yaml:"XRequest"`
+				XPayload struct {
+					Properties struct {
+						MaxAttempts struct{ Minimum, Maximum int } `yaml:"max_attempts"`
+						Exchanges   struct {
+							MinItems int `yaml:"minItems"`
+							MaxItems int `yaml:"maxItems"`
+						} `yaml:"exchanges"`
+					} `yaml:"properties"`
+				} `yaml:"XPayload"`
+			} `yaml:"schemas"`
+		} `yaml:"components"`
+	}
+	if err := yaml.Unmarshal(raw, &spec); err != nil {
+		t.Fatal(err)
+	}
+	pages, payload := spec.Components.Schemas.XRequest.Properties.Pages, spec.Components.Schemas.XPayload.Properties
+	if pages.Minimum != 1 || pages.Maximum != MaxXSearchPages || payload.MaxAttempts.Minimum != 1 || payload.MaxAttempts.Maximum != MaxXSearchPages || payload.Exchanges.MinItems != 1 || payload.Exchanges.MaxItems != MaxXSearchPages {
+		t.Fatalf("spec X page bounds differ from the node's %d: %+v %+v", MaxXSearchPages, pages, payload)
 	}
 }
 

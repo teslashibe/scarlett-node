@@ -128,67 +128,78 @@ func TestActualHelperTrafficAndPreSpawnFailure(t *testing.T) {
 	}
 }
 
+// Every page of a signed search, up to MaxXSearchPages, reserves one durable
+// sample; the journal's bound must hold a ten-page plan, or its first page
+// would fail its reservation and the job would never run.
 func TestXHelperPaginationBoundAndBootstrapExcluded(t *testing.T) {
-	c, l, _ := xFixture(t, coordinator.XRequest{Operation: "search", Query: "synthetic", Count: 20, Pages: 3})
-	if got := ProofSampleLimit(c, l); got != 3 {
-		t.Fatal("signed page bound", got)
+	if attempts.MaxProofSamples < coordinator.MaxXSearchPages {
+		t.Fatal("the journal cannot reserve every page of the longest search")
 	}
-	// The existing X client pins one total helper attempt per page, so a
-	// transport retry or fourth page must fail closed at the durable boundary.
-	j, err := attempts.Open(filepath.Join(t.TempDir(), "attempts"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer j.Close()
-	r := attempts.Record{JobID: l.JobID, Attempt: l.Attempt, Fence: l.Fence, Fingerprint: attempts.Hash([]byte("synthetic lease")), Deadline: l.LeaseDeadline}
-	if err := j.Begin(r); err != nil {
-		t.Fatal(err)
-	}
-	ctx := WithProofObserver(context.Background(), func() (func(attempts.ProofSample) error, error) {
-		ordinal, err := j.BeginProof(r, ProofSampleLimit(c, l))
-		if err != nil {
-			return nil, err
-		}
-		return func(s attempts.ProofSample) error { s.Ordinal = ordinal; return j.CompleteProof(r, s) }, nil
-	})
-	t.Setenv("SCARLETT_FAKE_PROVER", "xtraffic")
-	var bootstrapCalls int
-	transport := XTransport{Prover: os.Args[0], Verifier: "verifier:7047", Token: strings.Repeat("ab", 32), Base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		bootstrapCalls++
-		return &http.Response{StatusCode: 204, Body: http.NoBody, Request: req}, nil
-	})}
-	bootstrap := mustRequest(t, http.MethodGet, "https://abs.twimg.com/synthetic.js").WithContext(ctx)
-	if _, err := transport.RoundTrip(bootstrap); err != nil {
-		t.Fatal(err)
-	}
-	for range 3 {
-		req := mustRequest(t, http.MethodGet, "https://x.com/i/api/graphql/q/SearchTimeline?variables=%7B%7D").WithContext(ctx)
-		resp, err := transport.RoundTrip(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-	}
-	retry := mustRequest(t, http.MethodGet, "https://x.com/i/api/graphql/q/SearchTimeline?variables=%7B%7D").WithContext(ctx)
-	if _, err := transport.RoundTrip(retry); err == nil {
-		t.Fatal("extra helper escaped signed bound")
-	}
-	if err := j.FinishProofTraffic(r); err != nil {
-		t.Fatal(err)
-	}
-	pending, err := j.Pending()
-	if err != nil || len(pending) != 1 {
-		t.Fatal(err)
-	}
-	tm := pending[0].ProofTraffic
-	if bootstrapCalls != 1 || tm == nil || len(tm.Samples) != 3 || !tm.WorkerFinished {
-		t.Fatal("wrong coverage")
-	}
-	for i, s := range tm.Samples {
-		if s.Ordinal != i+1 || s.State != "complete" || s.SentBytes == nil || *s.SentBytes != 41 || *s.ReceivedBytes != 71 {
-			t.Fatal("missing actual helper bytes", s)
-		}
+	for _, pages := range []int{3, coordinator.MaxXSearchPages} {
+		t.Run(fmt.Sprint(pages), func(t *testing.T) {
+			c, l, _ := xFixture(t, coordinator.XRequest{Operation: "search", Query: "synthetic", Count: 20, Pages: pages})
+			if got := ProofSampleLimit(c, l); got != pages {
+				t.Fatal("signed page bound", got)
+			}
+			// The existing X client pins one total helper attempt per page, so a
+			// transport retry or an extra page must fail closed at the durable
+			// boundary.
+			j, err := attempts.Open(filepath.Join(t.TempDir(), "attempts"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer j.Close()
+			r := attempts.Record{JobID: l.JobID, Attempt: l.Attempt, Fence: l.Fence, Fingerprint: attempts.Hash([]byte("synthetic lease")), Deadline: l.LeaseDeadline}
+			if err := j.Begin(r); err != nil {
+				t.Fatal(err)
+			}
+			ctx := WithProofObserver(context.Background(), func() (func(attempts.ProofSample) error, error) {
+				ordinal, err := j.BeginProof(r, ProofSampleLimit(c, l))
+				if err != nil {
+					return nil, err
+				}
+				return func(s attempts.ProofSample) error { s.Ordinal = ordinal; return j.CompleteProof(r, s) }, nil
+			})
+			t.Setenv("SCARLETT_FAKE_PROVER", "xtraffic")
+			var bootstrapCalls int
+			transport := XTransport{Prover: os.Args[0], Verifier: "verifier:7047", Token: strings.Repeat("ab", 32), Base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				bootstrapCalls++
+				return &http.Response{StatusCode: 204, Body: http.NoBody, Request: req}, nil
+			})}
+			bootstrap := mustRequest(t, http.MethodGet, "https://abs.twimg.com/synthetic.js").WithContext(ctx)
+			if _, err := transport.RoundTrip(bootstrap); err != nil {
+				t.Fatal(err)
+			}
+			for range pages {
+				req := mustRequest(t, http.MethodGet, "https://x.com/i/api/graphql/q/SearchTimeline?variables=%7B%7D").WithContext(ctx)
+				resp, err := transport.RoundTrip(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+			retry := mustRequest(t, http.MethodGet, "https://x.com/i/api/graphql/q/SearchTimeline?variables=%7B%7D").WithContext(ctx)
+			if _, err := transport.RoundTrip(retry); err == nil {
+				t.Fatal("extra helper escaped signed bound")
+			}
+			if err := j.FinishProofTraffic(r); err != nil {
+				t.Fatal(err)
+			}
+			pending, err := j.Pending()
+			if err != nil || len(pending) != 1 {
+				t.Fatal(err)
+			}
+			tm := pending[0].ProofTraffic
+			if bootstrapCalls != 1 || tm == nil || len(tm.Samples) != pages || !tm.WorkerFinished {
+				t.Fatal("wrong coverage")
+			}
+			for i, s := range tm.Samples {
+				if s.Ordinal != i+1 || s.State != "complete" || s.SentBytes == nil || *s.SentBytes != 41 || *s.ReceivedBytes != 71 {
+					t.Fatal("missing actual helper bytes", s)
+				}
+			}
+		})
 	}
 }
 

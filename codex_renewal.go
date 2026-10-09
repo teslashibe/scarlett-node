@@ -23,7 +23,7 @@ const (
 	codexRenewalTimeout = 15 * time.Second
 	// Renewal starts this far before expiry, so a failed attempt is retried
 	// several times (backoff) before funded admission drops the profile at
-	// MaxOfferLifetime plus the clock margin before expiry.
+	// MaxCodexOfferLifetime plus the clock margin before expiry.
 	codexRenewalHorizon = 30 * time.Minute
 )
 

@@ -245,10 +245,12 @@ test("A busy web node's history counts from the oldest page kept", () => {
   assert.equal(webPagesServed(history(busy(120, 3.5)), NOW).note, "Last 24 hours · 14 in the browser");
   // X attempts can hold quota snapshots this app never sees: one per page.
   const x = (i: number): DiagnosticsRecord => ({...record, id: `x-${i}`.padEnd(64, "0"), pages: 3, spans: spans(37), started_at: new Date(NOW - i * 60_000).toISOString()});
-  const mixed = [...busy(160, 3.5), ...Array.from({length: 12}, (_, i) => x(i))];
-  assert.equal(historyBytes(mixed), 172 * (700 + 37 * 144) + 12 * 3 * 512);
+  // Without those snapshots these 165 attempts would sit under the bound.
+  const mixed = [...busy(150, 3.5), ...Array.from({length: 15}, (_, i) => x(i))];
+  assert.equal(historyBytes(mixed), 165 * (700 + 37 * 144) + 15 * 3 * 512);
+  assert.ok(165 * (700 + 37 * 144) < MAX_HISTORY_BYTES - MAX_ATTEMPT_BYTES);
   assert.ok(historyMayBeTruncated(mixed));
-  assert.ok(!historyMayBeTruncated(mixed.slice(0, 165)));
+  assert.ok(!historyMayBeTruncated(mixed.slice(0, 160)));
 });
 test("The history bounds match what the node writes", () => {
   const schema = readFileSync(new URL("../../internal/diagnostics/schema.go", import.meta.url), "utf8");
@@ -257,8 +259,8 @@ test("The history bounds match what the node writes", () => {
   assert.equal(constant("MaxAttempts"), String(MAX_RETAINED_ATTEMPTS));
   assert.equal(constant("MaxHistoryBytes"), "1 << 20");
   assert.equal(MAX_HISTORY_BYTES, 1 << 20);
-  assert.equal(constant("MaxAttemptBytes"), "8 << 10");
-  assert.equal(MAX_ATTEMPT_BYTES, 8 << 10);
+  assert.equal(constant("MaxAttemptBytes"), "48 << 10");
+  assert.equal(MAX_ATTEMPT_BYTES, 48 << 10);
   assert.match(quota, /const quotaSnapshotBytes = 512\r?\n/);
   assert.match(quota, /return 700 \+ len\(r\.Spans\)\*144 \+ len\(r\.QuotaSnapshots\)\*quotaSnapshotBytes\r?\n/);
   assert.equal(historyBytes([{...web(1), spans: spans(2)}]), 700 + 2 * 144);

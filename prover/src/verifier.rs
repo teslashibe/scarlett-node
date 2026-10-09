@@ -80,6 +80,10 @@ use crate::{
 
 const MAX_TTL: Duration = Duration::from_secs(600);
 
+/// A durable X job pins one to ten exchanges (a search of up to ten pages),
+/// with one attempt each.
+const MAX_DURABLE_X_EXCHANGES: usize = 10;
+
 /// X and Codex always keep this many of the verifier's session slots.
 const X_CODEX_SLOTS: usize = 16;
 
@@ -330,8 +334,8 @@ fn kind(payload: &Value, durable: bool) -> Result<(Kind, Status)> {
     if payload["type"] == "x.read" {
         let (specs, max) = xpolicy::validate_job(payload)?;
         let mode = xpolicy::proof_mode(payload)?;
-        if durable && (specs.len() > 3 || max != specs.len()) {
-            bail!("durable X jobs require 1-3 exchanges with one attempt each");
+        if durable && (specs.len() > MAX_DURABLE_X_EXCHANGES || max != specs.len()) {
+            bail!("durable X jobs require 1-{MAX_DURABLE_X_EXCHANGES} exchanges with one attempt each");
         }
         let pending = (0..specs.len()).collect();
         Ok((
@@ -789,6 +793,45 @@ mod durable_tests {
         assert_eq!(create(State(s.clone()), headers(), Json(r)).await.0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(status(State(s), headers(), Path(("synthetic".into(), "1".into()))).await.0, StatusCode::SERVICE_UNAVAILABLE);
         fs::rename(dir.0.with_extension("moved"), &dir.0).unwrap();
+    }
+    /// A search of up to ten pages registers durably, as
+    /// api/fixtures/lease-x-pages10.json pins it: ten exchanges chained by
+    /// cursor, one attempt each. An eleventh exchange or a retry is refused.
+    #[tokio::test]
+    async fn durable_x_jobs_take_one_to_ten_exchanges_with_one_attempt_each() {
+        let lease: Value = serde_json::from_str(include_str!("../../api/fixtures/lease-x-pages10.json")).unwrap();
+        let ten = lease["x_payload"].clone();
+        assert_eq!(ten["exchanges"].as_array().unwrap().len(), MAX_DURABLE_X_EXCHANGES);
+        let (k, st) = kind(&ten, true).unwrap();
+        assert!(validate_receipt(&k, &st, 0).is_ok());
+        assert!(matches!(&st, Status::XRead { remaining_attempts: 10, pending, .. } if pending.len() == 10));
+        let mut eleven = ten.clone();
+        let mut extra = eleven["exchanges"][9].clone();
+        extra["cursor_from"] = 9.into();
+        eleven["exchanges"].as_array_mut().unwrap().push(extra);
+        eleven["max_attempts"] = 11.into();
+        assert!(kind(&eleven, true).is_err());
+        // Legacy ephemeral sessions keep the wider read policy.
+        assert!(kind(&eleven, false).is_ok());
+        let mut retry = ten.clone();
+        retry["max_attempts"] = 11.into();
+        assert!(kind(&retry, true).is_err());
+
+        let dir = Temp::new();
+        let s = shared(&dir.0);
+        // A ten-page job's deadline is its creation second plus 298 s.
+        let expires = now_ms() + 298_000;
+        let mut r = request(expires);
+        r.payload = ten;
+        assert_eq!(create(State(s.clone()), headers(), Json(r)).await.0, StatusCode::CREATED);
+        let mut r = request(expires);
+        r.attempt = "2".into();
+        r.payload = eleven;
+        assert_eq!(create(State(s.clone()), headers(), Json(r)).await.0, StatusCode::BAD_REQUEST);
+        let (code, Json(view)) = status(State(s), headers(), Path(("synthetic".into(), "1".into()))).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!((view["status"].as_str(), view["remaining_attempts"].as_u64(), view["complete"].as_bool()), (Some("x_read"), Some(10), Some(false)));
+        assert_eq!(view["pending"].as_array().map(Vec::len), Some(10));
     }
     #[tokio::test]
     async fn durable_session_requires_fence_absolute_expiry_and_authorization() {

@@ -273,16 +273,16 @@ func validateDiagnosticsFixtureFailure(t *testing.T, c config.Config, store *dia
 
 func validateDenseDiagnosticsFixture(t *testing.T, store *diagnostics.Store) {
 	t.Helper()
-	attempt := store.Begin(diagnostics.Metadata{ID: "synthetic-dense-three-exchanges", Operation: "search", Pages: 3, ProofMode: "relay"})
+	attempt := store.Begin(diagnostics.Metadata{ID: "synthetic-dense-ten-exchanges", Operation: "search", Pages: 10, ProofMode: "relay"})
 	ctx := attempt.Context(context.Background())
-	for i := range 100 {
-		diagnostics.Start(ctx, "request_encode", i%3+1)("success")
+	for i := range diagnostics.MaxSpans + 36 {
+		diagnostics.Start(ctx, "request_encode", i%10+1)("success")
 	}
 	attempt.Finish("success")
 	for _, record := range store.Snapshot().Attempts {
 		if record.Operation == "search" {
 			if !record.Truncated || len(record.Spans) > diagnostics.MaxSpans {
-				t.Fatal("dense three-exchange diagnostic did not remain bounded", record)
+				t.Fatal("dense ten-exchange diagnostic did not remain bounded", record)
 			}
 			return
 		}

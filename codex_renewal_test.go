@@ -1004,7 +1004,7 @@ func TestCodexRenewalSurvivesUnrelatedJournalObservations(t *testing.T) {
 // One failed attempt, retried after the backoff, must still find the profile
 // admissible: the horizon leaves several retries before the funded guard.
 func TestCodexRenewalRetriesBeforeAdmissionGuard(t *testing.T) {
-	guard := coordinator.MaxOfferLifetime + codexAdmissionClockMargin
+	guard := coordinator.MaxCodexOfferLifetime + codexAdmissionClockMargin
 	if retries := (codexRenewalHorizon + codexAdmissionClockMargin - guard - codexRenewalCadence) / codexRenewalBackoff; retries < 3 {
 		t.Fatal("renewal horizon leaves too few retries before the admission guard", retries)
 	}
@@ -1067,7 +1067,7 @@ func TestCodexLocalGuardIsLocalExpiryAndInvalidOfferIsNotAuth(t *testing.T) {
 			want := codexLocalAuthExpired
 			if change == "offer-too-long" {
 				// A coordinator clock ahead of ours: Accept would refuse it locally.
-				l.LeaseDeadline = time.Now().Add(coordinator.MaxOfferLifetime + coordinator.OfferClockSkew + 6*time.Second)
+				l.LeaseDeadline = time.Now().Add(coordinator.MaxCodexOfferLifetime + coordinator.OfferClockSkew + 6*time.Second)
 				l.SettlementDeadline = l.LeaseDeadline
 				want = "invalid_lease"
 			} else if err := writePrivateFixture(filepath.Join(selected.config.CodexHome, "auth.json"), syntheticCodexAuth(time.Now().Add(-time.Minute)), 0600); err != nil {

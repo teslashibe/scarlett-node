@@ -295,7 +295,7 @@ func TestLegacyCodexTLSNHeartbeatHonorsLocalAdmission(t *testing.T) {
 		offer bool
 	}{
 		{"expired", syntheticCodexAuth(time.Now().Add(-time.Hour)), "exhausted", true},
-		{"shorter than an offer", syntheticCodexAuth(time.Now().Add(coordinator.MaxOfferLifetime)), "exhausted", false},
+		{"shorter than an offer", syntheticCodexAuth(time.Now().Add(coordinator.MaxCodexOfferLifetime)), "exhausted", false},
 		{"unknown expiry", []byte(`{"tokens":{"access_token":"synthetic-opaque","account_id":"synthetic"}}`), "exhausted", false},
 		{"fresh", freshSyntheticCodexAuth(), "available", false},
 	} {
