@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "version": "0.1.15",
+  "date": "2026-10-09",
+  "title": "Web page stats on the dashboard",
+  "highlights": [
+    "The top of the app now shows web pages next to X: whether they are on, free web slots, recent pages served and the hidden browser's state",
+    "Local request measurements name web pages and hidden browser renders, and a busy verifier or an oversized page no longer hides the history"
+  ]
+}

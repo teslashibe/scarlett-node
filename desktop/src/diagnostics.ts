@@ -1,7 +1,10 @@
-import { journalNote, type Snapshot } from "./model.ts";
+import { journalNote, type Metric, type Snapshot } from "./model.ts";
 
-export type DiagnosticsOperation = "search" | "profile" | "post" | "thread" | "codex" | "other";
-export type DiagnosticsProof = "relay" | "mpc" | "none";
+// The node and native projection share these closed sets (internal/diagnostics
+// schema.go and src-tauri diagnostics.rs). A web page is "scrape", and a page
+// rendered in the hidden browser has proof mode "browser".
+export type DiagnosticsOperation = "search" | "profile" | "post" | "thread" | "codex" | "scrape" | "other";
+export type DiagnosticsProof = "relay" | "mpc" | "browser" | "none";
 export type DiagnosticsSpan = {
   phase: string; source: "node" | "helper"; exchange: number;
   start_ms: number; duration_ms: number; outcome: string;
@@ -34,10 +37,13 @@ export const clockTime = (value?: string): string => {
   return Number.isFinite(date.getTime()) ? date.toLocaleString() : "Unknown";
 };
 export const operation = (value: DiagnosticsOperation): string =>
-  ({ search: "X search", profile: "X profile", post: "X post", thread: "X thread", codex: "Codex", other: "Other work" })[value];
-export const proof = (value: DiagnosticsProof): string => ({ relay: "Relay", mpc: "MPC", none: "No proof" })[value];
+  ({ search: "X search", profile: "X profile", post: "X post", thread: "X thread", codex: "Codex", scrape: "Web page", other: "Other work" })[value] ?? "Other work";
+export const proof = (value: DiagnosticsProof): string => ({ relay: "Relay", mpc: "MPC", browser: "Hidden browser", none: "No proof" })[value] ?? "No proof";
+// A web job is always one page; its exchanges are redirect hops, not pages.
 export const groupTitle = (value: {operation: DiagnosticsOperation; pages: number; proof_mode: DiagnosticsProof}): string =>
-  `${operation(value.operation)} · ${value.pages} ${value.pages === 1 ? "page" : "pages"} · ${proof(value.proof_mode)}`;
+  value.operation === "scrape"
+    ? `${operation(value.operation)} · ${proof(value.proof_mode)}`
+    : `${operation(value.operation)} · ${value.pages} ${value.pages === 1 ? "page" : "pages"} · ${proof(value.proof_mode)}`;
 export const outcome = (value: string): string => value.replaceAll("_", " ");
 const phases: Record<string, string> = {
   worker_acquire: "Worker admission", account_acquire: "Account admission", accept_http: "Accept request",
@@ -56,6 +62,7 @@ const phases: Record<string, string> = {
   relay_authorization: "Relay authorization, includes remaining TLS, OT and admission",
   request_sent: "Request sent", response_first_byte: "First response byte over the proof path", response_complete: "Response complete",
   opening_check: "Opening check", proof_finalize: "Finalize proof",
+  browser_fetch: "Hidden browser render", browser_upload: "Upload browser copy", verifier_busy_wait: "Verifier busy wait",
 };
 export const phase = (value: string): string => phases[value] ?? "Unknown phase";
 export function diagnosticsNote(value?: Diagnostics): string {
@@ -73,6 +80,44 @@ export function outcomeCounts(records: DiagnosticsRecord[]): {outcome: string; c
   const counts = new Map<string, number>();
   for (const record of records) counts.set(record.outcome, (counts.get(record.outcome) ?? 0) + 1);
   return [...counts].sort(([a], [b]) => a.localeCompare(b)).map(([outcome, count]) => ({outcome, count}));
+}
+// The node keeps attempts for 24 hours, at most this many (schema.go
+// MaxAttempts), and drops its oldest sooner to keep its own size estimate
+// under MaxHistoryBytes. One attempt never estimates above MaxAttemptBytes.
+export const MAX_RETAINED_ATTEMPTS = 200;
+export const MAX_HISTORY_BYTES = 1 << 20;
+export const MAX_ATTEMPT_BYTES = 8 << 10;
+// The node's per-attempt estimate (quota.go estimatedBytes): 700 bytes, 144
+// per span and 512 per X quota snapshot. This app never receives the
+// snapshots, so it counts the most an attempt keeps, one per page; web pages
+// keep none.
+export function historyBytes(attempts: DiagnosticsRecord[]): number {
+  return attempts.reduce((sum, r) => sum + 700 + 144 * r.spans.length + (r.operation === "scrape" ? 0 : 512 * r.pages), 0);
+}
+// Once the node has dropped an attempt for size, what it keeps stays within
+// one attempt of the bound until old attempts age out. A busy web node fills
+// it with about 175 pages, well before 200 attempts.
+export function historyMayBeTruncated(attempts: DiagnosticsRecord[]): boolean {
+  return attempts.length >= MAX_RETAINED_ATTEMPTS || historyBytes(attempts) >= MAX_HISTORY_BYTES - MAX_ATTEMPT_BYTES;
+}
+const DAY_MS = 24 * 60 * 60 * 1000;
+// Web pages this node served and reported, from its local attempt history. A
+// history that may have dropped attempts counts only from the oldest one kept,
+// and says so. Pass the history before xDiagnostics hides model attempts,
+// since those count toward the limits too.
+export function webPagesServed(value: Diagnostics | undefined, now = Date.now()): Metric {
+  if (!value) return { value: "—", note: "Checking local history" };
+  const snapshot = value.snapshot;
+  if (!value.available || !snapshot || snapshot.load_error) return { value: "Unknown", note: "Local history unavailable" };
+  const started = (r: DiagnosticsRecord) => Date.parse(r.started_at);
+  const recent = snapshot.attempts.filter((r) => now - started(r) <= DAY_MS);
+  const served = recent.filter((r) => r.operation === "scrape" && r.outcome === "success");
+  const browser = served.filter((r) => r.proof_mode === "browser").length;
+  const oldest = Math.min(...recent.map(started));
+  const period = historyMayBeTruncated(snapshot.attempts) && Number.isFinite(oldest)
+    ? `Since ${new Date(oldest).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
+    : "Last 24 hours";
+  return { value: String(served.length), note: browser ? `${period} · ${browser} in the browser` : period };
 }
 export function availableXSlots(s: Snapshot): number | undefined {
   const x = s.observation?.services?.find((v) => v.kind === "x_read");
@@ -96,9 +141,10 @@ export function localCapacity(s: Snapshot): string {
 // node's axis or summed with overlapping parent spans.
 export function timelineAxes(record: DiagnosticsRecord): { label: string; spans: DiagnosticsSpan[] }[] {
   const axes = [{ label: "Node clock · time since attempt started", spans: record.spans.filter((s) => s.source === "node") }];
-  for (const exchange of [1, 2, 3]) {
+  // Exchanges are X pages (up to three) or web hops (up to six).
+  for (const exchange of [1, 2, 3, 4, 5, 6]) {
     const spans = record.spans.filter((s) => s.source === "helper" && s.exchange === exchange);
-    if (spans.length) axes.push({ label: `Helper clock · page ${exchange} · time since helper started`, spans });
+    if (spans.length) axes.push({ label: `Helper clock · ${record.operation === "scrape" ? "hop" : "page"} ${exchange} · time since helper started`, spans });
   }
   return axes;
 }

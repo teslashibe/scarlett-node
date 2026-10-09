@@ -5,7 +5,7 @@ import { api } from "./api.ts";
 import { scheduleXLoginExpiry } from "./x-login-expiry.ts";
 import { accountRemovalConfirmation } from "./account-removal.ts";
 import { failureNotice, updatedBanner, updateSummary, updateToast, validVersion, type UpdateAction, type UpdateStatus } from "./update.ts";
-import { availableXSlots, diagnosticsNote, localCapacity, renderDiagnostics, xDiagnostics, type Diagnostics } from "./diagnostics.ts";
+import { availableXSlots, diagnosticsNote, localCapacity, renderDiagnostics, webPagesServed, xDiagnostics, type Diagnostics } from "./diagnostics.ts";
 import {
   accountHealth,
   accountTitle,
@@ -27,6 +27,10 @@ import {
   webServingSaved,
   accountsEmptyText,
   servingNote,
+  webServing,
+  availableWebSlots,
+  hiddenBrowser,
+  type Metric,
   type XLoginStatus,
   type Account,
   type Preferences,
@@ -78,6 +82,11 @@ const setText = (el: HTMLElement, text: string) => {
   // Live regions re-announce on every write; only write changes.
   if (el.textContent !== text) el.textContent = text;
 };
+// A tile whose note changes with its value; the note element is `${id}-note`.
+const setMetric = (id: string, metric: Metric) => {
+  setText($(id), metric.value);
+  setText($(`${id}-note`), metric.note);
+};
 const notice = (text: string, error = false) => {
   const n = $("notice");
   n.textContent = text;
@@ -105,6 +114,9 @@ function render(s: Snapshot) {
   setText($("metric-capacity"), String(availableXSlots(s) ?? "Unknown"));
   setText($("metric-jobs"), String(s.observation?.in_flight ?? "Unknown"));
   setText($("metric-pending"), String(s.observation?.unresolved_attempts ?? "Unknown"));
+  setMetric("metric-web", webServing(s));
+  setText($("metric-web-capacity"), String(availableWebSlots(s) ?? "Unknown"));
+  setMetric("metric-browser", hiddenBrowser(s));
   $("accounts-empty").hidden = accounts.length > 0 || draining.length > 0;
   setText($("accounts-empty"), accountsEmptyText(s));
   $("x-profile").toggleAttribute("disabled", busy || !browserProfilesAvailable);
@@ -316,9 +328,13 @@ async function refreshClaude() {
 async function refreshDiagnostics() {
   if (diagnosticsPolling) return;
   diagnosticsPolling = true;
-  try { diagnostics = xDiagnostics(await api.diagnostics()); }
-  catch { diagnostics = { available: false }; }
+  let history: Diagnostics;
+  try { history = await api.diagnostics(); }
+  catch { history = { available: false }; }
   finally { diagnosticsPolling = false; }
+  // Count web pages from the whole history: model attempts share its limit.
+  setMetric("metric-web-served", webPagesServed(history));
+  diagnostics = xDiagnostics(history);
   setText($("diagnostics-note"), diagnosticsNote(diagnostics));
   renderDiagnostics($("diagnostics-history"), diagnostics);
 }

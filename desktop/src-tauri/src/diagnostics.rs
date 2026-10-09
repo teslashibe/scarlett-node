@@ -100,6 +100,8 @@ const OUTCOMES: &[&str] = &[
     "web_fetch_failed",
     "web_browser_unavailable",
     "web_browser_failed",
+    "page_too_large",
+    "verifier_busy",
 ];
 const NODE_PHASES: &[&str] = &[
     "account_acquire",
@@ -132,6 +134,7 @@ const NODE_PHASES: &[&str] = &[
     "report_http",
     "browser_fetch",
     "browser_upload",
+    "verifier_busy_wait",
 ];
 const HELPER_PHASES: &[&str] = &[
     "helper_total",
@@ -440,6 +443,55 @@ mod tests {
         }
         v["attempts"][0]["proof_mode"] = json!("chrome");
         assert!(project(&serde_json::to_vec(&v).unwrap()).is_none());
+    }
+    /// Every word the node may write (internal/diagnostics/schema.go) must
+    /// project, or one such attempt hides all local history for a day.
+    #[test]
+    fn every_node_vocabulary_word_is_accepted() {
+        let schema = include_str!("../../../internal/diagnostics/schema.go");
+        let words = |name: &str| -> Vec<&str> {
+            let start = schema
+                .find(&format!("var {name} = words("))
+                .unwrap_or_else(|| panic!("{name} not found in schema.go"));
+            let list = &schema[start..];
+            list[..list.find(')').unwrap()]
+                .split('"')
+                .skip(1)
+                .step_by(2)
+                .collect()
+        };
+        let init = &schema[schema.find("func init()").unwrap()..];
+        let extra_phases = init[..init.find('}').unwrap()]
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .collect::<Vec<_>>();
+        assert_eq!(extra_phases.len(), 4);
+        for (name, accepted) in [
+            ("operations", OPERATIONS),
+            ("proofModes", PROOFS),
+            ("outcomes", OUTCOMES),
+            ("nodePhases", NODE_PHASES),
+            ("helperPhases", HELPER_PHASES),
+        ] {
+            let node = words(name);
+            assert!(!node.is_empty(), "{name}");
+            for word in node {
+                assert!(accepted.contains(&word), "{name}: {word}");
+            }
+        }
+        for phase in extra_phases {
+            assert!(NODE_PHASES.contains(&phase), "{phase}");
+        }
+    }
+    #[test]
+    fn web_page_failures_and_verifier_waits_stay_available() {
+        let mut v = sample();
+        v["attempts"][0]["operation"] = json!("scrape");
+        v["attempts"][0]["pages"] = json!(1);
+        v["attempts"][0]["outcome"] = json!("page_too_large");
+        v["attempts"][0]["spans"][0] = json!({"phase":"verifier_busy_wait","source":"node","exchange":1,"start_ms":0,"duration_ms":500,"outcome":"verifier_busy"});
+        assert!(project(&serde_json::to_vec(&v).unwrap()).is_some());
     }
     #[test]
     fn final_failure_vocabulary_keeps_a_valid_snapshot_available() {

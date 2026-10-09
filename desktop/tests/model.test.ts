@@ -25,6 +25,10 @@ import {
   webServingSaved,
   accountsEmptyText,
   servingNote,
+  webServing,
+  availableWebSlots,
+  hiddenBrowser,
+  type ServiceHealth,
   type Snapshot,
 } from "../src/model.ts";
 const base: Snapshot = {
@@ -290,5 +294,137 @@ test("With web on, the no-account copy does not say an X account is needed to ea
   for (const s of [{ ...base, accounts: [], web_enabled: false }, { ...base, accounts: [] }]) {
     assert.equal(accountsEmptyText(s), "Connect an X account to start serving work");
     assert.equal(servingNote(s), "Serve X network jobs with the accounts connected to this device");
+  }
+});
+
+// A paired web-only node: no X account, web on, running under this app.
+const webNode = (web?: ServiceHealth, extra: Partial<NonNullable<Snapshot["observation"]>> = {}): Snapshot => ({
+  ...base,
+  accounts: [],
+  supervised: true,
+  web_enabled: true,
+  observation: {
+    state: "running", in_flight: 0, drain_requested: false,
+    services: [
+      { kind: "x_read", state: "not_added", capacity: 0, in_flight: 0 },
+      ...(web ? [web] : []),
+    ],
+    ...extra,
+  },
+});
+const readyWeb: ServiceHealth = {
+  kind: "web", state: "ready", capacity: 4, in_flight: 1, egress: "direct",
+  browser: { state: "ready", capacity: 2, in_flight: 0, version: "141.0.7390.54" },
+};
+test("The web tiles show what the running node serves, not only the saved setting", () => {
+  assert.deepEqual(webServing(webNode(readyWeb)), { value: "On", note: "Serving on this device" });
+  assert.equal(availableWebSlots(webNode(readyWeb)), 3);
+  assert.deepEqual(hiddenBrowser(webNode(readyWeb)), { value: "Ready", note: "For pages behind bot checks" });
+  // A configured service has not served a page yet but takes work.
+  assert.equal(availableWebSlots(webNode({ ...readyWeb, state: "configured" })), 3);
+  assert.equal(webServing(webNode({ ...readyWeb, state: "configured" })).value, "On");
+  // Every slot busy is still on, with none free.
+  assert.equal(availableWebSlots(webNode({ ...readyWeb, in_flight: 4 })), 0);
+  assert.equal(availableWebSlots(webNode({ ...readyWeb, in_flight: 9 })), 0);
+  // A node running outside the app reports the same way, and the app's own
+  // setting never claims a restart would change it.
+  assert.deepEqual(webServing({ ...webNode(readyWeb), supervised: false, web_enabled: false }), { value: "On", note: "Serving on this device" });
+});
+test("Web off reads as off, and a pending change says how to apply it", () => {
+  // A node without web reports no egress or browser for it (services.go health).
+  const off: ServiceHealth = { kind: "web", state: "not_added", capacity: 0, in_flight: 0 };
+  const savedOff = { ...webNode(off), web_enabled: false };
+  assert.deepEqual(webServing(savedOff), { value: "Off", note: "Turn on in Device settings" });
+  assert.equal(availableWebSlots(savedOff), 0);
+  assert.deepEqual(hiddenBrowser(savedOff), { value: "Off", note: "Web pages are off" });
+  // Turned on while the node runs without web.
+  assert.deepEqual(webServing({ ...webNode(off), web_restart_pending: true }), { value: "Off", note: "Stop and start the node to turn on" });
+  // Turned off while the node still serves web.
+  assert.deepEqual(webServing({ ...webNode(readyWeb), web_enabled: false, web_restart_pending: true }), { value: "On", note: "Stop and start the node to turn off" });
+});
+test("A stopped node shows the saved web setting and frees no slots", () => {
+  for (const state of ["stopped", "offline"]) {
+    const on = webNode(readyWeb, { state });
+    assert.deepEqual(webServing(on), { value: "On", note: "Serves pages when the node runs" });
+    assert.equal(availableWebSlots(on), 0);
+    // The running node checks memory, disk and the download first, so a
+    // stopped one promises nothing about the browser.
+    assert.deepEqual(hiddenBrowser({ ...on, web_browser: true }), { value: "Off", note: "Checked when the node runs" });
+    assert.deepEqual(hiddenBrowser(on), { value: "Off", note: "Checked when the node runs" });
+    // Windows by default, or SCARLETT_WEB_BROWSER=off: the same words the
+    // running node's "disabled" reason gets, so Start changes nothing.
+    const relayOnly = { ...on, web_browser: false };
+    assert.deepEqual(hiddenBrowser(relayOnly), { value: "Off", note: "Relay pages only on this device" });
+    assert.deepEqual(hiddenBrowser(relayOnly), hiddenBrowser(webNode({ ...readyWeb, browser: { state: "unavailable", reason: "disabled" } })));
+    const off = { ...on, web_enabled: false };
+    assert.deepEqual(webServing(off), { value: "Off", note: "Turn on in Device settings" });
+    assert.deepEqual(hiddenBrowser(off), { value: "Off", note: "Web pages are off" });
+    assert.deepEqual(hiddenBrowser({ ...off, web_browser: false }), { value: "Off", note: "Web pages are off" });
+  }
+  // Never started: no status at all.
+  const fresh: Snapshot = { ...base, accounts: [], web_enabled: true };
+  assert.equal(webServing(fresh).value, "On");
+  assert.equal(availableWebSlots(fresh), undefined);
+  assert.deepEqual(webServing({ ...fresh, web_enabled: undefined }), { value: "Unknown", note: "Waiting for node status" });
+});
+test("A paused node or web service says why it takes no new pages", () => {
+  const draining = webNode(readyWeb, { drain_requested: true });
+  assert.deepEqual(webServing(draining), { value: "Paused", note: "Finishing accepted work" });
+  assert.equal(availableWebSlots(draining), 0);
+  assert.deepEqual(webServing(webNode(readyWeb, { state: "draining" })), { value: "Paused", note: "Finishing accepted work" });
+  for (const [code, note] of [
+    ["relay_misuse", "Relay paused on this node"],
+    ["web_proxy_failed", "Proxy failed · retrying in a minute"],
+    ["prover_error", "Proof helper missing"],
+    ["something_new", "Not taking new pages"],
+  ]) {
+    const paused = webNode({ kind: "web", state: "unreachable", capacity: 0, in_flight: 0, last_error_code: code, browser: { state: "unavailable", reason: "web_unavailable" } });
+    assert.deepEqual(webServing(paused), { value: "Paused", note });
+    assert.equal(availableWebSlots(paused), 0);
+    assert.deepEqual(hiddenBrowser(paused), { value: "Paused", note: "Waiting for web pages" });
+  }
+});
+test("A full receipt journal pauses web without turning a node with web off on", () => {
+  // The node rewrites every service, web off included, to exhausted while its
+  // receipt journal is full; only an enabled web entry carries egress and browser.
+  const full = { journal_full: true };
+  const on = webNode({ ...readyWeb, state: "exhausted" }, full);
+  assert.deepEqual(webServing(on), { value: "Paused", note: "Receipt journal full" });
+  assert.equal(availableWebSlots(on), 0);
+  assert.deepEqual(hiddenBrowser(on), { value: "Ready", note: "For pages behind bot checks" });
+  const off = { ...webNode({ kind: "web", state: "exhausted", capacity: 0, in_flight: 0 }, full), web_enabled: false };
+  assert.deepEqual(webServing(off), { value: "Off", note: "Turn on in Device settings" });
+  assert.equal(availableWebSlots(off), 0);
+  assert.deepEqual(hiddenBrowser(off), { value: "Off", note: "Web pages are off" });
+  // Turned on while a node without web runs with a full journal.
+  assert.deepEqual(webServing({ ...off, web_enabled: true, web_restart_pending: true }), { value: "Off", note: "Stop and start the node to turn on" });
+  // Draining says so first; the journal clears as accepted work finishes.
+  assert.deepEqual(webServing(webNode({ ...readyWeb, state: "exhausted" }, { ...full, drain_requested: true })), { value: "Paused", note: "Finishing accepted work" });
+  // With room again the web entry's own state decides.
+  assert.deepEqual(webServing(webNode(readyWeb, { journal_full: false })), { value: "On", note: "Serving on this device" });
+});
+test("Hidden browser states use plain words for every reason the node reports", () => {
+  const reasons = ["disabled", "memory_low", "disk_low", "runtime_missing", "runtime_invalid", "browser_downloading",
+    "browser_download_failed", "browser_invalid", "deps_missing", "sandbox_unavailable", "helper_failed"];
+  for (const reason of reasons) {
+    const tile = hiddenBrowser(webNode({ ...readyWeb, browser: { state: "unavailable", reason } }));
+    assert.ok(["Off", "Downloading", "Unavailable"].includes(tile.value), reason);
+    assert.ok(tile.note && !tile.note.endsWith(".") && !tile.note.includes("_"), reason);
+  }
+  assert.deepEqual(hiddenBrowser(webNode({ ...readyWeb, browser: { state: "unavailable", reason: "browser_downloading" } })), { value: "Downloading", note: "Getting the browser ready" });
+  assert.deepEqual(hiddenBrowser(webNode({ ...readyWeb, browser: { state: "unavailable", reason: "disabled" } })), { value: "Off", note: "Relay pages only on this device" });
+  // Unknown reasons and missing browser data never echo raw codes.
+  assert.deepEqual(hiddenBrowser(webNode({ ...readyWeb, browser: { state: "unavailable", reason: "launch_failed" } })), { value: "Unavailable", note: "Browser not ready" });
+  assert.equal(hiddenBrowser(webNode({ ...readyWeb, browser: undefined })).value, "Unknown");
+});
+test("Missing web status stays unknown instead of guessing", () => {
+  const noWeb = webNode();
+  assert.equal(webServing(noWeb).value, "Unknown");
+  assert.equal(availableWebSlots(noWeb), undefined);
+  assert.equal(hiddenBrowser(noWeb).value, "Unknown");
+  for (const field of ["capacity", "in_flight", "state"] as const) {
+    const web = { ...readyWeb };
+    delete web[field];
+    assert.equal(availableWebSlots(webNode(web)), undefined, field);
   }
 });
