@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "version": "0.1.13",
   "date": "2026-10-09",
-  "title": "Automatic updates",
+  "title": "Automatic updates and full-size web pages",
   "highlights": [
-    "Turn on Install updates automatically and Scarlett installs new versions when accepted jobs finish",
+    "Turn on Install updates automatically and Scarlett installs new versions when accepted jobs finish; app updates need no extra approval on Mac or Windows",
     "The node starts again when Scarlett opens if it was running when it closed",
-    "Updates downloaded by the app no longer need approving again on Mac or Windows"
+    "Web jobs now return whole pages up to 64 MiB: bodies stream to disk and the hidden browser uploads big pages in resumable parts"
   ]
 }
