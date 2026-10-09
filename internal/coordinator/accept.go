@@ -17,20 +17,28 @@ type LeaseAcceptance struct {
 	Lease            Lease  `json:"lease"`
 }
 
-// MaxOfferLifetime bounds the unchanged community offer accepted by a node
-// for codex and x_read; MaxWebOfferLifetime bounds a web offer, whose job may
-// run 298 s so that a large page fits a slow uplink.
+// The longest unchanged community offer a node accepts, per service. Codex
+// keeps 120 s (its job deadline is the creation second plus 118 s). Web and
+// x_read get 300 s: a web job runs 298 s so that a large page fits a slow
+// uplink, and an x_read search of four to ten pages runs up to 298 s because
+// its account spaces searches about 20 s apart (one to three pages keep
+// 118 s). An x_read offer need not carry its payload, so the node cannot count
+// its pages before acceptance; the coordinator's deadline bounds the job.
 const (
-	MaxOfferLifetime    = 120 * time.Second
-	MaxWebOfferLifetime = 300 * time.Second
+	MaxCodexOfferLifetime = 120 * time.Second
+	MaxXOfferLifetime     = 300 * time.Second
+	MaxWebOfferLifetime   = 300 * time.Second
 )
 
 // OfferLifetime is the longest lease a node accepts for service.
 func OfferLifetime(service string) time.Duration {
-	if service == "web" {
+	switch service {
+	case "web":
 		return MaxWebOfferLifetime
+	case "x_read":
+		return MaxXOfferLifetime
 	}
-	return MaxOfferLifetime
+	return MaxCodexOfferLifetime
 }
 
 // acceptRetries is how many more times Accept sends the same acceptance after

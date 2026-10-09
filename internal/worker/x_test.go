@@ -1,9 +1,11 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -114,8 +116,12 @@ func xFixture(t *testing.T, request coordinator.XRequest) (config.Config, coordi
 	return c, l, plan
 }
 func TestXPublicOperationsAndExactPagination(t *testing.T) {
-	for _, request := range []coordinator.XRequest{{Operation: "profile", Username: "fixture"}, {Operation: "post", PostID: "20"}, {Operation: "thread", PostID: "20"}, {Operation: "search", Query: "bitcoin", Count: 20, Pages: 3}} {
-		t.Run(request.Operation, func(t *testing.T) {
+	for _, request := range []coordinator.XRequest{{Operation: "profile", Username: "fixture"}, {Operation: "post", PostID: "20"}, {Operation: "thread", PostID: "20"}, {Operation: "search", Query: "bitcoin", Count: 20, Pages: 3}, {Operation: "search", Query: "bitcoin", Count: 20, Pages: coordinator.MaxXSearchPages}} {
+		name := request.Operation
+		if request.Pages > 0 {
+			name = fmt.Sprintf("%s %d pages", name, request.Pages)
+		}
+		t.Run(name, func(t *testing.T) {
 			c, l, plan := xFixture(t, request)
 			proofs := 0
 			proof := roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -142,7 +148,16 @@ func TestXPublicOperationsAndExactPagination(t *testing.T) {
 				}
 				return xBootstrap(r)
 			})
-			if code := (X{Config: c, Base: roundTripFunc(xBootstrap), Proof: proof}).Run(context.Background(), l); code != "" {
+			run := X{Config: c, Base: roundTripFunc(xBootstrap), Proof: proof}
+			if request.Pages > 3 {
+				// Ten pages at x-go's own spacing would take some 20 s.
+				clients := NewXClients()
+				clients.log = io.Discard
+				clients.minGap = 5 * time.Millisecond
+				t.Cleanup(clients.Stop)
+				run.Clients = clients
+			}
+			if code := run.Run(context.Background(), l); code != "" {
 				t.Fatal("synthetic X job failed", code)
 			}
 			if proofs != len(plan.Exchanges) {
@@ -151,6 +166,113 @@ func TestXPublicOperationsAndExactPagination(t *testing.T) {
 		})
 	}
 }
+
+// A search asks for one to MaxXSearchPages pages. Its lease pins exactly that
+// many exchanges, each after the first chained to the one before by cursor,
+// with one attempt each; anything else reaches no transport.
+func TestXSearchPagesOneToTen(t *testing.T) {
+	for pages := 0; pages <= coordinator.MaxXSearchPages+1; pages++ {
+		_, exchanges, ok := xRequestPolicy(&coordinator.XRequest{Operation: "search", Query: "bitcoin", Count: 20, Pages: pages})
+		if want := pages >= 1 && pages <= coordinator.MaxXSearchPages; ok != want || ok && exchanges != pages {
+			t.Fatalf("%d pages: ok %v, %d exchanges", pages, ok, exchanges)
+		}
+	}
+	c, ten, plan := xFixture(t, coordinator.XRequest{Operation: "search", Query: "bitcoin", Count: 20, Pages: coordinator.MaxXSearchPages})
+	if got, _, code := validateXLease(c, ten); code != "" || len(got.Exchanges) != coordinator.MaxXSearchPages || got.MaxAttempts != coordinator.MaxXSearchPages {
+		t.Fatal("ten-page lease refused", code)
+	}
+	withPlan := func(edit func(*xPlan)) coordinator.Lease {
+		l, p := ten, plan
+		p.Exchanges = append([]xSpec(nil), plan.Exchanges...)
+		edit(&p)
+		l.XPayload, _ = json.Marshal(p)
+		return l
+	}
+	extra := plan.Exchanges[len(plan.Exchanges)-1]
+	last := len(plan.Exchanges) - 1
+	extra.CursorFrom = &last
+	eleven := withPlan(func(p *xPlan) { p.Exchanges = append(p.Exchanges, extra); p.MaxAttempts++ })
+	r := *ten.XRequest
+	r.Pages = coordinator.MaxXSearchPages + 1
+	raw, _ := json.Marshal(r)
+	eleven.XRequest, eleven.InputSHA256 = &r, SHA(string(raw))
+	for name, l := range map[string]coordinator.Lease{
+		"eleven pages":           eleven,
+		"a page short":           withPlan(func(p *xPlan) { p.Exchanges = p.Exchanges[:last]; p.MaxAttempts-- }),
+		"a page more":            withPlan(func(p *xPlan) { p.Exchanges = append(p.Exchanges, extra); p.MaxAttempts++ }),
+		"fewer attempts":         withPlan(func(p *xPlan) { p.MaxAttempts-- }),
+		"a retry":                withPlan(func(p *xPlan) { p.MaxAttempts++ }),
+		"tenth page out of turn": withPlan(func(p *xPlan) { n := 7; p.Exchanges[last].CursorFrom = &n }),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var calls atomic.Int32
+			transport := roundTripFunc(func(*http.Request) (*http.Response, error) { calls.Add(1); return nil, errors.New("must not call") })
+			if code := (X{Config: c, Base: transport, Proof: transport}).Run(context.Background(), l); code != "invalid_lease" || calls.Load() != 0 {
+				t.Fatal("invalid ten-page work reached a transport", code, calls.Load())
+			}
+		})
+	}
+}
+
+// api/fixtures/lease-x-pages10.json is a coordinator's ten-page relay search as
+// node 0.1.16 holds it after acceptance: ten exchanges under the pinned x-go
+// request, chained by cursor with one attempt each, and the digests the
+// coordinator computes (input over Go's encoding of x_request, request over the
+// sorted-key canonical payload). Its deadline is the 298 s of a ten-page job,
+// and the node keeps only its usual report margin of it.
+func TestXTenPageWireFixture(t *testing.T) {
+	raw, e := os.ReadFile("../../api/fixtures/lease-x-pages10.json")
+	if e != nil {
+		t.Fatal(e)
+	}
+	var l coordinator.Lease
+	if e = json.Unmarshal(raw, &l); e != nil {
+		t.Fatal(e)
+	}
+	if l.XRequest == nil || l.XRequest.Pages != coordinator.MaxXSearchPages || !l.AcceptanceRequired || !l.LeaseDeadline.Equal(l.SettlementDeadline) {
+		t.Fatal("fixture is not a ten-page community lease")
+	}
+	request, _ := json.Marshal(l.XRequest)
+	var canonical any
+	d := json.NewDecoder(bytes.NewReader(l.XPayload))
+	d.UseNumber()
+	if e = d.Decode(&canonical); e != nil {
+		t.Fatal(e)
+	}
+	sorted, _ := json.Marshal(canonical)
+	if SHA(string(request)) != l.InputSHA256 || SHA(string(sorted)) != l.RequestSHA256 {
+		t.Fatal("fixture digests do not bind its request")
+	}
+	c, _, plan := xFixture(t, *l.XRequest)
+	if _, _, code := validateXLease(c, l); code != "invalid_lease" {
+		t.Fatal("relay lease served without the operator's opt-in", code)
+	}
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	c.XRelay = true
+	if _, _, code := validateXLease(c, l); code != "" {
+		t.Fatal("invalid pinned ten-page fixture", code)
+	}
+	plan.ProofMode, plan.ProofPolicy = "relay", xRelayPolicy
+	expected, _ := json.Marshal(plan)
+	a, e := uniqueJSON(l.XPayload)
+	if e != nil {
+		t.Fatal(e)
+	}
+	b, e := uniqueJSON(expected)
+	if e != nil || !reflect.DeepEqual(a, b) {
+		t.Fatal("ten-page X wire policy no longer matches pinned x-go")
+	}
+	if got := ProofSampleLimit(c, l); got != coordinator.MaxXSearchPages {
+		t.Fatal("ten-page proof sample bound", got)
+	}
+	l.LeaseDeadline = time.Now().Add(298 * time.Second)
+	l.SettlementDeadline = l.LeaseDeadline
+	if _, deadline, code := validateXLease(c, l); code != "" || !deadline.Equal(l.LeaseDeadline.Add(-xReportMargin)) {
+		t.Fatal("ten-page lease deadline", code, deadline)
+	}
+}
+
 func TestXRejectedPoliciesNeverReachAnyTransport(t *testing.T) {
 	c, original, _ := xFixture(t, coordinator.XRequest{Operation: "search", Query: "bitcoin", Count: 20, Pages: 2})
 	cases := map[string]func(*coordinator.Lease){
@@ -162,7 +284,17 @@ func TestXRejectedPoliciesNeverReachAnyTransport(t *testing.T) {
 		"duplicated JSON": func(l *coordinator.Lease) { l.XPayload = json.RawMessage(`{"type":"x.read","type":"x.read"}`) },
 		"Codex mixed in":  func(l *coordinator.Lease) { l.Prompt = "arbitrary" },
 		"expired":         func(l *coordinator.Lease) { l.LeaseDeadline = time.Now().Add(-time.Second) },
-		"unbounded pages": func(l *coordinator.Lease) { r := *l.XRequest; r.Pages = 4; l.XRequest = &r },
+		"unbounded pages": func(l *coordinator.Lease) {
+			r := *l.XRequest
+			r.Pages = coordinator.MaxXSearchPages + 1
+			l.XRequest = &r
+		},
+		"pages unlike the plan": func(l *coordinator.Lease) {
+			r := *l.XRequest
+			r.Pages = 3
+			raw, _ := json.Marshal(r)
+			l.XRequest, l.InputSHA256 = &r, SHA(string(raw))
+		},
 		"unrequested target": func(l *coordinator.Lease) {
 			var p xPlan
 			json.Unmarshal(l.XPayload, &p)

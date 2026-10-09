@@ -61,8 +61,12 @@ struct Summary {
 const OPERATIONS: &[&str] = &[
     "search", "profile", "post", "thread", "codex", "scrape", "other",
 ];
-/// Three X pages, or six web hops (a page with five redirects).
-const MAX_EXCHANGE: u8 = 6;
+/// Ten X pages, or six web hops (a page with five redirects). The node's
+/// internal/diagnostics bounds (MaxExchanges, MaxSpans, MaxAttemptBytes) are
+/// the same; a ten-page search writes about 250 spans.
+const MAX_EXCHANGE: u8 = 10;
+const MAX_SPANS: usize = 320;
+const MAX_RECORD_BYTES: usize = 48 * 1024;
 const PROOFS: &[&str] = &["relay", "mpc", "browser", "none"];
 const OUTCOMES: &[&str] = &[
     "success",
@@ -188,7 +192,7 @@ fn optional_ms(n: Option<f64>) -> bool {
     n.is_none_or(ms)
 }
 fn group(operation: &str, pages: u8, proof: &str) -> bool {
-    OPERATIONS.contains(&operation) && pages <= 3 && PROOFS.contains(&proof)
+    OPERATIONS.contains(&operation) && pages <= MAX_EXCHANGE && PROOFS.contains(&proof)
 }
 fn phase(phase: &str) -> bool {
     NODE_PHASES.contains(&phase) || HELPER_PHASES.contains(&phase)
@@ -209,7 +213,7 @@ impl Record {
             && self.unclassified_ms.is_none_or(|unclassified| {
                 self.duration_ms.is_some_and(|total| unclassified <= total)
             })
-            && self.spans.len() <= 64
+            && self.spans.len() <= MAX_SPANS
             && self.missing_phases.len() <= 64
             && self.missing_phases.iter().all(|p| phase(p))
             && self.spans.iter().all(|s| {
@@ -229,7 +233,7 @@ impl Record {
                         _ => false,
                     }
             })
-            && serde_json::to_vec(self).is_ok_and(|raw| raw.len() <= 8 * 1024)
+            && serde_json::to_vec(self).is_ok_and(|raw| raw.len() <= MAX_RECORD_BYTES)
     }
 }
 pub(crate) fn project(raw: &[u8]) -> Option<Snapshot> {
@@ -323,7 +327,7 @@ mod tests {
             span["phase"] = json!(phase);
             assert!(project(&serde_json::to_vec(&value).unwrap()).is_none());
         }
-        for (field, bad) in [("source", json!("helper")), ("exchange", json!(7))] {
+        for (field, bad) in [("source", json!("helper")), ("exchange", json!(11))] {
             let mut value = original.clone();
             let span = value["attempts"][22]["spans"]
                 .as_array_mut()
@@ -352,7 +356,7 @@ mod tests {
             ("outcome", json!("SECRET")),
             ("id", json!("SECRET")),
             ("started_at", json!("SECRET")),
-            ("pages", json!(4)),
+            ("pages", json!(11)),
             ("duration_ms", json!(-1)),
             ("duration_ms", json!(86_400_001)),
         ] {
@@ -404,7 +408,7 @@ mod tests {
             serde_json::to_value(safe).unwrap()["attempts"][0]["truncated"],
             true
         );
-        for bad in [json!(0), json!(7)] {
+        for bad in [json!(0), json!(11)] {
             v = sample();
             v["attempts"][0]["spans"][0]["exchange"] = bad;
             assert!(project(&serde_json::to_vec(&v).unwrap()).is_none());
@@ -424,6 +428,51 @@ mod tests {
         v["attempts"][0]["spans"][0]["exchange"] = json!(6);
         v["summaries"][0]["operation"] = json!("scrape");
         assert!(project(&serde_json::to_vec(&v).unwrap()).is_some());
+    }
+    #[test]
+    fn ten_page_search_records_stay_available() {
+        // As one is measured: about 20 node spans before the first page, then
+        // node and helper spans for every page, ten in all.
+        let mut v = sample();
+        v["attempts"][0]["pages"] = json!(10);
+        v["summaries"][0]["pages"] = json!(10);
+        let mut spans: Vec<serde_json::Value> = (0..20)
+            .map(|_| json!({"phase":"journal_write","source":"node","exchange":0,"start_ms":0,"duration_ms":1,"outcome":"success"}))
+            .collect();
+        for page in 1..=10 {
+            for k in 0..23 {
+                let (phase, source) = if k < 9 {
+                    ("page_wall", "node")
+                } else {
+                    ("request_sent", "helper")
+                };
+                spans.push(json!({"phase":phase,"source":source,"exchange":page,"start_ms":12.345,"duration_ms":67.891,"outcome":"success"}));
+            }
+        }
+        v["attempts"][0]["spans"] = json!(spans);
+        let safe = project(&serde_json::to_vec(&v).unwrap())
+            .expect("a ten-page search record stays available");
+        assert_eq!(
+            (safe.attempts[0].pages, safe.attempts[0].spans.len()),
+            (10, 250)
+        );
+        // Past the node's bounds the record is refused, never cut down here.
+        for (key, bad) in [("pages", json!(11)), ("exchange", json!(11))] {
+            let mut over = v.clone();
+            if key == "pages" {
+                over["attempts"][0]["pages"] = bad;
+            } else {
+                over["attempts"][0]["spans"][249]["exchange"] = bad;
+            }
+            assert!(
+                project(&serde_json::to_vec(&over).unwrap()).is_none(),
+                "{key}"
+            );
+        }
+        let mut over = v.clone();
+        let extra = over["attempts"][0]["spans"][0].clone();
+        over["attempts"][0]["spans"] = json!(vec![extra; MAX_SPANS + 1]);
+        assert!(project(&serde_json::to_vec(&over).unwrap()).is_none());
     }
     #[test]
     fn web_browser_records_stay_available() {

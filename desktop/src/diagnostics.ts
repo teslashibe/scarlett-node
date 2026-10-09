@@ -86,7 +86,7 @@ export function outcomeCounts(records: DiagnosticsRecord[]): {outcome: string; c
 // under MaxHistoryBytes. One attempt never estimates above MaxAttemptBytes.
 export const MAX_RETAINED_ATTEMPTS = 200;
 export const MAX_HISTORY_BYTES = 1 << 20;
-export const MAX_ATTEMPT_BYTES = 8 << 10;
+export const MAX_ATTEMPT_BYTES = 48 << 10;
 // The node's per-attempt estimate (quota.go estimatedBytes): 700 bytes, 144
 // per span and 512 per X quota snapshot. This app never receives the
 // snapshots, so it counts the most an attempt keeps, one per page; web pages

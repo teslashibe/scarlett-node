@@ -65,6 +65,13 @@ type Lease struct {
 	RequestSHA256      string `json:"request_sha256,omitempty"`
 }
 
+// MaxXSearchPages is the most pages one x_read search may ask for: one
+// verifier exchange and one attempt each, every page after the first
+// following the cursor the verifier recorded for the page before it. Nodes
+// before 0.1.16 accepted at most three; the coordinator sends more only to
+// nodes that report 0.1.16 or later.
+const MaxXSearchPages = 10
+
 // XRequest is bounded public read work; no URLs, headers or credentials come
 // from the coordinator. Pagination must be pinned separately in XPayload.
 type XRequest struct {

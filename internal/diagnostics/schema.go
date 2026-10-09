@@ -8,13 +8,18 @@ import (
 	"time"
 )
 
+// MaxSpans and MaxAttemptBytes hold a whole ten-page X search. A relay search
+// records about 20 spans before its first page and 23 for each page (node and
+// helper), so ten pages write about 250 spans and ten quota snapshots: some 42
+// KiB by the store's conservative estimate, 30 KiB as written. Three pages
+// already filled the earlier 64 spans and 8 KiB.
 const (
 	Version         = 1
 	MaxAttempts     = 200
-	MaxSpans        = 64
-	MaxExchanges    = 6 // three X pages, or six web hops (five redirects)
+	MaxSpans        = 320
+	MaxExchanges    = 10 // ten X pages, or six web hops (five redirects)
 	MaxHistoryBytes = 1 << 20
-	MaxAttemptBytes = 8 << 10
+	MaxAttemptBytes = 48 << 10
 	MaxHelperBytes  = 8 << 10
 	Retention       = 24 * time.Hour
 	MaxMilliseconds = float64(Retention / time.Millisecond)

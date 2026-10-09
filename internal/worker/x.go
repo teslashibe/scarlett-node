@@ -373,7 +373,7 @@ func xRequestPolicy(r *coordinator.XRequest) (string, int, bool) {
 	}
 	switch r.Operation {
 	case "search":
-		return "SearchTimeline", r.Pages, utf8.ValidString(r.Query) && r.Query == strings.TrimSpace(r.Query) && len(r.Query) > 0 && len(r.Query) <= 256 && r.Username == "" && r.PostID == "" && r.Count >= 1 && r.Count <= 20 && r.Pages >= 1 && r.Pages <= 3
+		return "SearchTimeline", r.Pages, utf8.ValidString(r.Query) && r.Query == strings.TrimSpace(r.Query) && len(r.Query) > 0 && len(r.Query) <= 256 && r.Username == "" && r.PostID == "" && r.Count >= 1 && r.Count <= 20 && r.Pages >= 1 && r.Pages <= coordinator.MaxXSearchPages
 	case "profile":
 		return "UserByScreenName", 1, validID(r.Username, 15) && !strings.Contains(r.Username, "-") && r.Query == "" && r.PostID == "" && r.Count == 0 && r.Pages == 0
 	case "post", "thread":
@@ -457,9 +457,10 @@ func validateXLease(c config.Config, l coordinator.Lease) (xPlan, time.Time, str
 // the journal writes, the proven report, the coordinator's inline verifier
 // read and, when that read is busy, one tick of its ten-second proof
 // reconciler. It also covers clock skew: ValidOffer refuses an offer whose
-// deadline is more than MaxOfferLifetime plus OfferClockSkew (5 s) past the
+// deadline is more than its OfferLifetime plus OfferClockSkew (5 s) past the
 // node's clock, so a node that accepted work lags the coordinator by at most
-// that much.
+// that much. It is the same for every page count: a ten-page search's longer
+// deadline is for its pages, not its report.
 const xReportMargin = 15 * time.Second
 
 // Run serves one x_read lease on the account's warm client (see XClients).

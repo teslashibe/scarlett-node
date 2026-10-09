@@ -29,7 +29,7 @@ func beginLeaseDiagnostics(store *diagnostics.Store, l coordinator.Lease) *diagn
 	if l.ServiceType == "x_read" && l.XRequest != nil {
 		switch l.XRequest.Operation {
 		case "search":
-			meta.Operation, meta.Pages = "search", max(0, min(3, l.XRequest.Pages))
+			meta.Operation, meta.Pages = "search", max(0, min(coordinator.MaxXSearchPages, l.XRequest.Pages))
 		case "profile", "post", "thread":
 			meta.Operation, meta.Pages = l.XRequest.Operation, 1
 		}

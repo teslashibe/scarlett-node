@@ -264,7 +264,7 @@ func TestBoundsPriorityRetentionAndLateCallbacks(t *testing.T) {
 	a := s.Begin(metadata("bounded"))
 	ctx := a.Context(context.Background())
 	late := Start(ctx, "journal_lock", 0)
-	for i := 0; i < 100; i++ {
+	for i := 0; i < MaxSpans+36; i++ {
 		Start(ctx, "journal_scan", 0)("success")
 	}
 	report := Start(ctx, "report_http", 0)
@@ -581,5 +581,57 @@ func BenchmarkAttemptRecording(b *testing.B) {
 				a.Finish("success")
 			}
 		})
+	}
+}
+
+// A ten-page relay search, sized as one is measured: about 20 spans before
+// the first page, 23 for each page and a quota snapshot per page. The whole
+// record is kept, it stays inside its bounds on disk and on export, and
+// nothing past the tenth page is recorded.
+func TestTenPageSearchKeepsEveryPage(t *testing.T) {
+	s := New(privateDir(t))
+	if s.Begin(Metadata{ID: "eleven", Operation: "search", Pages: MaxExchanges + 1, ProofMode: "relay"}) != nil {
+		t.Fatal("an eleven-page search was recorded")
+	}
+	a := s.Begin(Metadata{ID: "ten", Operation: "search", Pages: 10, ProofMode: "relay"})
+	if a == nil {
+		t.Fatal("a ten-page search was not recorded")
+	}
+	ctx := a.Context(context.Background())
+	for _, phase := range []string{"worker_acquire", "account_acquire", "accept_http", "worker", "client_acquire", "journal_lock", "journal_scan", "journal_write", "journal_finish", "journal_ready", "report_prepare", "report_http", "binding_check", "quota_wait", "fixed_gap_wait", "jitter_wait", "journal_lock", "journal_scan", "journal_write", "journal_terminal"} {
+		Start(ctx, phase, 0)("success")
+	}
+	pagePhases := []string{"page_wall", "pacing_wait", "request_encode", "proof_journal_begin", "helper_wall", "helper_stdout_decode", "response_decode", "proof_journal_complete"}
+	now := time.Now().UTC()
+	for page := 1; page <= 10; page++ {
+		for k := 0; k < 23; k++ {
+			Start(ctx, pagePhases[k%len(pagePhases)], page)("success")
+		}
+		ObserveQuota(ctx, QuotaSnapshot{Exchange: page, Operation: "search", Mode: "quota_budget", Limit: 50, Remaining: 50 - page, Reset: now.Add(15 * time.Minute), Complete: true, Authoritative: true, ObservedAt: now, CapturedAt: now})
+	}
+	Start(ctx, "page_wall", MaxExchanges+1)("success")
+	a.Finish("success")
+	s.Close()
+	waitForClose(t, s)
+	loaded := Read(s.dir)
+	if loaded.LoadError != "" || len(loaded.Attempts) != 1 {
+		t.Fatalf("ten-page history was not readable: %+v", loaded)
+	}
+	r := loaded.Attempts[0]
+	pages := map[int]bool{}
+	for _, span := range r.Spans {
+		if span.Exchange > MaxExchanges {
+			t.Fatalf("span past the tenth page recorded: %+v", span)
+		}
+		pages[span.Exchange] = true
+	}
+	for page := 0; page <= 10; page++ {
+		if !pages[page] {
+			t.Fatalf("exchange %d lost from a ten-page record", page)
+		}
+	}
+	raw, _ := json.Marshal(r)
+	if r.Pages != 10 || len(r.QuotaSnapshots) != 10 || len(r.Spans) != 20+23*10 || r.Truncated || len(raw) > MaxAttemptBytes || !validRecord(r) {
+		t.Fatalf("ten-page record: pages %d, %d quota snapshots, %d spans, truncated %v, %d bytes, valid %v", r.Pages, len(r.QuotaSnapshots), len(r.Spans), r.Truncated, len(raw), validRecord(r))
 	}
 }

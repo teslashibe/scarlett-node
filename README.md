@@ -201,7 +201,7 @@ The node serves four public reads, the ones published in [`api/x-request-catalog
 
 | Read | Operation | Scope |
 | --- | --- | --- |
-| Search | `SearchTimeline` | Latest, 1–20 items, 1–3 exact pages following the previous verified cursor |
+| Search | `SearchTimeline` | Latest, 1–20 items, 1–10 exact pages following the previous verified cursor (nodes before 0.1.16 take at most 3) |
 | Profile | `UserByScreenName` | One profile by handle |
 | Post | `TweetResultByRestId` | One post by ID |
 | Thread | `TweetDetail` | One thread response, not a guarantee of the whole conversation |

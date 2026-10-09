@@ -137,7 +137,7 @@ func TestUnboundedOrPrefilledCommunityOfferDoesNotCallCoordinator(t *testing.T) 
 	client := New(server.URL, "synthetic")
 	client.HTTP = server.Client()
 	for _, edit := range []func(*Lease){func(l *Lease) { l.AcceptanceRequired = false }, func(l *Lease) { l.VerifierToken = strings.Repeat("c", 64) }, func(l *Lease) { l.RequestSHA256 = "invalid" }, func(l *Lease) {
-		l.LeaseDeadline = time.Now().Add(MaxOfferLifetime + OfferClockSkew + time.Second)
+		l.LeaseDeadline = time.Now().Add(MaxCodexOfferLifetime + OfferClockSkew + time.Second)
 		l.SettlementDeadline = l.LeaseDeadline
 	}, func(l *Lease) { l.SettlementDeadline = l.LeaseDeadline.Add(time.Second) }} {
 		changed := offer
@@ -376,34 +376,41 @@ func TestAcceptRetryWaitsRetryAfterAndStopsOnCancel(t *testing.T) {
 	}
 }
 
-// The coordinator stamps a deadline up to MaxOfferLifetime ahead of its own
-// clock and delivers it within milliseconds. A node whose clock runs slightly
-// behind must still accept it; only a deadline beyond the skew margin is unsafe.
+// The coordinator stamps a deadline up to its service's OfferLifetime ahead of
+// its own clock and delivers it within milliseconds. A node whose clock runs
+// slightly behind must still accept it; only a deadline beyond the skew margin
+// is unsafe.
 func TestValidOfferToleratesSlowLocalClock(t *testing.T) {
 	now := time.Now()
-	offer := Lease{Version: Version, ServiceType: "x_read", JobID: "synthetic", Attempt: "attempt", Fence: "fence", AcceptanceRequired: true, SignedJobID: strings.Repeat("a", 64), RequestSHA256: strings.Repeat("b", 64)}
-	for _, tc := range []struct {
-		ahead time.Duration
-		ok    bool
-	}{{MaxOfferLifetime, true}, {MaxOfferLifetime + 900*time.Millisecond, true}, {MaxOfferLifetime + OfferClockSkew, true}, {MaxOfferLifetime + OfferClockSkew + time.Second, false}, {0, false}, {-time.Second, false}} {
-		offer.LeaseDeadline = now.Add(tc.ahead)
-		offer.SettlementDeadline = offer.LeaseDeadline
-		if err := ValidOffer(offer, now); (err == nil) != tc.ok {
-			t.Fatalf("deadline %v ahead: err %v, want ok=%v", tc.ahead, err, tc.ok)
+	for _, service := range []string{"codex", "x_read", "web"} {
+		offer := Lease{Version: Version, ServiceType: service, JobID: "synthetic", Attempt: "attempt", Fence: "fence", AcceptanceRequired: true, SignedJobID: strings.Repeat("a", 64), RequestSHA256: strings.Repeat("b", 64)}
+		lifetime := OfferLifetime(service)
+		for _, tc := range []struct {
+			ahead time.Duration
+			ok    bool
+		}{{lifetime, true}, {lifetime + 900*time.Millisecond, true}, {lifetime + OfferClockSkew, true}, {lifetime + OfferClockSkew + time.Second, false}, {0, false}, {-time.Second, false}} {
+			offer.LeaseDeadline = now.Add(tc.ahead)
+			offer.SettlementDeadline = offer.LeaseDeadline
+			if err := ValidOffer(offer, now); (err == nil) != tc.ok {
+				t.Fatalf("%s deadline %v ahead: err %v, want ok=%v", service, tc.ahead, err, tc.ok)
+			}
 		}
 	}
 }
 
 // A web offer may run 300 s (its job deadline is creation + 298 s), so a
-// large page fits a slow uplink; codex and x_read keep 120 s. The clock skew
-// margin applies to both.
+// large page fits a slow uplink. An x_read offer may too: a search of four to
+// ten pages runs up to 298 s, and the offer need not say how many pages it
+// has. Codex keeps 120 s. The clock skew margin applies to all three.
 func TestValidOfferLifetimePerService(t *testing.T) {
 	now := time.Now()
 	web := readLeaseFixture(t, "lease-web-offer.json")
-	xRead := Lease{Version: Version, ServiceType: "x_read", JobID: "synthetic", Attempt: "attempt", Fence: "fence", AcceptanceRequired: true, SignedJobID: strings.Repeat("a", 64), RequestSHA256: strings.Repeat("b", 64)}
-	codex := xRead
+	xRead := readLeaseFixture(t, "lease-x-pages10.json")
+	xRead.VerifierToken = "" // the offer form of the accepted fixture
+	bare := Lease{Version: Version, ServiceType: "x_read", JobID: "synthetic", Attempt: "attempt", Fence: "fence", AcceptanceRequired: true, SignedJobID: strings.Repeat("a", 64), RequestSHA256: strings.Repeat("b", 64)}
+	codex := bare
 	codex.ServiceType = "codex"
-	if OfferLifetime("web") != 300*time.Second || OfferLifetime("x_read") != 120*time.Second || OfferLifetime("codex") != 120*time.Second {
+	if OfferLifetime("web") != 300*time.Second || OfferLifetime("x_read") != 300*time.Second || OfferLifetime("codex") != 120*time.Second {
 		t.Fatal("lifetimes")
 	}
 	for _, tc := range []struct {
@@ -414,8 +421,14 @@ func TestValidOfferLifetimePerService(t *testing.T) {
 		{web, 298 * time.Second, true},
 		{web, 300*time.Second + OfferClockSkew, true},
 		{web, 300*time.Second + OfferClockSkew + time.Second, false},
-		{xRead, 121 * time.Second, true},
-		{xRead, 130 * time.Second, false},
+		{xRead, 118 * time.Second, true},
+		{xRead, 298 * time.Second, true},
+		{xRead, 300*time.Second + OfferClockSkew, true},
+		{xRead, 300*time.Second + OfferClockSkew + time.Second, false},
+		{bare, 121 * time.Second, true},
+		{bare, 298 * time.Second, true},
+		{bare, 306 * time.Second, false},
+		{codex, 121 * time.Second, true},
 		{codex, 130 * time.Second, false},
 		{codex, 298 * time.Second, false},
 	} {

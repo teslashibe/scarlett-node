@@ -9,9 +9,11 @@ import (
 
 const MaxProofBytes uint64 = 1 << 40
 
-// MaxProofSamples bounds the helper runs one attempt records: three X pages,
-// or a web page with up to five redirects (six hops).
-const MaxProofSamples = 6
+// MaxProofSamples bounds the helper runs one attempt records: ten X pages
+// (coordinator.MaxXSearchPages), or a web page with up to five redirects (six
+// hops). A plan with more helper runs than this fails its first reservation,
+// and so never runs.
+const MaxProofSamples = 10
 
 // ProofTraffic is private operational telemetry, never proof or billing evidence.
 // The enclosing immutable journal identity binds it to one accepted node attempt.

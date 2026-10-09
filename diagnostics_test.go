@@ -46,6 +46,22 @@ func TestDiagnosticMetadataExcludesPrivateLeaseContent(t *testing.T) {
 	}
 }
 
+// A search is labelled with its page count, one to ten, so a ten-page search
+// gets its own row; a count past the bound is clamped and never refused.
+func TestDiagnosticSearchPagesUpToTen(t *testing.T) {
+	for _, tc := range []struct{ pages, want int }{{1, 1}, {3, 3}, {4, 4}, {10, 10}, {11, 10}} {
+		store := diagnostics.New(privateTestDir(t))
+		l := testLease()
+		l.ServiceType = "x_read"
+		l.XRequest = &coordinator.XRequest{Operation: "search", Query: "synthetic", Count: 20, Pages: tc.pages}
+		beginLeaseDiagnostics(store, l).Finish("success")
+		records := store.Snapshot().Attempts
+		if len(records) != 1 || records[0].Operation != "search" || records[0].Pages != tc.want {
+			t.Fatalf("%d pages recorded as %+v", tc.pages, records)
+		}
+	}
+}
+
 func TestDiagnosticsPreserveReportsWhenStorageFails(t *testing.T) {
 	for _, status := range []int{http.StatusNoContent, http.StatusPartialContent} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
