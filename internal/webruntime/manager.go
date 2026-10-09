@@ -18,7 +18,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/teslashibe/scarlett-node/internal/localfs"
 )
@@ -39,9 +38,11 @@ const (
 	backoffStart    = 60 * time.Second
 	backoffMax      = time.Hour
 	minPhysical     = 8 << 30
-	htmlCap         = 10485760
-	maxResultBytes  = 80 << 20
-	gib             = 1 << 30
+	// htmlCap is the page ceiling for the DOM, in UTF-8 bytes. The helper
+	// writes the DOM to a file; its JSON answer carries only metadata.
+	htmlCap        = 67108864
+	maxResultBytes = 1 << 20
+	gib            = 1 << 30
 )
 
 // Config wires the browser tier. main injects the core egress guard and the
@@ -89,12 +90,19 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
-// Thresholds are the helper tree's recycle and kill sizes for a capacity:
-// recycle above 1.25 GiB + 0.75 GiB × capacity, kill 1.5 GiB above that.
-func Thresholds(capacity int) (recycle, kill uint64) {
+// Thresholds are the helper tree's recycle and kill sizes for a capacity on
+// a machine with physical bytes of memory (0 when unknown): recycle above
+// 1.25 GiB + 0.75 GiB × capacity, kill above max(recycle + 1.5 GiB,
+// physical / 4). Above recycle the helper drains (the pages in flight
+// finish, then it restarts); above kill it is killed at once.
+func Thresholds(capacity int, physical uint64) (recycle, kill uint64) {
 	recycle = 5*gib/4 + uint64(capacity)*3*gib/4
-	return recycle, recycle + 3*gib/2
+	return recycle, max(recycle+3*gib/2, physical/4)
 }
+
+// jobMemoryLimit is the Windows Job Object commit limit for a kill size: a
+// backstop 2 GiB above it, since recycle and kill read the working set.
+func jobMemoryLimit(kill uint64) uint64 { return kill + 2*gib }
 
 // FetchRequest is one page render, as the helper takes it.
 type FetchRequest struct {
@@ -143,18 +151,27 @@ type FetchResult struct {
 	Headers        [][2]string `json:"headers"`
 	SetCookieNames []string    `json:"set_cookie_names"`
 	ContentType    string      `json:"content_type"`
-	HTML           string      `json:"html"`
-	HTMLTruncated  bool        `json:"html_truncated"`
-	Cookies        []Cookie    `json:"cookies"`
-	Challenge      string      `json:"challenge"`
-	Redirects      []Redirect  `json:"redirects"`
-	StartedAtMS    int64       `json:"started_at_ms"`
-	Timings        Timings     `json:"timings"`
+	// HTMLPath is the DOM file the helper wrote (outcome ok only; empty for a
+	// document that is not HTML). Fetch moves it into the node's private DOM
+	// directory and checks its size and sha256; the caller deletes it.
+	// HTMLBytes is its UTF-8 size, or with error too_large the size of a DOM
+	// over the page ceiling, which the helper never writes.
+	HTMLPath    string     `json:"html_path"`
+	HTMLBytes   int64      `json:"html_bytes"`
+	HTMLSHA256  string     `json:"html_sha256"`
+	Cookies     []Cookie   `json:"cookies"`
+	Challenge   string     `json:"challenge"`
+	Redirects   []Redirect `json:"redirects"`
+	StartedAtMS int64      `json:"started_at_ms"`
+	Timings     Timings    `json:"timings"`
 	// Solver is "used" when the operator's captcha solver cleared the page,
 	// "needed" when the page stopped at a captcha that takes one, else "".
 	Solver string `json:"solver"`
 	// SolverCostMicroUSD is the providers' estimated charge for this fetch.
 	SolverCostMicroUSD int64 `json:"solver_cost_micro_usd"`
+	// TreePeakBytes is the largest helper tree size sampled while this page
+	// was in flight. Set by Fetch, never by the helper.
+	TreePeakBytes uint64 `json:"-"`
 }
 
 func (FetchResult) String() string   { return "web browser result [redacted]" }
@@ -198,6 +215,22 @@ func (r *FetchResult) validate() error {
 	default:
 		return invalid
 	}
+	// A DOM file exactly with outcome ok; a DOM size alone exactly with
+	// too_large, and it is over the ceiling.
+	switch {
+	case r.Outcome == "ok":
+		if r.Error != "" || r.HTMLPath == "" || r.HTMLBytes < 0 || r.HTMLBytes > htmlCap || !hex64(r.HTMLSHA256) {
+			return invalid
+		}
+	case r.Error == "too_large":
+		if r.Outcome != "failed" || r.HTMLPath != "" || r.HTMLBytes <= htmlCap || r.HTMLSHA256 != "" {
+			return invalid
+		}
+	default:
+		if r.HTMLPath != "" || r.HTMLBytes != 0 || r.HTMLSHA256 != "" {
+			return invalid
+		}
+	}
 	switch r.Challenge {
 	case "none", "solved", "unsolved":
 	default:
@@ -211,7 +244,7 @@ func (r *FetchResult) validate() error {
 	if r.SolverCostMicroUSD < 0 || r.SolverCostMicroUSD > maxFetchMicroUSD {
 		return invalid
 	}
-	if r.Outcome == "ok" && (r.StatusCode < 100 || r.StatusCode > 999) || len(r.HTML) > htmlCap || !utf8.ValidString(r.HTML) ||
+	if r.Outcome == "ok" && (r.StatusCode < 100 || r.StatusCode > 999) ||
 		len(r.Headers) > 128 || len(r.SetCookieNames) > 50 || len(r.Redirects) > 20 || len(r.Cookies) > 1000 || len(r.FinalURL) > 8192 {
 		return invalid
 	}
@@ -225,6 +258,8 @@ type Health struct {
 	Capacity int
 	InFlight int
 	Version  string // iff ready
+	// KillBytes is the tree size above which the helper is killed, iff ready.
+	KillBytes uint64
 	// Solvers are the operator's captcha-solver providers this browser may
 	// use now: configured, and today's spend under its cap. Names only.
 	Solvers []string
@@ -237,6 +272,10 @@ var (
 	// ErrBusy means every page slot is in use.
 	ErrBusy = fmt.Errorf("%w: every browser page slot is in use", ErrUnavailable)
 )
+
+// ErrorMemory is a FetchResult's Error when the node killed the helper for
+// memory while the page was in flight; TreePeakBytes says how large it got.
+const ErrorMemory = "memory"
 
 // deps are the Manager's seams for tests.
 type deps struct {
@@ -294,6 +333,8 @@ type Manager struct {
 	prepared    bool
 	reason      Reason
 	capacity    int
+	physical    uint64
+	domWiped    bool
 	inFlight    int
 	root        Root
 	browser     Browser
@@ -327,6 +368,14 @@ type helper struct {
 	draining bool
 	prewarm  bool
 	tree     []procInfo
+	// watches are the fetches in flight on this helper, for their tree peak
+	// and whether a memory kill ended them.
+	watches map[*fetchWatch]struct{}
+}
+
+type fetchWatch struct {
+	peak   uint64
+	killed bool
 }
 
 func (h *helper) exited() bool {
@@ -404,7 +453,8 @@ func (m *Manager) healthLocked() Health {
 	case m.d.now().Before(m.failedUntil):
 		return Health{State: "unavailable", Reason: ReasonHelperFailed}
 	}
-	h := Health{State: "ready", Capacity: m.capacity, InFlight: m.inFlight, Version: m.browser.Version}
+	_, kill := Thresholds(m.capacity, m.physical)
+	h := Health{State: "ready", Capacity: m.capacity, InFlight: m.inFlight, Version: m.browser.Version, KillBytes: kill}
 	if m.solverAllowedLocked() {
 		h.Solvers = m.cfg.Solvers.Providers()
 	}
@@ -442,14 +492,30 @@ func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 	if err != nil {
 		return FetchResult{}, err
 	}
+	watch := &fetchWatch{}
 	m.mu.Lock()
 	solver := m.solverAllowedLocked()
+	if h.watches == nil {
+		h.watches = map[*fetchWatch]struct{}{}
+	}
+	h.watches[watch] = struct{}{}
 	m.mu.Unlock()
 	res, err := m.call(ctx, h, helperFetch{FetchRequest: req, Solver: solver})
 	if err == nil {
 		m.recordSpend(res.SolverCostMicroUSD)
+		if res.HTMLPath, err = m.adoptDOM(res); err != nil {
+			res = FetchResult{}
+		}
 	}
 	m.mu.Lock()
+	delete(h.watches, watch)
+	peak, killed := watch.peak, watch.killed
+	if err != nil && killed {
+		// The node killed the browser for memory while this page loaded: a
+		// failed render the worker reports with its tree peak.
+		res, err = FetchResult{Outcome: "failed", Error: ErrorMemory, Challenge: "none"}, nil
+	}
+	res.TreePeakBytes = peak
 	h.inFlight--
 	h.served++
 	if err != nil || h.served >= recycleAfter {
@@ -699,6 +765,19 @@ func (m *Manager) prepare(ctx context.Context) (err error) {
 	if err = privateDir(state); err != nil {
 		return fail(ReasonRuntimeInvalid, "private browser state inaccessible")
 	}
+	// DOM files left by a node that stopped mid-upload, once per process: a
+	// later prepare may run while a DOM is being uploaded.
+	m.mu.Lock()
+	wipe := !m.domWiped
+	m.mu.Unlock()
+	if wipe {
+		if err = wipeDir(m.domDir()); err != nil {
+			return fail(ReasonRuntimeInvalid, "private browser state inaccessible")
+		}
+		m.mu.Lock()
+		m.domWiped = true
+		m.mu.Unlock()
+	}
 	_ = removeTree(filepath.Join(state, "crashpad"))
 	cleanBrowserPartials(m.cfg.StateDir)
 	root, err := m.d.ensure(m.cfg)
@@ -724,8 +803,11 @@ func (m *Manager) prepare(ctx context.Context) (err error) {
 		_ = removeTree(browser.Dir)
 		return err
 	}
+	if perr != nil {
+		physical = 0
+	}
 	m.mu.Lock()
-	m.root, m.browser, m.capacity = root, browser, capacity
+	m.root, m.browser, m.capacity, m.physical = root, browser, capacity, physical
 	m.mu.Unlock()
 	probe, err := m.startHelper(ctx)
 	if err != nil {
@@ -770,7 +852,7 @@ func (m *Manager) tick() {
 		m.mu.Unlock()
 		return
 	}
-	capacity := m.capacity
+	capacity, physical := m.capacity, m.physical
 	m.mu.Unlock()
 	if h.exited() {
 		return
@@ -779,24 +861,119 @@ func (m *Manager) tick() {
 	if err != nil {
 		return
 	}
-	recycle, kill := Thresholds(capacity)
+	recycle, kill := Thresholds(capacity, physical)
 	level := m.d.pressure()
 	m.mu.Lock()
 	if len(tree) > 0 {
 		h.tree = tree
 	}
+	for w := range h.watches {
+		w.peak = max(w.peak, bytes)
+	}
+	action := ""
 	switch {
-	case bytes > kill, h.inFlight > 0 && (level >= pressureCritical || level >= pressureWarn && bytes > recycle):
-		// In-flight fetches fail web_browser_failed. Under host memory
-		// pressure the operator's machine comes first, whatever RSS says
-		// (compressed and swapped renderer pages do not count in it).
+	case bytes > kill:
+		action = "kill_size"
+	case h.inFlight > 0 && level >= pressureCritical:
+		// Under critical host memory pressure the operator's machine comes
+		// first, whatever RSS says (compressed and swapped renderer pages do
+		// not count in it).
+		action = "kill_critical"
+	case bytes > recycle && !h.draining:
+		// Also at pressure warn: a large page finishes, then the helper
+		// restarts. Warn is common on healthy Macs (a 64 GiB Mac with 41% of
+		// its memory free was measured at warn), so it never kills.
+		action = "recycle_after_page"
+	}
+	switch action {
+	case "kill_size", "kill_critical":
+		// In-flight fetches fail with ErrorMemory.
+		for w := range h.watches {
+			w.killed = true
+		}
 		h.draining = true
 		h.p.kill(h.tree)
-	case bytes > recycle:
+	case "recycle_after_page":
 		h.draining = true
 	}
 	m.notify()
 	m.mu.Unlock()
+	if action != "" {
+		m.cfg.Logf("web browser: memory %s", action)
+	}
+}
+
+// domDir is the node's private directory for DOM files between the helper
+// and the upload. It is wiped at prepare, not at helper start, so a helper
+// restart never removes a DOM still being uploaded.
+func (m *Manager) domDir() string { return filepath.Join(m.cfg.StateDir, "web-browser", "dom") }
+
+// adoptDOM takes the DOM file of an ok result: it must be a regular file
+// named dom-*.html directly in the helper's TMPDIR with the reported size. It
+// is moved under a fresh name into the node's DOM directory, where the helper
+// no longer writes, and its sha256 checked there. Any failure deletes it and
+// is ErrHelper. A result that is not ok has no file.
+func (m *Manager) adoptDOM(res FetchResult) (string, error) {
+	if res.Outcome != "ok" {
+		return "", nil
+	}
+	invalid := fmt.Errorf("%w: DOM file invalid", ErrHelper)
+	tmp := filepath.Join(m.cfg.StateDir, "web-browser", "tmp")
+	path := res.HTMLPath
+	base := filepath.Base(path)
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || !samePath(filepath.Dir(path), tmp) || !domName(base) {
+		return "", invalid
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != res.HTMLBytes {
+		_ = os.Remove(path)
+		return "", invalid
+	}
+	if err = privateDir(m.domDir()); err != nil {
+		_ = os.Remove(path)
+		return "", invalid
+	}
+	name, err := randomHex(8)
+	if err != nil {
+		_ = os.Remove(path)
+		return "", invalid
+	}
+	dest := filepath.Join(m.domDir(), "dom-"+name+".html")
+	if err = os.Rename(path, dest); err != nil {
+		_ = os.Remove(path)
+		return "", invalid
+	}
+	sum, size, err := fileSHA256(dest)
+	if err != nil || size != res.HTMLBytes || sum != res.HTMLSHA256 {
+		_ = os.Remove(dest)
+		return "", invalid
+	}
+	return dest, nil
+}
+
+// domName is the helper's DOM file name: dom-<mkstemp letters>.html.
+func domName(base string) bool {
+	core, ok := strings.CutPrefix(base, "dom-")
+	if !ok {
+		return false
+	}
+	core, ok = strings.CutSuffix(core, ".html")
+	if !ok || core == "" || len(core) > 64 {
+		return false
+	}
+	for _, c := range core {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+func samePath(a, b string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
 }
 
 // backgroundVerify re-hashes the runtime and the browser while no helper is
@@ -974,8 +1151,10 @@ func (m *Manager) startHelper(ctx context.Context) (*helper, error) {
 		portRead.Close()
 		return nil, errors.New("helper stdin unavailable")
 	}
-	_, kill := Thresholds(capacity)
-	if h.p, err = startProcess(cmd, kill+2*gib); err != nil {
+	m.mu.Lock()
+	_, kill := Thresholds(capacity, m.physical)
+	m.mu.Unlock()
+	if h.p, err = startProcess(cmd, jobMemoryLimit(kill)); err != nil {
 		h.stdin.Close()
 		portRead.Close()
 		return nil, errors.New("helper could not start")

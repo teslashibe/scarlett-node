@@ -10,7 +10,7 @@ import (
 // NodeRelease is this build's release version. It must equal the desktop
 // version in desktop/src-tauri/tauri.conf.json; release-manifest.py
 // check-version refuses a release where they differ.
-const NodeRelease = "0.1.12"
+const NodeRelease = "0.1.13"
 
 // Release version headers, copied from api/fixtures/version-headers.json. The
 // node sends NodeVersionHeader on every request. While the coordinator

@@ -33,8 +33,21 @@ type Web struct {
 	Egress   *WebEgress
 	// Browser is the browser tier; nil when this node has none.
 	Browser BrowserTier
-	// Upload sends a browser result's gzip body before report; nil never stores one.
-	Upload func(ctx context.Context, jobID string, gzipBody []byte, report time.Time) error
+	// busyWait overrides webBusyBackoff; tests shorten it.
+	busyWait func(try int) time.Duration
+	// Upload stores a browser result before report: the DOM's gzip parts
+	// from gzipPath (with manifest.DOM "ok") and then the manifest. nil never
+	// stores one.
+	Upload func(ctx context.Context, jobID string, manifest coordinator.BrowserResult, gzipPath string, report time.Time) error
+}
+
+// WebReport is a web job's outcome: Code is "" when proven, else its failure
+// code; with page_too_large, Stage ("wire" or "dom") and ObservedBytes (a
+// lower bound) say where and how large.
+type WebReport struct {
+	Code          string
+	Stage         string
+	ObservedBytes int64
 }
 
 // The web proof policies: keyed relay with no hidden bits, so the verifier
@@ -47,18 +60,26 @@ const (
 )
 
 const (
-	maxWebRedirects     = 5
-	maxWebResponseBytes = 10 << 20
+	maxWebRedirects = 5
+	// maxWebResponseBytes is the page ceiling, the final hop's entity bytes;
+	// every web payload carries exactly this.
+	maxWebResponseBytes = coordinator.PageMax
 	maxWebHeaderValue   = 512
 	maxWebPayloadBytes  = 65536
 	// webReportMargin is the part of a web lease kept for after the last hop:
 	// the journal writes, the proven report and the coordinator's verifier read.
 	webReportMargin = 10 * time.Second
-	// webHopLimit bounds one relay session, as the verifier does.
-	webHopLimit = 30 * time.Second
+	// webHopLimit bounds one relay session, as the verifier does: a 64 MiB
+	// page at 1.92 Mbit/s.
+	webHopLimit = 280 * time.Second
 	// webLookupLimit bounds one hop's DNS lookup.
 	webLookupLimit = 5 * time.Second
 )
+
+// webBusyBackoff is the wait before each repeat of a hop the verifier turned
+// away as busy (at its web session limit): 1, 2, 4, then every 5 seconds,
+// while at least a second of the hop budget would remain.
+var webBusyBackoff = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 5 * time.Second}
 
 // webHeaderOrder is the allowlist of buyer-visible request headers, in the
 // only order they may appear.
@@ -149,7 +170,7 @@ func decodeWebPlan(raw []byte) (webPlan, bool) {
 			return plan, false
 		}
 	}
-	if plan.Type != "web.fetch" || plan.ProofMode != "relay" || plan.MaxRedirects < 0 || plan.MaxRedirects > maxWebRedirects || plan.MaxResponseBytes < 1 || plan.MaxResponseBytes > maxWebResponseBytes || len(plan.Headers) > len(webHeaderOrder) {
+	if plan.Type != "web.fetch" || plan.ProofMode != "relay" || plan.MaxRedirects < 0 || plan.MaxRedirects > maxWebRedirects || plan.MaxResponseBytes != maxWebResponseBytes || len(plan.Headers) > len(webHeaderOrder) {
 		return plan, false
 	}
 	switch plan.ProofPolicy {
@@ -160,7 +181,7 @@ func decodeWebPlan(raw []byte) (webPlan, bool) {
 	case webBrowserPolicy:
 		// Exactly the two default headers, the node's two headers, and the
 		// app's fixed limits.
-		if len(fields) != 8 || !slices.Equal(plan.Headers, webBrowserHeaders) || !slices.Equal(plan.NodeHeaders, webNodeHeaderNames) || plan.MaxRedirects != maxWebRedirects || plan.MaxResponseBytes != maxWebResponseBytes {
+		if len(fields) != 8 || !slices.Equal(plan.Headers, webBrowserHeaders) || !slices.Equal(plan.NodeHeaders, webNodeHeaderNames) || plan.MaxRedirects != maxWebRedirects {
 			return plan, false
 		}
 	default:
@@ -255,14 +276,19 @@ func validWebBrowser(b coordinator.WebBrowser) bool {
 	return true
 }
 
-// Run fetches the lease's page, following redirects only as the verifier
-// authorizes them, and returns "" once at least the first hop was proven.
-// The verifier holds every verified hop; the coordinator reads them there.
-// A browser job is run by runBrowser.
+// Run is Report's code.
 func (w Web) Run(ctx context.Context, l coordinator.Lease) string {
+	return w.Report(ctx, l).Code
+}
+
+// Report fetches the lease's page, following redirects only as the verifier
+// authorizes them, and returns code "" once at least the first hop was
+// proven. The verifier holds every verified hop; the coordinator reads them
+// there. A browser job is run by runBrowser.
+func (w Web) Report(ctx context.Context, l coordinator.Lease) WebReport {
 	plan, deadline, code := validateWebLease(w.Config, l)
 	if code != "" {
-		return code
+		return WebReport{Code: code}
 	}
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
@@ -270,7 +296,17 @@ func (w Web) Run(ctx context.Context, l coordinator.Lease) string {
 		return w.runBrowser(ctx, l, plan, deadline)
 	}
 	code, _ = w.relay(ctx, plan, l.VerifierToken, nil)
-	return code
+	return wireReport(code)
+}
+
+// wireReport is a relay outcome as a report: page_too_large there is the
+// wire stage, at least one byte over the ceiling (the coordinator reads the
+// verifier's own count).
+func wireReport(code string) WebReport {
+	if code == "page_too_large" {
+		return WebReport{Code: code, Stage: "wire", ObservedBytes: maxWebResponseBytes + 1}
+	}
+	return WebReport{Code: code}
 }
 
 func (w Web) egress() *WebEgress {
@@ -361,7 +397,32 @@ func (w Web) hop(ctx context.Context, plan webPlan, token string, hop int, targe
 	if !ok {
 		return webHopOutcome{code: "web_egress_denied"}
 	}
-	return w.prove(ctx, plan, token, hop, canonical, addr, headers)
+	for try := 0; ; try++ {
+		outcome := w.prove(ctx, plan, token, hop, canonical, addr, headers)
+		if outcome.code != "verifier_busy" {
+			return outcome
+		}
+		// The verifier is at its web session limit; it closed before relaying
+		// anything. Repeat the session while the hop budget allows.
+		wait := webBusyBackoff[min(try, len(webBusyBackoff)-1)]
+		if w.busyWait != nil {
+			wait = w.busyWait(try)
+		}
+		deadline, _ := ctx.Deadline()
+		if time.Until(deadline)-wait < time.Second {
+			return webHopOutcome{code: "web_fetch_failed"}
+		}
+		end := diagnostics.Start(ctx, "verifier_busy_wait", hop+1)
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			end("cancelled")
+			return webHopOutcome{code: "expired"}
+		case <-timer.C:
+			end("verifier_busy")
+		}
+	}
 }
 
 var errWebSummary = errors.New("unexpected relay-web summary")

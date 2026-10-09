@@ -38,7 +38,7 @@ func (*stubBrowser) Fetch(context.Context, worker.BrowserFetchRequest) (worker.B
 }
 
 func readyBrowser(capacity int) worker.BrowserStatus {
-	return worker.BrowserStatus{Ready: true, Capacity: capacity, Version: "155.0.8059.39", Engine: "scrapling/0.4.15+scarlett.2", UserAgent: "synthetic"}
+	return worker.BrowserStatus{Ready: true, Capacity: capacity, Version: "155.0.8059.39", Engine: "scrapling/0.4.15+scarlett.2", UserAgent: "synthetic", KillBytes: 6 << 30}
 }
 
 func browserEntry(t *testing.T, p *servicePool) (coordinator.ServiceHealth, coordinator.BrowserHealth) {
@@ -87,9 +87,18 @@ func TestWebBrowserReadinessInsideWebCapacity(t *testing.T) {
 		}
 	}
 	tier.set(readyBrowser(2))
-	if h, b := browserEntry(t, p); !reflect.DeepEqual(b, coordinator.BrowserHealth{State: "ready", Capacity: 2, Version: "155.0.8059.39"}) || h.Capacity != 4 {
+	if h, b := browserEntry(t, p); !reflect.DeepEqual(b, coordinator.BrowserHealth{State: "ready", Capacity: 2, Version: "155.0.8059.39", KillBytes: 6 << 30}) || h.Capacity != 4 {
 		t.Fatalf("ready browser: %+v in %+v", b, h)
 	}
+	// A ready browser always says where it is killed; without that it is a
+	// broken helper.
+	noKill := readyBrowser(2)
+	noKill.KillBytes = 0
+	tier.set(noKill)
+	if _, b := browserEntry(t, p); !reflect.DeepEqual(b, coordinator.BrowserHealth{State: "unavailable", Reason: "helper_failed"}) {
+		t.Fatalf("ready browser without kill_bytes: %+v", b)
+	}
+	tier.set(readyBrowser(2))
 	// The operator's solvers are reported by name, known names only, once
 	// each, and only while the browser is ready.
 	solving := readyBrowser(2)
@@ -201,11 +210,11 @@ func TestWebBrowserHeartbeatMatchesTheSpec(t *testing.T) {
 			webCapacity := int(s["capacity"].(float64))
 			switch state {
 			case "ready":
-				if reason != nil || b["version"] == nil || capacity < 1 || capacity > 4 || capacity > webCapacity {
+				if reason != nil || b["version"] == nil || b["kill_bytes"] == nil || capacity < 1 || capacity > 4 || capacity > webCapacity {
 					t.Fatalf("%s: ready entry %v (web capacity %d)", label, b, webCapacity)
 				}
 			case "unavailable":
-				if r, _ := reason.(string); !slices.Contains(reasons, r) || capacity != 0 || b["version"] != nil {
+				if r, _ := reason.(string); !slices.Contains(reasons, r) || capacity != 0 || b["version"] != nil || b["kill_bytes"] != nil {
 					t.Fatalf("%s: unavailable entry %v", label, b)
 				}
 			default:
@@ -243,7 +252,7 @@ func TestWebBrowserHeartbeatMatchesTheSpec(t *testing.T) {
 	}
 	t.Setenv("SCARLETT_STATE_DIR", p.config.StateDir)
 	var out strings.Builder
-	if err := localCommand("status", &out); err != nil || !strings.Contains(out.String(), `"browser":{"state":"ready","capacity":2,"in_flight":0,"version":"155.0.8059.39"}`) {
+	if err := localCommand("status", &out); err != nil || !strings.Contains(out.String(), `"browser":{"state":"ready","capacity":2,"in_flight":0,"version":"155.0.8059.39","kill_bytes":6442450944}`) {
 		t.Fatal("status output", err, out.String())
 	}
 }

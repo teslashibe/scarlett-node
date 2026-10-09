@@ -131,7 +131,10 @@ paths:
         network_unavailable the node repeats the same request inside the same acceptance, at
         most three times, each after the Retry-After (clamped to 1–60 seconds, one second when
         absent) plus jitter, and never later than 30 seconds before the lease deadline. It never
-        repeats a 401, 404, 409 or 429.
+        repeats a 401, 404, 409 or 429. The node refuses, without this request, an offer whose
+        lease deadline is more than its service's offer lifetime (plus 5 seconds of clock skew)
+        ahead of its own clock: 300 seconds for web (a web job's deadline is its creation second
+        plus 298 seconds) and 120 seconds for codex and x_read.
       requestBody:
         required: true
         content:
@@ -183,21 +186,114 @@ paths:
       responses:
         '200': {description: Accepted and committed once}
         '409': {description: Expired, conflicting body or fenced; not rewardable}
+  /api/node/v1/jobs/{job_id}/browser-result/parts/{n}:
+    put:
+      security: [{nodeBearer: []}]
+      parameters:
+        - {$ref: '#/components/parameters/JobID'}
+        - name: n
+          in: path
+          required: true
+          schema: {type: integer, minimum: 1, maximum: 33}
+        - {$ref: '#/components/parameters/BrowserAttempt'}
+        - {$ref: '#/components/parameters/BrowserFence'}
+        - {$ref: '#/components/parameters/BrowserRequestSHA256'}
+        - {$ref: '#/components/parameters/BrowserUploadSHA256'}
+        - name: X-Scarlett-Part-SHA256
+          in: header
+          required: true
+          description: SHA-256 of this part's bytes, lowercase hex
+          schema: {type: string, pattern: '^[0-9a-f]{64}$'}
+      summary: Upload one part of the browser's rendered DOM for a browser web job
+      description: >-
+        The DOM the node's browser rendered, as UTF-8 bytes, is compressed with gzip level 6 into
+        one stream; that stream is cut into parts of exactly 2097152 bytes except the last
+        (1-2097152 bytes), numbered from 1, at most 33 parts (a 64 MiB DOM that does not compress
+        still fits). upload_sha256 is the SHA-256 of the whole gzip stream, which is the
+        concatenation of the parts in order. Every request is bound to the job's current accepted
+        lease on this node (attempt, fence and request digest headers) and is accepted only before
+        the lease deadline and before /proven or /fail is committed. The coordinator keeps one
+        uncommitted part set per attempt: a PUT whose upload_sha256 differs from the stored set
+        replaces it (a node that rebuilt its gzip stream starts over); the same part sent again
+        with the same bytes gets 200. After the manifest is committed any PUT gets 409
+        result_conflict. The coordinator allows at least 90 seconds to read one part. The node
+        holds one part in memory, sends parts in order, and repeats a part after a transport
+        failure, 429 or 5xx at most three times (1, 2 and 4 seconds apart, or the Retry-After when
+        longer), each try starting only while max(10 s, part size / 250 kB/s + 5 s) is left before
+        the report deadline.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: {type: string, format: binary, minLength: 1, maxLength: 2097152}
+      responses:
+        '200':
+          description: Stored, including an identical replay
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status]
+                properties:
+                  status: {type: string, enum: [stored]}
+        '400': {description: invalid_part (sha256 mismatch, a part other than the last shorter than 2097152 bytes, bad headers)}
+        '401': {description: Invalid or revoked node credential}
+        '404': {description: Not this node's job}
+        '409': {description: result_conflict (manifest already committed), fenced, expired or already_reported}
+        '413': {description: Part larger than 2097152 bytes}
+        '429': {description: Rate limited}
+        '503':
+          description: network_unavailable
+          headers:
+            Retry-After: {$ref: '#/components/headers/RetryAfter'}
+  /api/node/v1/jobs/{job_id}/browser-result/parts:
+    get:
+      security: [{nodeBearer: []}]
+      parameters:
+        - {$ref: '#/components/parameters/JobID'}
+        - {$ref: '#/components/parameters/BrowserAttempt'}
+        - {$ref: '#/components/parameters/BrowserFence'}
+        - {$ref: '#/components/parameters/BrowserRequestSHA256'}
+      summary: List the stored parts of this attempt's browser DOM upload, for resume
+      description: >-
+        Bound to the accepted lease like the PUT. The node reads it before it sends parts and
+        again after a manifest answered 409 parts_incomplete, and skips every part already stored
+        with the same upload_sha256 and part sha256.
+      responses:
+        '200':
+          description: The stored set, possibly empty
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BrowserResultParts'}
+        '401': {description: Invalid or revoked node credential}
+        '404': {description: Not this node's job}
+        '409': {description: fenced, expired or already_reported}
+        '429': {description: Rate limited}
+        '503':
+          description: network_unavailable
+          headers:
+            Retry-After: {$ref: '#/components/headers/RetryAfter'}
   /api/node/v1/jobs/{job_id}/browser-result:
     post:
       security: [{nodeBearer: []}]
       parameters: [{$ref: '#/components/parameters/JobID'}]
-      summary: Upload the page the node's browser rendered for a browser web job
+      summary: Commit the browser's result for a browser web job (the manifest)
       description: >-
-        One upload per attempt, for the job's current accepted lease on this node, before
-        /proven or /fail is committed and before the lease deadline. The body is gzip JSON
-        (Content-Encoding gzip required), at most 12582912 bytes compressed and 16777216
-        decompressed; the node shrinks html until the decompressed body is at most 16711680
-        bytes. The coordinator stores the compressed body as received. The same attempt sending
-        the same decompressed bytes again gets 200; a different body gets 409 result_conflict.
-        Scarlett did not see this page on the wire, so content served from it is labelled not
-        TLS-verified. A /proven for a browser job is accepted when this upload is stored or the
-        verifier holds at least one verified hop of the proven re-fetch.
+        One manifest per attempt, for the job's current accepted lease on this node, before
+        /proven or /fail is committed and before the lease deadline. Plain JSON of at most
+        262144 bytes (no Content-Encoding). For dom ok the coordinator checks that every listed
+        part is stored with its sha256, that the SHA-256 of the concatenated parts is
+        upload_sha256 and their length gzip_bytes, gunzips them with a 67108864-byte cap, checks
+        html_bytes and html_sha256, then commits. For dom too_large (the DOM was larger than
+        67108864 bytes; html_bytes is its size and nothing was uploaded) and dom memory (the node
+        killed its browser for memory before the DOM existed) it commits the metadata alone, and
+        the job is served from the proven re-fetch when that is usable. The same manifest sent
+        again gets 200; a different one after commit gets 409 result_conflict. Scarlett did not
+        see this page on the wire, so content served from the DOM is labelled not TLS-verified.
+        A /proven for a browser job is accepted when this manifest is stored or the verifier
+        holds at least one verified hop of the proven re-fetch. The node runs the proven re-fetch
+        and this upload at the same time.
       requestBody:
         required: true
         content:
@@ -205,12 +301,11 @@ paths:
             schema: {$ref: '#/components/schemas/BrowserResult'}
       responses:
         '200': {description: Stored, including an identical replay}
-        '400': {description: invalid_result}
+        '400': {description: invalid_result (fields, or the parts do not hash, gunzip or measure as the manifest says)}
         '401': {description: Invalid or revoked node credential}
         '404': {description: Not this node's job}
-        '409': {description: result_conflict, fenced, expired or already_reported}
+        '409': {description: "parts_incomplete (a listed part is missing or differs: read the parts list, send what is missing and post again), result_conflict, fenced, expired or already_reported"}
         '413': {description: Body too large}
-        '415': {description: Not gzip}
         '429': {description: Rate limited}
         '503':
           description: network_unavailable
@@ -288,6 +383,30 @@ components:
       in: path
       required: true
       schema: {type: string, maxLength: 128}
+    BrowserAttempt:
+      name: X-Scarlett-Attempt
+      in: header
+      required: true
+      description: The accepted lease's attempt
+      schema: {type: string, format: uuid}
+    BrowserFence:
+      name: X-Scarlett-Fence
+      in: header
+      required: true
+      description: The accepted lease's fence
+      schema: {type: string, format: uuid}
+    BrowserRequestSHA256:
+      name: X-Scarlett-Request-SHA256
+      in: header
+      required: true
+      description: The accepted lease's request_sha256
+      schema: {type: string, pattern: '^[0-9a-f]{64}$'}
+    BrowserUploadSHA256:
+      name: X-Scarlett-Upload-SHA256
+      in: header
+      required: true
+      description: SHA-256 of the whole gzip stream (all parts concatenated), lowercase hex
+      schema: {type: string, pattern: '^[0-9a-f]{64}$'}
   headers:
     RetryAfter:
       description: >-
@@ -428,6 +547,18 @@ components:
         capacity: {type: integer, minimum: 0, maximum: 4, description: "1-4 when ready, 0 when unavailable"}
         in_flight: {type: integer, minimum: 0, maximum: 4, description: At most capacity}
         version: {type: string, maxLength: 64, description: Chrome for Testing version; present exactly when ready}
+        kill_bytes:
+          type: integer
+          minimum: 1
+          description: >-
+            Present exactly when ready. The browser process tree size, in bytes, above which this
+            node kills its browser: max(recycle + 1.5 GiB, physical memory / 4), where recycle is
+            1.25 GiB + 0.75 GiB × capacity. Above recycle (or at macOS memory pressure warn above
+            recycle) the browser only drains: the pages in flight finish, then it restarts. While a
+            page is in flight, macOS memory pressure critical also kills it. A killed page is
+            reported in the browser-result manifest as dom memory with tree_peak_bytes; the
+            coordinator may send the job again to a node whose kill_bytes is at least 1.5 ×
+            tree_peak_bytes.
         solvers:
           type: array
           maxItems: 3
@@ -626,16 +757,23 @@ components:
         The node never receives page plaintext. Unknown fields are refused. web-relay-v1 has no
         node_headers. web-browser-v1 (browser mode) has exactly the headers accept and
         accept-language with their default values, in that order, node_headers exactly
-        [user-agent, cookie], max_redirects 5 and max_response_bytes 10485760; the node supplies
-        the browser's pinned User-Agent and, optionally, a Cookie of anti-bot clearance cookies
-        only, which the verifier checks against the same pins and allowlist (api/web-vectors.json).
+        [user-agent, cookie] and max_redirects 5; the node supplies the browser's pinned
+        User-Agent and, optionally, a Cookie of anti-bot clearance cookies only, which the
+        verifier checks against the same pins and allowlist (api/web-vectors.json).
+        max_response_bytes is the page ceiling (64 MiB) for both policies: the final hop's entity
+        bytes (de-chunked, still content-encoded); the verifier counts chunk framing and heads
+        apart. A larger page fails the hop as page_too_large. Each hop (one relay-web session)
+        runs at most 280 seconds (relay-web timeout_ms 1000-280000), and never past the lease
+        deadline less the node's 10-second report margin. A verifier at its web session limit
+        answers verifier_busy (relay-web class verifier_busy) and closes; the node retries the hop 1, 2, 4
+        and then every 5 seconds while at least 1 second of that budget would remain.
       properties:
         type: {type: string, enum: [web.fetch]}
         proof_mode: {type: string, enum: [relay]}
         proof_policy: {type: string, enum: [web-relay-v1, web-browser-v1]}
         url: {type: string, maxLength: 2048, pattern: '^https://', description: Equal to web_request.url}
         max_redirects: {type: integer, minimum: 0, maximum: 5}
-        max_response_bytes: {type: integer, minimum: 1, maximum: 10485760}
+        max_response_bytes: {type: integer, enum: [67108864], description: The page ceiling; must equal 67108864}
         headers:
           type: array
           maxItems: 3
@@ -656,20 +794,23 @@ components:
     BrowserResult:
       type: object
       additionalProperties: false
-      required: [version, attempt, fence, request_sha256, url, final_url, status_code, headers, set_cookie_names, content_type, html, html_bytes, html_sha256, html_truncated, challenge, redirects, browser, started_at_ms, duration_ms]
+      required: [version, attempt, fence, request_sha256, url, final_url, status_code, headers, set_cookie_names, content_type, dom, html_bytes, gzip_bytes, parts, challenge, redirects, browser, started_at_ms, duration_ms]
       description: >-
-        Decompressed body of a browser-result upload. Integers only and no unknown fields.
-        attempt, fence and request_sha256 must equal the job's current accepted lease for this
-        node, and url its web_request.url. Cookie values never appear; set_cookie_names carries
-        names only.
+        The browser-result manifest: what the node's browser rendered, without the DOM itself,
+        which travels as gzip parts (browser-result/parts). Plain JSON, integers only and no
+        unknown fields. attempt, fence and request_sha256 must equal the job's current accepted
+        lease for this node, and url its web_request.url. Cookie values never appear;
+        set_cookie_names carries names only. With dom memory the browser was killed before the
+        page finished, so final_url and content_type are empty, status_code is 0, headers,
+        set_cookie_names and redirects are empty and challenge is none.
       properties:
         version: {type: string, enum: [node-v1]}
         attempt: {type: string, format: uuid}
         fence: {type: string, format: uuid}
         request_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
         url: {type: string, maxLength: 2048}
-        final_url: {type: string, maxLength: 2048, description: Absolute http or https URL of the last main-frame document; never an x.com or twitter.com host}
-        status_code: {type: integer, minimum: 100, maximum: 999}
+        final_url: {type: string, maxLength: 2048, description: "Absolute http or https URL of the last main-frame document; never an x.com or twitter.com host. Empty exactly with dom memory."}
+        status_code: {type: integer, minimum: 0, maximum: 999, description: "100-999; 0 exactly with dom memory"}
         headers:
           type: array
           maxItems: 128
@@ -681,10 +822,25 @@ components:
             items: {type: string}
         set_cookie_names: {type: array, maxItems: 50, items: {type: string}}
         content_type: {type: string}
-        html: {type: string, description: "The rendered DOM for an HTML document, else empty; valid UTF-8, cut on a code point boundary"}
-        html_bytes: {type: integer, minimum: 0, maximum: 10485760, description: UTF-8 length of html}
-        html_sha256: {type: string, pattern: '^[0-9a-f]{64}$', description: SHA-256 of the UTF-8 bytes of html}
-        html_truncated: {type: boolean}
+        dom:
+          type: string
+          enum: [ok, too_large, memory]
+          description: >-
+            ok: the DOM (the rendered document for an HTML page, else empty) was uploaded in
+            parts, never cut. too_large: the DOM was larger than 67108864 UTF-8 bytes; html_bytes
+            is its size and no part was sent. memory: the node killed its browser for memory
+            while the page was loading (see BrowserHealth.kill_bytes); tree_peak_bytes is
+            required.
+        html_bytes: {type: integer, minimum: 0, description: "UTF-8 length of the DOM: 0-67108864 with dom ok, above 67108864 with dom too_large, 0 with dom memory"}
+        html_sha256: {type: string, pattern: '^[0-9a-f]{64}$', description: SHA-256 of the DOM's UTF-8 bytes; present exactly with dom ok}
+        gzip_bytes: {type: integer, minimum: 0, maximum: 69206016, description: "Length of the gzip stream (sum of the parts): at least 1 with dom ok, else 0"}
+        upload_sha256: {type: string, pattern: '^[0-9a-f]{64}$', description: SHA-256 of the gzip stream (the concatenated parts); present exactly with dom ok. The coordinator stores it as the result's upload_sha256 and the signed browser proof carries it.}
+        parts:
+          type: array
+          maxItems: 33
+          description: "The sha256 of each part in order, ceil(gzip_bytes / 2097152) entries with dom ok, else empty"
+          items: {type: string, pattern: '^[0-9a-f]{64}$'}
+        tree_peak_bytes: {type: integer, minimum: 1, description: "The largest browser process tree size the node sampled while this page loaded; required with dom memory, optional otherwise"}
         challenge: {type: string, enum: [none, solved, unsolved]}
         redirects:
           type: array
@@ -715,6 +871,23 @@ components:
             under the operator's daily cap, or the solver failed). Absent otherwise. The coordinator
             remembers the page's domain and offers its browser jobs to nodes that report solvers
             first.
+    BrowserResultParts:
+      type: object
+      additionalProperties: false
+      required: [parts]
+      properties:
+        upload_sha256: {type: string, pattern: '^[0-9a-f]{64}$', description: The stored set's upload sha256; absent when no part is stored}
+        parts:
+          type: array
+          maxItems: 33
+          description: The stored parts in order of n
+          items:
+            type: object
+            additionalProperties: false
+            required: [n, sha256]
+            properties:
+              n: {type: integer, minimum: 1, maximum: 33}
+              sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
     Result:
       type: object
       description: >-
@@ -767,4 +940,6 @@ components:
         version: {type: string, enum: [node-v1]}
         attempt: {type: string}
         fence: {type: string}
-        code: {type: string, enum: [invalid_lease, expired, gateway_error, capacity_unavailable, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds, prover_error, execution_uncertain, auth_required, service_unavailable, x_rate_limited, x_incomplete, x_request_failed, relay_misuse, web_egress_denied, web_dns_failed, web_connect_failed, web_proxy_failed, web_fetch_failed, web_browser_unavailable, web_browser_failed], description: relay_misuse means the node caught its verifier sealing something other than the node's own request in a keyed-relay session, or closing the session without opening the record; the node then stops serving relay until its operator clears the halt. execution_uncertain means a provider call might have occurred before interruption and must not automatically requeue paid work. Transport failure alone does not prove a call never ran; capacity_unavailable must not authorize an ambiguous provider retry. Web codes describe the first hop only (a later hop failing after a verified first hop is reported proven); web_egress_denied means the page host resolved to a private, reserved or local address, or its URL failed node validation; web_dns_failed means the host did not resolve within 5 seconds; web_connect_failed means the node could not open TCP to the checked address, before any verifier session; web_proxy_failed means the local CONNECT proxy was unreachable, refused authentication or did not answer 200; web_fetch_failed means the verified session failed after the token was presented (TLS, framing, size or a verifier refusal). For browser web jobs, web_browser_unavailable means the browser tier was not ready or its helper could not start, and web_browser_failed means the browser failed (navigation, TLS, crash, timeout or a memory kill) with no browser copy stored and no verified re-fetch hop; neither changes the web state.}
+        code: {type: string, enum: [invalid_lease, expired, gateway_error, capacity_unavailable, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds, prover_error, execution_uncertain, auth_required, service_unavailable, x_rate_limited, x_incomplete, x_request_failed, relay_misuse, web_egress_denied, web_dns_failed, web_connect_failed, web_proxy_failed, web_fetch_failed, web_browser_unavailable, web_browser_failed, page_too_large], description: relay_misuse means the node caught its verifier sealing something other than the node's own request in a keyed-relay session, or closing the session without opening the record; the node then stops serving relay until its operator clears the halt. execution_uncertain means a provider call might have occurred before interruption and must not automatically requeue paid work. Transport failure alone does not prove a call never ran; capacity_unavailable must not authorize an ambiguous provider retry. Web codes describe the first hop only (a later hop failing after a verified first hop is reported proven); web_egress_denied means the page host resolved to a private, reserved or local address, or its URL failed node validation; web_dns_failed means the host did not resolve within 5 seconds; web_connect_failed means the node could not open TCP to the checked address, before any verifier session; web_proxy_failed means the local CONNECT proxy was unreachable, refused authentication or did not answer 200; web_fetch_failed means the verified session failed after the token was presented (TLS, framing, a verifier refusal, or a verifier that stayed busy for the whole hop budget). page_too_large means the page is over the 64 MiB ceiling: stage wire when the first hop's verifier refused the entity as too large (relay-web class page_too_large), stage dom when a browser job's DOM was larger than 67108864 bytes and neither its manifest was stored nor a re-fetch hop verified; stage and observed_bytes are present exactly with it, and observed_bytes is a lower bound (the coordinator prefers the verifier's own byte counts). For browser web jobs, web_browser_unavailable means the browser tier was not ready or its helper could not start, and web_browser_failed means the browser failed (navigation, TLS, crash, timeout or a memory kill) with no browser copy stored and no verified re-fetch hop; neither changes the web state.}
+        stage: {type: string, enum: [wire, dom], description: page_too_large only}
+        observed_bytes: {type: integer, minimum: 67108865, description: "page_too_large only: at least this many bytes (wire: 67108865 when the node has no count; dom: the DOM's UTF-8 size)"}

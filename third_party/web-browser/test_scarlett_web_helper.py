@@ -68,6 +68,54 @@ def run(coro):
     return asyncio.run(coro)
 
 
+DOM_DIR = None
+
+
+def setUpModule():
+    # The helper writes DOM files to TMPDIR; the tests give it a private one.
+    global DOM_DIR
+    DOM_DIR = tempfile.mkdtemp(prefix="scarlett-dom-test-")
+    tempfile.tempdir = DOM_DIR
+
+
+def tearDownModule():
+    tempfile.tempdir = None
+    import shutil
+    shutil.rmtree(DOM_DIR, ignore_errors=True)
+
+
+def dom_files():
+    return sorted(name for name in os.listdir(DOM_DIR) if name.startswith("dom-"))
+
+
+def clear_dom_files():
+    for name in dom_files():
+        os.unlink(os.path.join(DOM_DIR, name))
+
+
+def read_dom(data):
+    """The DOM a fetch answered with, read from its file (then deleted) after
+    checking the file is private, in TMPDIR and matches html_bytes and
+    html_sha256; "" when the answer has no file."""
+    path = data["html_path"]
+    if not path:
+        assert data["html_sha256"] == "", data
+        return ""
+    import hashlib
+    assert os.path.dirname(path) == tempfile.gettempdir(), path
+    name = os.path.basename(path)
+    assert re.fullmatch(r"dom-[A-Za-z0-9_]+\.html", name), name
+    info = os.lstat(path)
+    assert stat.S_ISREG(info.st_mode), path
+    if os.name == "posix":
+        assert stat.S_IMODE(info.st_mode) == 0o600, oct(info.st_mode)
+    with open(path, "rb") as f:
+        raw = f.read()
+    os.unlink(path)
+    assert len(raw) == data["html_bytes"] and hashlib.sha256(raw).hexdigest() == data["html_sha256"], data
+    return raw.decode("utf-8")
+
+
 class OptionSetTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -372,18 +420,29 @@ class RedirectGuardTests(unittest.TestCase):
                                      ("Fetch.continueResponse", {"requestId": "r1"}), ("Fetch.continueResponse", {"requestId": "r1"})])
 
 
-class CapTests(unittest.TestCase):
-    def test_code_point_truncation(self):
-        cap = helper.HTML_CAP
-        text = "a" * (cap - 1) + "é" + "tail"  # é is two bytes; it straddles the cap
-        out, truncated = helper.cap_html(text)
-        self.assertTrue(truncated)
-        self.assertEqual(len(out.encode("utf-8")), cap - 1)
-        self.assertEqual(out, "a" * (cap - 1))
-        out, truncated = helper.cap_html("short é")
-        self.assertEqual((out, truncated), ("short é", False))
-        out, _ = helper.cap_html("lone \ud800 surrogate")
-        out.encode("utf-8")  # valid UTF-8 after replacement
+class DOMTests(unittest.TestCase):
+    def setUp(self):
+        clear_dom_files()
+
+    def test_the_ceiling_is_the_page_max(self):
+        self.assertEqual(helper.HTML_CAP, 67108864)
+
+    def test_dom_bytes_are_valid_utf8_and_never_cut(self):
+        valid = "short é".encode("utf-8")
+        self.assertIs(helper.dom_bytes(valid), valid)  # no copy of a valid body
+        self.assertEqual(helper.dom_bytes(None), b"")
+        fixed = helper.dom_bytes(b"lone \xed\xa0\x80 surrogate \xff end")
+        fixed.decode("utf-8")
+        self.assertTrue(fixed.startswith(b"lone ") and fixed.endswith(b" end"))
+
+    def test_write_dom_is_private_exclusive_and_hashed(self):
+        raw = ("<p>é</p>" * 1000).encode("utf-8")
+        data = helper.write_dom(raw)
+        self.assertEqual(set(data), {"html_path", "html_bytes", "html_sha256"})
+        self.assertEqual(read_dom(data), raw.decode("utf-8"))
+        self.assertEqual(dom_files(), [])
+        empty = helper.write_dom(b"")
+        self.assertEqual((empty["html_bytes"], read_dom(empty)), (0, ""))
 
     def test_header_pairs(self):
         headers, names = helper.header_pairs([("Content-Type", "text/html"), ("Set-Cookie", "__cf_bm=abc; Path=/"),
@@ -625,6 +684,9 @@ class FakeScope(FakeRouter):
 
 
 class FetchTests(unittest.TestCase):
+    def setUp(self):
+        clear_dom_files()
+
     def fetch(self, session, req=None, solver=None):
         async def go():
             return await helper.Fetcher(session, "http://127.0.0.1:1111", 2, solver).fetch(req or request())
@@ -641,7 +703,7 @@ class FetchTests(unittest.TestCase):
         self.assertIn(["x-last", "1"], data["headers"])
         self.assertEqual(data["set_cookie_names"], ["sid", "__cf_bm"])
         self.assertEqual(data["cookies"][0]["http_only"], True)
-        self.assertEqual(data["html"], page.html)
+        self.assertEqual(read_dom(data), page.html)
         kwargs = session.fetch_calls[0]
         self.assertEqual(kwargs["proxy"], "http://127.0.0.1:1111")
         self.assertIs(kwargs["network_idle"], False)
@@ -721,6 +783,9 @@ class FetchTests(unittest.TestCase):
         data = self.fetch(session)
         self.assertEqual(len(session.fetch_calls), 2)
         self.assertEqual(data["challenge"], "none")
+        # The first pass's DOM file is gone; only the answer's remains.
+        self.assertEqual(dom_files(), [os.path.basename(data["html_path"])])
+        self.assertEqual(read_dom(data), PAGE)
 
     def test_unsolved_without_time_left_is_not_retried(self):
         session = FakeSession([FakePage(PAGE), FakePage(PAGE)], [TIMED_OUT, CLEAN])
@@ -776,7 +841,7 @@ class FetchTests(unittest.TestCase):
             async def fetch(self, url, **kwargs):
                 raise Exception("Page.goto: net::ERR_CERT_AUTHORITY_INVALID at https://self-signed.example/")
         data = self.fetch(Failing([]))
-        self.assertEqual((data["outcome"], data["error"], data["html"]), ("failed", "tls", ""))
+        self.assertEqual((data["outcome"], data["error"], read_dom(data)), ("failed", "tls", ""))
 
         class Slow(FakeSession):
             async def fetch(self, url, **kwargs):
@@ -789,7 +854,32 @@ class FetchTests(unittest.TestCase):
     def test_non_html_documents_return_no_html(self):
         page = FakePage('{"a":1}', headers=[("content-type", "application/json")])
         data = self.fetch(FakeSession([page]))
-        self.assertEqual((data["html"], data["content_type"]), ("", "application/json"))
+        # An ok answer always has a DOM file; here it is empty.
+        self.assertEqual((data["outcome"], data["html_bytes"]), ("ok", 0))
+        self.assertEqual((read_dom(data), data["content_type"]), ("", "application/json"))
+
+    def test_a_large_dom_is_written_whole(self):
+        html = "<html><body>" + "<p>é and more text</p>" * 400000 + "</body></html>"  # about 9 MB
+        data = self.fetch(FakeSession([FakePage(html)]))
+        self.assertEqual(data["outcome"], "ok")
+        self.assertEqual(data["html_bytes"], len(html.encode("utf-8")))
+        self.assertEqual(read_dom(data), html)
+        self.assertLess(len(json.dumps(data)), 1 << 20)  # the answer itself stays small
+
+    def test_a_dom_over_the_ceiling_is_reported_not_cut(self):
+        page = FakePage(PAGE + "é" * 64)
+        page.cookie_jar = [{"name": "__cf_bm", "value": "v", "domain": ".example.com", "path": "/", "expires": -1, "secure": True, "httpOnly": True}]
+        size = len(page.html.encode("utf-8"))
+        with mock.patch.object(helper, "HTML_CAP", size - 1):
+            data = self.fetch(FakeSession([page]))
+        self.assertEqual((data["outcome"], data["error"], data["html_bytes"], data["html_path"], data["html_sha256"]),
+                         ("failed", "too_large", size, "", ""))
+        # The metadata and clearance cookies stay: the node still re-fetches.
+        self.assertEqual((data["status_code"], data["final_url"], data["cookies"][0]["name"]), (200, "https://example.com/", "__cf_bm"))
+        self.assertEqual(dom_files(), [])
+        with mock.patch.object(helper, "HTML_CAP", size):
+            data = self.fetch(FakeSession([FakePage(page.html)]))
+        self.assertEqual((data["outcome"], read_dom(data)), ("ok", page.html))
 
     def test_a_guard_that_cannot_start_closes_the_page_and_fails(self):
         for case in ("session", "enable"):
@@ -800,7 +890,7 @@ class FetchTests(unittest.TestCase):
                 page.context.cdp_failing = ("Fetch.enable",)
             session = FakeSession([page])
             data = self.fetch(session)
-            self.assertEqual((data["outcome"], data["error"], data["html"], data["challenge"]),
+            self.assertEqual((data["outcome"], data["error"], read_dom(data), data["challenge"]),
                              ("failed", "navigation_failed", "", "none"), case)
             self.assertTrue(page.closed, case)
             self.assertEqual(page.navigations, 0, case)  # nothing loaded unguarded
@@ -814,7 +904,7 @@ class FetchTests(unittest.TestCase):
         session = FakeSession([page])
         data = self.fetch(session)
         self.assertEqual(page.navigations, 1)
-        self.assertEqual((data["outcome"], data["error"], data["html"]), ("failed", "navigation_failed", ""))
+        self.assertEqual((data["outcome"], data["error"], read_dom(data)), ("failed", "navigation_failed", ""))
 
     def test_waits_that_do_not_finish_fail(self):
         async def broken(*args):
@@ -823,7 +913,7 @@ class FetchTests(unittest.TestCase):
         with mock.patch.object(helper, "settle_navigation", broken):
             data = self.fetch(FakeSession([page]))
         self.assertEqual(page.navigations, 1)
-        self.assertEqual((data["outcome"], data["error"], data["html"]), ("failed", "navigation_failed", ""))
+        self.assertEqual((data["outcome"], data["error"], read_dom(data)), ("failed", "navigation_failed", ""))
 
 
 class AntibotResultTests(unittest.TestCase):
@@ -911,6 +1001,7 @@ class ScraplingFetchTests(unittest.TestCase):
     Fetcher must fail closed regardless."""
 
     def setUp(self):
+        clear_dom_files()
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         profile = os.path.join(tmp.name, helper.PROFILE_PREFIX + "x")
@@ -953,7 +1044,7 @@ class ScraplingFetchTests(unittest.TestCase):
     def test_a_guarded_page_is_ok(self):
         page = FakePage(PAGE)
         data = self.fetch(page)
-        self.assertEqual((data["outcome"], data["status_code"], data["html"], data["challenge"]), ("ok", 200, page.html, "none"))
+        self.assertEqual((data["outcome"], data["status_code"], read_dom(data), data["challenge"]), ("ok", 200, page.html, "none"))
         self.assertEqual(page.context.cdp.sent[0][0], "Fetch.enable")
         self.assertEqual(page.navigations, 1)
 
@@ -1003,7 +1094,7 @@ class ScraplingFetchTests(unittest.TestCase):
             else:
                 page.context.cdp_failing = ("Fetch.enable",)
             data = self.fetch(page)
-            self.assertEqual((data["outcome"], data["error"], data["html"]), ("failed", "navigation_failed", ""), case)
+            self.assertEqual((data["outcome"], data["error"], read_dom(data)), ("failed", "navigation_failed", ""), case)
             self.assertEqual(page.navigations, 0, case)
 
     def test_an_unguarded_page_is_never_ok(self):
@@ -1012,7 +1103,7 @@ class ScraplingFetchTests(unittest.TestCase):
         page.close_error = Exception("Target closed")
         data = self.fetch(page)
         self.assertEqual(page.navigations, 1)  # Scrapling navigated without the guard
-        self.assertEqual((data["outcome"], data["error"], data["html"]), ("failed", "navigation_failed", ""))
+        self.assertEqual((data["outcome"], data["error"], read_dom(data)), ("failed", "navigation_failed", ""))
 
     def test_waits_that_do_not_finish_fail(self):
         async def broken(*args):
@@ -1021,7 +1112,7 @@ class ScraplingFetchTests(unittest.TestCase):
         with mock.patch.object(helper, "settle_navigation", broken):
             data = self.fetch(page)
         self.assertEqual(page.navigations, 1)
-        self.assertEqual((data["outcome"], data["error"], data["html"]), ("failed", "navigation_failed", ""))
+        self.assertEqual((data["outcome"], data["error"], read_dom(data)), ("failed", "navigation_failed", ""))
 
 
 class ServerTests(unittest.TestCase):

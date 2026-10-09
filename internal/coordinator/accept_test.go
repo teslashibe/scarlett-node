@@ -393,3 +393,36 @@ func TestValidOfferToleratesSlowLocalClock(t *testing.T) {
 		}
 	}
 }
+
+// A web offer may run 300 s (its job deadline is creation + 298 s), so a
+// large page fits a slow uplink; codex and x_read keep 120 s. The clock skew
+// margin applies to both.
+func TestValidOfferLifetimePerService(t *testing.T) {
+	now := time.Now()
+	web := readLeaseFixture(t, "lease-web-offer.json")
+	xRead := Lease{Version: Version, ServiceType: "x_read", JobID: "synthetic", Attempt: "attempt", Fence: "fence", AcceptanceRequired: true, SignedJobID: strings.Repeat("a", 64), RequestSHA256: strings.Repeat("b", 64)}
+	codex := xRead
+	codex.ServiceType = "codex"
+	if OfferLifetime("web") != 300*time.Second || OfferLifetime("x_read") != 120*time.Second || OfferLifetime("codex") != 120*time.Second {
+		t.Fatal("lifetimes")
+	}
+	for _, tc := range []struct {
+		offer Lease
+		ahead time.Duration
+		ok    bool
+	}{
+		{web, 298 * time.Second, true},
+		{web, 300*time.Second + OfferClockSkew, true},
+		{web, 300*time.Second + OfferClockSkew + time.Second, false},
+		{xRead, 121 * time.Second, true},
+		{xRead, 130 * time.Second, false},
+		{codex, 130 * time.Second, false},
+		{codex, 298 * time.Second, false},
+	} {
+		tc.offer.LeaseDeadline = now.Add(tc.ahead)
+		tc.offer.SettlementDeadline = tc.offer.LeaseDeadline
+		if err := ValidOffer(tc.offer, now); (err == nil) != tc.ok {
+			t.Fatalf("%s %v ahead: err %v, want ok=%v", tc.offer.ServiceType, tc.ahead, err, tc.ok)
+		}
+	}
+}

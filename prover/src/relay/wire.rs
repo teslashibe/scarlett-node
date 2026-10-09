@@ -31,6 +31,11 @@ pub const OPENING: u8 = 24;
 /// Web sessions only, after OPENING: the hop's status and the URL the
 /// verifier authorizes next. The supplier learns nothing else of the page.
 pub const OUTCOME: u8 = 25;
+/// Web sessions only: the session ends without a hop, `{"reason":"…"}`.
+/// `verifier_busy` comes right after the token and spends nothing; any other
+/// reason comes once the hop's rejection is committed (after OPENING when a
+/// request was sealed).
+pub const FAILED: u8 = 26;
 
 /// Largest tunnel chunk either side forwards in one frame.
 pub const CHUNK: usize = 32 << 10;
@@ -40,6 +45,7 @@ fn limit(kind: u8) -> Option<usize> {
         HELLO | DONE => 1 << 10,
         // Two URLs of at most 2048 bytes each, plus the fields around them.
         OUTCOME => 8 << 10,
+        FAILED => 256,
         CO_SETUP | KOS_CHI | OPENING => 1 << 8,
         CO_CHOOSE | CO_PAYLOAD | KOS_CHECK => 32 << 10,
         // The KOS matrix is 16 bytes per transfer, plus its padding rows.
@@ -77,6 +83,49 @@ pub async fn recv<R: AsyncRead + Unpin>(r: &mut R) -> Result<(u8, Vec<u8>)> {
     let mut payload = vec![0u8; len];
     r.read_exact(&mut payload).await?;
     Ok((head[0], payload))
+}
+
+/// Reads frames like `recv`, but can be cancelled between frames without
+/// losing bytes: a frame is consumed only when `recv` returns it, so it can
+/// race a timer in `tokio::select!`.
+pub struct FrameReader<R> {
+    inner: R,
+    buf: Vec<u8>,
+}
+
+impl<R: AsyncRead + Unpin> FrameReader<R> {
+    pub fn new(inner: R) -> Self {
+        Self { inner, buf: Vec::new() }
+    }
+
+    /// The next frame. Cancel-safe.
+    pub async fn recv(&mut self) -> Result<(u8, Vec<u8>)> {
+        loop {
+            if let Some(&[kind, a, b, c, d]) = self.buf.get(..5) {
+                let len = u32::from_be_bytes([a, b, c, d]) as usize;
+                match limit(kind) {
+                    Some(max) if len <= max => {}
+                    _ => bail!("relay frame {kind} of {len} bytes is not acceptable"),
+                }
+                if self.buf.len() >= 5 + len {
+                    let payload = self.buf[5..5 + len].to_vec();
+                    self.buf.drain(..5 + len);
+                    return Ok((kind, payload));
+                }
+            }
+            self.buf.reserve(CHUNK + 5);
+            // read_buf is cancel-safe: if this future is dropped, no bytes were taken.
+            if self.inner.read_buf(&mut self.buf).await? == 0 {
+                bail!("relay connection closed");
+            }
+        }
+    }
+
+    /// The underlying reader. Bytes already buffered are dropped.
+    pub fn get_mut(&mut self) -> &mut R {
+        self.buf.clear();
+        &mut self.inner
+    }
 }
 
 /// Encodes one of the OT library's messages.
@@ -120,6 +169,37 @@ mod tests {
         assert!(send(&mut a, OUTCOME, &vec![b' '; (8 << 10) + 1]).await.is_err());
         a.write_all(&[OUTCOME, 0, 0, 0x20, 1]).await.unwrap();
         assert!(recv(&mut b).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_frame_reader_survives_cancellation_and_reads_what_recv_reads() {
+        let (mut a, b) = tokio::io::duplex(1 << 20);
+        let mut reader = FrameReader::new(b);
+        // Nothing to read: a timer wins, and nothing is lost.
+        tokio::select! {
+            _ = reader.recv() => panic!("no frame was sent"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+        // A frame that arrives in pieces across a cancelled read.
+        let busy = br#"{"reason":"verifier_busy"}"#;
+        let mut frame = vec![FAILED, 0, 0, 0, busy.len() as u8];
+        frame.extend_from_slice(busy);
+        a.write_all(&frame[..3]).await.unwrap();
+        tokio::select! {
+            _ = reader.recv() => panic!("half a head"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+        a.write_all(&frame[3..]).await.unwrap();
+        send(&mut a, PLAIN, b"next").await.unwrap();
+        assert_eq!(reader.recv().await.unwrap(), (FAILED, busy.to_vec()));
+        assert_eq!(reader.recv().await.unwrap(), (PLAIN, b"next".to_vec()));
+        // The same size and kind limits as recv.
+        a.write_all(&[FAILED, 0, 0, 1, 1]).await.unwrap();
+        assert!(reader.recv().await.is_err());
+        drop(a);
+        let (a, b) = tokio::io::duplex(64);
+        drop(a);
+        assert!(FrameReader::new(b).recv().await.is_err());
     }
 
     #[test]

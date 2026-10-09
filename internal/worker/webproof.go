@@ -139,6 +139,11 @@ func webHelperFailure(ctx, hopCtx context.Context, err error, stderr string) str
 		return "web_connect_failed"
 	case "proxy_failed":
 		return "web_proxy_failed"
+	case "verifier_busy":
+		// Repeated by hop within its budget; never a job code.
+		return "verifier_busy"
+	case "page_too_large":
+		return "page_too_large"
 	}
 	return "web_fetch_failed"
 }

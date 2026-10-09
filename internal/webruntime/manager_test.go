@@ -2,6 +2,8 @@ package webruntime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -121,10 +123,19 @@ func fakeHelper(mode, dump string) int {
 		}
 		n := fetches.Add(1)
 		os.WriteFile(filepath.Join(dump, "solver-"+strconv.FormatInt(n, 10)), []byte(strconv.FormatBool(req.Solver)), 0o600)
+		// The DOM goes to a private file in TMPDIR, as the real helper writes
+		// it; the answer names the file, its size and its sha256.
+		dom := fakeDOM(mode, dump)
+		if mode == "too-large" {
+			fmt.Fprintf(w, `{"data":{"outcome":"failed","error":"too_large","final_url":%q,"status_code":200,"headers":[],"set_cookie_names":[],"content_type":"text/html",
+				"html_path":"","html_bytes":67108865,"html_sha256":"","cookies":[],"challenge":"none","redirects":[],"started_at_ms":1,
+				"timings":{"context_ms":1,"navigate_ms":1,"settle_ms":1,"challenge_ms":0,"total_ms":3},"solver":"","solver_cost_micro_usd":0}}`, req.URL)
+			return
+		}
 		if mode == "solver-cost" {
 			fmt.Fprintf(w, `{"data":{"outcome":"ok","error":"","final_url":%q,"status_code":200,"headers":[],"set_cookie_names":[],"content_type":"text/html",
-				"html":"<p>ok</p>","html_truncated":false,"cookies":[],"challenge":"solved","redirects":[],"started_at_ms":1,
-				"timings":{"context_ms":1,"navigate_ms":1,"settle_ms":1,"challenge_ms":1,"total_ms":4},"solver":"used","solver_cost_micro_usd":600000}}`, req.URL)
+				%s,"cookies":[],"challenge":"solved","redirects":[],"started_at_ms":1,
+				"timings":{"context_ms":1,"navigate_ms":1,"settle_ms":1,"challenge_ms":1,"total_ms":4},"solver":"used","solver_cost_micro_usd":600000}}`, req.URL, dom)
 			return
 		}
 		if mode == "hang" || mode == "hang-once" && os.WriteFile(filepath.Join(dump, "hung"), nil, 0o600) == nil && !exists(filepath.Join(dump, "hung-done")) {
@@ -133,10 +144,10 @@ func fakeHelper(mode, dump string) int {
 			return
 		}
 		fmt.Fprintf(w, `{"data":{"outcome":"ok","error":"","final_url":%q,"status_code":200,"headers":[["content-type","text/html"]],
-			"set_cookie_names":["sid"],"content_type":"text/html","html":"<p>ok</p>","html_truncated":false,
+			"set_cookie_names":["sid"],"content_type":"text/html",%s,
 			"cookies":[{"name":"cf_clearance","value":"secret","domain":".example.com","path":"/","expires":-1,"secure":true,"http_only":true}],
 			"challenge":"none","redirects":[],"started_at_ms":1,"timings":{"context_ms":1,"navigate_ms":1,"settle_ms":1,"challenge_ms":0,"total_ms":3},
-			"solver":"","solver_cost_micro_usd":0}}`, req.URL)
+			"solver":"","solver_cost_micro_usd":0}}`, req.URL, dom)
 	}))
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -160,6 +171,44 @@ func fakeHelper(mode, dump string) int {
 }
 
 func exists(p string) bool { _, err := os.Stat(p); return err == nil }
+
+// fakeDOMPage is what the fake helper renders.
+const fakeDOMPage = "<p>ok é</p>"
+
+// fakeDOM writes the page to a new dom-*.html file in TMPDIR and returns the
+// answer's html_path, html_bytes and html_sha256 members. The dom-* modes
+// break one rule each.
+func fakeDOM(mode, dump string) string {
+	f, err := os.CreateTemp(os.TempDir(), "dom-*.html")
+	if err != nil {
+		return `"html_path":"","html_bytes":0,"html_sha256":""`
+	}
+	f.WriteString(fakeDOMPage)
+	f.Close()
+	path, size, sum := f.Name(), len(fakeDOMPage), sha256.Sum256([]byte(fakeDOMPage))
+	digest := hex.EncodeToString(sum[:])
+	switch mode {
+	case "dom-outside":
+		outside := filepath.Join(dump, "dom-outside.html")
+		os.Rename(path, outside)
+		path = outside
+	case "dom-symlink":
+		link := filepath.Join(os.TempDir(), "dom-link.html")
+		os.Symlink(path, link)
+		path = link
+	case "dom-size":
+		size++
+	case "dom-sha":
+		digest = strings.Repeat("0", 64)
+	case "dom-name":
+		renamed := filepath.Join(os.TempDir(), "page.html")
+		os.Rename(path, renamed)
+		path = renamed
+	}
+	os.WriteFile(filepath.Join(dump, "dom-path"), []byte(path), 0o600)
+	raw, _ := json.Marshal(map[string]any{"html_path": path, "html_bytes": size, "html_sha256": digest})
+	return string(raw[1 : len(raw)-1])
+}
 
 // testSolverKey is a synthetic provider key.
 const testSolverKey = "synthetic-capmonster-key-0123456789"
@@ -471,10 +520,12 @@ func TestManagerRecyclesAfter50Fetches(t *testing.T) {
 func TestManagerMemoryRecycleAndKill(t *testing.T) {
 	s := newTestManager(t, "ok")
 	s.prepare(t)
-	if _, err := s.fetch(context.Background()); err != nil {
+	res, err := s.fetch(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
-	recycle, kill := Thresholds(2)
+	os.Remove(res.HTMLPath)
+	recycle, kill := Thresholds(2, 32<<30)
 	s.sample.Store(recycle)
 	s.m.tick()
 	s.m.mu.Lock()
@@ -487,9 +538,10 @@ func TestManagerMemoryRecycleAndKill(t *testing.T) {
 	s.m.tick()
 	s.m.tick() // the drained, idle helper stops on the next tick
 	s.waitStopped(t)
-	if _, err := s.fetch(context.Background()); err != nil {
+	if res, err = s.fetch(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	os.Remove(res.HTMLPath)
 	pid := s.helperPID(t)
 	s.sample.Store(kill + 1)
 	s.m.tick()
@@ -502,31 +554,39 @@ func TestManagerMemoryRecycleAndKill(t *testing.T) {
 	}
 }
 
-// Host memory pressure kills a helper with a page in flight: critical at
-// once, warn only above the recycle size. An idle helper is left alone.
-func TestManagerKillsUnderHostMemoryPressure(t *testing.T) {
-	recycle, _ := Thresholds(2)
+// The memory rule with a page in flight: above recycle the helper only
+// drains, at macOS pressure warn too (the page finishes; html.spec.whatwg.org
+// was killed at warn under the old rule); critical pressure or a tree above
+// the kill size kills it, and the fetch answers ErrorMemory with the tree
+// peak it reached. An idle helper is never killed for pressure.
+func TestManagerMemoryRuleWithAPageInFlight(t *testing.T) {
+	recycle, kill := Thresholds(2, 32<<30)
 	for _, c := range []struct {
 		name   string
 		level  int64
 		bytes  uint64
 		killed bool
 	}{
-		{"normal", 1, recycle + 1, false},
+		{"normal above recycle", 1, recycle + 1, false},
 		{"warn below recycle", pressureWarn, recycle, false},
-		{"warn above recycle", pressureWarn, recycle + 1, true},
+		{"warn above recycle", pressureWarn, recycle + 1, false},
+		{"warn just under kill", pressureWarn, kill, false},
 		{"critical", pressureCritical, 1 << 20, true},
+		{"above kill", 1, kill + 1, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			s := newTestManager(t, "hang")
 			s.prepare(t)
-			s.level.Store(c.level)
-			done := make(chan error, 1)
-			go func() { _, err := s.fetch(context.Background()); done <- err }()
+			type answer struct {
+				res FetchResult
+				err error
+			}
+			done := make(chan answer, 1)
+			go func() { res, err := s.fetch(context.Background()); done <- answer{res, err} }()
 			deadline := time.Now().Add(5 * time.Second)
 			for {
 				s.m.mu.Lock()
-				busy := s.m.helper != nil && s.m.helper.inFlight == 1
+				busy := s.m.helper != nil && s.m.helper.inFlight == 1 && len(s.m.helper.watches) == 1
 				s.m.mu.Unlock()
 				if busy || time.Now().After(deadline) {
 					break
@@ -534,6 +594,10 @@ func TestManagerKillsUnderHostMemoryPressure(t *testing.T) {
 				time.Sleep(5 * time.Millisecond)
 			}
 			pid := s.helperPID(t)
+			// A smaller sample first: the peak is the largest one.
+			s.sample.Store(c.bytes / 2)
+			s.m.tick()
+			s.level.Store(c.level)
 			s.sample.Store(c.bytes)
 			s.m.tick()
 			gone := false
@@ -543,9 +607,16 @@ func TestManagerKillsUnderHostMemoryPressure(t *testing.T) {
 			if gone != c.killed {
 				t.Fatalf("killed = %v, want %v", gone, c.killed)
 			}
+			s.m.mu.Lock()
+			draining := s.m.helper != nil && s.m.helper.draining
+			s.m.mu.Unlock()
+			if !c.killed && draining != (c.bytes > recycle) {
+				t.Fatalf("draining = %v", draining)
+			}
 			if c.killed {
-				if err := <-done; !errors.Is(err, ErrHelper) {
-					t.Fatalf("in-flight fetch: %v", err)
+				a := <-done
+				if a.err != nil || a.res.Outcome != "failed" || a.res.Error != ErrorMemory || a.res.TreePeakBytes != c.bytes || a.res.HTMLPath != "" {
+					t.Fatalf("in-flight fetch: %v %+v", a.err, a.res.Error)
 				}
 			}
 		})
@@ -553,9 +624,11 @@ func TestManagerKillsUnderHostMemoryPressure(t *testing.T) {
 	// Without a page in flight, critical pressure does not kill.
 	s := newTestManager(t, "ok")
 	s.prepare(t)
-	if _, err := s.fetch(context.Background()); err != nil {
-		t.Fatal(err)
+	res, err := s.fetch(context.Background())
+	if err != nil || res.TreePeakBytes != 0 {
+		t.Fatal(err, res.TreePeakBytes)
 	}
+	os.Remove(res.HTMLPath)
 	pid := s.helperPID(t)
 	s.level.Store(pressureCritical)
 	s.m.tick()
@@ -585,11 +658,132 @@ func TestManagerSamplesFasterWhileBusy(t *testing.T) {
 	}
 }
 
-func TestThresholdsScaleWithCapacity(t *testing.T) {
-	for capacity, want := range map[int][2]float64{1: {2.0, 3.5}, 2: {2.75, 4.25}, 4: {4.25, 5.75}} {
-		recycle, kill := Thresholds(capacity)
-		if float64(recycle)/gib != want[0] || float64(kill)/gib != want[1] {
-			t.Errorf("capacity %d: %v / %v GiB", capacity, float64(recycle)/gib, float64(kill)/gib)
+func TestThresholdsScaleWithCapacityAndMemory(t *testing.T) {
+	for _, c := range []struct {
+		capacity      int
+		physical      uint64
+		recycle, kill float64
+	}{
+		{1, 0, 2.0, 3.5}, {2, 0, 2.75, 4.25}, {4, 0, 4.25, 5.75},
+		// kill = max(recycle + 1.5 GiB, physical / 4)
+		{1, 8 << 30, 2.0, 3.5}, {2, 16 << 30, 2.75, 4.25}, {2, 24 << 30, 2.75, 6}, {2, 64 << 30, 2.75, 16}, {4, 32 << 30, 4.25, 8},
+	} {
+		recycle, kill := Thresholds(c.capacity, c.physical)
+		if float64(recycle)/gib != c.recycle || float64(kill)/gib != c.kill {
+			t.Errorf("capacity %d, %d GiB: %v / %v GiB", c.capacity, c.physical>>30, float64(recycle)/gib, float64(kill)/gib)
+		}
+		if jobMemoryLimit(kill) != kill+2*gib {
+			t.Errorf("job limit for %d", kill)
+		}
+	}
+}
+
+// Health reports the kill size the heartbeat sends as browser.kill_bytes.
+func TestHealthReportsKillBytes(t *testing.T) {
+	s := newTestManager(t, "ok")
+	s.prepare(t)
+	if h := s.m.Health(); h.KillBytes != 8<<30 {
+		t.Fatalf("kill bytes %d", h.KillBytes)
+	}
+}
+
+// The DOM comes back as a file: moved out of the helper's TMPDIR into the
+// node's private DOM directory under a fresh name, checked for size and
+// sha256. The caller owns it.
+func TestManagerAdoptsTheDOMFile(t *testing.T) {
+	s := newTestManager(t, "ok")
+	s.prepare(t)
+	res, err := s.fetch(context.Background())
+	if err != nil || res.Outcome != "ok" {
+		t.Fatal(err)
+	}
+	if filepath.Dir(res.HTMLPath) != filepath.Join(s.state, "web-browser", "dom") || !domName(filepath.Base(res.HTMLPath)) || res.HTMLBytes != int64(len(fakeDOMPage)) {
+		t.Fatalf("path %s bytes %d", res.HTMLPath, res.HTMLBytes)
+	}
+	raw, err := os.ReadFile(res.HTMLPath)
+	sum := sha256.Sum256(raw)
+	if err != nil || string(raw) != fakeDOMPage || hex.EncodeToString(sum[:]) != res.HTMLSHA256 {
+		t.Fatal("DOM file content")
+	}
+	helperPath, _ := os.ReadFile(filepath.Join(s.dump, "dom-path"))
+	if exists(string(helperPath)) {
+		t.Fatal("the helper's copy stayed in TMPDIR")
+	}
+	if info, _ := os.Stat(filepath.Dir(res.HTMLPath)); runtime.GOOS != "windows" && info.Mode().Perm() != 0o700 {
+		t.Fatal("DOM directory not private", info.Mode())
+	}
+	// A stale DOM survives a helper restart (an upload may still read it);
+	// only the first prepare of a process clears the directory.
+	s.m.mu.Lock()
+	s.m.helper.draining = true
+	s.m.mu.Unlock()
+	next, err := s.fetch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(next.HTMLPath)
+	if !exists(res.HTMLPath) {
+		t.Fatal("a helper restart removed a DOM file")
+	}
+	s.m.mu.Lock()
+	s.m.helper.draining = true
+	s.m.mu.Unlock()
+	s.m.tick()
+	s.waitStopped(t)
+	if err := s.m.prepare(context.Background()); err != nil || !exists(res.HTMLPath) {
+		t.Fatal("a later prepare removed a DOM file", err)
+	}
+	fresh := New(s.m.cfg)
+	fresh.d = s.m.d
+	if err := fresh.prepare(context.Background()); err != nil || exists(res.HTMLPath) {
+		t.Fatal("a new process kept a stale DOM file", err)
+	}
+	fresh.Close(context.Background())
+}
+
+func TestManagerRefusesBadDOMFiles(t *testing.T) {
+	for _, mode := range []string{"dom-outside", "dom-symlink", "dom-size", "dom-sha", "dom-name"} {
+		t.Run(mode, func(t *testing.T) {
+			if mode == "dom-symlink" && runtime.GOOS == "windows" {
+				t.Skip("symlinks need privileges on Windows")
+			}
+			s := newTestManager(t, mode)
+			s.prepare(t)
+			res, err := s.fetch(context.Background())
+			if !errors.Is(err, ErrHelper) || res.HTMLPath != "" {
+				t.Fatalf("%v %+v", err, res.HTMLPath)
+			}
+			entries, _ := os.ReadDir(filepath.Join(s.state, "web-browser", "dom"))
+			if len(entries) != 0 {
+				t.Fatal("a refused DOM was kept")
+			}
+			if mode == "dom-outside" {
+				// A path outside the helper's directory is never touched.
+				if !exists(filepath.Join(s.dump, "dom-outside.html")) {
+					t.Fatal("removed a file outside TMPDIR")
+				}
+			}
+		})
+	}
+}
+
+// A DOM over the ceiling is reported, never cut, and has no file.
+func TestManagerReportsATooLargeDOM(t *testing.T) {
+	s := newTestManager(t, "too-large")
+	s.prepare(t)
+	res, err := s.fetch(context.Background())
+	if err != nil || res.Outcome != "failed" || res.Error != "too_large" || res.HTMLBytes != htmlCap+1 || res.HTMLPath != "" || res.StatusCode != 200 {
+		t.Fatalf("%v %+v", err, res.Error)
+	}
+	for _, bad := range []FetchResult{
+		{Outcome: "failed", Error: "too_large", HTMLBytes: htmlCap, Challenge: "none"},
+		{Outcome: "failed", Error: "too_large", HTMLBytes: htmlCap + 1, HTMLPath: "/x", Challenge: "none"},
+		{Outcome: "ok", StatusCode: 200, HTMLBytes: htmlCap + 1, HTMLPath: "/x", HTMLSHA256: strings.Repeat("a", 64), Challenge: "none"},
+		{Outcome: "ok", StatusCode: 200, Challenge: "none"},
+		{Outcome: "timeout", Error: "timeout", HTMLPath: "/x", Challenge: "none"},
+	} {
+		if bad.validate() == nil {
+			t.Errorf("accepted %+v", bad.Outcome)
 		}
 	}
 }
@@ -926,7 +1120,7 @@ func TestManagerSolversAndDailyCap(t *testing.T) {
 }
 
 func TestSolverResultValidation(t *testing.T) {
-	ok := FetchResult{Outcome: "ok", StatusCode: 200, Challenge: "solved", Solver: "used", SolverCostMicroUSD: 1200}
+	ok := FetchResult{Outcome: "ok", StatusCode: 200, Challenge: "solved", Solver: "used", SolverCostMicroUSD: 1200, HTMLPath: "/dom-x.html", HTMLSHA256: strings.Repeat("a", 64)}
 	if err := ok.validate(); err != nil {
 		t.Fatal(err)
 	}

@@ -887,6 +887,7 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	}
 	var body any
 	code := ""
+	var webReport worker.WebReport
 	endWorker := diagnostics.Start(ctx, "worker", 0)
 	if c.Executor == config.ExecutorCodexTLSN || c.Executor == config.ExecutorServices {
 		var detail string
@@ -902,7 +903,8 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 			if w.Upload == nil && client != nil {
 				w.Upload = logBrowserUpload(client.UploadBrowserResult, os.Stderr)
 			}
-			code = w.Run(ctx, l)
+			webReport = w.Report(ctx, l)
+			code = webReport.Code
 		} else {
 			code, detail = worker.Prover{Config: c}.Run(ctx, l)
 		}
@@ -910,7 +912,11 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 			fmt.Fprintln(os.Stderr, detail)
 		}
 		if code != "" {
-			body = coordinator.Failure{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence, Code: code}
+			failure := coordinator.Failure{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence, Code: code}
+			if code == "page_too_large" {
+				failure.Stage, failure.ObservedBytes = webReport.Stage, webReport.ObservedBytes
+			}
+			body = failure
 		} else {
 			body = coordinator.Proven{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence}
 		}

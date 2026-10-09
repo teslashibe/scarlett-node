@@ -229,7 +229,7 @@ document.addEventListener('click', async () => {
 		FVL          int      `json:"fvl"`
 		Notification string   `json:"notification"`
 	}
-	if err := json.Unmarshal([]byte(between(res.HTML, `<div id="done">`, `</div>`)), &page); err != nil {
+	if err := json.Unmarshal([]byte(between(domText(t, res), `<div id="done">`, `</div>`)), &page); err != nil {
 		t.Fatalf("page report missing: %v", err)
 	}
 	if page.UA != m.UserAgent() || page.FVL == 0 || page.Notification != "denied" || !slices.ContainsFunc(page.Brands, func(b string) bool { return strings.HasSuffix(b, "/"+strconv.Itoa(PinnedMajor)) }) {
@@ -237,7 +237,7 @@ document.addEventListener('click', async () => {
 	}
 
 	// A second fetch sees no cookies from the first (fresh context per job).
-	if res = fetch(loopback+"/cookies", "load", ""); between(res.HTML, `<div id="cookies">`, `</div>`) != "0" {
+	if res = fetch(loopback+"/cookies", "load", ""); between(domText(t, res), `<div id="cookies">`, `</div>`) != "0" {
 		t.Fatal("a later fetch saw an earlier fetch's cookies")
 	}
 	if res = fetch(origin+"/cookies", "load", ""); res.Outcome != "ok" || res.StatusCode != 200 || res.FinalURL != origin+"/cookies" {
@@ -272,7 +272,7 @@ document.addEventListener('click', async () => {
 		Candidates int    `json:"candidates"`
 		Error      string `json:"error"`
 	}
-	if err := json.Unmarshal([]byte(between(res.HTML, `<div id="done">`, `</div>`)), &rtc); err != nil || rtc.Candidates != 0 {
+	if err := json.Unmarshal([]byte(between(domText(t, res), `<div id="done">`, `</div>`)), &rtc); err != nil || rtc.Candidates != 0 {
 		t.Fatalf("WebRTC produced candidates: %+v %v", rtc, err)
 	}
 	if n := datagrams.Load(); n != 0 {
@@ -290,10 +290,10 @@ document.addEventListener('click', async () => {
 	// External protocols open nothing: no handler app starts, every frame
 	// navigation stays in the browser, a 3xx to mailto: fails the page.
 	apps := handlerApps(t)
-	if res = fetch(loopback+"/external", "load", "#done"); res.Outcome != "ok" || between(res.HTML, `<div id="done">`, `</div>`) != "4" {
-		t.Fatalf("external-protocol page: outcome %s, frames kept in the browser %q of 4", res.Outcome, between(res.HTML, `<div id="done">`, `</div>`))
+	if res = fetch(loopback+"/external", "load", "#done"); res.Outcome != "ok" || between(domText(t, res), `<div id="done">`, `</div>`) != "4" {
+		t.Fatalf("external-protocol page: outcome %s, frames kept in the browser %q of 4", res.Outcome, between(domText(t, res), `<div id="done">`, `</div>`))
 	}
-	if res = fetch(loopback+"/to-mailto", "load", ""); res.Outcome == "ok" || res.HTML != "" {
+	if res = fetch(loopback+"/to-mailto", "load", ""); res.Outcome == "ok" || domText(t, res) != "" {
 		t.Fatalf("a document redirect to mailto: was followed: outcome %s", res.Outcome)
 	}
 
@@ -316,7 +316,7 @@ document.addEventListener('click', async () => {
 		Serial         string `json:"serial"`
 		Display        string `json:"display"`
 	}
-	if err := json.Unmarshal([]byte(between(res.HTML, `<div id="done">`, `</div>`)), &act); err != nil || !act.Activation {
+	if err := json.Unmarshal([]byte(between(domText(t, res), `<div id="done">`, `</div>`)), &act); err != nil || !act.Activation {
 		t.Fatalf("the solver did not click the interstitial-shaped page: %v %+v", err, act)
 	}
 	if !strings.HasPrefix(act.ClipboardWrite, "refused") || !strings.HasPrefix(act.ClipboardRead, "refused") || !strings.HasPrefix(act.Picker, "refused") {
@@ -349,7 +349,7 @@ document.addEventListener('click', async () => {
 
 	// An invalid certificate fails the main document as tls.
 	res, err = m.Fetch(ctx, FetchRequest{URL: "https://tls.webruntime.example:" + securePort + "/", Wait: "load", TimeoutMS: 15000})
-	if err != nil || res.Outcome != "failed" || res.Error != "tls" || res.HTML != "" {
+	if err != nil || res.Outcome != "failed" || res.Error != "tls" || domText(t, res) != "" {
 		t.Fatalf("self-signed origin: %v outcome %s error %s", err, res.Outcome, res.Error)
 	}
 
@@ -648,4 +648,17 @@ func sameMap(a, b map[string]string) bool {
 		}
 	}
 	return true
+}
+
+// domText is the DOM of a fetch, read from its file; "" when it has none.
+func domText(t *testing.T, res FetchResult) string {
+	t.Helper()
+	if res.HTMLPath == "" {
+		return ""
+	}
+	raw, err := os.ReadFile(res.HTMLPath)
+	if err != nil || int64(len(raw)) != res.HTMLBytes {
+		t.Fatalf("DOM file: %v", err)
+	}
+	return string(raw)
 }

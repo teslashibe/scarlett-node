@@ -232,7 +232,8 @@ pub struct WebSummary {
 }
 
 /// A failed hop: `class` is what the node maps to a failure code
-/// (`connect_failed`, `proxy_failed` or `fetch_failed`).
+/// (`connect_failed`, `proxy_failed`, `fetch_failed`, `page_too_large`, or
+/// `verifier_busy`, which the node repeats within its hop budget).
 pub struct WebError {
     pub class: &'static str,
     pub error: anyhow::Error,
@@ -242,7 +243,45 @@ impl WebError {
     fn fetch(error: anyhow::Error) -> Self {
         Self { class: "fetch_failed", error }
     }
+
+    /// A failed session: what the verifier said, if it said anything.
+    fn session(error: anyhow::Error) -> Self {
+        let class = match error.downcast_ref::<Refused>() {
+            Some(Refused("verifier_busy")) => "verifier_busy",
+            Some(Refused("page_too_large")) => "page_too_large",
+            _ => "fetch_failed",
+        };
+        Self { class, error }
+    }
 }
+
+/// The reasons a verifier may give in a FAILED frame (api/verifier-v1.md 8.3).
+const REFUSALS: [&str; 9] = ["verifier_busy", "tls_failed", "request_rejected", "page_too_large", "response_invalid", "server_closed", "session_timeout", "execution_uncertain", "proof_rejected"];
+
+/// The verifier ended a web hop without a result and said why: one of
+/// `REFUSALS`, or `other` for anything else it sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Refused(pub &'static str);
+
+impl Refused {
+    fn parse(payload: &[u8]) -> Self {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Frame {
+            reason: String,
+        }
+        let reason = serde_json::from_slice::<Frame>(payload).ok().map(|f| f.reason);
+        Self(REFUSALS.into_iter().find(|r| reason.as_deref() == Some(*r)).unwrap_or("other"))
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "verifier ended the hop: {}", self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
 
 pub async fn run_web(input: &[u8]) -> Result<WebSummary, WebError> {
     let diagnostics = Run::new();
@@ -286,7 +325,7 @@ fn validate_hop(request: &WebRequest) -> Result<(Vec<u8>, IpAddr, Duration)> {
         bail!("target port must be 443");
     }
     if !(1000..=webpolicy::HOP_LIMIT.as_millis() as u64).contains(&request.timeout_ms) {
-        bail!("timeout_ms must be 1000-30000");
+        bail!("timeout_ms must be 1000-{}", webpolicy::HOP_LIMIT.as_millis());
     }
     Ok((raw, ip, Duration::from_millis(request.timeout_ms)))
 }
@@ -313,7 +352,7 @@ async fn run_web_observed(input: &[u8], trace: &Trace) -> Result<WebSummary, Web
         anyhow::Ok((outcome, traffic))
     };
     let (outcome, traffic) = match tokio::time::timeout_at(deadline, session).await {
-        Ok(result) => result.map_err(WebError::fetch)?,
+        Ok(result) => result.map_err(WebError::session)?,
         Err(_) => return Err(WebError::fetch(anyhow::anyhow!("relay session timed out"))),
     };
     let (target_sent_bytes, target_received_bytes) = target.bytes();
@@ -560,6 +599,13 @@ where
                 trace.measure_sync(Phase::OpeningCheck, || opened_as(&payload, &record, raw))?;
                 checked = true;
             }
+            Event::Frame(wire::FAILED, payload) if web => {
+                // A verifier opens a sealed record before it says why the hop failed.
+                if record_sent && !checked {
+                    bail!("{MISUSE}: it ended the session before it opened the request record");
+                }
+                return Err(Refused::parse(&payload).into());
+            }
             Event::Frame(wire::OUTCOME, payload) if web => {
                 let Mode::Web { hop, url } = mode else { unreachable!("web mode") };
                 if !checked || outcome.is_some() {
@@ -757,7 +803,7 @@ mod tests {
         serde_json::json!({
             "verifier": "127.0.0.1:1", "plaintext_fixture": true, "token": "ab".repeat(32), "hop": 0,
             "url": "https://example.com/", "ip": "93.184.215.14", "port": 443,
-            "payload": {"type":"web.fetch","proof_mode":"relay","proof_policy":"web-relay-v1","url":"https://example.com/","max_redirects":5,"max_response_bytes":10485760,"headers":vectors["default_headers"]},
+            "payload": {"type":"web.fetch","proof_mode":"relay","proof_policy":"web-relay-v1","url":"https://example.com/","max_redirects":5,"max_response_bytes":67108864,"headers":vectors["default_headers"]},
             "timeout_ms": 1000
         })
     }
@@ -790,7 +836,8 @@ mod tests {
             ("hop 0 elsewhere", Box::new(|v| v["url"] = "https://www.example.com/".into())),
             ("hop beyond redirects", Box::new(|v| v["hop"] = 6.into())),
             ("payload", Box::new(|v| v["payload"]["max_redirects"] = 9.into())),
-            ("timeout", Box::new(|v| v["timeout_ms"] = 30001.into())),
+            ("timeout", Box::new(|v| v["timeout_ms"] = 280_001.into())),
+            ("ten MiB pages", Box::new(|v| v["payload"]["max_response_bytes"] = 10_485_760.into())),
             ("short timeout", Box::new(|v| v["timeout_ms"] = 999.into())),
             ("token", Box::new(|v| v["token"] = "short".into())),
             ("unknown field", Box::new(|v| v["extra"] = true.into())),
@@ -805,6 +852,11 @@ mod tests {
                 assert!(!error.contains(private), "{name}: {error}");
             }
         }
+        // The longest hop budget is accepted and goes on to dial.
+        let mut longest = web_input();
+        longest["timeout_ms"] = 280_000.into();
+        longest["proxy"] = serde_json::json!({"host":"127.0.0.1","port":1});
+        assert_eq!(web_class(&longest).await.0, "proxy_failed");
         // A later hop may fetch any canonical URL the verifier authorized.
         let mut later = web_input();
         later["hop"] = 1.into();

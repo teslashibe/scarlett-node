@@ -15,6 +15,16 @@
 //! hop also records the node's User-Agent, its cookie names and a hash of
 //! its Cookie value, never the value.
 //!
+//!
+//! A web job's final page is never in its receipt: the verifier streams the
+//! entity to a private body file beside it (see body.rs), which the
+//! coordinator reads with `GET /v1/sessions/{job}/{attempt}/body` and
+//! releases with `DELETE` once it has the result. Web sessions take one of
+//! `SCARLETT_VERIFIER_WEB_CONCURRENCY` slots (else `verifier_busy`), and web
+//! receipts and bodies live in a pool (`SCARLETT_VERIFIER_MAX_WEB_BYTES`)
+//! that always leaves X and Codex a full receipt. The contract is
+//! api/verifier-v1.md.
+//!
 //! Environment: SCARLETT_VERIFIER_KEY (required, 32+ chars),
 //! SCARLETT_VERIFIER_LISTEN (default 0.0.0.0:7047), SCARLETT_VERIFIER_API
 //! (default 127.0.0.1:7070), UPSTREAM (default chatgpt.com:443),
@@ -24,9 +34,11 @@
 use std::{
     collections::HashMap,
     env,
+    os::unix::fs::DirBuilderExt,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -35,8 +47,10 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -50,21 +64,24 @@ use tlsn::{
     webpki::RootCertStore,
 };
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncReadExt, AsyncSeekExt},
     net::{TcpListener, TcpStream},
 };
-use tokio_util::compat::TokioAsyncReadCompatExt;
+use tokio_util::{compat::TokioAsyncReadCompatExt, io::ReaderStream};
 
 use crate::{
     policy::{self, Verified},
-    relay::verifier::{Failure, WebOutcome},
+    relay::verifier::{Conn, Failure, HopClock, TimedOut, Timing, WebReader, web_session},
     verifier_store::{self, Record, Store},
-    webpolicy,
+    webpolicy::{self, Framer},
     xpolicy::{self, Exchange, ProofMode, Spec},
     xprove::{MAX_RECV, MAX_SENT},
 };
 
 const MAX_TTL: Duration = Duration::from_secs(600);
+
+/// X and Codex always keep this many of the verifier's session slots.
+const X_CODEX_SLOTS: usize = 16;
 
 struct Config {
     key: String,
@@ -75,6 +92,30 @@ struct Config {
     slots: Arc<tokio::sync::Semaphore>,
     /// TLS client settings for relay sessions, where the verifier is X's TLS peer.
     relay_tls: Arc<rustls::ClientConfig>,
+    /// Web sessions admitted at once; beyond them a web session is turned
+    /// away as `verifier_busy` without spending anything.
+    web_concurrency: usize,
+    web_slots: Arc<tokio::sync::Semaphore>,
+    web_timing: Timing,
+    busy_refusals: AtomicU64,
+}
+
+impl Config {
+    fn new(key: String, upstream: String, session_limit: Duration, limits: verifier_store::Limits, concurrency: usize, web_concurrency: usize, relay_tls: Arc<rustls::ClientConfig>) -> Self {
+        Self {
+            key,
+            upstream,
+            session_limit,
+            limits,
+            concurrency,
+            slots: Arc::new(tokio::sync::Semaphore::new(concurrency)),
+            relay_tls,
+            web_concurrency,
+            web_slots: Arc::new(tokio::sync::Semaphore::new(web_concurrency)),
+            web_timing: Timing::WEB,
+            busy_refusals: AtomicU64::new(0),
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -108,11 +149,34 @@ enum Status {
         next_url: Option<String>,
         hops: Vec<WebHop>,
         rejections: Vec<String>,
+        /// The failed hop's byte counts, exactly when `rejections` is not empty.
+        rejection: Option<Rejection>,
+        /// When the coordinator released the page body file.
+        body_released_at_ms: Option<u64>,
     },
+}
+
+/// Why a web hop failed, with what it had taken: lower bounds of the page's
+/// size when the reason is `page_too_large`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Rejection {
+    reason: String,
+    received_bytes: u64,
+    entity_bytes: u64,
+    /// The final head's Content-Length, if it had one.
+    declared_bytes: Option<u64>,
+}
+
+impl Rejection {
+    fn new(reason: &str, counts: webpolicy::Counts) -> Self {
+        Self { reason: reason.into(), received_bytes: counts.received as u64, entity_bytes: counts.entity as u64, declared_bytes: counts.declared }
+    }
 }
 
 /// One verified web hop.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WebHop {
     index: usize,
     /// Canonical; hop 0 is the job URL and each later hop the location before it.
@@ -124,8 +188,11 @@ struct WebHop {
     location_refused: Option<String>,
     /// The final (non-1xx) status line and headers, through the blank line.
     head_base64: String,
-    /// The entity body, dechunked but still content-encoded; final hop only.
-    body_base64: Option<String>,
+    /// Whether the entity (dechunked, still content-encoded) is kept in the
+    /// receipt's body file: exactly on the final hop of a complete chain.
+    body_stored: bool,
+    /// Entity bytes and their hash, on every hop: a followable redirect's
+    /// body is counted and hashed but not kept.
     body_bytes: usize,
     body_sha256: String,
     /// Every decrypted response byte up to completion, interim heads included.
@@ -155,7 +222,7 @@ struct WebHop {
 }
 
 /// The reasons a web hop can be rejected for.
-const WEB_REJECTIONS: [&str; 8] = ["tls_failed", "request_rejected", "response_too_large", "response_invalid", "server_closed", "session_timeout", "execution_uncertain", "proof_rejected"];
+const WEB_REJECTIONS: [&str; 8] = ["tls_failed", "request_rejected", "page_too_large", "response_invalid", "server_closed", "session_timeout", "execution_uncertain", "proof_rejected"];
 const WEB_TLS_VERSION: &str = "TLSv1_3";
 /// The only suite a relay session negotiates (`relay::verifier::tls_config`).
 const WEB_CIPHER_SUITE: &str = "TLS13_AES_128_GCM_SHA256";
@@ -192,12 +259,68 @@ struct Entry {
     in_flight: usize,
 }
 
-#[derive(Default)]
 struct Sessions {
     by_job: HashMap<String, Entry>,
     by_token: HashMap<String, String>,
     store: Option<Store>,
     failed: bool,
+    /// Without a store: a private temporary directory for page bodies.
+    temp_bodies: Option<TempBodies>,
+    /// Web receipts purged while this process ran, so their bodies read as
+    /// released (410) rather than unknown.
+    purged: HashMap<String, u64>,
+}
+
+impl Default for Sessions {
+    fn default() -> Self {
+        Self { by_job: HashMap::new(), by_token: HashMap::new(), store: None, failed: false, temp_bodies: Some(TempBodies::new()), purged: HashMap::new() }
+    }
+}
+
+/// The page body directory of a verifier without durable state, removed
+/// with it.
+struct TempBodies(PathBuf);
+
+impl TempBodies {
+    fn new() -> Self {
+        let dir = env::temp_dir().join(format!("scarlett-verifier-bodies-{:032x}", rand::random::<u128>()));
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+        Self(dir)
+    }
+}
+
+impl Drop for TempBodies {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Why a body cannot be read.
+#[derive(Debug, PartialEq, Eq)]
+enum NoBody {
+    /// No such receipt.
+    Unknown,
+    /// The receipt never stored a body.
+    None,
+    /// Released, or purged while this process ran.
+    Released,
+}
+
+/// Unlinks page body files on the blocking pool, after the receipts that
+/// held them are gone.
+fn unlink_later(paths: Vec<PathBuf>) {
+    if paths.is_empty() {
+        return;
+    }
+    tokio::task::spawn_blocking(move || {
+        for path in paths {
+            if let Err(e) = std::fs::remove_file(&path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!("verifier: could not remove a page body file: {}", e.kind());
+            }
+        }
+    });
 }
 
 fn now_ms() -> u64 {
@@ -218,7 +341,10 @@ fn kind(payload: &Value, durable: bool) -> Result<(Kind, Status)> {
     } else if payload["type"] == webpolicy::PAYLOAD_TYPE {
         let job = webpolicy::validate_job(payload)?;
         let sessions = job.max_redirects + 1;
-        Ok((Kind::Web(Arc::new(job)), Status::WebRead { remaining_sessions: sessions, complete: false, next_url: None, hops: Vec::new(), rejections: Vec::new() }))
+        Ok((
+            Kind::Web(Arc::new(job)),
+            Status::WebRead { remaining_sessions: sessions, complete: false, next_url: None, hops: Vec::new(), rejections: Vec::new(), rejection: None, body_released_at_ms: None },
+        ))
     } else {
         policy::validate_job(payload)?;
         Ok((Kind::Codex, Status::Pending))
@@ -261,7 +387,7 @@ fn validate_receipt(kind: &Kind, status: &Status, in_flight: usize) -> Result<()
             }
             Ok(())
         }
-        (Kind::Web(job), Status::WebRead { remaining_sessions, complete, next_url, hops, rejections }) => {
+        (Kind::Web(job), Status::WebRead { remaining_sessions, complete, next_url, hops, rejections, rejection, body_released_at_ms }) => {
             if in_flight > 1
                 || remaining_sessions.checked_add(hops.len()).and_then(|n| n.checked_add(rejections.len())).and_then(|n| n.checked_add(in_flight)) != Some(job.max_redirects + 1)
                 || rejections.len() > 1
@@ -271,17 +397,20 @@ fn validate_receipt(kind: &Kind, status: &Status, in_flight: usize) -> Result<()
             {
                 bail!("invalid web receipt session count");
             }
+            if rejection.as_ref().map(|r| r.reason.as_str()) != rejections.first().map(String::as_str) || rejection.as_ref().is_some_and(|r| r.entity_bytes > r.received_bytes) {
+                bail!("invalid web receipt rejection");
+            }
             let is_final = |hop: &WebHop| hop.location.is_none() || hop.index == job.max_redirects;
             for (i, hop) in hops.iter().enumerate() {
                 let url = if i == 0 { Some(&job.url) } else { hops[i - 1].location.as_ref() };
                 let last = i + 1 == hops.len();
-                if hop.index != i || Some(&hop.url) != url || (!last && is_final(hop)) || hop.body_base64.is_some() != (last && *complete) {
+                if hop.index != i || Some(&hop.url) != url || (!last && is_final(hop)) || hop.body_stored != (last && *complete) {
                     bail!("invalid web receipt chain");
                 }
                 valid_web_hop(job, hop)?;
             }
             let followable = hops.last().and_then(|hop| hop.location.as_ref()).filter(|_| !*complete && rejections.is_empty());
-            if *complete != hops.last().is_some_and(is_final) || next_url.as_ref() != followable {
+            if *complete != hops.last().is_some_and(is_final) || next_url.as_ref() != followable || (body_released_at_ms.is_some() && !*complete) {
                 bail!("invalid web receipt completion");
             }
             Ok(())
@@ -290,9 +419,9 @@ fn validate_receipt(kind: &Kind, status: &Status, in_flight: usize) -> Result<()
     }
 }
 
-/// The most a web receipt can hold (verifier_store::web_receipt_bound).
-fn web_receipt_bound(job: &webpolicy::Job) -> u64 {
-    verifier_store::web_receipt_bound(job.max_response_bytes, job.max_redirects)
+/// The most a web receipt's JSON can hold (verifier_store::web_json_bound).
+fn web_json_bound(job: &webpolicy::Job) -> u64 {
+    verifier_store::web_json_bound(job.max_redirects)
 }
 
 fn valid_web_hop(job: &webpolicy::Job, hop: &WebHop) -> Result<()> {
@@ -300,10 +429,6 @@ fn valid_web_hop(job: &webpolicy::Job, hop: &WebHop) -> Result<()> {
     let canonical = |url: &str| webpolicy::canonical_url(url).ok().as_deref() == Some(url);
     let redirect = webpolicy::REDIRECTS.contains(&hop.status_code);
     let head = STANDARD.decode(&hop.head_base64).ok().filter(|head| head.len() <= webpolicy::MAX_HEAD);
-    let body_ok = match &hop.body_base64 {
-        None => true,
-        Some(body) => STANDARD.decode(body).is_ok_and(|body| body.len() == hop.body_bytes && verifier_store::hash(&body) == hop.body_sha256),
-    };
     // A browser job's hops say what the node sent, and only those; never a cookie value.
     let node_ok = match job.policy {
         webpolicy::Policy::Relay => hop.node_user_agent.is_none() && hop.node_cookie_names.is_none() && hop.node_cookie_sha256.is_none(),
@@ -322,9 +447,9 @@ fn valid_web_hop(job: &webpolicy::Job, hop: &WebHop) -> Result<()> {
         || hop.location.as_deref().is_some_and(|next| !redirect || !canonical(next) || hop.location_refused.is_some())
         || hop.location_refused.as_deref().is_some_and(|reason| !redirect || !webpolicy::UrlError::ALL.iter().any(|e| e.code() == reason))
         || head.is_none()
-        || !body_ok
         || hop.body_bytes > hop.received_bytes
-        || hop.received_bytes > job.max_response_bytes
+        || hop.body_bytes > job.max_response_bytes
+        || hop.received_bytes > webpolicy::max_wire(job.max_response_bytes)
         || !(1..=crate::relay::MAX_REQUEST).contains(&hop.sent_bytes)
         || ![&hop.body_sha256, &hop.response_sha256, &hop.cert_chain_sha256, &hop.leaf_cert_sha256].into_iter().all(|h| hex(h))
         || !["none", "content_length", "chunked", "close"].contains(&hop.framing.as_str())
@@ -337,14 +462,19 @@ fn valid_web_hop(job: &webpolicy::Job, hop: &WebHop) -> Result<()> {
 }
 impl Sessions {
     fn restore(store: Store, records: Vec<Record>) -> Result<Self> {
-        let mut s = Self { store: Some(store), ..Self::default() };
+        let mut s = Self { by_job: HashMap::new(), by_token: HashMap::new(), store: Some(store), failed: false, temp_bodies: None, purged: HashMap::new() };
         let now = now_ms();
         for r in records {
             if r.expires_ms > now.saturating_add(MAX_TTL.as_millis() as u64) {
                 bail!("verifier receipt expiry exceeds the session bound");
             }
             if r.in_flight == 0 && r.status["reason"] != "execution_uncertain" && now > r.expires_ms.saturating_add(verifier_store::retention_ms(&r.payload)) {
-                s.store.as_mut().unwrap().remove(&r.job_id, &r.attempt)?;
+                if let Some(body) = s.store.as_mut().unwrap().remove(&r.job_id, &r.attempt)?
+                    && let Err(e) = std::fs::remove_file(body)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(e.into());
+                }
                 continue;
             }
             let (kind, _) = kind(&r.payload, true)?;
@@ -352,9 +482,10 @@ impl Sessions {
             validate_receipt(&kind, &status, r.in_flight)?;
             let mut token = r.token;
             if r.in_flight > 0 || matches!(status, Status::Running) {
-                if let Status::WebRead { rejections, next_url, .. } = &mut status {
+                if let Status::WebRead { rejections, rejection, next_url, .. } = &mut status {
                     // A web receipt keeps the hops it verified; the interrupted one ends the job.
                     rejections.push("execution_uncertain".into());
+                    *rejection = Some(Rejection::new("execution_uncertain", webpolicy::Counts::default()));
                     *next_url = None;
                 } else {
                     status = Status::Rejected { reason: "execution_uncertain".into() };
@@ -419,8 +550,38 @@ impl Sessions {
         }
         result
     }
-    fn purge(&mut self) -> Result<()> {
+    /// Where a receipt's page body lives.
+    fn body_path(&self, key: &str) -> PathBuf {
+        let (job, attempt) = key.split_once('\n').unwrap_or((key, ""));
+        match (&self.store, &self.temp_bodies) {
+            (Some(store), _) => store.body_path(job, attempt),
+            (None, Some(temp)) => temp.0.join(format!("{}{}", verifier_store::hash(key.as_bytes()), crate::body::SUFFIX)),
+            (None, None) => PathBuf::from("/nonexistent"),
+        }
+    }
+
+    /// The stored, unreleased page body of a receipt: its path, size and SHA-256.
+    fn body(&self, key: &str) -> Result<(PathBuf, u64, String), NoBody> {
+        let Some(entry) = self.by_job.get(key) else {
+            return Err(if self.purged.contains_key(key) { NoBody::Released } else { NoBody::Unknown });
+        };
+        match &entry.status {
+            Status::WebRead { complete: true, hops, body_released_at_ms, .. } if hops.last().is_some_and(|hop| hop.body_stored) => {
+                if body_released_at_ms.is_some() {
+                    return Err(NoBody::Released);
+                }
+                let hop = hops.last().expect("a stored body has a hop");
+                Ok((self.body_path(key), hop.body_bytes as u64, hop.body_sha256.clone()))
+            }
+            _ => Err(NoBody::None),
+        }
+    }
+
+    /// Removes receipts past retention and returns the page body files they
+    /// may leave, for the caller to unlink outside the lock.
+    fn purge(&mut self) -> Result<Vec<PathBuf>> {
         let now = now_ms();
+        self.purged.retain(|_, at| now.saturating_sub(*at) < verifier_store::RETENTION_MS);
         // Expiry revokes unspent tokens and releases reserved result space.
         // In-flight proofs keep their reservation until their outcome commits.
         let expired: Vec<_> = self.by_token.values().filter(|key| self.by_job.get(*key).is_some_and(|e| e.in_flight == 0 && e.expires_ms <= now)).cloned().collect();
@@ -436,18 +597,27 @@ impl Sessions {
             .filter(|(_, e)| e.in_flight == 0 && !matches!(&e.status, Status::Rejected { reason } if reason == "execution_uncertain") && now > e.expires_ms.saturating_add(retention(e)))
             .map(|(k, _)| k.clone())
             .collect();
+        let mut bodies = Vec::new();
         for key in stale {
             if let Some(store) = self.store.as_mut() {
                 let (job, attempt) = key.split_once('\n').context("invalid receipt key")?;
-                if let Err(e) = store.remove(job, attempt) {
-                    self.failed = true;
-                    return Err(e);
+                match store.remove(job, attempt) {
+                    Ok(body) => bodies.extend(body),
+                    Err(e) => {
+                        self.failed = true;
+                        return Err(e);
+                    }
                 }
+            } else if self.by_job.get(&key).is_some_and(|e| matches!(e.kind, Kind::Web(_))) {
+                bodies.push(self.body_path(&key));
+            }
+            if self.by_job.get(&key).is_some_and(|e| matches!(&e.status, Status::WebRead { hops, .. } if hops.last().is_some_and(|h| h.body_stored))) {
+                self.purged.insert(key.clone(), now);
             }
             self.by_job.remove(&key);
             self.by_token.retain(|_, k| k != &key);
         }
-        Ok(())
+        Ok(bodies)
     }
 }
 
@@ -473,15 +643,7 @@ mod durable_tests {
     fn shared(dir: &std::path::Path) -> Shared {
         let (store, records) = Store::open(dir).unwrap();
         Arc::new((
-            Config {
-                key: "synthetic-fixture-key-never-used-remotely".into(),
-                upstream: "127.0.0.1:1".into(),
-                session_limit: Duration::from_secs(30),
-                limits: verifier_store::Limits::default(),
-                concurrency: 64,
-                slots: Arc::new(tokio::sync::Semaphore::new(64)),
-                relay_tls: crate::relay::verifier::tls_config(rustls::RootCertStore::empty()).unwrap(),
-            },
+            Config::new("synthetic-fixture-key-never-used-remotely".into(), "127.0.0.1:1".into(), Duration::from_secs(30), verifier_store::Limits::default(), 64, 48, crate::relay::verifier::tls_config(rustls::RootCertStore::empty()).unwrap()),
             Mutex::new(Sessions::restore(store, records).unwrap()),
         ))
     }
@@ -855,15 +1017,7 @@ mod relay_tests {
 
     fn shared(roots: rustls::RootCertStore) -> Shared {
         Arc::new((
-            Config {
-                key: KEY.into(),
-                upstream: "127.0.0.1:1".into(),
-                session_limit: Duration::from_secs(20),
-                limits: verifier_store::Limits::default(),
-                concurrency: 64,
-                slots: Arc::new(tokio::sync::Semaphore::new(64)),
-                relay_tls: crate::relay::verifier::tls_config(roots).unwrap(),
-            },
+            Config::new(KEY.into(), "127.0.0.1:1".into(), Duration::from_secs(20), verifier_store::Limits::default(), 64, 48, crate::relay::verifier::tls_config(roots).unwrap()),
             Mutex::new(Sessions::default()),
         ))
     }
@@ -1044,15 +1198,7 @@ mod web_tests {
             None => Sessions::default(),
         };
         Arc::new((
-            Config {
-                key: KEY.into(),
-                upstream: "127.0.0.1:1".into(),
-                session_limit: Duration::from_secs(20),
-                limits: verifier_store::Limits::default(),
-                concurrency: 64,
-                slots: Arc::new(tokio::sync::Semaphore::new(64)),
-                relay_tls: crate::relay::verifier::tls_config(roots).unwrap(),
-            },
+            Config::new(KEY.into(), "127.0.0.1:1".into(), Duration::from_secs(20), verifier_store::Limits::default(), 64, 48, crate::relay::verifier::tls_config(roots).unwrap()),
             Mutex::new(sessions),
         ))
     }
@@ -1061,8 +1207,8 @@ mod web_tests {
         h.insert("authorization", format!("Bearer {KEY}").parse().unwrap());
         h
     }
-    fn payload(url: &str, max_redirects: u64, max_bytes: u64) -> Value {
-        json!({"type":"web.fetch","proof_mode":"relay","proof_policy":"web-relay-v1","url":url,"max_redirects":max_redirects,"max_response_bytes":max_bytes,"headers":web_headers()})
+    fn payload(url: &str, max_redirects: u64) -> Value {
+        json!({"type":"web.fetch","proof_mode":"relay","proof_policy":"web-relay-v1","url":url,"max_redirects":max_redirects,"max_response_bytes":webpolicy::PAGE_MAX,"headers":web_headers()})
     }
     fn job(payload: Value, expires: u64) -> CreateRequest {
         CreateRequest { job_id: "synthetic".into(), attempt: "1".into(), fence: Some("f1".into()), expires_at_ms: Some(expires), ttl_seconds: None, payload }
@@ -1105,6 +1251,24 @@ mod web_tests {
     fn decode(value: &Value) -> Vec<u8> {
         STANDARD.decode(value.as_str().unwrap()).unwrap()
     }
+    /// `GET …/body` for job `synthetic` attempt `attempt`, with an optional Range.
+    async fn read_body(s: &Shared, attempt: &str, range: Option<&str>) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let mut h = headers();
+        if let Some(range) = range {
+            h.insert(header::RANGE, range.parse().unwrap());
+        }
+        let response = get_body(State(s.clone()), h, Path(("synthetic".into(), attempt.into()))).await;
+        let (parts, body) = response.into_parts();
+        (parts.status, parts.headers, axum::body::to_bytes(body, usize::MAX).await.unwrap().to_vec())
+    }
+    /// The stored body of attempt 1, which must be whole.
+    async fn stored(s: &Shared) -> Vec<u8> {
+        let (code, headers, body) = read_body(s, "1", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(headers["x-body-sha256"].to_str().unwrap(), verifier_store::hash(&body));
+        assert_eq!(headers["x-body-bytes"].to_str().unwrap(), body.len().to_string());
+        body
+    }
 
     const PAGE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: 20\r\n\r\n<title>hello</title>";
 
@@ -1112,7 +1276,7 @@ mod web_tests {
     async fn a_single_hop_records_the_page_and_ends_the_job() {
         let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
         let s = shared(origin.roots.clone(), None);
-        let token = register(&s, payload("https://example.com/", 5, 10 << 20)).await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
         let (reported, verifier) = hop(&s, &origin, &token, 0, "https://example.com/", None).await;
         verifier.unwrap();
         let reported = reported.unwrap();
@@ -1122,13 +1286,15 @@ mod web_tests {
         let view = view(&s).await;
         assert_eq!((view["status"].as_str(), view["complete"].as_bool(), view["remaining_sessions"].as_u64()), (Some("web_read"), Some(true), Some(5)));
         assert_eq!((view["next_url"].clone(), view["rejections"].clone()), (Value::Null, json!([])));
-        assert_eq!(view["request_sha256"], verifier_store::hash(&serde_json::to_vec(&payload("https://example.com/", 5, 10 << 20)).unwrap()));
+        assert_eq!(view["request_sha256"], verifier_store::hash(&serde_json::to_vec(&payload("https://example.com/", 5)).unwrap()));
+        assert_eq!(view["request_sha256"], "d4362de8c9e08295b9a777f758e8f9833a4257b30b689c391d609c0e4a7c610c");
         let h = &view["hops"][0];
         let head_end = PAGE.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
         assert_eq!((h["index"].as_u64(), h["url"].as_str(), h["status_code"].as_u64()), (Some(0), Some("https://example.com/"), Some(200)));
         assert_eq!((h["location"].clone(), h["location_refused"].clone()), (Value::Null, Value::Null));
         assert_eq!(decode(&h["head_base64"]), &PAGE[..head_end]);
-        assert_eq!(decode(&h["body_base64"]), &PAGE[head_end..]);
+        assert_eq!((h["body_stored"].as_bool(), view["body_released_at_ms"].clone(), view["rejection"].clone()), (Some(true), Value::Null, Value::Null));
+        assert_eq!(stored(&s).await, &PAGE[head_end..]);
         assert_eq!(h["body_bytes"].as_u64(), Some(20));
         assert_eq!(h["body_sha256"], verifier_store::hash(&PAGE[head_end..]));
         assert_eq!(h["response_sha256"], verifier_store::hash(PAGE));
@@ -1158,7 +1324,7 @@ mod web_tests {
         )
         .await;
         let s = shared(origin.roots.clone(), None);
-        let token = register(&s, payload("https://example.com/a/b?x=1", 5, 10 << 20)).await;
+        let token = register(&s, payload("https://example.com/a/b?x=1", 5)).await;
         let (first, verifier) = hop(&s, &origin, &token, 0, "https://example.com/a/b?x=1", None).await;
         verifier.unwrap();
         let first = first.unwrap();
@@ -1166,8 +1332,10 @@ mod web_tests {
         assert_eq!((first.status_code, first.is_final, first.next_url.as_deref()), (301, false, Some(next)));
         let view = view(&s).await;
         assert_eq!((view["complete"].as_bool(), view["next_url"].as_str(), view["remaining_sessions"].as_u64()), (Some(false), Some(next), Some(5)));
-        assert_eq!(view["hops"][0]["body_base64"], Value::Null);
+        assert_eq!((view["hops"][0]["body_stored"].as_bool(), view["hops"][0]["body_bytes"].as_u64()), (Some(false), Some(5)));
         assert_eq!(view["hops"][0]["body_sha256"], verifier_store::hash(b"moved"));
+        // A followable redirect keeps no body.
+        assert_eq!(read_body(&s, "1", None).await.0, StatusCode::NOT_FOUND);
         assert_eq!(tokens(&s), 1);
 
         let (second, verifier) = hop(&s, &origin, &token, 1, next, None).await;
@@ -1180,7 +1348,8 @@ mod web_tests {
         assert_eq!((hops.len(), hops[0]["location"].as_str(), hops[1]["url"].as_str()), (2, Some(next), Some(next)));
         assert_eq!((hops[1]["server_name"].as_str(), hops[1]["framing"].as_str()), (Some("www.example.com"), Some("chunked")));
         // The entity body is dechunked and still gzip-encoded.
-        assert_eq!(decode(&hops[1]["body_base64"]), b"\x1f\x8b\x08\x00zz");
+        assert_eq!(stored(&s).await, b"\x1f\x8b\x08\x00zz");
+        assert_eq!((hops[1]["body_stored"].as_bool(), hops[1]["body_sha256"].as_str()), (Some(true), Some(verifier_store::hash(b"\x1f\x8b\x08\x00zz").as_str())));
         assert_eq!(hops[1]["response_sha256"], verifier_store::hash(GZIP_CHUNKED));
         assert_eq!(tokens(&s), 0);
     }
@@ -1192,13 +1361,13 @@ mod web_tests {
             let table: &'static [(&str, &[u8], End)] = Box::leak(vec![("example.com/", response, End::Wait)].into_boxed_slice());
             let origin = web_origin(routes(table), false).await;
             let s = shared(origin.roots.clone(), None);
-            let token = register(&s, payload("https://example.com/", 5, 10 << 20)).await;
+            let token = register(&s, payload("https://example.com/", 5)).await;
             let (reported, _) = hop(&s, &origin, &token, 0, "https://example.com/", None).await;
             assert!(reported.unwrap().is_final);
             let view = view(&s).await;
             let h = &view["hops"][0];
             assert_eq!((view["complete"].as_bool(), h["location"].clone(), h["location_refused"].as_str()), (Some(true), Value::Null, Some(reason)), "{location}");
-            assert_eq!(decode(&h["body_base64"]), b"body");
+            assert_eq!(stored(&s).await, b"body");
         }
     }
 
@@ -1213,7 +1382,7 @@ mod web_tests {
         )
         .await;
         let s = shared(origin.roots.clone(), None);
-        let token = register(&s, payload("https://example.com/a", 1, 10 << 20)).await;
+        let token = register(&s, payload("https://example.com/a", 1)).await;
         assert_eq!(hop(&s, &origin, &token, 0, "https://example.com/a", None).await.0.unwrap().next_url.as_deref(), Some("https://example.com/b"));
         let last = hop(&s, &origin, &token, 1, "https://example.com/b", None).await.0.unwrap();
         assert!(last.is_final && last.next_url.is_none());
@@ -1221,7 +1390,8 @@ mod web_tests {
         assert_eq!((view["complete"].as_bool(), view["remaining_sessions"].as_u64()), (Some(true), Some(0)));
         // The followable location is still recorded, so the buyer sees where it pointed.
         assert_eq!(view["hops"][1]["location"], "https://example.com/c");
-        assert_eq!(decode(&view["hops"][1]["body_base64"]), b"");
+        assert_eq!(view["hops"][1]["body_stored"], true);
+        assert_eq!(stored(&s).await, b"");
         assert_eq!(tokens(&s), 0);
         assert!(hop(&s, &origin, &token, 2, "https://example.com/c", None).await.0.is_err());
     }
@@ -1231,21 +1401,33 @@ mod web_tests {
         let url = "https://example.com/";
         let mut tampered = webpolicy::request(url, &web_headers());
         tampered[5] = b'x';
-        let cases: Vec<(&str, &'static [(&str, &[u8], End)], bool, u64, Option<Vec<u8>>, &str)> = vec![
-            ("tampered", &[("example.com/", PAGE, End::Wait)], false, 10 << 20, Some(tampered), "request_rejected"),
-            ("tls 1.2", &[("example.com/", PAGE, End::Wait)], true, 10 << 20, None, "tls_failed"),
-            ("too large", &[("example.com/", PAGE, End::Wait)], false, 64, None, "response_too_large"),
-            ("bad framing", &[("example.com/", b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n", End::Wait)], false, 10 << 20, None, "response_invalid"),
-            ("cut short", &[("example.com/", b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort", End::Close)], false, 10 << 20, None, "server_closed"),
+        const TOO_LARGE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 67108865\r\n\r\n";
+        let cases: Vec<(&str, &'static [(&str, &[u8], End)], bool, Option<Vec<u8>>, &str)> = vec![
+            ("tampered", &[("example.com/", PAGE, End::Wait)], false, Some(tampered), "request_rejected"),
+            ("tls 1.2", &[("example.com/", PAGE, End::Wait)], true, None, "tls_failed"),
+            ("too large", &[("example.com/", TOO_LARGE, End::Wait)], false, None, "page_too_large"),
+            ("bad framing", &[("example.com/", b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n", End::Wait)], false, None, "response_invalid"),
+            ("cut short", &[("example.com/", b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort", End::Close)], false, None, "server_closed"),
         ];
-        for (case, table, tls12, max, raw, reason) in cases {
+        for (case, table, tls12, raw, reason) in cases {
             let origin = web_origin(routes(table), tls12).await;
             let s = shared(origin.roots.clone(), None);
-            let token = register(&s, payload(url, 5, max)).await;
+            let token = register(&s, payload(url, 5)).await;
             let (reported, _) = hop(&s, &origin, &token, 0, url, raw).await;
-            assert!(reported.is_err(), "{case}");
+            let error = reported.err().unwrap_or_else(|| panic!("{case}: reported"));
+            // The node learns the reason, after its record was opened.
+            assert_eq!(error.downcast_ref::<node::Refused>(), Some(&node::Refused(reason)), "{case}: {error:#}");
+            assert!(!format!("{error:#}").contains(node::MISUSE), "{case}");
             let view = view(&s).await;
             assert_eq!(view["rejections"], json!([reason]), "{case}");
+            assert_eq!(view["rejection"]["reason"], reason, "{case}");
+            if case == "too large" {
+                assert_eq!(view["rejection"], json!({"reason":"page_too_large","received_bytes":TOO_LARGE.len(),"entity_bytes":0,"declared_bytes":67108865}));
+            }
+            if case == "cut short" {
+                assert_eq!(view["rejection"], json!({"reason":"server_closed","received_bytes":44,"entity_bytes":5,"declared_bytes":10}));
+            }
+            assert_eq!(read_body(&s, "1", None).await.0, StatusCode::NOT_FOUND, "{case}");
             assert_eq!((view["complete"].as_bool(), view["remaining_sessions"].as_u64(), view["hops"].as_array().unwrap().len()), (Some(false), Some(5), 0), "{case}");
             assert_eq!(tokens(&s), 0, "{case}");
         }
@@ -1259,13 +1441,14 @@ mod web_tests {
         )
         .await;
         let s = shared(origin.roots.clone(), None);
-        let token = register(&s, payload("https://example.com/", 5, 10 << 20)).await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
         hop(&s, &origin, &token, 0, "https://example.com/", None).await.0.unwrap();
         let (reported, _) = hop(&s, &origin, &token, 1, "https://example.com/other", None).await;
         assert!(reported.is_err());
         assert_ne!(origin.seen.lock().unwrap().as_deref().map(|r| r.starts_with(b"GET /other")), Some(true));
         let view = view(&s).await;
         assert_eq!((view["rejections"].clone(), view["next_url"].clone(), view["hops"].as_array().unwrap().len()), (json!(["request_rejected"]), Value::Null, 1));
+        assert_eq!(view["rejection"], json!({"reason":"request_rejected","received_bytes":0,"entity_bytes":0,"declared_bytes":null}));
         assert_eq!(tokens(&s), 0);
     }
 
@@ -1273,7 +1456,7 @@ mod web_tests {
     async fn a_second_concurrent_session_is_refused_without_spending_one() {
         let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
         let s = shared(origin.roots.clone(), None);
-        let token = register(&s, payload("https://example.com/", 5, 10 << 20)).await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
         let key = job_key("synthetic", "1");
         s.1.lock().unwrap().by_job.get_mut(&key).unwrap().in_flight = 1;
         let (reported, verifier) = hop(&s, &origin, &token, 0, "https://example.com/", None).await;
@@ -1291,10 +1474,10 @@ mod web_tests {
         let dir = Temp::new();
         let s = shared(origin.roots.clone(), Some(&dir.0));
         let expires = now_ms() + 60_000;
-        let (code, Json(created)) = create(State(s.clone()), headers(), Json(job(payload("https://example.com/", 5, 10 << 20), expires))).await;
+        let (code, Json(created)) = create(State(s.clone()), headers(), Json(job(payload("https://example.com/", 5), expires))).await;
         assert_eq!(code, StatusCode::CREATED);
         // Registration is idempotent for the same binding.
-        let (_, Json(again)) = create(State(s.clone()), headers(), Json(job(payload("https://example.com/", 5, 10 << 20), expires))).await;
+        let (_, Json(again)) = create(State(s.clone()), headers(), Json(job(payload("https://example.com/", 5), expires))).await;
         assert_eq!(created["token"], again["token"]);
         let token = created["token"].as_str().unwrap().to_owned();
         hop(&s, &origin, &token, 0, "https://example.com/", None).await.0.unwrap();
@@ -1317,9 +1500,10 @@ mod web_tests {
         let s = shared(origin.roots.clone(), Some(&dir.0));
         let view = view(&s).await;
         assert_eq!((view["status"].as_str(), view["rejections"].clone(), view["next_url"].clone()), (Some("web_read"), json!(["execution_uncertain"]), Value::Null));
+        assert_eq!(view["rejection"], json!({"reason":"execution_uncertain","received_bytes":0,"entity_bytes":0,"declared_bytes":null}));
         assert_eq!((view["hops"].as_array().unwrap().len(), view["remaining_sessions"].as_u64()), (1, Some(4)));
         assert_eq!(tokens(&s), 0);
-        assert_eq!(create(State(s.clone()), headers(), Json(job(payload("https://example.com/", 5, 10 << 20), expires))).await.0, StatusCode::CONFLICT);
+        assert_eq!(create(State(s.clone()), headers(), Json(job(payload("https://example.com/", 5), expires))).await.0, StatusCode::CONFLICT);
         // The finished receipt no longer reserves a full record.
         let capacity = s.1.lock().unwrap().store.as_ref().unwrap().capacity();
         assert_eq!(capacity.reserved_bytes, capacity.bytes);
@@ -1330,7 +1514,7 @@ mod web_tests {
         let origin = web_origin(routes(&[("example.com/", b"HTTP/1.1 301 Moved\r\nLocation: /x\r\nContent-Length: 0\r\n\r\n", End::Wait)]), false).await;
         for verified in [false, true] {
             let s = shared(origin.roots.clone(), None);
-            let token = register(&s, payload("https://example.com/", 5, 10 << 20)).await;
+            let token = register(&s, payload("https://example.com/", 5)).await;
             if verified {
                 hop(&s, &origin, &token, 0, "https://example.com/", None).await.0.unwrap();
             }
@@ -1345,61 +1529,53 @@ mod web_tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_web_job_whose_receipt_could_outgrow_the_record_limit_is_refused() {
-        let dir = Temp::new();
-        let limits = verifier_store::Limits { max_records: 8, max_record_bytes: 4 << 20, max_total_bytes: 64 << 20 };
-        let (store, records) = Store::open_with_limits(&dir.0, limits).unwrap();
-        let s: Shared = Arc::new((
-            Config {
-                key: KEY.into(),
-                upstream: "127.0.0.1:1".into(),
-                session_limit: Duration::from_secs(20),
-                limits,
-                concurrency: 64,
-                slots: Arc::new(tokio::sync::Semaphore::new(64)),
-                relay_tls: crate::relay::verifier::tls_config(rustls::RootCertStore::empty()).unwrap(),
-            },
+    fn durable(dir: &std::path::Path, limits: verifier_store::Limits) -> Shared {
+        let (store, records) = Store::open_with_limits(dir, limits).unwrap();
+        Arc::new((
+            Config::new(KEY.into(), "127.0.0.1:1".into(), Duration::from_secs(20), limits, 64, 48, crate::relay::verifier::tls_config(rustls::RootCertStore::empty()).unwrap()),
             Mutex::new(Sessions::restore(store, records).unwrap()),
-        ));
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_64_mib_web_job_registers_under_the_default_limits() {
+        let dir = Temp::new();
+        let s = durable(&dir.0, verifier_store::Limits::default());
         let expires = now_ms() + 60_000;
-        assert_eq!(create(State(s.clone()), headers(), Json(job(payload("https://example.com/", 5, 10 << 20), expires))).await.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(create(State(s.clone()), headers(), Json(job(payload("https://example.com/", 5, 2 << 20), expires))).await.0, StatusCode::CREATED);
-        // The default job fits the default record limit with room to spare.
-        let default = webpolicy::validate_job(&payload("https://example.com/", 5, 10 << 20)).unwrap();
-        assert!(web_receipt_bound(&default) <= 24 << 20 && web_receipt_bound(&default) > 10 << 20);
+        let page = |attempt: &str| CreateRequest { attempt: attempt.into(), ..job(payload("https://example.com/", 5), expires) };
+        // Two reservations fit the default 192 MiB pool, a third does not.
+        assert_eq!(create(State(s.clone()), headers(), Json(page("1"))).await.0, StatusCode::CREATED);
+        assert_eq!(create(State(s.clone()), headers(), Json(page("2"))).await.0, StatusCode::CREATED);
+        let (code, Json(refused)) = create(State(s.clone()), headers(), Json(page("3"))).await;
+        assert_eq!((code, refused["error"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("verifier web capacity reached")));
+        // A smaller page ceiling is refused, whatever the store holds.
+        let mut small = payload("https://example.com/", 5);
+        small["max_response_bytes"] = (10 << 20).into();
+        assert_eq!(create(State(s.clone()), headers(), Json(CreateRequest { attempt: "4".into(), ..job(small, expires) })).await.0, StatusCode::BAD_REQUEST);
+        // The receipt JSON of any valid job fits the smallest record limit; the page is a file.
+        let job = webpolicy::validate_job(&payload("https://example.com/", 5)).unwrap();
+        assert_eq!(web_json_bound(&job), 658_324);
+        assert!(web_json_bound(&job) < 1 << 20);
     }
 
     #[tokio::test]
     async fn web_receipts_reserve_their_own_bound_and_leave_soon_after_expiry() {
         let dir = Temp::new();
-        // Room for one X or Codex reservation (the full record limit) or four
-        // default web jobs (about 14 MiB each).
-        let limits = verifier_store::Limits { max_records: 16, max_record_bytes: 64 << 20, max_total_bytes: 64 << 20 };
-        let open = |dir: &std::path::Path| -> Shared {
-            let (store, records) = Store::open_with_limits(dir, limits).unwrap();
-            Arc::new((
-                Config {
-                    key: KEY.into(),
-                    upstream: "127.0.0.1:1".into(),
-                    session_limit: Duration::from_secs(20),
-                    limits,
-                    concurrency: 64,
-                    slots: Arc::new(tokio::sync::Semaphore::new(64)),
-                    relay_tls: crate::relay::verifier::tls_config(rustls::RootCertStore::empty()).unwrap(),
-                },
-                Mutex::new(Sessions::restore(store, records).unwrap()),
-            ))
-        };
+        // A web pool of four pages, and room for one X or Codex reservation beside it.
+        let pool = 4 * verifier_store::WEB_RESERVATION;
+        let limits = verifier_store::Limits { max_records: 16, max_record_bytes: 64 << 20, max_web_bytes: pool, max_total_bytes: pool + (64 << 20) };
+        let open = |dir: &std::path::Path| durable(dir, limits);
         let s = open(&dir.0);
         let expires = now_ms() + 60_000;
-        let web = |attempt: u32| CreateRequest { attempt: attempt.to_string(), ..job(payload("https://example.com/", 5, 10 << 20), expires) };
+        let web = |attempt: u32| CreateRequest { attempt: attempt.to_string(), ..job(payload("https://example.com/", 5), expires) };
         for attempt in 1..=4 {
             assert_eq!(create(State(s.clone()), headers(), Json(web(attempt))).await.0, StatusCode::CREATED, "web {attempt}");
         }
         assert_eq!(create(State(s.clone()), headers(), Json(web(5))).await.0, StatusCode::SERVICE_UNAVAILABLE);
-        let codex = CreateRequest { attempt: "codex".into(), ..job(json!({"type":"response.create","model":"synthetic-model"}), expires) };
-        assert_eq!(create(State(s.clone()), headers(), Json(codex)).await.0, StatusCode::SERVICE_UNAVAILABLE);
+        // Web cannot take the X/Codex floor: a Codex job still registers, then the total is full.
+        let codex = |attempt: &str| CreateRequest { attempt: attempt.into(), ..job(json!({"type":"response.create","model":"synthetic-model"}), expires) };
+        assert_eq!(create(State(s.clone()), headers(), Json(codex("codex"))).await.0, StatusCode::CREATED);
+        assert_eq!(create(State(s.clone()), headers(), Json(codex("codex2"))).await.0, StatusCode::SERVICE_UNAVAILABLE);
         // Expired web receipts stay ten minutes, then leave, in a purge or on restart.
         {
             let mut sessions = s.1.lock().unwrap();
@@ -1410,7 +1586,7 @@ mod web_tests {
             };
             age(&mut sessions, "1", verifier_store::WEB_RETENTION_MS + 1);
             age(&mut sessions, "2", verifier_store::WEB_RETENTION_MS - 60_000);
-            sessions.purge().unwrap();
+            assert_eq!(sessions.purge().unwrap().len(), 1);
             assert!(!sessions.by_job.contains_key(&job_key("synthetic", "1")) && sessions.by_job.contains_key(&job_key("synthetic", "2")));
             assert!(verifier_store::WEB_RETENTION_MS < verifier_store::RETENTION_MS);
             // Attempt 3 ages while the verifier is down and leaves on restart.
@@ -1432,7 +1608,7 @@ mod web_tests {
             location: location.map(Into::into),
             location_refused: None,
             head_base64: STANDARD.encode(format!("HTTP/1.1 {status} X\r\n\r\n")),
-            body_base64: body.map(|b| STANDARD.encode(b)),
+            body_stored: body.is_some(),
             body_bytes: body.map_or(0, <[u8]>::len),
             body_sha256: verifier_store::hash(body.unwrap_or_default()),
             response_sha256: hex(&Sha256::digest(b"r")),
@@ -1455,34 +1631,67 @@ mod web_tests {
 
     #[test]
     fn malformed_web_receipts_cannot_restore() {
-        let (kind, _) = kind(&payload("https://example.com/", 2, 1000), true).unwrap();
+        let (kind, _) = kind(&payload("https://example.com/", 2), true).unwrap();
         let good = || Status::WebRead {
             remaining_sessions: 1,
             complete: true,
             next_url: None,
             hops: vec![valid_hop(0, "https://example.com/", 301, Some("https://www.example.com/"), None), valid_hop(1, "https://www.example.com/", 200, None, Some(b"page"))],
             rejections: vec![],
+            rejection: None,
+            body_released_at_ms: None,
         };
         assert!(validate_receipt(&kind, &good(), 0).is_ok());
-        let pending = Status::WebRead { remaining_sessions: 2, complete: false, next_url: Some("https://www.example.com/".into()), hops: vec![valid_hop(0, "https://example.com/", 301, Some("https://www.example.com/"), None)], rejections: vec![] };
+        let pending = Status::WebRead {
+            remaining_sessions: 2,
+            complete: false,
+            next_url: Some("https://www.example.com/".into()),
+            hops: vec![valid_hop(0, "https://example.com/", 301, Some("https://www.example.com/"), None)],
+            rejections: vec![],
+            rejection: None,
+            body_released_at_ms: None,
+        };
         assert!(validate_receipt(&kind, &pending, 0).is_ok());
         let Status::WebRead { next_url, hops, .. } = &pending else { unreachable!() };
-        let in_flight = Status::WebRead { remaining_sessions: 1, complete: false, next_url: next_url.clone(), hops: hops.clone(), rejections: vec![] };
+        let in_flight = Status::WebRead { remaining_sessions: 1, complete: false, next_url: next_url.clone(), hops: hops.clone(), rejections: vec![], rejection: None, body_released_at_ms: None };
         assert!(validate_receipt(&kind, &in_flight, 1).is_ok());
+        // A released body is still a valid receipt.
+        let mut released = good();
+        if let Status::WebRead { body_released_at_ms, .. } = &mut released {
+            *body_released_at_ms = Some(1);
+        }
+        assert!(validate_receipt(&kind, &released, 0).is_ok());
         fn edit(status: &mut Status) -> (&mut usize, &mut bool, &mut Option<String>, &mut Vec<WebHop>, &mut Vec<String>) {
-            let Status::WebRead { remaining_sessions, complete, next_url, hops, rejections } = status else { unreachable!() };
+            let Status::WebRead { remaining_sessions, complete, next_url, hops, rejections, .. } = status else { unreachable!() };
             (remaining_sessions, complete, next_url, hops, rejections)
         }
+        fn extra(status: &mut Status) -> (&mut Option<Rejection>, &mut Option<u64>) {
+            let Status::WebRead { rejection, body_released_at_ms, .. } = status else { unreachable!() };
+            (rejection, body_released_at_ms)
+        }
+        let reject = |reason: &str| Rejection { reason: reason.into(), received_bytes: 10, entity_bytes: 4, declared_bytes: None };
         let mutations: Vec<(&str, Box<dyn Fn(&mut Status)>)> = vec![
             ("count", Box::new(|s| *edit(s).0 = 2)),
             ("broken chain", Box::new(|s| edit(s).3[1].url = "https://example.com/other".into())),
             ("index", Box::new(|s| edit(s).3[1].index = 2)),
             ("first url", Box::new(|s| edit(s).3[0].url = "https://example.com/x".into())),
-            ("body on a redirect", Box::new(|s| edit(s).3[0].body_base64 = Some(String::new()))),
-            ("no final body", Box::new(|s| edit(s).3[1].body_base64 = None)),
-            ("body hash", Box::new(|s| edit(s).3[1].body_sha256 = hex(&Sha256::digest(b"other")))),
-            ("body size", Box::new(|s| edit(s).3[1].body_bytes = 5)),
-            ("too large", Box::new(|s| edit(s).3[1].received_bytes = 1001)),
+            ("body on a redirect", Box::new(|s| edit(s).3[0].body_stored = true)),
+            ("no final body", Box::new(|s| edit(s).3[1].body_stored = false)),
+            ("body hash", Box::new(|s| edit(s).3[1].body_sha256 = "ZZ".repeat(32))),
+            ("body over received", Box::new(|s| edit(s).3[1].body_bytes = 101)),
+            ("body over the ceiling", Box::new(|s| {
+                edit(s).3[1].body_bytes = webpolicy::PAGE_MAX + 1;
+                edit(s).3[1].received_bytes = webpolicy::PAGE_MAX + 100;
+            })),
+            ("too large", Box::new(|s| edit(s).3[1].received_bytes = webpolicy::max_wire(webpolicy::PAGE_MAX) + 1)),
+            ("released while incomplete", Box::new(|s| {
+                let (remaining, complete, _, hops, _) = edit(s);
+                (*remaining, *complete) = (2, false);
+                hops.pop();
+                *edit(s).2 = Some("https://www.example.com/".into());
+                *extra(s).1 = Some(1);
+            })),
+            ("rejection without reason", Box::new(move |s| *extra(s).0 = Some(reject("tls_failed")))),
             ("not complete", Box::new(|s| *edit(s).1 = false)),
             ("next url", Box::new(|s| *edit(s).2 = Some("https://www.example.com/".into()))),
             ("redirect not followed", Box::new(|s| edit(s).3[0].location = None)),
@@ -1493,15 +1702,44 @@ mod web_tests {
             ("framing", Box::new(|s| edit(s).3[1].framing = "magic".into())),
             ("cipher", Box::new(|s| edit(s).3[1].cipher_suite = "TLS13_CHACHA20_POLY1305_SHA256".into())),
             ("refused on a 200", Box::new(|s| edit(s).3[1].location_refused = Some("insecure".into()))),
-            ("unknown rejection", Box::new(|s| {
+            ("unknown rejection", Box::new(move |s| {
                 let (remaining, complete, _, hops, rejections) = edit(s);
                 (*remaining, *complete) = (1, false);
                 hops.pop();
                 rejections.push("made_up".into());
+                *extra(s).0 = Some(reject("made_up"));
             })),
-            ("complete and rejected", Box::new(|s| {
+            ("old reason", Box::new(move |s| {
+                let (remaining, complete, _, hops, rejections) = edit(s);
+                (*remaining, *complete) = (1, false);
+                hops.pop();
+                rejections.push("response_too_large".into());
+                *extra(s).0 = Some(reject("response_too_large"));
+            })),
+            ("reason without rejection", Box::new(|s| {
+                let (remaining, complete, _, hops, rejections) = edit(s);
+                (*remaining, *complete) = (1, false);
+                hops.pop();
+                rejections.push("tls_failed".into());
+            })),
+            ("rejection of another reason", Box::new(move |s| {
+                let (remaining, complete, _, hops, rejections) = edit(s);
+                (*remaining, *complete) = (1, false);
+                hops.pop();
+                rejections.push("tls_failed".into());
+                *extra(s).0 = Some(reject("page_too_large"));
+            })),
+            ("entity over received", Box::new(|s| {
+                let (remaining, complete, _, hops, rejections) = edit(s);
+                (*remaining, *complete) = (1, false);
+                hops.pop();
+                rejections.push("page_too_large".into());
+                *extra(s).0 = Some(Rejection { reason: "page_too_large".into(), received_bytes: 1, entity_bytes: 2, declared_bytes: None });
+            })),
+            ("complete and rejected", Box::new(move |s| {
                 *edit(s).0 = 0;
                 edit(s).4.push("tls_failed".into());
+                *extra(s).0 = Some(reject("tls_failed"));
             })),
         ];
         for (name, mutate) in mutations {
@@ -1515,13 +1753,14 @@ mod web_tests {
             let (remaining, complete, _, hops, rejections) = edit(&mut rejected);
             (*remaining, *complete) = (1, false);
             hops.pop();
-            rejections.push("tls_failed".into());
+            rejections.push("page_too_large".into());
+            *extra(&mut rejected).0 = Some(Rejection { reason: "page_too_large".into(), received_bytes: 67_174_401, entity_bytes: 67_108_865, declared_bytes: None });
         }
         assert!(validate_receipt(&kind, &rejected, 0).is_ok());
         // A redirect that could not be followed ends the chain with its reason.
         let mut refused = valid_hop(0, "https://example.com/", 302, None, Some(b""));
         refused.location_refused = Some("insecure".into());
-        let ended = |hop: WebHop| Status::WebRead { remaining_sessions: 2, complete: true, next_url: None, hops: vec![hop], rejections: vec![] };
+        let ended = |hop: WebHop| Status::WebRead { remaining_sessions: 2, complete: true, next_url: None, hops: vec![hop], rejections: vec![], rejection: None, body_released_at_ms: None };
         assert!(validate_receipt(&kind, &ended(refused.clone()), 0).is_ok());
         refused.location_refused = Some("because".into());
         assert!(validate_receipt(&kind, &ended(refused), 0).is_err());
@@ -1537,8 +1776,8 @@ mod web_tests {
     #[test]
     fn browser_receipt_node_fields_follow_the_policy() {
         let (browser, _) = kind(&browser_payload("https://example.com/"), true).unwrap();
-        let (relay, _) = kind(&payload("https://example.com/", 5, 10 << 20), true).unwrap();
-        let receipt = |hops: Vec<WebHop>| Status::WebRead { remaining_sessions: 6 - hops.len(), complete: true, next_url: None, hops, rejections: vec![] };
+        let (relay, _) = kind(&payload("https://example.com/", 5), true).unwrap();
+        let receipt = |hops: Vec<WebHop>| Status::WebRead { remaining_sessions: 6 - hops.len(), complete: true, next_url: None, hops, rejections: vec![], rejection: None, body_released_at_ms: None };
         let two = || vec![browser_hop(0, "https://example.com/", 302, Some("https://www.example.com/"), None, Some(CLEARANCE)), browser_hop(1, "https://www.example.com/", 200, None, Some(b"page"), None)];
         assert!(validate_receipt(&browser, &receipt(two()), 0).is_ok());
         // The same hops without the node fields are a relay receipt, and only that.
@@ -1587,7 +1826,7 @@ mod web_tests {
             // The origin got the node's headers, on the wire the verifier sealed.
             assert_eq!(origin.seen.lock().unwrap().as_deref(), Some(&raw[..]));
             let view = view(&s).await;
-            assert_eq!(view["request_sha256"], "f24ba0094ed03be33c287a26997889217a0e6aebf62ca0b278f34dbecf0a175e");
+            assert_eq!(view["request_sha256"], "964f55b17be3ad0fb55ae96c3a1cdd36883b9a2f4833da2946c1eeefcdd62ba7");
             assert_eq!((view["complete"].as_bool(), view["rejections"].clone()), (Some(true), json!([])));
             let h = &view["hops"][0];
             assert_eq!((h["node_user_agent"].as_str(), h["sent_bytes"].as_u64()), (Some(DARWIN_UA), Some(raw.len() as u64)));
@@ -1642,7 +1881,7 @@ mod web_tests {
         // A relay job refuses the browser form just the same.
         let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
         let s = shared(origin.roots.clone(), None);
-        let token = register(&s, payload(url, 5, 10 << 20)).await;
+        let token = register(&s, payload(url, 5)).await;
         let mut raw = webpolicy::request(url, &web_headers());
         let at = raw.windows(15).position(|w| w == b"Accept-Encoding").unwrap();
         raw.splice(at..at, format!("Cookie: {CLEARANCE}\r\n").into_bytes());
@@ -1736,7 +1975,7 @@ mod web_tests {
     async fn relay_web_runs_a_hop_through_a_connect_proxy() {
         let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
         let s = shared(origin.roots.clone(), None);
-        let token = register(&s, payload("https://example.com/", 5, 10 << 20)).await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
         let verifier = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let verifier_addr = verifier.local_addr().unwrap();
         let shared_verifier = s.clone();
@@ -1768,7 +2007,7 @@ mod web_tests {
             "verifier": verifier_addr.to_string(), "plaintext_fixture": true, "token": token, "hop": 0,
             "url": "https://example.com/", "ip": "93.184.215.14", "port": 443,
             "proxy": {"host": "127.0.0.1", "port": proxy_port, "authorization": "Basic c2VjcmV0"},
-            "payload": payload("https://example.com/", 5, 10 << 20), "timeout_ms": 20000
+            "payload": payload("https://example.com/", 5), "timeout_ms": 20000
         });
         let summary = match node::run_web(&serde_json::to_vec(&input).unwrap()).await {
             Ok(summary) => serde_json::to_value(summary).unwrap(),
@@ -1796,6 +2035,394 @@ mod web_tests {
         }
         assert_eq!(view(&s).await["complete"], true);
     }
+
+    /// Runs `serve` for `s` on a loopback port.
+    async fn serve_verifier(s: &Shared) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, s.clone(), None));
+        addr
+    }
+
+    /// A CONNECT proxy that tunnels every connection to `origin`.
+    async fn tunnel(origin: std::net::SocketAddr) -> u16 {
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = proxy.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut client, _)) = proxy.accept().await {
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") && client.read(&mut byte).await.unwrap_or(0) == 1 {
+                        head.push(byte[0]);
+                    }
+                    let Ok(mut upstream) = TcpStream::connect(origin).await else { return };
+                    let _ = client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await;
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                });
+            }
+        });
+        port
+    }
+
+    /// One whole `relay-web` hop 0 of `https://example.com/` through `serve`
+    /// and a proxy: the summary, or the class and error the node reports.
+    async fn relay_web(verifier: std::net::SocketAddr, proxy: u16, token: &str) -> Result<Value, (&'static str, String)> {
+        let input = json!({
+            "verifier": verifier.to_string(), "plaintext_fixture": true, "token": token, "hop": 0,
+            "url": "https://example.com/", "ip": "93.184.215.14", "port": 443, "proxy": {"host": "127.0.0.1", "port": proxy},
+            "payload": payload("https://example.com/", 5), "timeout_ms": 20000
+        });
+        match tokio::time::timeout(Duration::from_secs(30), node::run_web(&serde_json::to_vec(&input).unwrap())).await.unwrap() {
+            Ok(summary) => Ok(serde_json::to_value(summary).unwrap()),
+            Err(failure) => Err((failure.class, format!("{:#}", failure.error))),
+        }
+    }
+
+    async fn capacity_view(s: &Shared) -> Value {
+        let (_, Json(view)) = capacity(State(s.clone()), headers()).await;
+        view
+    }
+
+    #[tokio::test]
+    async fn a_stored_body_is_read_whole_or_by_range_and_released_once() {
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        let dir = Temp::new();
+        let s = shared(origin.roots.clone(), Some(&dir.0));
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        hop(&s, &origin, &token, 0, "https://example.com/", None).await.1.unwrap();
+        let body = &PAGE[PAGE.len() - 20..];
+        let path = s.1.lock().unwrap().body_path(&job_key("synthetic", "1"));
+        assert!(path.starts_with(&dir.0) && path.exists());
+        let (code, h, read) = read_body(&s, "1", None).await;
+        assert_eq!((code, read.as_slice()), (StatusCode::OK, body));
+        assert_eq!((h["content-length"].to_str().unwrap(), h["accept-ranges"].to_str().unwrap(), h["content-type"].to_str().unwrap()), ("20", "bytes", "application/octet-stream"));
+        let (code, h, read) = read_body(&s, "1", Some("bytes=0-9")).await;
+        assert_eq!((code, read.as_slice(), h["content-range"].to_str().unwrap(), h["content-length"].to_str().unwrap()), (StatusCode::PARTIAL_CONTENT, &body[..10], "bytes 0-9/20", "10"));
+        assert_eq!(h["x-body-sha256"].to_str().unwrap(), verifier_store::hash(body));
+        let (code, _, read) = read_body(&s, "1", Some("bytes=15-")).await;
+        assert_eq!((code, read.as_slice()), (StatusCode::PARTIAL_CONTENT, &body[15..]));
+        let (code, h, _) = read_body(&s, "1", Some("bytes=12-999")).await;
+        assert_eq!((code, h["content-range"].to_str().unwrap()), (StatusCode::PARTIAL_CONTENT, "bytes 12-19/20"));
+        for bad in ["bytes=20-30", "bytes=5-2", "bytes=0-1,3-4", "items=0-1", "bytes=-5", "bytes=a-b"] {
+            let (code, h, _) = read_body(&s, "1", Some(bad)).await;
+            assert_eq!((code, h["content-range"].to_str().unwrap()), (StatusCode::RANGE_NOT_SATISFIABLE, "bytes */20"), "{bad}");
+        }
+        // Key auth, and receipts that hold no body.
+        let response = get_body(State(s.clone()), HeaderMap::new(), Path(("synthetic".into(), "1".into()))).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = delete_body(State(s.clone()), HeaderMap::new(), Path(("synthetic".into(), "1".into()))).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(read_body(&s, "2", None).await.0, StatusCode::NOT_FOUND);
+        let c = capacity_view(&s).await;
+        assert_eq!((c["storage"]["body_files"].as_u64(), c["storage"]["body_bytes"].as_u64(), c["web"]["body_bytes"].as_u64()), (Some(1), Some(20), Some(20)));
+        // The body survives a restart.
+        drop(s);
+        let s = shared(origin.roots.clone(), Some(&dir.0));
+        assert_eq!(stored(&s).await, body);
+        // Released once; later deletes are no-ops and reads are gone, also after a restart.
+        let response = delete_body(State(s.clone()), headers(), Path(("synthetic".into(), "1".into()))).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        for _ in 0..50 {
+            if !path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!path.exists());
+        assert_eq!(read_body(&s, "1", None).await.0, StatusCode::GONE);
+        assert_eq!(delete_body(State(s.clone()), headers(), Path(("synthetic".into(), "1".into()))).await.status(), StatusCode::NO_CONTENT);
+        assert!(view(&s).await["body_released_at_ms"].as_u64().is_some());
+        let c = capacity_view(&s).await;
+        assert_eq!((c["storage"]["body_files"].as_u64(), c["web"]["body_bytes"].as_u64()), (Some(0), Some(0)));
+        drop(s);
+        let s = shared(origin.roots.clone(), Some(&dir.0));
+        assert_eq!(read_body(&s, "1", None).await.0, StatusCode::GONE);
+        // Purged with retention: gone, not unknown, while this process runs.
+        {
+            let mut sessions = s.1.lock().unwrap();
+            let key = job_key("synthetic", "1");
+            sessions.by_job.get_mut(&key).unwrap().expires_ms = now_ms() - verifier_store::WEB_RETENTION_MS - 1;
+            sessions.commit(&key).unwrap();
+            sessions.purge().unwrap();
+        }
+        assert_eq!(read_body(&s, "1", None).await.0, StatusCode::GONE);
+        assert_eq!(delete_body(State(s.clone()), headers(), Path(("synthetic".into(), "1".into()))).await.status(), StatusCode::NO_CONTENT);
+        assert_eq!(delete_body(State(s.clone()), headers(), Path(("synthetic".into(), "9".into()))).await.status(), StatusCode::NOT_FOUND);
+        // A redirect-only receipt never stored a body.
+        let origin = web_origin(routes(&[("example.com/", b"HTTP/1.1 301 Moved\r\nLocation: /x\r\nContent-Length: 0\r\n\r\n", End::Wait)]), false).await;
+        let s = shared(origin.roots.clone(), None);
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        hop(&s, &origin, &token, 0, "https://example.com/", None).await.0.unwrap();
+        let response = delete_body(State(s.clone()), headers(), Path(("synthetic".into(), "1".into()))).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn relay_web_reports_page_too_large_and_verifier_busy() {
+        const TOO_LARGE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 67108865\r\n\r\n";
+        let origin = web_origin(routes(&[("example.com/", TOO_LARGE, End::Wait)]), false).await;
+        let s = shared(origin.roots.clone(), None);
+        let verifier = serve_verifier(&s).await;
+        let proxy = tunnel(origin.addr).await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let (class, error) = relay_web(verifier, proxy, &token).await.err().unwrap();
+        assert_eq!(class, "page_too_large", "{error}");
+        assert!(!error.contains(node::MISUSE) && !error.contains("example.com"), "{error}");
+        let view = view(&s).await;
+        assert_eq!((view["rejections"].clone(), view["rejection"]["declared_bytes"].as_u64()), (json!(["page_too_large"]), Some(67_108_865)));
+
+        // At the web session limit the node is told so, and nothing is spent.
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        let s = shared(origin.roots.clone(), None);
+        let verifier = serve_verifier(&s).await;
+        let proxy = tunnel(origin.addr).await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let held = s.0.web_slots.clone().try_acquire_many_owned(48).unwrap();
+        for _ in 0..2 {
+            let (class, error) = relay_web(verifier, proxy, &token).await.err().unwrap();
+            assert_eq!(class, "verifier_busy", "{error}");
+        }
+        let view = super::web_tests::view(&s).await;
+        assert_eq!((view["remaining_sessions"].as_u64(), view["rejections"].clone(), tokens(&s)), (Some(6), json!([]), 1));
+        assert!(origin.seen.lock().unwrap().is_none());
+        let c = capacity_view(&s).await;
+        assert_eq!((c["web"]["busy_refusals"].as_u64(), c["web"]["active_sessions"].as_u64(), c["web"]["concurrency"].as_u64()), (Some(2), Some(48), Some(48)));
+        drop(held);
+        let summary = relay_web(verifier, proxy, &token).await.unwrap();
+        assert_eq!((summary["status_code"].as_u64(), summary["final"].as_bool()), (Some(200), Some(true)));
+        assert_eq!(stored(&s).await, &PAGE[PAGE.len() - 20..]);
+    }
+
+    #[test]
+    fn the_hop_clock_holds_each_timing_rule() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let clock = || {
+            let mut c = HopClock::new(Timing::WEB, at(280_000));
+            c.request_sent(t0);
+            c
+        };
+        // Runs `bytes(ms)` arrivals at every 100 ms tick from `first` (the
+        // first response byte) and checks the clock at every tick and wake;
+        // returns when and why it ended, if it did by `until`.
+        let run = |first: u64, until: u64, bytes: &dyn Fn(u64) -> usize| -> Option<(u64, &'static str)> {
+            let mut c = clock();
+            let mut ms = 0;
+            while ms <= until {
+                if ms >= first {
+                    if ms == first {
+                        c.first_byte(at(ms));
+                    }
+                    let n = bytes(ms);
+                    if n > 0 {
+                        c.target(at(ms), n);
+                    }
+                }
+                if let Err(rule) = c.check(at(ms)) {
+                    return Some((ms, rule.0));
+                }
+                ms += 100;
+            }
+            None
+        };
+        // A 40 s hop at a steady 100 KiB/s.
+        assert_eq!(run(1000, 41_000, &|_| 10 << 10), None);
+        // 25 s to the first byte, then steady data: fine.
+        assert_eq!(run(25_000, 70_000, &|_| 10 << 10), None);
+        // 61 s to the first byte: ended at 60 s.
+        assert_eq!(run(61_000, 70_000, &|_| 10 << 10), Some((60_000, "ttfb_timeout")));
+        // Silence for 20 s after the first byte.
+        assert_eq!(run(1000, 60_000, &|ms| if ms < 5000 { 10 << 10 } else { 0 }), Some((24_900, "idle_timeout")));
+        // One byte every 19 s never trips idle, and the floor ends it within ~35 s of the first byte.
+        let trickle = run(1000, 120_000, &|ms| usize::from((ms - 1000) % 19_000 == 0));
+        assert_eq!(trickle.map(|(_, rule)| rule), Some("throughput_floor"));
+        assert!(trickle.unwrap().0 <= 1000 + 35_000, "{trickle:?}");
+        // A page that finishes inside 30 s is never held to the floor.
+        assert_eq!(run(1000, 30_900, &|ms| usize::from(ms % 10_000 == 0)), None);
+        // The hop limit, and the wake times the session sleeps until.
+        let mut c = clock();
+        assert_eq!(c.wake(), at(60_000));
+        c.first_byte(at(500));
+        assert_eq!(c.wake(), at(20_500));
+        assert_eq!(c.check(at(280_000)), Err(TimedOut("hop_limit")));
+        assert_eq!(Timing::WEB.floor_bytes(), 1_966_080);
+    }
+
+    /// A verifier for `roots` whose hops run on short, test-sized timing rules.
+    fn hurried(roots: rustls::RootCertStore) -> Shared {
+        let mut config = Config::new(KEY.into(), "127.0.0.1:1".into(), Duration::from_secs(20), verifier_store::Limits::default(), 64, 48, crate::relay::verifier::tls_config(roots).unwrap());
+        config.web_timing = Timing { ttfb: Duration::from_millis(400), idle: Duration::from_millis(300), floor_after: Duration::from_secs(30), floor_window: Duration::from_secs(30), floor_rate: 1 };
+        Arc::new((config, Mutex::new(Sessions::default())))
+    }
+
+    #[tokio::test]
+    async fn a_slow_origin_is_ended_inside_the_session_and_the_node_learns_why() {
+        let silent: Respond = Arc::new(|_: &[u8]| (Vec::new(), End::Wait));
+        let stalled: Respond = Arc::new(|_: &[u8]| (b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nfirst".to_vec(), End::Wait));
+        for (case, respond, entity) in [("ttfb", silent, 0), ("idle", stalled, 5)] {
+            let origin = web_origin(respond, false).await;
+            let s = hurried(origin.roots.clone());
+            let token = register(&s, payload("https://example.com/", 5)).await;
+            let started = Instant::now();
+            let (reported, verifier) = hop(&s, &origin, &token, 0, "https://example.com/", None).await;
+            assert!(started.elapsed() < Duration::from_secs(5), "{case}");
+            verifier.unwrap();
+            // The record was opened first, so this is a failure the node can report, not misuse.
+            let error = reported.err().unwrap();
+            assert_eq!(error.downcast_ref::<node::Refused>(), Some(&node::Refused("session_timeout")), "{case}: {error:#}");
+            assert!(!format!("{error:#}").contains(node::MISUSE), "{case}");
+            let view = view(&s).await;
+            assert_eq!((view["rejections"].clone(), view["rejection"]["entity_bytes"].as_u64()), (json!(["session_timeout"]), Some(entity)), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn web_sessions_beyond_their_slots_are_refused_and_x_still_starts() {
+        let s = shared(rustls::RootCertStore::empty(), None);
+        let verifier = serve_verifier(&s).await;
+        let expires = now_ms() + 60_000;
+        let mut tokens = Vec::new();
+        for i in 0..64 {
+            let (code, Json(created)) = create(State(s.clone()), headers(), Json(CreateRequest { attempt: format!("w{i}"), ..job(payload("https://example.com/", 5), expires) })).await;
+            assert_eq!(code, StatusCode::CREATED);
+            tokens.push(created["token"].as_str().unwrap().to_owned());
+        }
+        // 64 web sessions that present their token and hello, then stall.
+        let mut open = Vec::new();
+        for token in &tokens {
+            let mut socket = TcpStream::connect(verifier).await.unwrap();
+            socket.write_all(format!("{token}\n").as_bytes()).await.unwrap();
+            crate::relay::wire::send(&mut socket, crate::relay::wire::HELLO, br#"{"version":1,"transfers":0}"#).await.unwrap();
+            open.push(socket);
+        }
+        // 16 of them are turned away at once with FAILED verifier_busy; the
+        // node closes those, as relay-web does.
+        let mut stalled = Vec::new();
+        for mut socket in open {
+            let first = tokio::time::timeout(Duration::from_secs(5), crate::relay::wire::FrameReader::new(&mut socket).recv()).await.unwrap().unwrap();
+            if first.0 == crate::relay::wire::FAILED {
+                assert_eq!(first.1, br#"{"reason":"verifier_busy"}"#);
+            } else {
+                assert_eq!(first.0, crate::relay::wire::TO_SERVER);
+                stalled.push(socket);
+            }
+        }
+        assert_eq!(stalled.len(), 48);
+        let c = capacity_view(&s).await;
+        assert_eq!((c["web"]["active_sessions"].as_u64(), c["web"]["busy_refusals"].as_u64()), (Some(48), Some(16)));
+        // An X session still gets a connection slot and starts.
+        let x = json!({"type":"x.read","max_attempts":1,"exchanges":[{"operation":"UserByScreenName","query_id":"qid_1","variables":{"screen_name":"jack"},"features":{}}],"proof_mode":"relay","proof_policy":"x-relay-v1"});
+        let (code, Json(created)) = create(State(s.clone()), headers(), Json(CreateRequest { attempt: "x".into(), fence: None, expires_at_ms: None, ttl_seconds: Some(60), ..job(x, 0) })).await;
+        assert_eq!(code, StatusCode::CREATED, "{created}");
+        let mut socket = TcpStream::connect(verifier).await.unwrap();
+        socket.write_all(format!("{}\n", created["token"].as_str().unwrap()).as_bytes()).await.unwrap();
+        let mut started = false;
+        for _ in 0..500 {
+            if s.1.lock().unwrap().by_job.get(&job_key("synthetic", "x")).is_some_and(|e| e.in_flight == 1) {
+                started = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started, "X session did not start");
+        drop(stalled);
+    }
+
+    #[tokio::test]
+    async fn a_slow_fsync_stalls_neither_capacity_nor_x_registrations() {
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        let dir = Temp::new();
+        let s = shared(origin.roots.clone(), Some(&dir.0));
+        crate::body::SLOW_SYNC.lock().unwrap().push((dir.0.clone(), Duration::from_secs(2)));
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let started = Instant::now();
+        let running = {
+            let (s, token, addr) = (s.clone(), token.clone(), origin.addr);
+            tokio::spawn(async move {
+                let (mut node_end, verifier_end) = tokio::io::duplex(1 << 20);
+                let session = tokio::spawn(handle(s.clone(), Box::new(verifier_end)));
+                node_end.write_all(format!("{token}\n").as_bytes()).await.unwrap();
+                let tcp = TcpStream::connect(addr).await.unwrap();
+                let raw = webpolicy::request("https://example.com/", &web_headers());
+                let result = node::web_session(node_end, tcp, &raw, "example.com", 0, "https://example.com/", &Trace::new()).await;
+                (result.map(|o| o.is_final), session.await.unwrap().is_ok())
+            })
+        };
+        // While the body's fsyncs sleep, the lock is free.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for _ in 0..2 {
+            let asked = Instant::now();
+            assert_eq!(capacity_view(&s).await["healthy"], true);
+            let x = CreateRequest {
+                attempt: format!("x{}", rand::random::<u32>()),
+                ..job(json!({"type":"x.read","max_attempts":1,"exchanges":[{"operation":"UserByScreenName","query_id":"qid_1","variables":{"screen_name":"jack"},"features":{}}],"proof_mode":"relay","proof_policy":"x-relay-v1"}), now_ms() + 60_000)
+            };
+            assert_eq!(create(State(s.clone()), headers(), Json(x)).await.0, StatusCode::CREATED);
+            assert!(asked.elapsed() < Duration::from_millis(400), "{:?}", asked.elapsed());
+        }
+        let (result, verifier) = running.await.unwrap();
+        crate::body::SLOW_SYNC.lock().unwrap().retain(|(d, _)| d != &dir.0);
+        assert!(verifier && result.unwrap());
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert_eq!(stored(&s).await, &PAGE[PAGE.len() - 20..]);
+    }
+
+    /// api/fixtures/verifier: the contract's receipts, capacity and frames are what the code reads and writes.
+    #[tokio::test]
+    async fn contract_fixtures_match_the_code() {
+        let fixture = |name: &str| -> Value {
+            let raw = fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../api/fixtures/verifier").join(name)).unwrap();
+            serde_json::from_slice(&raw).unwrap()
+        };
+        let registration = fixture("register-web.json");
+        let request: CreateRequest = serde_json::from_value(registration.clone()).unwrap();
+        let (kind, _) = kind(&request.payload, true).unwrap();
+        let binding = ["durable", "job_id", "attempt", "fence", "expires_at_ms", "request_sha256"];
+        for name in ["session-web-complete.json", "session-web-released.json", "session-web-rejected.json"] {
+            let view = fixture(name);
+            assert_eq!(view["request_sha256"], verifier_store::hash(&serde_json::to_vec(&request.payload).unwrap()), "{name}");
+            assert_eq!((view["job_id"].clone(), view["attempt"].clone(), view["fence"].clone(), view["expires_at_ms"].clone()), (registration["job_id"].clone(), registration["attempt"].clone(), registration["fence"].clone(), registration["expires_at_ms"].clone()));
+            let mut status = view.clone();
+            binding.iter().for_each(|k| drop(status.as_object_mut().unwrap().remove(*k)));
+            let parsed: Status = serde_json::from_value(status.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            validate_receipt(&kind, &parsed, 0).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(serde_json::to_value(&parsed).unwrap(), status, "{name}");
+        }
+        // The body the complete receipt names.
+        let complete = fixture("session-web-complete.json");
+        let body = fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../api/fixtures/verifier/body-1.bin")).unwrap();
+        let last = complete["hops"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!((last["body_sha256"].as_str().unwrap(), last["body_bytes"].as_u64().unwrap()), (verifier_store::hash(&body).as_str(), body.len() as u64));
+        // A real receipt and capacity have exactly the fixtures' fields.
+        fn keys(v: &Value) -> Vec<String> {
+            let mut out = Vec::new();
+            if let Some(map) = v.as_object() {
+                for (k, child) in map {
+                    out.push(k.clone());
+                    out.extend(keys(child).into_iter().map(|c| format!("{k}.{c}")));
+                }
+            }
+            out.sort();
+            out
+        }
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        let dir = Temp::new();
+        let s = shared(origin.roots.clone(), Some(&dir.0));
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        hop(&s, &origin, &token, 0, "https://example.com/", None).await.0.unwrap();
+        let real = view(&s).await;
+        let mut expected = complete.clone();
+        expected["hops"] = complete["hops"][1].clone();
+        let mut got = real.clone();
+        got["hops"] = real["hops"][0].clone();
+        assert_eq!(keys(&got), keys(&expected));
+        assert_eq!(keys(&capacity_view(&s).await), keys(&fixture("capacity.json")));
+        // The FAILED payloads.
+        for (name, reason) in [("relay-failed-busy.json", "verifier_busy"), ("relay-failed-page-too-large.json", "page_too_large")] {
+            assert_eq!(fixture(name), json!({"reason": reason}));
+        }
+    }
 }
 
 type Shared = Arc<(Config, Mutex<Sessions>)>;
@@ -1818,8 +2445,17 @@ pub async fn run() -> Result<()> {
         max_records: bounded_env("SCARLETT_VERIFIER_MAX_RECORDS", 1024, 1, 1_000_000)? as usize,
         max_record_bytes: bounded_env("SCARLETT_VERIFIER_MAX_RECORD_BYTES", 64 << 20, 1 << 20, 64 << 20)?,
         max_total_bytes: bounded_env("SCARLETT_VERIFIER_MAX_TOTAL_BYTES", 256 << 20, 1 << 20, 1 << 40)?,
-    }.validate()?;
+        max_web_bytes: bounded_env("SCARLETT_VERIFIER_MAX_WEB_BYTES", verifier_store::MAX_WEB_BYTES, verifier_store::WEB_RESERVATION, 1 << 40)?,
+    };
+    if limits.max_web_bytes + limits.max_record_bytes > limits.max_total_bytes {
+        bail!("SCARLETT_VERIFIER_MAX_WEB_BYTES must leave a full receipt (SCARLETT_VERIFIER_MAX_RECORD_BYTES) in SCARLETT_VERIFIER_MAX_TOTAL_BYTES");
+    }
+    let limits = limits.validate()?;
     let concurrency = bounded_env("SCARLETT_VERIFIER_CONCURRENCY", 64, 1, 256)? as usize;
+    let web_concurrency = bounded_env("SCARLETT_VERIFIER_WEB_CONCURRENCY", 48, 1, (256 - X_CODEX_SLOTS) as u64)? as usize;
+    if web_concurrency + X_CODEX_SLOTS > concurrency {
+        bail!("SCARLETT_VERIFIER_WEB_CONCURRENCY must leave {X_CODEX_SLOTS} of SCARLETT_VERIFIER_CONCURRENCY to X and Codex");
+    }
     let sessions = if let Ok(dir) = env::var("SCARLETT_VERIFIER_STATE_DIR") {
         let (store, records) = Store::open_with_limits(std::path::Path::new(&dir), limits)?;
         Sessions::restore(store, records)?
@@ -1838,19 +2474,25 @@ pub async fn run() -> Result<()> {
         _ => bail!("verifier needs a TLS certificate/key or an explicit loopback plaintext fixture"),
     };
     let relay_tls = crate::relay::verifier::tls_config(crate::relay::verifier::mozilla_roots()?)?;
-    let shared: Shared = Arc::new((Config { key, upstream, session_limit: Duration::from_secs(limit), limits, concurrency, slots: Arc::new(tokio::sync::Semaphore::new(concurrency)), relay_tls }, Mutex::new(sessions)));
+    let shared: Shared = Arc::new((Config::new(key, upstream, Duration::from_secs(limit), limits, concurrency, web_concurrency, relay_tls), Mutex::new(sessions)));
     let cleanup = shared.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(60)).await;
-            if cleanup.1.lock().unwrap().purge().is_err() {
-                eprintln!("verifier state unavailable");
+            let purged = cleanup.1.lock().unwrap().purge();
+            match purged {
+                Ok(bodies) => unlink_later(bodies),
+                Err(_) => eprintln!("verifier state unavailable"),
             }
         }
     });
 
-    let router =
-        Router::new().route("/v1/sessions", post(create)).route("/v1/sessions/{job_id}/{attempt}", get(status)).route("/v1/capacity", get(capacity)).with_state(shared.clone());
+    let router = Router::new()
+        .route("/v1/sessions", post(create))
+        .route("/v1/sessions/{job_id}/{attempt}", get(status))
+        .route("/v1/sessions/{job_id}/{attempt}/body", get(get_body).delete(delete_body))
+        .route("/v1/capacity", get(capacity))
+        .with_state(shared.clone());
     let api_listener = TcpListener::bind(&api).await.with_context(|| format!("binding {api}"))?;
     tokio::spawn(async move {
         if let Err(e) = axum::serve(api_listener, router).await {
@@ -1859,7 +2501,13 @@ pub async fn run() -> Result<()> {
     });
 
     let listener = TcpListener::bind(&listen).await.with_context(|| format!("binding {listen}"))?;
-    println!("verifier: sessions on {listen}, API on {api}, upstream {}", shared.0.upstream);
+    println!("verifier: sessions on {listen} ({concurrency}, {web_concurrency} for web), API on {api}, upstream {}", shared.0.upstream);
+    serve(listener, shared, acceptor).await
+}
+
+/// Accepts supplier connections, each into one of the connection slots;
+/// a connection that finds none is closed at once.
+async fn serve(listener: TcpListener, shared: Shared, acceptor: Option<tokio_rustls::TlsAcceptor>) -> Result<()> {
     let slots = shared.0.slots.clone();
     loop {
         let (socket, peer) = listener.accept().await?;
@@ -1915,8 +2563,12 @@ async fn create(State(shared): State<Shared>, headers: HeaderMap, Json(request):
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid job or attempt"})));
     }
     let mut sessions = sessions.lock().unwrap();
-    if sessions.failed || sessions.purge().is_err() {
+    if sessions.failed {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"verifier state unavailable"})));
+    }
+    match sessions.purge() {
+        Ok(bodies) => unlink_later(bodies),
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"verifier state unavailable"}))),
     }
     let durable = sessions.store.is_some();
     if durable && (request.fence.is_none() || request.expires_at_ms.is_none()) {
@@ -1930,10 +2582,11 @@ async fn create(State(shared): State<Shared>, headers: HeaderMap, Json(request):
         }
     };
     // A receipt that cannot be stored would take the whole verifier down when
-    // its hop commits, so a job that could outgrow the record limit is refused now.
+    // its hop commits, so a job whose receipt JSON could outgrow the record
+    // limit is refused now. The page itself is a file of its own.
     if let Kind::Web(job) = &kind
         && durable
-        && web_receipt_bound(job) > config.limits.max_record_bytes
+        && web_json_bound(job) > config.limits.max_record_bytes
     {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"verifier record limit is below this web job's receipt"})));
     }
@@ -1957,10 +2610,12 @@ async fn create(State(shared): State<Shared>, headers: HeaderMap, Json(request):
         }
         return (StatusCode::CONFLICT, Json(serde_json::json!({"error": "session already exists for this attempt"})));
     }
-    // A web job reserves its own receipt bound, so web registrations are not
-    // limited by the larger reservation X and Codex receipts need.
+    // A web job reserves its own receipt and page in the web pool, which
+    // always leaves an X or Codex receipt room in the total.
     if sessions.by_job.len() >= config.limits.max_records || sessions.store.as_ref().is_some_and(|store| !store.can_reserve(&request.payload)) {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"verifier session capacity reached"})));
+        let pool_full = matches!(kind, Kind::Web(_)) && sessions.by_job.len() < config.limits.max_records && sessions.store.as_ref().is_some_and(|store| !store.web_pool().can_register);
+        let error = if pool_full { "verifier web capacity reached" } else { "verifier session capacity reached" };
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": error})));
     }
     sessions.by_job.insert(
         key.clone(),
@@ -1985,12 +2640,18 @@ async fn capacity(State(shared): State<Shared>, headers: HeaderMap) -> (StatusCo
     if !authorized(&shared.0, &headers) {
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"verifier key required"})));
     }
+    let config = &shared.0;
     let sessions = shared.1.lock().unwrap();
     let storage = sessions.store.as_ref().map(Store::capacity);
+    let pool = sessions.store.as_ref().map(Store::web_pool).unwrap_or(verifier_store::WebPool { can_register: true, reserved_bytes: 0, body_files: 0, body_bytes: 0, max_bytes: config.limits.max_web_bytes });
+    let mut web = serde_json::to_value(pool).unwrap_or_default();
+    web["concurrency"] = config.web_concurrency.into();
+    web["active_sessions"] = (config.web_concurrency - config.web_slots.available_permits()).into();
+    web["busy_refusals"] = config.busy_refusals.load(Ordering::Relaxed).into();
     (if sessions.failed { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK }, Json(serde_json::json!({
-        "healthy": !sessions.failed, "durable": sessions.store.is_some(), "concurrency":shared.0.concurrency,
-        "records":sessions.by_job.len(), "storage":storage, "limits":shared.0.limits,
-        "active_connections":shared.0.concurrency - shared.0.slots.available_permits(),
+        "healthy": !sessions.failed, "durable": sessions.store.is_some(), "concurrency":config.concurrency,
+        "records":sessions.by_job.len(), "storage":storage, "limits":config.limits, "web": web,
+        "active_connections":config.concurrency - config.slots.available_permits(),
         "in_flight_proofs":sessions.by_job.values().map(|entry| entry.in_flight).sum::<usize>(),
         "pending_sessions":sessions.by_token.values().filter(|key| sessions.by_job.get(*key).is_some_and(|entry| entry.expires_ms > now_ms())).count()
     })))
@@ -2028,6 +2689,131 @@ async fn status(
     (StatusCode::OK, Json(response))
 }
 
+fn error_response(status: StatusCode, error: &str) -> Response {
+    (status, Json(serde_json::json!({ "error": error }))).into_response()
+}
+
+/// One `Range: bytes=a-b` or `bytes=a-` within a body of `len` bytes, as
+/// first and last byte; `Err` for anything else or nothing satisfiable.
+fn byte_range(value: &HeaderValue, len: u64) -> Result<(u64, u64), ()> {
+    let spec = value.to_str().map_err(drop)?.trim().strip_prefix("bytes=").ok_or(())?;
+    let (first, last) = spec.split_once('-').ok_or(())?;
+    let digits = |s: &str| !s.is_empty() && s.len() <= 19 && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(first) || !(last.is_empty() || digits(last)) {
+        return Err(());
+    }
+    let first: u64 = first.parse().map_err(drop)?;
+    let last = if last.is_empty() { len.saturating_sub(1) } else { last.parse::<u64>().map_err(drop)?.min(len.saturating_sub(1)) };
+    if first >= len || first > last {
+        return Err(());
+    }
+    Ok((first, last))
+}
+
+/// `GET /v1/sessions/{job}/{attempt}/body`: a web receipt's stored page
+/// body, whole or one byte range. The session lock is held only to look the
+/// body up, never across its I/O.
+async fn get_body(State(shared): State<Shared>, headers: HeaderMap, Path((job_id, attempt)): Path<(String, String)>) -> Response {
+    let (config, sessions) = &*shared;
+    if !authorized(config, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED, "verifier key required");
+    }
+    let found = {
+        let sessions = sessions.lock().unwrap();
+        if sessions.failed {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "verifier state unavailable");
+        }
+        sessions.body(&job_key(&job_id, &attempt))
+    };
+    let (path, bytes, sha256) = match found {
+        Ok(found) => found,
+        Err(NoBody::Unknown) => return error_response(StatusCode::NOT_FOUND, "unknown session"),
+        Err(NoBody::None) => return error_response(StatusCode::NOT_FOUND, "no body"),
+        Err(NoBody::Released) => return error_response(StatusCode::GONE, "body released"),
+    };
+    let range = match headers.get(header::RANGE).map(|value| byte_range(value, bytes)) {
+        None => None,
+        Some(Ok(range)) => Some(range),
+        Some(Err(())) => {
+            let mut response = error_response(StatusCode::RANGE_NOT_SATISFIABLE, "invalid range");
+            response.headers_mut().insert(header::CONTENT_RANGE, HeaderValue::from_str(&format!("bytes */{bytes}")).expect("ascii"));
+            return response;
+        }
+    };
+    let mut file = match tokio::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path).await {
+        Ok(file) => file,
+        // Released between the lookup and the open.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return error_response(StatusCode::GONE, "body released"),
+        Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "verifier state unavailable"),
+    };
+    if !file.metadata().await.is_ok_and(|m| m.is_file() && m.len() == bytes) {
+        eprintln!("verifier: job {job_id} page body file does not match its receipt");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "body does not match its receipt");
+    }
+    let (status, start, length) = match range {
+        Some((first, last)) => (StatusCode::PARTIAL_CONTENT, first, last - first + 1),
+        None => (StatusCode::OK, 0, bytes),
+    };
+    if start > 0 && file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "verifier state unavailable");
+    }
+    let mut response = Body::from_stream(ReaderStream::with_capacity(file.take(length), 64 << 10)).into_response();
+    *response.status_mut() = status;
+    let set = response.headers_mut();
+    set.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+    set.insert(header::CONTENT_LENGTH, HeaderValue::from(length));
+    set.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    set.insert("x-body-sha256", HeaderValue::from_str(&sha256).expect("hex"));
+    set.insert("x-body-bytes", HeaderValue::from(bytes));
+    if let Some((first, last)) = range {
+        set.insert(header::CONTENT_RANGE, HeaderValue::from_str(&format!("bytes {first}-{last}/{bytes}")).expect("ascii"));
+    }
+    response
+}
+
+/// `DELETE /v1/sessions/{job}/{attempt}/body`: releases a stored page body.
+/// The receipt records the release first, then the file is unlinked, so a
+/// crash in between leaves only an orphan file that the next start deletes.
+async fn delete_body(State(shared): State<Shared>, headers: HeaderMap, Path((job_id, attempt)): Path<(String, String)>) -> Response {
+    let (config, sessions) = &*shared;
+    if !authorized(config, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED, "verifier key required");
+    }
+    let key = job_key(&job_id, &attempt);
+    let path = {
+        let mut guard = sessions.lock().unwrap();
+        let s = &mut *guard;
+        if s.failed {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "verifier state unavailable");
+        }
+        let path = match s.body(&key) {
+            Ok((path, ..)) => path,
+            Err(NoBody::Released) => return StatusCode::NO_CONTENT.into_response(),
+            Err(NoBody::Unknown) => return error_response(StatusCode::NOT_FOUND, "unknown session"),
+            Err(NoBody::None) => return error_response(StatusCode::NOT_FOUND, "no body"),
+        };
+        if let Some(Entry { status: Status::WebRead { body_released_at_ms, .. }, .. }) = s.by_job.get_mut(&key) {
+            *body_released_at_ms = Some(now_ms());
+        }
+        if s.commit(&key).is_err() {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "verifier state unavailable");
+        }
+        path
+    };
+    let removed = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => std::fs::File::open(path.parent().unwrap_or(std::path::Path::new("/")))?.sync_all(),
+        }
+    })
+    .await;
+    if !matches!(removed, Ok(Ok(()))) {
+        // The receipt says released; the next start deletes the file.
+        eprintln!("verifier: job {job_id} released page body could not be removed now");
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
 enum Job {
     Codex(Value),
     /// The pinned reads, how they are proven, and the reads already fulfilled
@@ -2045,13 +2831,16 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
         bail!("malformed session token");
     }
     let token = std::str::from_utf8(&line[..64])?;
-    let (key, job, expires) = {
+    // Err(key): the job's web session must wait for a web slot.
+    let admitted = 'admit: {
         let mut guard = sessions.lock().unwrap();
         let s = &mut *guard;
         if s.failed {
             bail!("verifier state unavailable");
         }
         let key = s.by_token.get(token).cloned().context("unknown or used session token")?;
+        let body_path = s.body_path(&key);
+        let mut web_slot = None;
         let entry = s.by_job.get_mut(&key).context("session expired")?;
         if Instant::now() >= entry.expires {
             s.by_token.remove(token);
@@ -2086,13 +2875,19 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
                 Job::X(specs.clone(), *mode, fulfilled)
             }
             Kind::Web(web) => {
-                let Status::WebRead { remaining_sessions, complete, next_url, hops, rejections } = &mut entry.status else {
+                let Status::WebRead { remaining_sessions, complete, next_url, hops, rejections, .. } = &mut entry.status else {
                     bail!("session is in an unexpected state")
                 };
                 // Hops run one at a time, and none after the job has ended.
                 if entry.in_flight > 0 || *complete || !rejections.is_empty() || *remaining_sessions == 0 {
                     bail!("web session cannot start a hop now");
                 }
+                // A hop takes a web slot, so X and Codex keep theirs. Without
+                // one the session spends nothing and the node tries again.
+                let Ok(slot) = config.web_slots.clone().try_acquire_owned() else {
+                    break 'admit Err(key);
+                };
+                web_slot = Some(slot);
                 let url = if hops.is_empty() { web.url.clone() } else { next_url.clone().context("web session has no authorized next hop")? };
                 // Each connection spends one session; the token dies with the last one.
                 *remaining_sessions -= 1;
@@ -2106,7 +2901,16 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
         let expires = entry.expires;
         // A durable spent token/attempt must exist before any provider session.
         s.commit(&key)?;
-        (key, job, expires)
+        Ok((key, job, expires, web_slot, body_path))
+    };
+    let (key, job, expires, web_slot, body_path) = match admitted {
+        Ok(admitted) => admitted,
+        Err(key) => {
+            config.busy_refusals.fetch_add(1, Ordering::Relaxed);
+            println!("verifier: job {} web session refused: verifier_busy", key.split('\n').next().unwrap_or_default());
+            let _ = tokio::time::timeout(Duration::from_secs(5), Conn::new(socket).refuse("verifier_busy")).await;
+            return Ok(());
+        }
     };
 
     let started = Instant::now();
@@ -2210,96 +3014,109 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
             s.commit(&key)?;
         }
         Job::Web(web, index, url) => {
+            let _web_slot = web_slot;
             let host = webpolicy::url_host(&url).to_owned();
             let authorize = |public: &[u8]| webpolicy::authorize(&web, &url, public).map(drop);
             let started_at_ms = now_ms();
-            let concluded = AtomicBool::new(false);
-            // Runs once the supplier holds the record opening: the hop is
-            // durable before the supplier learns the next URL.
-            let conclude = |outcome: &WebOutcome| -> Result<Vec<u8>> {
+            let hop_limit = limit.min(webpolicy::HOP_LIMIT);
+            let mut conn = Conn::new(socket);
+            let mut reader = WebReader::new(Framer::for_hop(web.max_response_bytes, web.rule(&url, index)), body_path);
+            let mut clock = HopClock::new(config.web_timing, Instant::now() + hop_limit);
+            // The clock ends the hop inside the session, so the node always
+            // gets its record opened; this only bounds a session that stops
+            // making progress some other way.
+            let session = tokio::time::timeout(hop_limit + Duration::from_secs(10), web_session(&mut conn, config.relay_tls.clone(), &host, authorize, &mut reader, &mut clock)).await;
+            let duration_ms = started.elapsed().as_millis() as u64;
+            let (reason, detail) = match session {
                 // What the node chose for this hop, from the bytes just authorized.
-                let node = webpolicy::authorize(&web, &url, &outcome.sent)?;
-                let response = &outcome.response;
-                let (location, location_refused) = match response.location() {
-                    Some(location) if webpolicy::REDIRECTS.contains(&response.status) => match location.and_then(|l| webpolicy::resolve_location(&url, l)) {
-                        Ok(next) => (Some(next), None),
-                        Err(refused) => (None, Some(refused.code().to_owned())),
-                    },
-                    _ => (None, None),
-                };
-                let is_final = location.is_none() || index == web.max_redirects;
-                let hop = WebHop {
-                    index,
-                    url: url.clone(),
-                    status_code: response.status,
-                    location: location.clone(),
-                    location_refused,
-                    head_base64: STANDARD.encode(&response.head),
-                    body_base64: is_final.then(|| STANDARD.encode(&response.body)),
-                    body_bytes: response.body.len(),
-                    body_sha256: verifier_store::hash(&response.body),
-                    response_sha256: hex(&response.response_sha256),
-                    framing: response.framing.name().into(),
-                    sent_bytes: outcome.sent.len(),
-                    received_bytes: response.received,
-                    server_name: host.clone(),
-                    tls_version: WEB_TLS_VERSION.into(),
-                    cipher_suite: WEB_CIPHER_SUITE.into(),
-                    alpn: outcome.tls.alpn.clone(),
-                    cert_chain_sha256: hex(&outcome.tls.cert_chain_sha256),
-                    leaf_cert_sha256: hex(&outcome.tls.leaf_cert_sha256),
-                    started_at_ms,
-                    duration_ms: started.elapsed().as_millis() as u64,
-                    node_user_agent: node.as_ref().map(|n| n.user_agent.clone()),
-                    node_cookie_names: node.as_ref().map(webpolicy::NodeHeaders::cookie_names),
-                    node_cookie_sha256: node.as_ref().and_then(webpolicy::NodeHeaders::cookie_sha256),
-                };
-                let next_url = (!is_final).then_some(location).flatten();
-                let frame = serde_json::to_vec(&HopOutcome { hop: index, url: &url, status_code: response.status, is_final, next_url: next_url.as_deref() })?;
+                Ok(Ok(sealed)) => match (reader.finish().await, webpolicy::authorize(&web, &url, &sealed.sent)) {
+                    (Ok((response, stored)), Ok(node)) => {
+                        let is_final = !response.followable;
+                        let next_url = response.followable.then(|| response.location.clone()).flatten();
+                        let hop = WebHop {
+                            index,
+                            url: url.clone(),
+                            status_code: response.status,
+                            location: response.location.clone(),
+                            location_refused: response.location_refused.map(Into::into),
+                            head_base64: STANDARD.encode(&response.head),
+                            body_stored: is_final,
+                            body_bytes: response.body_bytes,
+                            body_sha256: hex(&response.body_sha256),
+                            response_sha256: hex(&response.response_sha256),
+                            framing: response.framing.name().into(),
+                            sent_bytes: sealed.sent.len(),
+                            received_bytes: response.received,
+                            server_name: host.clone(),
+                            tls_version: WEB_TLS_VERSION.into(),
+                            cipher_suite: WEB_CIPHER_SUITE.into(),
+                            alpn: sealed.tls.alpn.clone(),
+                            cert_chain_sha256: hex(&sealed.tls.cert_chain_sha256),
+                            leaf_cert_sha256: hex(&sealed.tls.leaf_cert_sha256),
+                            started_at_ms,
+                            duration_ms,
+                            node_user_agent: node.as_ref().map(|n| n.user_agent.clone()),
+                            node_cookie_names: node.as_ref().map(webpolicy::NodeHeaders::cookie_names),
+                            node_cookie_sha256: node.as_ref().and_then(webpolicy::NodeHeaders::cookie_sha256),
+                        };
+                        let frame = serde_json::to_vec(&HopOutcome { hop: index, url: &url, status_code: response.status, is_final, next_url: next_url.as_deref() })?;
+                        // The hop, and its body file, are durable before the node learns the next URL.
+                        {
+                            let mut guard = sessions.lock().unwrap();
+                            let s = &mut *guard;
+                            if s.failed {
+                                bail!("verifier state unavailable");
+                            }
+                            let Some(Entry { status: Status::WebRead { complete, next_url: pending, hops, .. }, in_flight, .. }) = s.by_job.get_mut(&key) else {
+                                bail!("web receipt is gone");
+                            };
+                            hops.push(hop);
+                            *pending = next_url;
+                            *in_flight = 0;
+                            if is_final {
+                                *complete = true;
+                                s.by_token.retain(|_, k| *k != key);
+                            }
+                            s.commit(&key)?;
+                        }
+                        if let Some(stored) = stored {
+                            stored.commit();
+                        }
+                        println!("verifier: job {job_id} proved web hop {index} (HTTP {}, {} bytes, {duration_ms} ms)", response.status, response.body_bytes);
+                        let _ = tokio::time::timeout(Duration::from_secs(10), conn.done(Some(&frame))).await;
+                        return Ok(());
+                    }
+                    (Err(e), _) | (_, Err(e)) => {
+                        println!("verifier: job {job_id} web hop {index} could not be recorded: {}", loggable(&e));
+                        (Failure::ProofRejected.reason(), None)
+                    }
+                },
+                // Only the reason is logged: never the URL, host or anything the page said.
+                Ok(Err(e)) => (Failure::of(&e).reason(), e.downcast_ref::<TimedOut>().map(|t| t.0)),
+                Err(_) => (Failure::SessionTimeout.reason(), Some("stalled")),
+            };
+            match detail {
+                Some(detail) => println!("verifier: job {job_id} web hop {index} failed: {reason} ({detail})"),
+                None => println!("verifier: job {job_id} web hop {index} failed: {reason}"),
+            }
+            let rejection = Rejection::new(reason, reader.counts());
+            {
                 let mut guard = sessions.lock().unwrap();
                 let s = &mut *guard;
                 if s.failed {
                     bail!("verifier state unavailable");
                 }
-                let Some(Entry { status: Status::WebRead { complete, next_url: pending, hops, .. }, in_flight, .. }) = s.by_job.get_mut(&key) else {
-                    bail!("web receipt is gone");
-                };
-                hops.push(hop);
-                *pending = next_url;
-                *in_flight = 0;
-                if is_final {
-                    *complete = true;
+                if let Some(Entry { status: Status::WebRead { next_url, rejections, rejection: recorded, .. }, in_flight, .. }) = s.by_job.get_mut(&key) {
+                    *in_flight = 0;
+                    *next_url = None;
+                    rejections.push(reason.into());
+                    *recorded = Some(rejection);
                     s.by_token.retain(|_, k| *k != key);
+                    s.commit(&key)?;
                 }
-                s.commit(&key)?;
-                concluded.store(true, Ordering::SeqCst);
-                println!("verifier: job {job_id} proved web hop {index} (HTTP {})", response.status);
-                Ok(frame)
-            };
-            let hop = crate::relay::verifier::run_web(socket, config.relay_tls.clone(), &host, authorize, web.max_response_bytes, conclude);
-            let result = tokio::time::timeout(limit.min(webpolicy::HOP_LIMIT), hop).await;
-            if concluded.load(Ordering::SeqCst) {
-                return Ok(());
             }
-            // Only the reason is logged: never the URL, host or anything the page said.
-            let reason = match &result {
-                Ok(Err(e)) => Failure::of(e).reason(),
-                Ok(Ok(_)) => Failure::ProofRejected.reason(),
-                Err(_) => "session_timeout",
-            };
-            println!("verifier: job {job_id} web hop {index} failed: {reason}");
-            let mut guard = sessions.lock().unwrap();
-            let s = &mut *guard;
-            if s.failed {
-                bail!("verifier state unavailable");
-            }
-            if let Some(Entry { status: Status::WebRead { next_url, rejections, .. }, in_flight, .. }) = s.by_job.get_mut(&key) {
-                *in_flight = 0;
-                *next_url = None;
-                rejections.push(reason.into());
-                s.by_token.retain(|_, k| *k != key);
-                s.commit(&key)?;
-            }
+            // The rejection is committed; now the node may learn why.
+            let _ = tokio::time::timeout(Duration::from_secs(5), conn.refuse(reason)).await;
         }
     }
     Ok(())

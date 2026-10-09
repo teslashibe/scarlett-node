@@ -8,37 +8,51 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"hash"
+	"io"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"time"
-	"unicode/utf8"
 )
 
-// BrowserResult is the decompressed body of POST
-// /api/node/v1/jobs/{job_id}/browser-result: the page as the node's hidden
-// browser rendered it for a browser web job. Scarlett did not see these bytes
-// on the wire, so the coordinator labels anything served from them as not
-// TLS-verified. Cookie values never appear here; set_cookie_names carries
-// names only.
+// BrowserResult is the body of POST /api/node/v1/jobs/{job_id}/browser-result:
+// the manifest of what the node's hidden browser rendered for a browser web
+// job. The DOM itself travels as gzip parts (PUT …/browser-result/parts/{n})
+// and is never cut: DOM says whether it was uploaded ("ok"), was over the
+// page ceiling ("too_large", HTMLBytes is its size) or never existed because
+// the node killed its browser for memory ("memory", TreePeakBytes is the
+// tree size it reached). Scarlett did not see these bytes on the wire, so the
+// coordinator labels anything served from them as not TLS-verified. Cookie
+// values never appear here; set_cookie_names carries names only.
 type BrowserResult struct {
-	Version        string            `json:"version"`
-	Attempt        string            `json:"attempt"`
-	Fence          string            `json:"fence"`
-	RequestSHA256  string            `json:"request_sha256"`
-	URL            string            `json:"url"`
-	FinalURL       string            `json:"final_url"`
-	StatusCode     int               `json:"status_code"`
-	Headers        [][2]string       `json:"headers"`
-	SetCookieNames []string          `json:"set_cookie_names"`
-	ContentType    string            `json:"content_type"`
-	HTML           string            `json:"html"`
-	HTMLBytes      int               `json:"html_bytes"`
-	HTMLSHA256     string            `json:"html_sha256"`
-	HTMLTruncated  bool              `json:"html_truncated"`
-	Challenge      string            `json:"challenge"`
-	Redirects      []BrowserRedirect `json:"redirects"`
-	Browser        BrowserInfo       `json:"browser"`
-	StartedAtMS    int64             `json:"started_at_ms"`
-	DurationMS     int64             `json:"duration_ms"`
+	Version        string      `json:"version"`
+	Attempt        string      `json:"attempt"`
+	Fence          string      `json:"fence"`
+	RequestSHA256  string      `json:"request_sha256"`
+	URL            string      `json:"url"`
+	FinalURL       string      `json:"final_url"`
+	StatusCode     int         `json:"status_code"`
+	Headers        [][2]string `json:"headers"`
+	SetCookieNames []string    `json:"set_cookie_names"`
+	ContentType    string      `json:"content_type"`
+	DOM            string      `json:"dom"`
+	HTMLBytes      int64       `json:"html_bytes"`
+	// HTMLSHA256, UploadSHA256 and Parts describe the uploaded DOM and are
+	// set exactly when DOM is "ok"; GzipBytes is 0 otherwise.
+	HTMLSHA256    string   `json:"html_sha256,omitempty"`
+	GzipBytes     int64    `json:"gzip_bytes"`
+	UploadSHA256  string   `json:"upload_sha256,omitempty"`
+	Parts         []string `json:"parts"`
+	TreePeakBytes int64    `json:"tree_peak_bytes,omitempty"`
+	// Challenge, Redirects and the rest are today's metadata.
+	Challenge   string            `json:"challenge"`
+	Redirects   []BrowserRedirect `json:"redirects"`
+	Browser     BrowserInfo       `json:"browser"`
+	StartedAtMS int64             `json:"started_at_ms"`
+	DurationMS  int64             `json:"duration_ms"`
 	// Solver is "used" when the operator's captcha solver cleared the page
 	// and "needed" when the page stopped at a captcha that takes one; absent
 	// otherwise. The coordinator remembers such domains and sends their
@@ -60,43 +74,165 @@ type BrowserInfo struct {
 	UserAgent string `json:"user_agent"`
 }
 
+// BrowserResultParts is GET …/browser-result/parts: the stored part set.
+type BrowserResultParts struct {
+	UploadSHA256 string        `json:"upload_sha256,omitempty"`
+	Parts        []BrowserPart `json:"parts"`
+}
+
+// BrowserPart is one stored part.
+type BrowserPart struct {
+	N      int    `json:"n"`
+	SHA256 string `json:"sha256"`
+}
+
+// The browser-result DOM states.
 const (
-	// MaxBrowserHTMLBytes caps the rendered document, in UTF-8 bytes.
-	MaxBrowserHTMLBytes = 10485760
-	// MaxBrowserResultGzipBytes caps the compressed upload.
-	MaxBrowserResultGzipBytes = 12582912
-	// MaxBrowserResultBytes is the coordinator's limit on the decompressed body.
-	MaxBrowserResultBytes = 16777216
-	// BrowserResultTarget is the decompressed size the node shrinks html to,
-	// 64 KiB under the coordinator's limit.
-	BrowserResultTarget = MaxBrowserResultBytes - 64<<10
-	// browserUploadRate is the slowest uplink an upload try is planned for,
-	// in bytes per second.
-	browserUploadRate = 250_000
-	// browserUploadTries bounds the tries of one upload.
-	browserUploadTries = 3
-	// browserUploadMinimum is the least time before the report deadline in
-	// which a try may start, whatever the body size.
-	browserUploadMinimum = 15 * time.Second
+	DOMOK       = "ok"
+	DOMTooLarge = "too_large"
+	DOMMemory   = "memory"
 )
 
-// browserUploadBackoff is the wait before each retry of an upload.
+const (
+	// PageMax is the page ceiling: a web hop's entity bytes, and the
+	// browser's DOM in UTF-8 bytes.
+	PageMax = 67108864
+	// MaxBrowserHTMLBytes caps the rendered document, in UTF-8 bytes.
+	MaxBrowserHTMLBytes = PageMax
+	// BrowserPartBytes is the size of every upload part but the last.
+	BrowserPartBytes = 2 << 20
+	// MaxBrowserParts bounds the parts of one upload: a DOM of PageMax bytes
+	// that does not compress still fits.
+	MaxBrowserParts = 33
+	// MaxBrowserGzipBytes caps the gzip stream.
+	MaxBrowserGzipBytes = MaxBrowserParts * BrowserPartBytes
+	// maxBrowserManifestBytes bounds the manifest JSON.
+	maxBrowserManifestBytes = 256 << 10
+	// maxBrowserPartsReply bounds GET …/parts.
+	maxBrowserPartsReply = 16 << 10
+	// browserUploadRate is the slowest uplink a part try is planned for, in
+	// bytes per second.
+	browserUploadRate = 250_000
+	// browserUploadTries bounds the tries of one part or of the manifest.
+	browserUploadTries = 3
+	// browserPartMinimum is the least time before the report deadline in
+	// which a part try may start; browserManifestReserve is kept after a
+	// part for the manifest.
+	browserPartMinimum     = 10 * time.Second
+	browserManifestReserve = 5 * time.Second
+	// browserManifestMinimum is the least time before the report deadline in
+	// which a manifest try may start.
+	browserManifestMinimum = 3 * time.Second
+)
+
+// browserUploadBackoff is the wait before each retry of a part or manifest.
 var browserUploadBackoff = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
 
-// ErrBrowserUploadTooLate means no upload try could start with enough time
-// left before the report deadline.
+// ErrBrowserUploadTooLate means a part or the manifest could not start with
+// enough time left before the report deadline.
 var ErrBrowserUploadTooLate = errors.New("browser result upload: not enough time before the report deadline")
 
-// EncodeBrowserResult fixes up r and returns its gzip body. html is first
-// capped at MaxBrowserHTMLBytes, then cut further until the JSON body (HTML
-// escaping off) fits BrowserResultTarget and its gzip fits
-// MaxBrowserResultGzipBytes. Every cut lands on a UTF-8 code point boundary
-// and sets html_truncated. html_bytes and html_sha256 are computed here, on
-// the final string, so they always describe the bytes sent.
-func EncodeBrowserResult(r BrowserResult) (BrowserResult, []byte, error) {
-	if !utf8.ValidString(r.HTML) {
-		return r, nil, errors.New("browser result html is not UTF-8")
+// ErrDOMTooLarge is a DOM over PageMax bytes.
+var ErrDOMTooLarge = errors.New("browser DOM is larger than the page ceiling")
+
+// BrowserUpload is a DOM file compressed for upload: the gzip stream at Path
+// and what the manifest says about it.
+type BrowserUpload struct {
+	Path         string
+	HTMLBytes    int64
+	HTMLSHA256   string
+	GzipBytes    int64
+	UploadSHA256 string
+	Parts        []string
+}
+
+// partWriter writes the gzip stream to a file and hashes it whole and per
+// 2 MiB part as it goes.
+type partWriter struct {
+	file  *os.File
+	whole hash.Hash
+	part  hash.Hash
+	fill  int
+	total int64
+	parts []string
+}
+
+func (w *partWriter) Write(b []byte) (int, error) {
+	if w.total+int64(len(b)) > MaxBrowserGzipBytes {
+		return 0, errors.New("browser DOM gzip stream exceeds the upload limit")
 	}
+	n, err := w.file.Write(b)
+	w.total += int64(n)
+	w.whole.Write(b[:n])
+	for rest := b[:n]; len(rest) > 0; {
+		take := min(len(rest), BrowserPartBytes-w.fill)
+		w.part.Write(rest[:take])
+		w.fill += take
+		rest = rest[take:]
+		if w.fill == BrowserPartBytes {
+			w.closePart()
+		}
+	}
+	return n, err
+}
+
+func (w *partWriter) closePart() {
+	w.parts = append(w.parts, hex.EncodeToString(w.part.Sum(nil)))
+	w.part.Reset()
+	w.fill = 0
+}
+
+// PrepareBrowserUpload compresses the DOM at htmlPath (UTF-8, at most PageMax
+// bytes) with gzip level 6 into gzipPath, created exclusively and private, and
+// returns the hashes the manifest carries. The DOM is read once and never held
+// in memory; on failure gzipPath is removed.
+func PrepareBrowserUpload(htmlPath, gzipPath string) (up BrowserUpload, err error) {
+	in, err := os.Open(htmlPath)
+	if err != nil {
+		return up, errors.New("browser DOM unreadable")
+	}
+	defer in.Close()
+	out, err := os.OpenFile(gzipPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return up, errors.New("browser DOM gzip file unavailable")
+	}
+	defer func() {
+		if cerr := out.Close(); err == nil && cerr != nil {
+			err = cerr
+		}
+		if err != nil {
+			_ = os.Remove(gzipPath)
+		}
+	}()
+	pw := &partWriter{file: out, whole: sha256.New(), part: sha256.New()}
+	zw, err := gzip.NewWriterLevel(pw, 6)
+	if err != nil {
+		return up, err
+	}
+	html := sha256.New()
+	n, err := io.Copy(io.MultiWriter(zw, html), io.LimitReader(in, MaxBrowserHTMLBytes+1))
+	if err != nil {
+		return up, err
+	}
+	if n > MaxBrowserHTMLBytes {
+		return up, ErrDOMTooLarge
+	}
+	if err = zw.Close(); err != nil {
+		return up, err
+	}
+	if pw.fill > 0 {
+		pw.closePart()
+	}
+	if err = out.Sync(); err != nil {
+		return up, err
+	}
+	return BrowserUpload{Path: gzipPath, HTMLBytes: n, HTMLSHA256: hex.EncodeToString(html.Sum(nil)), GzipBytes: pw.total,
+		UploadSHA256: hex.EncodeToString(pw.whole.Sum(nil)), Parts: pw.parts}, nil
+}
+
+// EncodeBrowserResult fills r's empty lists and returns its JSON (HTML
+// escaping off), checking that the DOM fields agree with r.DOM.
+func EncodeBrowserResult(r BrowserResult) (BrowserResult, []byte, error) {
 	if r.Headers == nil {
 		r.Headers = [][2]string{}
 	}
@@ -106,187 +242,271 @@ func EncodeBrowserResult(r BrowserResult) (BrowserResult, []byte, error) {
 	if r.Redirects == nil {
 		r.Redirects = []BrowserRedirect{}
 	}
-	if len(r.HTML) > MaxBrowserHTMLBytes {
-		r.HTML, r.HTMLTruncated = cutUTF8(r.HTML, MaxBrowserHTMLBytes), true
+	if r.Parts == nil {
+		r.Parts = []string{}
 	}
-	target := BrowserResultTarget
-	for range 64 {
-		raw, err := encodeBrowserJSON(&r)
-		if err != nil {
-			return r, nil, err
+	switch r.DOM {
+	case DOMOK:
+		if r.HTMLBytes < 0 || r.HTMLBytes > MaxBrowserHTMLBytes || !digest(r.HTMLSHA256) || !digest(r.UploadSHA256) || r.GzipBytes < 1 || r.GzipBytes > MaxBrowserGzipBytes ||
+			int64(len(r.Parts)) != (r.GzipBytes+BrowserPartBytes-1)/BrowserPartBytes || r.TreePeakBytes < 0 {
+			return r, nil, errors.New("browser result: inconsistent DOM upload")
 		}
-		if len(raw) > target {
-			// Cut html to what fits next to the rest of the body, counting
-			// each code point at its escaped size.
-			overhead := len(raw) - escapedJSONLen(r.HTML)
-			r.HTML, r.HTMLTruncated = fitEscaped(r.HTML, target-overhead), true
-			continue
+		for _, part := range r.Parts {
+			if !digest(part) {
+				return r, nil, errors.New("browser result: invalid part digest")
+			}
 		}
-		var buf bytes.Buffer
-		zw, err := gzip.NewWriterLevel(&buf, 6)
-		if err != nil {
-			return r, nil, err
+	case DOMTooLarge:
+		if r.HTMLBytes <= MaxBrowserHTMLBytes || r.HTMLSHA256 != "" || r.UploadSHA256 != "" || r.GzipBytes != 0 || len(r.Parts) != 0 || r.TreePeakBytes < 0 {
+			return r, nil, errors.New("browser result: inconsistent too_large")
 		}
-		if _, err := zw.Write(raw); err != nil {
-			return r, nil, err
+	case DOMMemory:
+		if r.HTMLBytes != 0 || r.HTMLSHA256 != "" || r.UploadSHA256 != "" || r.GzipBytes != 0 || len(r.Parts) != 0 || r.TreePeakBytes < 1 {
+			return r, nil, errors.New("browser result: inconsistent memory")
 		}
-		if err := zw.Close(); err != nil {
-			return r, nil, err
-		}
-		if buf.Len() <= MaxBrowserResultGzipBytes {
-			return r, buf.Bytes(), nil
-		}
-		if r.HTML == "" {
-			break
-		}
-		// Barely compressible content: shrink the decompressed target by the
-		// overshoot and try again.
-		target = int(int64(target) * MaxBrowserResultGzipBytes / int64(buf.Len()) * 15 / 16)
+	default:
+		return r, nil, errors.New("browser result: unknown dom state")
 	}
-	return r, nil, errors.New("browser result cannot fit the upload limits")
-}
-
-func encodeBrowserJSON(r *BrowserResult) ([]byte, error) {
-	sum := sha256.Sum256([]byte(r.HTML))
-	r.HTMLBytes, r.HTMLSHA256 = len(r.HTML), hex.EncodeToString(sum[:])
 	var buf bytes.Buffer
 	e := json.NewEncoder(&buf)
 	e.SetEscapeHTML(false)
 	if err := e.Encode(r); err != nil {
-		return nil, err
+		return r, nil, err
 	}
-	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
+	raw := bytes.TrimSuffix(buf.Bytes(), []byte("\n"))
+	if len(raw) > maxBrowserManifestBytes {
+		return r, nil, errors.New("browser result manifest too large")
+	}
+	return r, raw, nil
 }
 
-// cutUTF8 returns the longest prefix of s within limit bytes that ends on a
-// code point boundary.
-func cutUTF8(s string, limit int) string {
-	if limit <= 0 {
-		return ""
-	}
-	if len(s) <= limit {
-		return s
-	}
-	for limit > 0 && !utf8.RuneStart(s[limit]) {
-		limit--
-	}
-	return s[:limit]
+// UploadStats counts what one UploadBrowserResult sent, for the node's log.
+type UploadStats struct {
+	PartsSent, PartsSkipped, Retries int
 }
 
-// escapedRuneLen is how many bytes encoding/json writes for r inside a string
-// with HTML escaping off.
-func escapedRuneLen(r rune, size int) int {
-	switch {
-	case r == '"' || r == '\\' || r == '\n' || r == '\r' || r == '\t' || r == '\b' || r == '\f':
-		return 2
-	case r < 0x20 || r == '\u2028' || r == '\u2029' || r == utf8.RuneError && size == 1:
-		return 6
-	}
-	return size
-}
-
-func escapedJSONLen(s string) int {
-	n := 0
-	for i := 0; i < len(s); {
-		r, size := utf8.DecodeRuneInString(s[i:])
-		n += escapedRuneLen(r, size)
-		i += size
-	}
-	return n
-}
-
-// fitEscaped returns the longest code point prefix of s whose escaped size is
-// within limit.
-func fitEscaped(s string, limit int) string {
-	n := 0
-	for i := 0; i < len(s); {
-		r, size := utf8.DecodeRuneInString(s[i:])
-		n += escapedRuneLen(r, size)
-		if n > limit {
-			return s[:i]
-		}
-		i += size
-	}
-	return s
-}
-
-// UploadBrowserResult posts one gzip browser result for jobID and returns nil
-// once the coordinator stored it (200). It uses the client's transport, roots
-// and version headers but not its 10-second timeout: every try runs under the
-// report deadline instead, starts only while max(15 s, size / 250 kB/s) is
-// left before it, and at most three tries are made, the retries after 1 and
-// 2 seconds or the coordinator's Retry-After. Only a transport failure, 429
-// or 5xx is retried; the coordinator stores one body per attempt and answers
-// a repeat of the same body with 200.
-func (c *Client) UploadBrowserResult(ctx context.Context, jobID string, gzipBody []byte, report time.Time) error {
-	path, err := JobPath(jobID, "browser-result")
+// UploadBrowserResult stores the browser's result for jobID: with r.DOM "ok"
+// the parts of the gzip stream at gzipPath first, then the manifest r. It
+// uses the client's transport, roots and version headers but not its
+// 10-second timeout: every request runs under the report deadline. It reads
+// the stored part set first and skips parts already stored under the same
+// upload sha256 (the coordinator replaces a set with a different one). Each
+// part is held in memory alone, and each part or manifest is tried at most
+// three times, after 1, 2 and 4 seconds or the coordinator's Retry-After;
+// only a transport failure, 429 or 5xx is retried. A part try starts only
+// while max(10 s, size / 250 kB/s + 5 s) is left before report, a manifest
+// try while 3 s is. A manifest answered 409 parts_incomplete sends the
+// missing parts once more and posts again.
+func (c *Client) UploadBrowserResult(ctx context.Context, jobID string, r BrowserResult, gzipPath string, report time.Time) (UploadStats, error) {
+	var stats UploadStats
+	base, err := JobPath(jobID, "browser-result")
 	if err != nil {
-		return err
+		return stats, err
 	}
-	if len(gzipBody) == 0 || len(gzipBody) > MaxBrowserResultGzipBytes {
-		return errors.New("browser result upload: invalid body size")
-	}
-	need := max(browserUploadMinimum, time.Duration(int64(len(gzipBody))*int64(time.Second)/browserUploadRate))
-	backoff := browserUploadBackoff
-	if c.uploadBackoff != nil {
-		backoff = c.uploadBackoff
+	r, manifest, err := EncodeBrowserResult(r)
+	if err != nil {
+		return stats, err
 	}
 	client := *c.HTTP
 	client.Timeout = 0
+	u := browserUploader{c: c, client: &client, base: base, r: r, report: report, stats: &stats}
+	if r.DOM == DOMOK {
+		file, err := os.Open(gzipPath)
+		if err != nil {
+			return stats, errors.New("browser DOM gzip file unreadable")
+		}
+		defer file.Close()
+		if info, err := file.Stat(); err != nil || info.Size() != r.GzipBytes {
+			return stats, errors.New("browser DOM gzip file does not match the manifest")
+		}
+		u.file = file
+		if err := u.sendParts(ctx); err != nil {
+			return stats, err
+		}
+	}
+	for round := 0; ; round++ {
+		status, err := u.send(ctx, http.MethodPost, base, manifest, "application/json", nil, browserManifestMinimum)
+		if err == nil {
+			return stats, nil
+		}
+		var se *StatusError
+		if round > 0 || r.DOM != DOMOK || !errors.As(err, &se) || status != http.StatusConflict || se.Code != "parts_incomplete" {
+			return stats, err
+		}
+		if err := u.sendParts(ctx); err != nil {
+			return stats, err
+		}
+	}
+}
+
+type browserUploader struct {
+	c      *Client
+	client *http.Client
+	base   string
+	r      BrowserResult
+	file   *os.File
+	report time.Time
+	stats  *UploadStats
+}
+
+// sendParts sends every part the coordinator does not hold yet.
+func (u *browserUploader) sendParts(ctx context.Context) error {
+	have := u.storedParts(ctx)
+	buf := make([]byte, BrowserPartBytes)
+	for i, want := range u.r.Parts {
+		n := i + 1
+		if have[n] == want {
+			u.stats.PartsSkipped++
+			continue
+		}
+		size := min(int64(BrowserPartBytes), u.r.GzipBytes-int64(i)*BrowserPartBytes)
+		part := buf[:size]
+		if _, err := u.file.ReadAt(part, int64(i)*BrowserPartBytes); err != nil {
+			return errors.New("browser DOM gzip file unreadable")
+		}
+		sum := sha256.Sum256(part)
+		if hex.EncodeToString(sum[:]) != want {
+			return errors.New("browser DOM gzip file changed")
+		}
+		need := max(browserPartMinimum, time.Duration(size)*time.Second/browserUploadRate+browserManifestReserve)
+		headers := map[string]string{"X-Scarlett-Part-SHA256": want}
+		if _, err := u.send(ctx, http.MethodPut, u.base+"/parts/"+strconv.Itoa(n), part, "application/octet-stream", headers, need); err != nil {
+			return err
+		}
+		u.stats.PartsSent++
+	}
+	return nil
+}
+
+// storedParts reads GET …/parts once and returns the part digests stored
+// under this upload's sha256. Any failure reads as nothing stored.
+func (u *browserUploader) storedParts(ctx context.Context) map[int]string {
+	have := map[int]string{}
+	if time.Until(u.report) < browserPartMinimum {
+		return have
+	}
+	tryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := u.request(tryCtx, http.MethodGet, u.base+"/parts", nil, "")
+	if err != nil {
+		return have
+	}
+	resp, err := u.client.Do(req)
+	if err != nil {
+		return have
+	}
+	defer resp.Body.Close()
+	u.c.observeRelease(resp.Header)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBrowserPartsReply+1))
+	var stored BrowserResultParts
+	if resp.StatusCode != http.StatusOK || err != nil || len(data) > maxBrowserPartsReply || json.Unmarshal(data, &stored) != nil || stored.UploadSHA256 != u.r.UploadSHA256 {
+		return have
+	}
+	for _, p := range stored.Parts {
+		if p.N >= 1 && p.N <= MaxBrowserParts && digest(p.SHA256) {
+			have[p.N] = p.SHA256
+		}
+	}
+	return have
+}
+
+func (u *browserUploader) request(ctx context.Context, method, path string, body []byte, contentType string) (*http.Request, error) {
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u.c.Origin+path, reader)
+	if err != nil {
+		return nil, err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set(NodeVersionHeader, NodeRelease)
+	req.Header.Set("X-Scarlett-Attempt", u.r.Attempt)
+	req.Header.Set("X-Scarlett-Fence", u.r.Fence)
+	req.Header.Set("X-Scarlett-Request-SHA256", u.r.RequestSHA256)
+	if u.r.UploadSHA256 != "" {
+		req.Header.Set("X-Scarlett-Upload-SHA256", u.r.UploadSHA256)
+	}
+	if u.c.Credential != "" {
+		req.Header.Set("Authorization", "Bearer "+u.c.Credential)
+	}
+	return req, nil
+}
+
+// send makes one request with the upload's retry rule and returns its last
+// status. need is the least time before the report deadline for a try.
+func (u *browserUploader) send(ctx context.Context, method, path string, body []byte, contentType string, headers map[string]string, need time.Duration) (int, error) {
+	backoff := browserUploadBackoff
+	if u.c.uploadBackoff != nil {
+		backoff = u.c.uploadBackoff
+	}
 	var last error = ErrBrowserUploadTooLate
+	status := 0
 	for try := 0; try < browserUploadTries; try++ {
 		if try > 0 {
 			wait := backoff[min(try-1, len(backoff)-1)]
-			var status *StatusError
-			if errors.As(last, &status) && status.RetryAfter > wait {
-				wait = status.RetryAfter
+			var se *StatusError
+			if errors.As(last, &se) && se.RetryAfter > wait {
+				wait = se.RetryAfter
 			}
-			if time.Until(report)-wait < need {
-				return last
+			if time.Until(u.report)-wait < need {
+				return status, last
 			}
+			u.stats.Retries++
 			timer := time.NewTimer(wait)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return last
+				return status, last
 			case <-timer.C:
 			}
 		}
-		if time.Until(report) < need {
-			return last
+		if time.Until(u.report) < need {
+			return status, last
 		}
 		var retry bool
-		retry, last = c.uploadBrowserResultOnce(ctx, &client, path, gzipBody, report)
+		status, retry, last = u.once(ctx, method, path, body, contentType, headers)
 		if last == nil || !retry {
-			return last
+			return status, last
 		}
 	}
-	return last
+	return status, last
 }
 
-func (c *Client) uploadBrowserResultOnce(ctx context.Context, client *http.Client, path string, body []byte, report time.Time) (bool, error) {
-	tryCtx, cancel := context.WithDeadline(ctx, report)
+func (u *browserUploader) once(ctx context.Context, method, path string, body []byte, contentType string, headers map[string]string) (int, bool, error) {
+	tryCtx, cancel := context.WithDeadline(ctx, u.report)
 	defer cancel()
-	req, err := http.NewRequestWithContext(tryCtx, http.MethodPost, c.Origin+path, bytes.NewReader(body))
+	req, err := u.request(tryCtx, method, path, body, contentType)
 	if err != nil {
-		return false, err
+		return 0, false, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Content-Encoding", "gzip")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set(NodeVersionHeader, NodeRelease)
-	if c.Credential != "" {
-		req.Header.Set("Authorization", "Bearer "+c.Credential)
+	for name, value := range headers {
+		req.Header.Set(name, value)
 	}
-	resp, err := client.Do(req)
+	resp, err := u.client.Do(req)
 	if err != nil {
-		return ctx.Err() == nil, errors.New("coordinator unavailable")
+		return 0, ctx.Err() == nil, errors.New("coordinator unavailable")
 	}
 	defer resp.Body.Close()
-	c.observeRelease(resp.Header)
+	u.c.observeRelease(resp.Header)
 	if resp.StatusCode == http.StatusOK {
-		return false, nil
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBytes))
+		return resp.StatusCode, false, nil
 	}
 	err = statusError(resp)
-	return resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500, err
+	return resp.StatusCode, resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500, fmt.Errorf("%s %s: %w", method, browserRoute(path), err)
+}
+
+// browserRoute names a browser-result route for errors without the job ID.
+func browserRoute(path string) string {
+	switch {
+	case strings.HasSuffix(path, "/parts"):
+		return "parts"
+	case strings.Contains(path, "/parts/"):
+		return "part"
+	}
+	return "manifest"
 }

@@ -22,7 +22,8 @@ func processGone(pid int) bool {
 }
 
 // The helper runs in a Job assigned before it ran: kill on close, a commit
-// backstop of the kill threshold plus 2 GiB, below-normal priority.
+// backstop of the kill threshold (from the memory rule) plus 2 GiB,
+// below-normal priority.
 func TestWindowsHelperJobAndPriority(t *testing.T) {
 	s := newTestManager(t, "ok")
 	s.prepare(t)
@@ -36,9 +37,11 @@ func TestWindowsHelperJobAndPriority(t *testing.T) {
 	if err := windows.QueryInformationJobObject(h.p.job, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits)), nil); err != nil {
 		t.Fatal(err)
 	}
-	_, kill := Thresholds(2)
-	if limits.BasicLimitInformation.LimitFlags&windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE == 0 ||
-		limits.BasicLimitInformation.LimitFlags&windows.JOB_OBJECT_LIMIT_JOB_MEMORY == 0 || uint64(limits.JobMemoryLimit) != kill+2*gib {
+	// The test machine reports 32 GiB: kill = max(4.25 GiB, 8 GiB), so the
+	// job limit follows the physical-memory rule, not the capacity alone.
+	_, kill := Thresholds(2, 32<<30)
+	if kill != 8*gib || limits.BasicLimitInformation.LimitFlags&windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE == 0 ||
+		limits.BasicLimitInformation.LimitFlags&windows.JOB_OBJECT_LIMIT_JOB_MEMORY == 0 || uint64(limits.JobMemoryLimit) != jobMemoryLimit(kill) {
 		t.Fatalf("job limits %+v", limits.BasicLimitInformation)
 	}
 	pids, err := h.p.jobPIDs()

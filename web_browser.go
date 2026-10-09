@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/teslashibe/scarlett-node/internal/config"
+	"github.com/teslashibe/scarlett-node/internal/coordinator"
 	"github.com/teslashibe/scarlett-node/internal/worker"
 )
 
@@ -36,15 +37,22 @@ var checkWebRuntime = func(ctx context.Context, resources, state string, withBro
 	return errors.New("web runtime is not part of this build")
 }
 
+// browserUploadFunc is coordinator.Client.UploadBrowserResult.
+type browserUploadFunc func(ctx context.Context, jobID string, manifest coordinator.BrowserResult, gzipPath string, report time.Time) (coordinator.UploadStats, error)
+
 // logBrowserUpload logs each browser result upload that the coordinator did
-// not store, with its status and error code ("coordinator HTTP 404"). The
-// worker serves the job from the proven re-fetch either way, so without this
-// line a refused upload shows only as a failed browser_upload diagnostic.
-func logBrowserUpload(upload func(ctx context.Context, jobID string, gzipBody []byte, report time.Time) error, out io.Writer) func(ctx context.Context, jobID string, gzipBody []byte, report time.Time) error {
-	return func(ctx context.Context, jobID string, gzipBody []byte, report time.Time) error {
-		err := upload(ctx, jobID, gzipBody, report)
+// not store, with the route, status and error code ("PUT part: coordinator
+// HTTP 503 network_unavailable"), and the part counts and retries of every
+// upload that sent parts. The worker serves the job from the proven re-fetch
+// either way, so without this line a refused upload shows only as a failed
+// browser_upload diagnostic.
+func logBrowserUpload(upload browserUploadFunc, out io.Writer) func(ctx context.Context, jobID string, manifest coordinator.BrowserResult, gzipPath string, report time.Time) error {
+	return func(ctx context.Context, jobID string, manifest coordinator.BrowserResult, gzipPath string, report time.Time) error {
+		stats, err := upload(ctx, jobID, manifest, gzipPath, report)
 		if err != nil {
-			fmt.Fprintln(out, "web browser: result upload not stored:", err)
+			fmt.Fprintf(out, "web browser: result upload not stored (dom %s, %d parts sent, %d skipped, %d retries): %v\n", manifest.DOM, stats.PartsSent, stats.PartsSkipped, stats.Retries, err)
+		} else if stats.Retries > 0 || stats.PartsSkipped > 0 {
+			fmt.Fprintf(out, "web browser: result stored (dom %s, %d parts sent, %d skipped, %d retries)\n", manifest.DOM, stats.PartsSent, stats.PartsSkipped, stats.Retries)
 		}
 		return err
 	}
