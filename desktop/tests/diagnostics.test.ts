@@ -253,14 +253,14 @@ test("A busy web node's history counts from the oldest page kept", () => {
 test("The history bounds match what the node writes", () => {
   const schema = readFileSync(new URL("../../internal/diagnostics/schema.go", import.meta.url), "utf8");
   const quota = readFileSync(new URL("../../internal/diagnostics/quota.go", import.meta.url), "utf8");
-  const constant = (name: string) => schema.match(new RegExp(`\\b${name}\\s+=\\s+([^\\n/]+)`))?.[1].trim();
+  const constant = (name: string) => schema.match(new RegExp(`\\b${name}\\s+=\\s+([^\\r\\n/]+)`))?.[1].trim();
   assert.equal(constant("MaxAttempts"), String(MAX_RETAINED_ATTEMPTS));
   assert.equal(constant("MaxHistoryBytes"), "1 << 20");
   assert.equal(MAX_HISTORY_BYTES, 1 << 20);
   assert.equal(constant("MaxAttemptBytes"), "8 << 10");
   assert.equal(MAX_ATTEMPT_BYTES, 8 << 10);
-  assert.match(quota, /const quotaSnapshotBytes = 512\n/);
-  assert.match(quota, /return 700 \+ len\(r\.Spans\)\*144 \+ len\(r\.QuotaSnapshots\)\*quotaSnapshotBytes\n/);
+  assert.match(quota, /const quotaSnapshotBytes = 512\r?\n/);
+  assert.match(quota, /return 700 \+ len\(r\.Spans\)\*144 \+ len\(r\.QuotaSnapshots\)\*quotaSnapshotBytes\r?\n/);
   assert.equal(historyBytes([{...web(1), spans: spans(2)}]), 700 + 2 * 144);
 });
 test("Web pages served is unknown when local history cannot be read", () => {
