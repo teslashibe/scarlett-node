@@ -23,6 +23,10 @@ import {
   statusPredates,
   xProofModes,
   xLoginMessage,
+  webServingNote,
+  webServingSaved,
+  accountsEmptyText,
+  servingNote,
   type XLoginStatus,
   type Account,
   type Preferences,
@@ -55,7 +59,8 @@ let mutationEpoch = 0;
 let claudePolling = false;
 let browserProfilesAvailable = false;
 let preferencesAvailable = false;
-// The saved settings the form does not edit (update mode, resume on launch).
+// The saved settings the form does not edit (update mode, resume on launch,
+// web pages).
 let savedPreferences: Preferences | undefined;
 let updateStatus: UpdateStatus | undefined;
 let updatePolling = false;
@@ -101,12 +106,17 @@ function render(s: Snapshot) {
   setText($("metric-jobs"), String(s.observation?.in_flight ?? "Unknown"));
   setText($("metric-pending"), String(s.observation?.unresolved_attempts ?? "Unknown"));
   $("accounts-empty").hidden = accounts.length > 0 || draining.length > 0;
+  setText($("accounts-empty"), accountsEmptyText(s));
   $("x-profile").toggleAttribute("disabled", busy || !browserProfilesAvailable);
   $("x-consent").toggleAttribute("disabled", busy || !browserProfilesAvailable);
   $("x-import").toggleAttribute("disabled", busy || !s.accounts_available || !browserProfilesAvailable || !$<HTMLSelectElement>("x-profile").value || !$<HTMLInputElement>("x-consent").checked);
   for (const id of ["background", "saved-api-port", "x-concurrency"]) $(id).toggleAttribute("disabled", busy || !preferencesAvailable);
   $("preferences-form").querySelector("button")!.toggleAttribute("disabled", busy || !preferencesAvailable);
   $("autostart").toggleAttribute("disabled", busy || !autostartAvailable);
+  $("serve-web").toggleAttribute("disabled", busy || !preferencesAvailable);
+  const webNote = webServingNote(s);
+  setText($("web-note"), webNote);
+  $("web-note").hidden = !webNote;
   const local = s.local_api;
   setText($("api-summary"), !local?.available ? "Unavailable" : local.running ? (local.ready ? "Ready" : "Not ready") : "Stopped");
   $("api-status").textContent = local?.running ? `${local.ready ? "Ready" : "Not ready"} · ${local.base_url ?? ""} · ${local.claude_enabled ? "Codex and Claude" : "Codex"}` : local?.available ? "Stopped · listens only on this device" : "Local API controls are unavailable in this build";
@@ -151,7 +161,7 @@ function render(s: Snapshot) {
         ? "The proof helper is missing. New work is disabled"
         : local?.running
           ? "Quit and reopen Scarlett before starting X network jobs"
-          : journalNote(s) || "Serve X network jobs with the accounts connected to this device";
+          : journalNote(s) || servingNote(s);
   $("start").toggleAttribute("disabled", busy || !canStart(s));
   const controllable = s.supervised || externalRuntime(s);
   const paused = s.observation?.drain_requested;
@@ -596,6 +606,7 @@ async function loadPreferences() {
   $<HTMLInputElement>("saved-api-port").value = String(settings.local_api_port);
   $<HTMLInputElement>("background").checked = settings.background;
   $<HTMLInputElement>("x-concurrency").value = String(settings.x_concurrency);
+  $<HTMLInputElement>("serve-web").checked = settings.serve_web;
   preferencesAvailable = true;
   try {
     $<HTMLInputElement>("autostart").checked = await api.autostart();
@@ -613,11 +624,25 @@ $("preferences-form").addEventListener("submit", event => {
   void act(async () => {
     const current = await api.preferences().catch(() => savedPreferences);
     await api.savePreferences({schema: 1, local_api_port: port, background, x_concurrency: xConcurrency,
-      updates: current?.updates ?? "notify", resume_serving: current?.resume_serving ?? false});
+      updates: current?.updates ?? "notify", resume_serving: current?.resume_serving ?? false,
+      serve_web: current?.serve_web ?? true});
     if (!snapshot?.local_api?.running) $<HTMLInputElement>("api-port").value = String(port);
   }, background
     ? "Preferences saved. Closing the window keeps Scarlett running"
     : "Preferences saved. Closing the window quits Scarlett");
+});
+$("serve-web").addEventListener("change", () => {
+  const input = $<HTMLInputElement>("serve-web");
+  const enabled = input.checked;
+  if (busy) { input.checked = !enabled; return; }
+  void act(async () => {
+    try { await api.setWebServing(enabled); }
+    finally {
+      // Show what is saved, whether or not the change was.
+      const saved = await api.preferences().catch(() => undefined);
+      if (saved) { savedPreferences = saved; input.checked = saved.serve_web; }
+    }
+  }, webServingSaved(enabled, !!snapshot?.supervised));
 });
 $("autostart").addEventListener("change", () => {
   const input = $<HTMLInputElement>("autostart");

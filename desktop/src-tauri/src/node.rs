@@ -223,9 +223,12 @@ pub struct Snapshot {
     /// `relay_halted`, this tells a pending resume (marker gone, node not yet
     /// caught up) from a halt nobody has resumed.
     pub relay_halt_marker: bool,
-    /// The node also serves web pages (SCARLETT_DESKTOP_WEB=1), which need no
-    /// provider account, so it may start with none.
+    /// The saved "Serve web pages" setting. Web needs no provider account, so
+    /// with it on the node may start with none.
     pub web_enabled: bool,
+    /// The running node was started with the other web setting; it changes
+    /// on the next Stop and Start.
+    pub web_restart_pending: bool,
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
@@ -314,9 +317,11 @@ pub struct Node {
     x_concurrency: std::sync::atomic::AtomicU8,
     x_login_resources: PathBuf,
     x_login_browser: Option<PathBuf>,
-    /// Serve web pages as well. Set only from the trusted desktop process
-    /// environment (SCARLETT_DESKTOP_WEB=1); there is no preference for it yet.
-    web: bool,
+    /// Serve web pages as well: the saved device setting, on by default. Like
+    /// X concurrency it applies to the next child process.
+    web: AtomicBool,
+    /// The web setting the supervised child was started with.
+    web_running: AtomicBool,
     /// An explicit SCARLETT_WEB_BROWSER ("on" or "off") from the same trusted
     /// environment, passed on only with web. Unset, the node's platform
     /// default applies (on for macOS, off for Windows in this release).
@@ -460,6 +465,9 @@ pub(crate) fn private_dir_with_helper(path: &Path, helper: &Path) -> Result<()> 
         Ok(())
     }
 }
+/// The largest reply `private_helper` reads. The longest is the device
+/// preferences (136 bytes with every field at its widest).
+pub(crate) const PRIVATE_HELPER_REPLY_LIMIT: usize = 256;
 pub(crate) fn private_helper(binary: &Path, action: &str, path: &Path) -> Result<Value> {
     if !path.is_absolute() || !regular(binary) {
         return Err(Error::PrivateStorageUnavailable);
@@ -508,10 +516,10 @@ pub(crate) fn private_helper(binary: &Path, action: &str, path: &Path) -> Result
         .stdout
         .take()
         .ok_or(Error::PrivateStorageUnavailable)?
-        .take(129)
+        .take(PRIVATE_HELPER_REPLY_LIMIT as u64 + 1)
         .read_to_end(&mut output)
         .map_err(|_| Error::PrivateStorageUnavailable)?;
-    if !status.success() || output.len() > 128 {
+    if !status.success() || output.len() > PRIVATE_HELPER_REPLY_LIMIT {
         return Err(Error::PrivateStorageUnavailable);
     }
     serde_json::from_slice(&output).map_err(|_| Error::PrivateStorageUnavailable)
@@ -718,7 +726,8 @@ impl Node {
             ),
             x_login_resources: PathBuf::new(),
             x_login_browser: None,
-            web: false,
+            web: AtomicBool::new(crate::preferences::default_serve_web()),
+            web_running: AtomicBool::new(false),
             web_browser: None,
         }
     }
@@ -733,7 +742,6 @@ impl Node {
     }
     pub fn from_environment(state: PathBuf, binary: PathBuf, helper: PathBuf) -> Result<Self> {
         let mut node = Self::new(state, binary, helper);
-        node.web = std::env::var_os("SCARLETT_DESKTOP_WEB").is_some_and(|v| v == "1");
         node.web_browser =
             web_browser_setting(std::env::var("SCARLETT_WEB_BROWSER").ok().as_deref());
         let browser = std::env::var_os("SCARLETT_X_LOGIN_BROWSER").map(PathBuf::from);
@@ -761,6 +769,11 @@ impl Node {
         self.x_concurrency.store(concurrency, Ordering::SeqCst);
         Ok(())
     }
+    /// Device setting for the next child process. A running node keeps
+    /// serving as it was started until the operator stops and starts it.
+    pub fn set_web(&self, enabled: bool) {
+        self.web.store(enabled, Ordering::SeqCst);
+    }
     pub fn network_url(&self, destination: &str) -> Result<String> {
         let path = match destination {
             "setup" => "/setup/",
@@ -776,6 +789,9 @@ impl Node {
         Ok(())
     }
     pub(crate) fn command(&self, args: &[&str]) -> Result<Command> {
+        self.command_with_web(args, self.web.load(Ordering::SeqCst))
+    }
+    fn command_with_web(&self, args: &[&str], web: bool) -> Result<Command> {
         self.prepare()?;
         if !regular(&self.binary) {
             return Err(Error::RuntimeUnavailable);
@@ -809,7 +825,7 @@ impl Node {
             .env("SCARLETT_EXECUTOR", "services")
             .env(
                 "SCARLETT_SERVICES",
-                if self.web {
+                if web {
                     "codex,x_read,web"
                 } else {
                     "codex,x_read"
@@ -836,7 +852,7 @@ impl Node {
             .kill_on_drop(true);
         #[cfg(windows)]
         cmd.creation_flags(0x08000000);
-        if self.web {
+        if web {
             cmd.env("SCARLETT_WEB_CONCURRENCY", "4");
             if let Some(browser) = self.web_browser {
                 cmd.env("SCARLETT_WEB_BROWSER", browser);
@@ -1288,10 +1304,11 @@ impl Node {
             return Err(Error::RuntimeUnavailable);
         }
         // Web serves pages without any provider account.
-        if self.accounts().await?.is_empty() && !self.web {
+        let web = self.web.load(Ordering::SeqCst);
+        if self.accounts().await?.is_empty() && !web {
             return Err(Error::AccountsUnavailable);
         }
-        let mut cmd = self.command(&["desktop", "run"])?;
+        let mut cmd = self.command_with_web(&["desktop", "run"], web)?;
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -1300,6 +1317,7 @@ impl Node {
             cmd.process_group(0);
         }
         *running = Some(cmd.spawn().map_err(|_| Error::RuntimeUnavailable)?);
+        self.web_running.store(web, Ordering::SeqCst);
         Ok(())
     }
     pub async fn control(&self, action: &str) -> Result<()> {
@@ -1548,7 +1566,7 @@ impl Node {
             s.observation = observation_projection(&raw).ok();
         }
         s.relay_halt_marker = self.relay_halt_marker();
-        s.web_enabled = self.web;
+        s.web_enabled = self.web.load(Ordering::SeqCst);
         let mut run = self.running.lock().await;
         if let Some(p) = run.as_mut() {
             s.supervised = p.try_wait().ok().flatten().is_none();
@@ -1556,6 +1574,8 @@ impl Node {
                 *run = None;
             }
         }
+        s.web_restart_pending =
+            s.supervised && self.web_running.load(Ordering::SeqCst) != s.web_enabled;
         s.login_pending = self.login.lock().await.is_some();
         s.login_error = self.login_error.lock().await.clone();
         s
@@ -2746,7 +2766,7 @@ esac
     }
     #[cfg(unix)]
     #[test]
-    fn launcher_adds_web_only_when_enabled() {
+    fn launcher_serves_web_by_default_and_follows_the_setting() {
         let temp = tempfile::tempdir().unwrap();
         let binary = temp.path().join("node");
         std::fs::write(&binary, "synthetic node").unwrap();
@@ -2768,10 +2788,7 @@ esac
                 })
                 .collect()
         };
-        let plain = env(&node);
-        assert_eq!(plain["SCARLETT_SERVICES"].as_deref(), Some("codex,x_read"));
-        assert!(!plain.contains_key("SCARLETT_WEB_CONCURRENCY"));
-        node.web = true;
+        // No saved setting: web is on, with the default capacity.
         let web = env(&node);
         assert_eq!(
             web["SCARLETT_SERVICES"].as_deref(),
@@ -2782,10 +2799,14 @@ esac
         // The node's platform default applies unless the trusted environment
         // set the browser tier explicitly; it is passed on only with web.
         assert!(!web.contains_key("SCARLETT_WEB_BROWSER"));
+        node.set_web(false);
+        let plain = env(&node);
+        assert_eq!(plain["SCARLETT_SERVICES"].as_deref(), Some("codex,x_read"));
+        assert!(!plain.contains_key("SCARLETT_WEB_CONCURRENCY"));
         node.web_browser = web_browser_setting(Some("on"));
-        assert_eq!(env(&node)["SCARLETT_WEB_BROWSER"].as_deref(), Some("on"));
-        node.web = false;
         assert!(!env(&node).contains_key("SCARLETT_WEB_BROWSER"));
+        node.set_web(true);
+        assert_eq!(env(&node)["SCARLETT_WEB_BROWSER"].as_deref(), Some("on"));
         for (value, want) in [
             (Some("off"), Some("off")),
             (Some("on"), Some("on")),
@@ -2799,7 +2820,7 @@ esac
     }
     #[cfg(unix)]
     #[tokio::test]
-    async fn web_node_starts_without_accounts() {
+    async fn web_node_starts_without_accounts_and_applies_changes_on_restart() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let binary = temp.path().join("node");
@@ -2807,19 +2828,58 @@ esac
         std::fs::write(&binary, "#!/bin/sh\ncase \"$1 $2\" in\n'accounts list') printf '[]';;\n'desktop run') cat >/dev/null;;\n'drain ') exit 0;;\n'status ') printf '{\"state\":\"running\",\"services\":[{\"kind\":\"web\",\"state\":\"configured\",\"capacity\":4,\"egress\":\"direct\",\"max_input_bytes\":32768}]}';;\n*) exit 1;;\nesac\n").unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(&helper, "synthetic helper fixture").unwrap();
-        let mut node = Node::new(temp.path().join("state"), binary, helper);
+        let node = Node::new(temp.path().join("state"), binary, helper);
         node.prepare().unwrap();
         std::fs::write(node.state.join("identity.json"), "{}").unwrap();
+        node.set_web(false);
         assert_eq!(node.start().await, Err(Error::AccountsUnavailable));
-        node.web = true;
+        assert!(!node.snapshot().await.web_enabled);
+        node.set_web(true);
         node.start().await.unwrap();
         let snapshot = node.snapshot().await;
-        assert!(snapshot.web_enabled && snapshot.supervised);
+        assert!(snapshot.web_enabled && snapshot.supervised && !snapshot.web_restart_pending);
         let service = &snapshot.observation.unwrap()["services"][0];
         assert_eq!(service["kind"], "web");
         assert_eq!(service["egress"], "direct");
         assert!(service.get("max_input_bytes").is_none());
+        // Turning web off while it runs never restarts accepted work: the
+        // running node keeps its services until the next Stop and Start.
+        node.set_web(false);
+        let snapshot = node.snapshot().await;
+        assert!(!snapshot.web_enabled && snapshot.supervised && snapshot.web_restart_pending);
+        node.set_web(true);
+        assert!(!node.snapshot().await.web_restart_pending);
+        node.set_web(false);
         node.stop().await.unwrap();
+        let snapshot = node.snapshot().await;
+        assert!(!snapshot.supervised && !snapshot.web_restart_pending);
+        assert_eq!(node.start().await, Err(Error::AccountsUnavailable));
+    }
+    /// The saved setting reaches the node helper and back, through the real
+    /// helper when one is supplied (desktop-complete builds it).
+    #[tokio::test]
+    async fn web_setting_persists_off_through_the_node_helper() {
+        let Some(helper) = std::env::var_os("SCARLETT_TEST_NODE_BINARY").map(PathBuf::from) else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let node = Node::new(state.clone(), helper.clone(), temp.path().join("prover"));
+        node.prepare().unwrap();
+        let saved = crate::preferences::Preferences::load(&state, &helper)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert!(saved.serve_web);
+        let mut off = saved.clone();
+        off.serve_web = false;
+        node.save_preferences(&off).await.unwrap();
+        let reopened = crate::preferences::Preferences::load(&state, &helper)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(reopened, off);
+        assert!(state.join("web-preferences-v1.json").is_file());
     }
     #[cfg(unix)]
     #[tokio::test]

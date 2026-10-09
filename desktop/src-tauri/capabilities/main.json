@@ -29,6 +29,7 @@
     "allow-local-api-key",
     "allow-desktop-preferences",
     "allow-save-desktop-preferences",
+    "allow-set-web-serving",
     "allow-desktop-autostart",
     "allow-set-desktop-autostart",
     "allow-update-status",

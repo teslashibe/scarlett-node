@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,13 +22,13 @@ func TestDesktopPreferencesPersistPrivatelyWithoutChangingDefaultsOnReads(t *tes
 	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil {
 		t.Fatal(err)
 	}
-	if out.String() != "{\"schema\":1,\"local_api_port\":8088,\"background\":false,\"x_concurrency\":2,\"updates\":\"notify\",\"resume_serving\":false}\n" {
+	if out.String() != "{\"schema\":1,\"local_api_port\":8088,\"background\":false,\"x_concurrency\":2,\"updates\":\"notify\",\"resume_serving\":false,\"serve_web\":true}\n" {
 		t.Fatal("unexpected defaults")
 	}
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
 		t.Fatal("read wrote preferences")
 	}
-	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":3,"updates":"automatic","resume_serving":true}`
+	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":3,"updates":"automatic","resume_serving":true,"serve_web":false}`
 	out.Reset()
 	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(value), &out); err != nil {
 		t.Fatal(err)
@@ -93,7 +95,7 @@ func TestDesktopPreferencesMigrateExistingSettingsAndBoundXConcurrency(t *testin
 	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(out.String()) != `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":2,"updates":"notify","resume_serving":false}` {
+	if strings.TrimSpace(out.String()) != `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":2,"updates":"notify","resume_serving":false,"serve_web":true}` {
 		t.Fatal("old preferences did not retain values with default concurrency")
 	}
 	stored, err := os.ReadFile(path)
@@ -118,7 +120,7 @@ func TestSavedThroughputPreferencesRetainDesktop013RollbackRepresentation(t *tes
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "preferences.json")
-	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":4,"updates":"notify","resume_serving":false}`
+	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":4,"updates":"notify","resume_serving":false,"serve_web":true}`
 	var out bytes.Buffer
 	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(value), &out); err != nil {
 		t.Fatal(err)
@@ -153,7 +155,7 @@ func TestLifecyclePreferencesDefaultToNotifyAndRoundTrip(t *testing.T) {
 	}
 	path := filepath.Join(dir, "preferences.json")
 	var out bytes.Buffer
-	value := `{"schema":1,"local_api_port":8088,"background":false,"x_concurrency":2,"updates":"automatic","resume_serving":true}`
+	value := `{"schema":1,"local_api_port":8088,"background":false,"x_concurrency":2,"updates":"automatic","resume_serving":true,"serve_web":true}`
 	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(value), &out); err != nil {
 		t.Fatal(err)
 	}
@@ -182,5 +184,106 @@ func TestLifecyclePreferencesDefaultToNotifyAndRoundTrip(t *testing.T) {
 	}
 	if desktopCommand([]string{"preferences-get", path}, nil, &out) == nil {
 		t.Fatal("corrupt lifecycle extension did not fail closed")
+	}
+}
+
+// Web serving defaults on, survives reopen when turned off, and lives in its
+// own extension so desktop 0.1.13 still reads every file it knows on rollback.
+func TestWebPreferenceDefaultsOnPersistsOffAndKeepsDesktop013FilesReadable(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "private")
+	if err := localfs.EnsureDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "preferences.json")
+	webPath := filepath.Join(dir, "web-preferences-v1.json")
+	// A device updating from 0.1.13 has its files but no web extension: on.
+	for name, raw := range map[string]string{
+		"preferences.json":               `{"schema":1,"local_api_port":18088,"background":true}`,
+		"throughput-preferences-v1.json": `{"schema":1,"x_concurrency":3}`,
+		"lifecycle-preferences-v1.json":  `{"schema":1,"updates":"automatic","resume_serving":true}`,
+	} {
+		if err := localfs.WriteAtomic(filepath.Join(dir, name), []byte(raw), true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var out bytes.Buffer
+	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil ||
+		strings.TrimSpace(out.String()) != `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":3,"updates":"automatic","resume_serving":true,"serve_web":true}` {
+		t.Fatalf("0.1.13 settings did not read with web on: %v %q", err, out.String())
+	}
+	if _, err := os.Lstat(webPath); !os.IsNotExist(err) {
+		t.Fatal("read wrote the web extension")
+	}
+	off := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":3,"updates":"automatic","resume_serving":true,"serve_web":false}`
+	out.Reset()
+	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(off), &out); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil || strings.TrimSpace(out.String()) != off {
+		t.Fatal("web off did not survive reopen")
+	}
+	raw, err := os.ReadFile(webPath)
+	if err != nil || string(raw) != `{"schema":1,"serve_web":false}` {
+		t.Fatalf("unexpected web extension %q", raw)
+	}
+	f, err := localfs.OpenPrivate(webPath)
+	if err != nil {
+		t.Fatal("web extension not private", err)
+	}
+	f.Close()
+
+	// Desktop 0.1.13's readers, as released: its preferences.json struct
+	// decoded strictly (decodeDesktopPreferences at v0.1.13) and the two
+	// extension readers, which this release leaves unchanged.
+	type desktop013Preferences struct {
+		Schema        int    `json:"schema"`
+		LocalAPIPort  int    `json:"local_api_port"`
+		Background    bool   `json:"background"`
+		XConcurrency  int    `json:"x_concurrency"`
+		Updates       string `json:"updates"`
+		ResumeServing bool   `json:"resume_serving"`
+	}
+	raw, err = os.ReadFile(path)
+	if err != nil || string(raw) != `{"schema":1,"local_api_port":18088,"background":true}` {
+		t.Fatalf("preferences.json changed representation: %q", raw)
+	}
+	old := desktop013Preferences{XConcurrency: 2, Updates: "notify"}
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.DisallowUnknownFields()
+	if d.Decode(&old) != nil || d.Decode(&struct{}{}) != io.EOF || old.LocalAPIPort != 18088 || !old.Background {
+		t.Fatal("desktop 0.1.13 cannot decode preferences.json")
+	}
+	if throughput, err := readDesktopThroughputPreferences(filepath.Join(dir, "throughput-preferences-v1.json")); err != nil || throughput.XConcurrency != 3 {
+		t.Fatal("desktop 0.1.13 cannot read the throughput extension")
+	}
+	if lifecycle, err := readDesktopLifecyclePreferences(filepath.Join(dir, "lifecycle-preferences-v1.json")); err != nil || lifecycle.Updates != "automatic" || !lifecycle.ResumeServing {
+		t.Fatal("desktop 0.1.13 cannot read the lifecycle extension")
+	}
+
+	on := strings.Replace(off, `"serve_web":false`, `"serve_web":true`, 1)
+	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(on), &out); err != nil {
+		t.Fatal(err)
+	}
+	if raw, err := os.ReadFile(webPath); err != nil || string(raw) != `{"schema":1,"serve_web":true}` {
+		t.Fatalf("web on not saved: %q", raw)
+	}
+	for _, invalid := range []string{`{"schema":1}`, `{"schema":2,"serve_web":true}`, `{"schema":1,"serve_web":"on"}`, `{"schema":1,"serve_web":true,"web_browser":"on"}`, `{"schema":1,"serve_web":true}{}`, "corrupted"} {
+		if err := localfs.WriteAtomic(webPath, []byte(invalid), true); err != nil {
+			t.Fatal(err)
+		}
+		if desktopCommand([]string{"preferences-get", path}, nil, &out) == nil {
+			t.Fatalf("corrupt web extension %q did not fail closed", invalid)
+		}
+	}
+	if err := localfs.WriteAtomic(webPath, []byte(`{"schema":1,"serve_web":false}`), true); err != nil {
+		t.Fatal(err)
+	}
+	if desktopCommand([]string{"preferences-set", path}, strings.NewReader(`{"schema":1,"local_api_port":8088,"background":false,"serve_web":"yes"}`), &out) == nil {
+		t.Fatal("invalid web preference accepted")
+	}
+	out.Reset()
+	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil || strings.TrimSpace(out.String()) != off {
+		t.Fatal("invalid web input changed saved settings")
 	}
 }

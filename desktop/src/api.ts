@@ -5,6 +5,8 @@ import type { UpdateStatus } from "./update.ts";
 export const api = {
   preferences: () => invoke<Preferences>("desktop_preferences"),
   savePreferences: (data: Preferences) => invoke<void>("save_desktop_preferences", { data }),
+  // Saved at once; used from the next node start.
+  setWebServing: (enabled: boolean) => invoke<void>("set_web_serving", { enabled }),
   autostart: () => invoke<boolean>("desktop_autostart"),
   setAutostart: (enabled: boolean) => invoke<void>("set_desktop_autostart", { enabled }),
   quit: () => invoke<void>("quit_desktop"),

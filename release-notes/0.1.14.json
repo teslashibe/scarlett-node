@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "version": "0.1.14",
+  "date": "2026-10-09",
+  "title": "Web pages on by default",
+  "highlights": [
+    "Scarlett now serves web pages by default and earns from web scraping jobs, with no X account needed",
+    "Turn it off or on again with Serve web pages in Device settings; a running node picks up the change when you stop and start it"
+  ]
+}

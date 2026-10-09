@@ -23,12 +23,19 @@ pub struct Data {
     /// Start the node when the app opens; follows the last Start/Stop.
     #[serde(default)]
     pub resume_serving: bool,
+    /// Serve web pages as well. On unless the operator turned it off; the
+    /// node helper keeps it in its own file beside preferences.json.
+    #[serde(default = "default_serve_web")]
+    pub serve_web: bool,
 }
 pub const fn default_x_concurrency() -> u8 {
     2
 }
 pub fn default_updates() -> String {
     "notify".into()
+}
+pub const fn default_serve_web() -> bool {
+    true
 }
 impl Data {
     pub fn validate(&self) -> Result<()> {
@@ -93,6 +100,7 @@ mod tests {
         assert_eq!(legacy.x_concurrency, 2);
         assert_eq!(legacy.updates, "notify");
         assert!(!legacy.resume_serving);
+        assert!(legacy.serve_web);
         assert!(legacy.validate().is_ok());
         let mut silent = legacy.clone();
         silent.updates = "silent".into();
@@ -126,6 +134,7 @@ mod tests {
                 x_concurrency: 2,
                 updates: "notify".into(),
                 resume_serving: false,
+                serve_web: true,
             }),
             background: AtomicBool::new(false),
         };
@@ -138,9 +147,43 @@ mod tests {
                 x_concurrency: 3,
                 updates: "automatic".into(),
                 resume_serving: true,
+                serve_web: false,
             })
             .unwrap();
         assert!(prefs.background());
         assert_eq!(prefs.snapshot().unwrap().local_api_port, 18088);
+        assert!(!prefs.snapshot().unwrap().serve_web);
+    }
+    #[test]
+    fn web_serving_defaults_on_and_round_trips_off() {
+        // Every helper reply before this release, and a device that never
+        // chose: web is on.
+        let older: Data = serde_json::from_str(
+            r#"{"schema":1,"local_api_port":8088,"background":false,"x_concurrency":2,"updates":"notify","resume_serving":true}"#,
+        )
+        .unwrap();
+        assert!(older.serve_web);
+        let mut off = older.clone();
+        off.serve_web = false;
+        let raw = serde_json::to_string(&off).unwrap();
+        assert!(raw.contains(r#""serve_web":false"#), "{raw}");
+        let back: Data = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back, off);
+        assert!(back.validate().is_ok());
+        assert!(serde_json::from_str::<Data>(&raw.replace("false}", "\"off\"}")).is_err());
+        // The helper's reply, every field at its widest, fits what the app
+        // reads back from it (with the encoder's newline).
+        let widest = Data {
+            schema: 1,
+            local_api_port: u16::MAX,
+            background: false,
+            x_concurrency: 8,
+            updates: "automatic".into(),
+            resume_serving: false,
+            serve_web: false,
+        };
+        assert!(widest.validate().is_ok());
+        let reply = serde_json::to_vec(&widest).unwrap().len() + 1;
+        assert!(reply <= crate::node::PRIVATE_HELPER_REPLY_LIMIT, "{reply}");
     }
 }
