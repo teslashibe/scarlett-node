@@ -148,6 +148,76 @@ export function servingNote(s: Snapshot): string {
     ? "Serve web pages, and X network jobs with the accounts connected to this device"
     : "Serve X network jobs with the accounts connected to this device";
 }
+// One tile in the activity rows: a short value and the note under it.
+export type Metric = { value: string; note: string };
+const webEntry = (s: Snapshot): ServiceHealth | undefined =>
+  s.observation?.services?.find((v) => v.kind === "web");
+// Whether the running node serves web pages, from what it reports; the saved
+// setting while it is stopped. A running node without a web entry is unknown.
+function webOn(s: Snapshot): boolean | undefined {
+  if (!nodeLive(s)) return s.web_enabled;
+  const state = webEntry(s)?.state;
+  return state === undefined ? undefined : state !== "not_added";
+}
+// Why an enabled web service is not taking new pages (services.go refreshWeb).
+const WEB_PAUSED: Record<string, string> = {
+  relay_misuse: "Relay paused on this node",
+  web_proxy_failed: "Proxy failed · retrying in a minute",
+  prover_error: "Proof helper missing",
+};
+export function webServing(s: Snapshot): Metric {
+  const on = webOn(s);
+  if (on === undefined) return { value: "Unknown", note: "Waiting for node status" };
+  if (!nodeLive(s))
+    return on
+      ? { value: "On", note: "Serves pages when the node runs" }
+      : { value: "Off", note: "Turn on in Device settings" };
+  if (!on)
+    return { value: "Off", note: s.web_restart_pending ? "Stop and start the node to turn on" : "Turn on in Device settings" };
+  const web = webEntry(s)!;
+  if (s.observation?.drain_requested || s.observation?.state === "draining")
+    return { value: "Paused", note: "Finishing accepted work" };
+  if (web.state !== "configured" && web.state !== "ready" && web.state !== "exhausted")
+    return { value: "Paused", note: WEB_PAUSED[web.last_error_code ?? ""] ?? "Not taking new pages" };
+  return { value: "On", note: s.web_restart_pending ? "Stop and start the node to turn off" : "Serving on this device" };
+}
+// Free web slots on the running node, like availableXSlots: none while it is
+// stopped, paused or the web service is not ready, and unknown without data.
+export function availableWebSlots(s: Snapshot): number | undefined {
+  const web = webEntry(s);
+  const state = s.observation?.state;
+  if (web?.capacity === undefined || web.in_flight === undefined || web.state === undefined || state === undefined) return undefined;
+  if (state !== "running" || s.observation?.drain_requested || (web.state !== "configured" && web.state !== "ready")) return 0;
+  return Math.max(0, web.capacity - web.in_flight);
+}
+// The closed browser-tier reasons the node reports (services.go browserReasons).
+const BROWSER_UNAVAILABLE: Record<string, Metric> = {
+  disabled: { value: "Off", note: "Relay pages only on this device" },
+  web_unavailable: { value: "Paused", note: "Waiting for web pages" },
+  browser_downloading: { value: "Downloading", note: "Getting the browser ready" },
+  memory_low: { value: "Unavailable", note: "Needs 8 GB of memory" },
+  disk_low: { value: "Unavailable", note: "Not enough free disk space" },
+  runtime_missing: { value: "Unavailable", note: "Browser runtime missing from this build" },
+  runtime_invalid: { value: "Unavailable", note: "Browser runtime failed its check" },
+  browser_download_failed: { value: "Unavailable", note: "Download failed · retrying" },
+  browser_invalid: { value: "Unavailable", note: "Browser failed its check" },
+  deps_missing: { value: "Unavailable", note: "System libraries missing" },
+  sandbox_unavailable: { value: "Unavailable", note: "Browser sandbox unavailable" },
+  helper_failed: { value: "Unavailable", note: "Browser failed · retrying shortly" },
+};
+// The hidden browser renders web jobs that need one, such as pages behind a
+// bot check. It runs only inside a running node that serves web pages.
+export function hiddenBrowser(s: Snapshot): Metric {
+  const on = webOn(s);
+  if (on === undefined) return { value: "Unknown", note: "Waiting for node status" };
+  if (!on) return { value: "Off", note: "Web pages are off" };
+  if (!nodeLive(s)) return { value: "Off", note: "Starts with the node" };
+  const browser = webEntry(s)?.browser;
+  if (browser?.state === "ready") return { value: "Ready", note: "For pages behind bot checks" };
+  if (browser?.state === "unavailable")
+    return BROWSER_UNAVAILABLE[browser.reason ?? ""] ?? { value: "Unavailable", note: "Browser not ready" };
+  return { value: "Unknown", note: "Waiting for node status" };
+}
 export function codexAccountLimitReached(s: Snapshot): boolean {
   return (
     s.accounts.filter((a) => a.service === "codex").length >=

@@ -24,11 +24,17 @@ export const layout = `
     <div class="node-controls"><div class="actions"><button id="start">Start node</button><button id="pause">Pause</button><button id="resume">Resume</button><button id="stop" class="quiet">Stop</button></div><p id="work" class="muted"></p></div>
   </section>
   <section id="relay-banner" class="relay-banner" aria-labelledby="relay-heading" hidden><div><h2 id="relay-heading">Keyed relay is paused on this node</h2><p id="relay-detail" tabindex="-1"></p></div><button id="relay-resume" type="button">Resume relay</button></section>
-  <div class="metrics" aria-label="Local node activity">
+  <div class="metrics" role="group" aria-label="Local node activity">
     <div class="metric"><span class="metric-label">Saved X accounts</span><strong id="metric-accounts">—</strong><span class="metric-note">On this device</span></div>
     <div class="metric"><span class="metric-label">Available X slots</span><strong id="metric-capacity">—</strong><span class="metric-note">Ready for new work</span></div>
     <div class="metric"><span class="metric-label">Jobs in flight</span><strong id="metric-jobs">—</strong><span class="metric-note">Currently running</span></div>
     <div class="metric"><span class="metric-label">Awaiting reconciliation</span><strong id="metric-pending">—</strong><span class="metric-note">Pending confirmation</span></div>
+  </div>
+  <div class="metrics" role="group" aria-label="Web page activity">
+    <div class="metric"><span class="metric-label">Web pages</span><strong id="metric-web" class="metric-word">—</strong><span id="metric-web-note" class="metric-note">Checking node status</span></div>
+    <div class="metric"><span class="metric-label">Available web slots</span><strong id="metric-web-capacity">—</strong><span class="metric-note">Ready for new work</span></div>
+    <div class="metric"><span class="metric-label">Web pages served</span><strong id="metric-web-served">—</strong><span id="metric-web-served-note" class="metric-note">Checking local history</span></div>
+    <div class="metric"><span class="metric-label">Hidden browser</span><strong id="metric-browser" class="metric-word">—</strong><span id="metric-browser-note" class="metric-note">Checking node status</span></div>
   </div>
   <section id="pair-section" class="panel pairing" aria-labelledby="pair-heading">
     <div class="section-head"><div><h2 id="pair-heading">Pair with Scarlett</h2><p class="section-description">Link this device to your network account</p></div><button id="setup" class="quiet">Open setup ↗</button></div>

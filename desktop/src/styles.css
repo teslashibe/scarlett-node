@@ -63,6 +63,10 @@ main { max-width: 1120px; margin: auto; padding: 30px 28px 24px; display: flex; 
 .metric-label { color: var(--muted); font-size: 12px; }
 .metric strong { font-size: 32px; line-height: 1.25; font-weight: 600; letter-spacing: -.035em; font-variant-numeric: tabular-nums; }
 .metric-note { color: var(--faint); font-size: 11px; }
+/* State words such as Downloading shrink to fit a narrow tile; numbers keep their size.
+   A webview without container units keeps 32px and cuts the word off with an ellipsis. */
+.metric { container-type: inline-size; }
+.metric strong.metric-word { font-size: min(32px, 16cqi); line-height: 40px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .panel { border: 1px solid var(--border); border-radius: 10px; background: var(--surface); box-shadow: inset 0 1px 0 rgb(255 255 255 / 4%); }
 .accounts-panel, .pairing { padding: 20px; }
 .section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -177,6 +181,7 @@ dialog .actions { justify-content: flex-end; }
   .brand-name { font-size: 16px; }
   .metric { padding: 14px; }
   .metric strong { font-size: 28px; }
+  .metric strong.metric-word { font-size: min(28px, 16cqi); line-height: 35px; }
   .accounts-panel, .pairing { padding: 16px; }
   .account-row { flex-wrap: wrap; }
   .account-row .account-copy { flex: 1 1 200px; }
