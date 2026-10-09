@@ -371,8 +371,8 @@ present and `ready` after a proven job. It is `unreachable` with
 while relay is halted and `web_proxy_failed` for 60 s after the egress proxy
 failed. Failures on the target's side (`web_dns_failed`, `web_egress_denied`,
 `web_connect_failed`, `web_fetch_failed`) never change it. Account files, their
-errors and account mode never apply to web, so a desktop node with
-`SCARLETT_DESKTOP_WEB=1` can start with no accounts. The two browser codes
+errors and account mode never apply to web, so a desktop node with Serve web
+pages on (the default) can start with no accounts. The two browser codes
 never change it either.
 
 **Egress guard.** IPv4-mapped IPv6 is judged as its IPv4 address. Denied IPv4:
@@ -413,8 +413,8 @@ on Windows in this release. Without web the tier is off whatever it says.
 may not exceed `SCARLETT_WEB_CONCURRENCY`; unset, the runtime uses 1 below
 16 GiB of physical memory and 2 otherwise, never more than web capacity.
 `SCARLETT_WEB_BROWSER_IDLE_SECONDS` (30–3600, default 120) is the idle stop.
-All three need the services executor (so do the solver settings below). A desktop node started with
-`SCARLETT_DESKTOP_WEB=1` inherits the defaults; the desktop app passes an
+All three need the services executor (so do the solver settings below). A desktop node with Serve web
+pages on (the default) inherits the defaults; the desktop app passes an
 explicit `SCARLETT_WEB_BROWSER` of `on` or `off` from its own environment to
 the node, and only together with web.
 

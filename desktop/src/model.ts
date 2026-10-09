@@ -1,4 +1,4 @@
-export type Preferences = { schema: 1; local_api_port: number; background: boolean; x_concurrency: number; updates: "notify" | "automatic"; resume_serving: boolean };
+export type Preferences = { schema: 1; local_api_port: number; background: boolean; x_concurrency: number; updates: "notify" | "automatic"; resume_serving: boolean; serve_web: boolean };
 export type Account = {
   id: string;
   service: "codex" | "x_read";
@@ -49,8 +49,10 @@ export type Snapshot = {
   accounts: Account[];
   // The node's saved keyed-relay halt is still on disk.
   relay_halt_marker?: boolean;
-  // The node also serves web pages, which need no provider account.
+  // The saved "Serve web pages" setting. Web needs no provider account.
   web_enabled?: boolean;
+  // The running node was started with the other web setting.
+  web_restart_pending?: boolean;
   observation?: {
     state?: string;
     updated_at?: string;
@@ -121,6 +123,18 @@ export function canStart(s: Snapshot): boolean {
     !s.local_api?.running &&
     !externalRuntime(s)
   );
+}
+// "Serve web pages" is saved at once; a running node picks it up when the
+// operator stops and starts it, so accepted jobs are never cut short.
+export function webServingNote(s: Snapshot): string {
+  if (!s.web_restart_pending) return "";
+  return s.web_enabled
+    ? "Saved · stop and start the node to begin serving web pages. Accepted jobs finish before it stops"
+    : "Saved · the node serves web pages until you stop and start it. Accepted jobs finish before it stops";
+}
+export function webServingSaved(enabled: boolean, running: boolean): string {
+  if (running) return `Web pages turned ${enabled ? "on" : "off"}. Stop and start the node to apply it`;
+  return enabled ? "Web pages turned on. The node serves them when it starts" : "Web pages turned off";
 }
 export function codexAccountLimitReached(s: Snapshot): boolean {
   return (

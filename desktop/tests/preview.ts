@@ -17,7 +17,8 @@ type Scenario = typeof scenarios[number];
 const requested = new URLSearchParams(location.search).get("scenario");
 const scenario: Scenario = scenarios.includes(requested as Scenario) ? requested as Scenario : "ready";
 const at = (secondsAgo = 0) => new Date(Date.now() - secondsAgo * 1000).toISOString();
-let preferences: Preferences = { schema: 1, local_api_port: 8088, background: true, x_concurrency: 2, updates: "notify", resume_serving: true };
+let preferences: Preferences = { schema: 1, local_api_port: 8088, background: true, x_concurrency: 2, updates: "notify", resume_serving: true, serve_web: true };
+let webRunning = true;
 let autostart = false;
 let claude: ClaudeStatus = { available: true, connected: false, pending: false };
 let challenge: XLoginStatus | undefined;
@@ -161,6 +162,8 @@ mockIPC((command, payload) => {
     case "set_desktop_autostart": autostart = !!data.enabled; return null;
     case "desktop_status":
       observation.updated_at = new Date(Date.now() + 1).toISOString();
+      snapshot.web_enabled = preferences.serve_web;
+      snapshot.web_restart_pending = snapshot.supervised && webRunning !== preferences.serve_web;
       return structuredClone(snapshot);
     case "desktop_diagnostics": return structuredClone(diagnostics);
     case "claude_status": return structuredClone(claude);
@@ -172,6 +175,7 @@ mockIPC((command, payload) => {
     case "update_later": update.snoozed = !update.required; return null;
     case "update_ack": return null;
     case "update_dismiss": if (text(data, "notice") === "updated") update.updated = null; else update.failure = null; return null;
+    case "set_web_serving": preferences.serve_web = !!data.enabled; return null;
     case "set_update_mode": preferences.updates = text(data, "mode") === "automatic" ? "automatic" : "notify"; return null;
     case "pair_node": if (!text(data, "code")) throw "invalid_input"; snapshot.paired = true; return null;
     case "control_node": {
@@ -179,6 +183,7 @@ mockIPC((command, payload) => {
       if (action === "start" && !snapshot.paired) throw "not_paired";
       if (action === "start" && snapshot.local_api?.running) throw "mode_conflict";
       if (action === "start" || action === "stop") snapshot.supervised = action === "start";
+      if (action === "start") webRunning = preferences.serve_web;
       observation.state = snapshot.supervised ? "running" : "offline";
       observation.drain_requested = action === "pause";
       if (action === "stop") {

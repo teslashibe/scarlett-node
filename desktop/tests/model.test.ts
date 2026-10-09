@@ -21,6 +21,8 @@ import {
   statusPredates,
   xProofModes,
   X_SESSION_EXPIRED,
+  webServingNote,
+  webServingSaved,
   type Snapshot,
 } from "../src/model.ts";
 const base: Snapshot = {
@@ -265,4 +267,16 @@ test("The update toast follows the coordinator's release notice", () => {
   assert.equal(updateNotice({ ...at({ latest_release: "0.1.12", update_required: true }), observation: { state: "offline", latest_release: "0.1.12", update_required: true } })?.level, "required");
   // Anything but a plain version is ignored rather than shown.
   assert.equal(updateNotice(at({ latest_release: "<b>0.1.12</b>", update_required: true })), null);
+});
+test("Serve web pages applies on the next start and says so while the node runs", () => {
+  assert.equal(webServingNote({ ...base, web_enabled: true }), "");
+  assert.equal(webServingNote({ ...base, supervised: true, web_enabled: true, web_restart_pending: false }), "");
+  assert.match(webServingNote({ ...base, supervised: true, web_enabled: true, web_restart_pending: true }), /stop and start the node to begin serving web pages/);
+  assert.match(webServingNote({ ...base, supervised: true, web_enabled: false, web_restart_pending: true }), /serves web pages until you stop and start it/);
+  assert.equal(webServingSaved(true, false), "Web pages turned on. The node serves them when it starts");
+  assert.equal(webServingSaved(false, false), "Web pages turned off");
+  assert.equal(webServingSaved(false, true), "Web pages turned off. Stop and start the node to apply it");
+  // With web on (the default) a paired node with no X account can start.
+  assert.equal(canStart({ ...base, accounts: [], web_enabled: true }), true);
+  assert.equal(canStart({ ...base, accounts: [], web_enabled: false }), false);
 });

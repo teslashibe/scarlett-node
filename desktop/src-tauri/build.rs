@@ -26,6 +26,7 @@ fn main() {
             "local_api_key",
             "desktop_preferences",
             "save_desktop_preferences",
+            "set_web_serving",
             "desktop_autostart",
             "set_desktop_autostart",
             "update_status",

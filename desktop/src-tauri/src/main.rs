@@ -192,6 +192,25 @@ async fn save_desktop_preferences(
     let _guard = runtime.0.lock().await;
     node.save_preferences(&data).await?;
     node.set_x_concurrency(data.x_concurrency)?;
+    node.set_web(data.serve_web);
+    preferences.updated(data)
+}
+/// "Serve web pages": saved at once and used from the next node start. A
+/// running node is never drained or restarted by it; accepted work finishes.
+#[tauri::command]
+async fn set_web_serving(
+    window: WebviewWindow,
+    node: State<'_, Arc<Node>>,
+    preferences: State<'_, Arc<Preferences>>,
+    runtime: State<'_, RuntimeControl>,
+    enabled: bool,
+) -> node::Result<()> {
+    local_window(&window)?;
+    let _guard = runtime.0.lock().await;
+    let mut data = preferences.snapshot()?;
+    data.serve_web = enabled;
+    node.save_preferences(&data).await?;
+    node.set_web(enabled);
     preferences.updated(data)
 }
 #[tauri::command]
@@ -648,6 +667,7 @@ fn main() {
             local_api_key,
             desktop_preferences,
             save_desktop_preferences,
+            set_web_serving,
             desktop_autostart,
             set_desktop_autostart,
             update_status,
@@ -689,14 +709,14 @@ fn main() {
                 .map_err(|_| "invalid desktop endpoint configuration")?
                 .with_provider_runtime(&resources),
             ));
-            let x_concurrency = app
+            let saved = app
                 .state::<Arc<Preferences>>()
                 .snapshot()
-                .map_err(|_| "private desktop preferences unavailable")?
-                .x_concurrency;
+                .map_err(|_| "private desktop preferences unavailable")?;
             app.state::<Arc<Node>>()
-                .set_x_concurrency(x_concurrency)
+                .set_x_concurrency(saved.x_concurrency)
                 .map_err(|_| "invalid desktop X concurrency")?;
+            app.state::<Arc<Node>>().set_web(saved.serve_web);
             let updater = Arc::new(Updater::new(
                 app.package_info().version.to_string(),
                 app.path().app_data_dir()?,
