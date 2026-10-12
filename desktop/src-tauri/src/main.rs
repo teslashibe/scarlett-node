@@ -3,6 +3,7 @@ mod claude_auth;
 mod diagnostics;
 mod local_api;
 mod node;
+mod node_log;
 mod preferences;
 mod updater;
 #[cfg(windows)]
@@ -701,6 +702,15 @@ fn main() {
                 directory.join(format!("open-agent-api{suffix}")),
                 resources.join("runtime"),
             )));
+            // ~/Library/Logs/Scarlett Node on macOS, %LOCALAPPDATA%\Scarlett
+            // Node\logs on Windows. Without one the node's stderr is dropped.
+            let logs = if cfg!(target_os = "macos") {
+                app.path().home_dir()
+            } else {
+                app.path().local_data_dir()
+            }
+            .ok()
+            .map(|base| node_log::dir(&base));
             app.manage(Arc::new(
                 Node::from_environment(
                     state,
@@ -708,7 +718,8 @@ fn main() {
                     directory.join(format!("scarlett-prover{suffix}")),
                 )
                 .map_err(|_| "invalid desktop endpoint configuration")?
-                .with_provider_runtime(&resources),
+                .with_provider_runtime(&resources)
+                .with_log_dir(logs),
             ));
             let saved = app
                 .state::<Arc<Preferences>>()

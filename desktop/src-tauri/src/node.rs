@@ -332,6 +332,11 @@ pub struct Node {
     /// environment, passed on only with web. Unset, the node's platform
     /// default applies (on for macOS, off for Windows in this release).
     web_browser: Option<&'static str>,
+    /// Where the supervised node's stderr goes (see node_log). Without it, or
+    /// when it cannot be opened privately, stderr is discarded as before.
+    log_dir: Option<PathBuf>,
+    /// Keeps the running node's log bounded; replaced on each start.
+    log_bound: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// SCARLETT_WEB_CONCURRENCY for a Web pages at once setting. Auto (0) asks
@@ -753,7 +758,13 @@ impl Node {
             web_running: AtomicBool::new(false),
             web_concurrency: std::sync::atomic::AtomicU8::new(0),
             web_browser: None,
+            log_dir: None,
+            log_bound: std::sync::Mutex::new(None),
         }
+    }
+    pub fn with_log_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.log_dir = dir;
+        self
     }
     pub fn with_provider_runtime(mut self, resource_root: &Path) -> Self {
         self.x_login_resources = resource_root.join("runtime");
@@ -1345,16 +1356,36 @@ impl Node {
             return Err(Error::AccountsUnavailable);
         }
         let mut cmd = self.command_with_web(&["desktop", "run"], web)?;
+        // The node's stderr goes to its private local log; a log that cannot
+        // be opened never stops the node from starting.
+        let log = self
+            .log_dir
+            .as_deref()
+            .and_then(|dir| crate::node_log::open(dir, &self.binary).ok());
+        let logging = log.is_some();
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(log.map_or_else(Stdio::null, Stdio::from));
         #[cfg(unix)]
         {
             cmd.process_group(0);
         }
         *running = Some(cmd.spawn().map_err(|_| Error::RuntimeUnavailable)?);
         self.web_running.store(web, Ordering::SeqCst);
+        let bound = self
+            .log_dir
+            .clone()
+            .filter(|_| logging)
+            .map(|dir| tokio::spawn(crate::node_log::keep_bounded(dir)));
+        self.stop_log_bound(bound);
         Ok(())
+    }
+    /// Ends the previous node's log rotation, starting `next` in its place.
+    fn stop_log_bound(&self, next: Option<tokio::task::JoinHandle<()>>) {
+        let mut bound = self.log_bound.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(previous) = std::mem::replace(&mut *bound, next) {
+            previous.abort();
+        }
     }
     pub async fn control(&self, action: &str) -> Result<()> {
         match action {
@@ -1383,6 +1414,7 @@ impl Node {
                 .is_some()
             {
                 *running = None;
+                self.stop_log_bound(None);
                 return Ok(());
             }
             self.call(&["drain"], None, 5).await?;
@@ -1404,10 +1436,12 @@ impl Node {
                             }
                         }
                         child.kill().await.map_err(|_| Error::CommandFailed)?;
+                        self.stop_log_bound(None);
                         return Err(Error::CommandTimeout);
                     }
                 }
                 *running = None;
+                self.stop_log_bound(None);
             }
         }
         Ok(())
@@ -2978,6 +3012,60 @@ esac
             node.control("shell-command").await,
             Err(Error::InvalidInput)
         );
+    }
+    /// The supervised node's stderr lands in its private log, including what
+    /// it writes while draining after the owner pipe closes, and across
+    /// restarts. Other commands' stderr is still discarded, and a log that
+    /// cannot be private never keeps the node from starting.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervised_node_stderr_goes_to_its_private_log() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("node");
+        let helper = temp.path().join("helper");
+        std::fs::write(&binary, "#!/bin/sh\ncase \"$1 $2\" in\n'accounts list') echo 'accounts stderr' >&2; printf '[]';;\n'desktop run') echo 'heartbeat: synthetic' >&2; cat >/dev/null; echo 'drained' >&2;;\n'drain ') ;;\n*) exit 1;;\nesac\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&helper, "synthetic helper fixture").unwrap();
+        let logs = temp.path().join("Logs").join("Scarlett Node");
+        let log = logs.join(crate::node_log::FILE);
+        let node = Node::new(temp.path().join("state"), binary.clone(), helper.clone())
+            .with_log_dir(Some(logs.clone()));
+        node.prepare().unwrap();
+        std::fs::write(node.state.join("identity.json"), "{}").unwrap();
+        for run in 1..=2 {
+            node.start().await.unwrap();
+            let began = Instant::now();
+            while std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .matches("heartbeat")
+                .count()
+                < run
+            {
+                assert!(began.elapsed() < Duration::from_secs(5));
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            node.stop().await.unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "heartbeat: synthetic\ndrained\n".repeat(2)
+        );
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&logs), mode(&log)), (0o700, 0o600));
+        // A log directory others can read is refused, and the node runs
+        // with its stderr discarded.
+        let shared = temp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let node = Node::new(temp.path().join("state2"), binary, helper)
+            .with_log_dir(Some(shared.clone()));
+        node.prepare().unwrap();
+        std::fs::write(node.state.join("identity.json"), "{}").unwrap();
+        node.start().await.unwrap();
+        assert!(node.snapshot().await.supervised);
+        node.stop().await.unwrap();
+        assert_eq!(std::fs::read_dir(&shared).unwrap().count(), 0);
     }
     #[cfg(unix)]
     #[tokio::test]
