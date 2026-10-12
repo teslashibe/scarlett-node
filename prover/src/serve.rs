@@ -36,7 +36,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -65,6 +68,27 @@ const PING_EVERY: Duration = Duration::from_secs(15);
 const RETIRE_AFTER: Duration = Duration::from_secs(45);
 /// How long a connection a redirect hop left waits for the job's next hop.
 const RESERVE_FOR: Duration = Duration::from_secs(10);
+
+/// The daemon's stderr goes to the node's log, line by line: a few lines
+/// always (the pool losing or finding the verifier), and every hop's steps
+/// as well with `SCARLETT_SERVE_LOG=1`, which the node sets for
+/// `SCARLETT_WEB_DAEMON_LOG=1`. A line carries hop ids, steps, classes and
+/// times: never a token, a job, or a target's URL or address.
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+/// Writes one log line.
+pub fn note(line: std::fmt::Arguments) {
+    let ms = EPOCH.get_or_init(Instant::now).elapsed().as_millis();
+    eprintln!("+{ms}ms {line}");
+}
+
+/// Writes one log line in verbose mode only.
+pub fn detail(line: std::fmt::Arguments) {
+    if VERBOSE.load(Ordering::Relaxed) {
+        note(line);
+    }
+}
 
 /// Reads one message; `None` at end of input between messages.
 pub async fn read_message<R: AsyncRead + Unpin>(input: &mut R) -> Result<Option<Vec<u8>>> {
@@ -101,6 +125,25 @@ enum Reply {
     Summary { id: String, summary: WebSummary },
     Error { id: String, class: &'static str, error: String, presented: bool, diagnostics: Snapshot },
     Cancelled { id: String, diagnostics: Snapshot },
+}
+
+impl Reply {
+    fn kind(&self) -> &'static str {
+        match self {
+            Reply::Ready { .. } => "ready",
+            Reply::Presenting { .. } => "presenting",
+            Reply::Summary { .. } => "summary",
+            Reply::Error { .. } => "error",
+            Reply::Cancelled { .. } => "cancelled",
+        }
+    }
+
+    fn id(&self) -> &str {
+        match self {
+            Reply::Ready { .. } => "-",
+            Reply::Presenting { id } | Reply::Summary { id, .. } | Reply::Error { id, .. } | Reply::Cancelled { id, .. } => id,
+        }
+    }
 }
 
 /// A reply on its way to stdout, and who wants to know it was written.
@@ -208,6 +251,10 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    if std::env::var("SCARLETT_SERVE_LOG").as_deref() == Ok("1") {
+        VERBOSE.store(true, Ordering::Relaxed);
+    }
+    EPOCH.get_or_init(Instant::now);
     let (sender, mut outbox) = mpsc::unbounded_channel::<Out>();
     let writer = tokio::spawn(async move {
         let mut output = output;
@@ -217,6 +264,7 @@ where
                 // The node is gone; nothing more can be told.
                 return;
             }
+            detail(format_args!("{} {} written", reply.kind(), reply.id()));
             if let Some(written) = written {
                 let _ = written.send(());
             }
@@ -238,15 +286,15 @@ where
                 "hop" => start_hop(&shared, serde_json::from_value(body).context("invalid hop request")?),
                 "token" => {
                     let TokenRequest { id, token } = serde_json::from_value(body).context("invalid token request")?;
-                    if let Some(start) = shared.hops.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
-                        let _ = start.send(Start::Token(token));
-                    }
+                    let start = shared.hops.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                    let taken = start.map(|start| start.send(Start::Token(token)).is_ok());
+                    detail(format_args!("hop {id}: token request ({})", match taken { Some(true) => "taken", Some(false) => "hop gone", None => "no such hop" }));
                 }
                 "cancel" => {
                     let CancelRequest { id } = serde_json::from_value(body).context("invalid cancel request")?;
-                    if let Some(start) = shared.hops.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) {
-                        let _ = start.send(Start::Cancel);
-                    }
+                    let start = shared.hops.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                    let taken = start.map(|start| start.send(Start::Cancel).is_ok());
+                    detail(format_args!("hop {id}: cancel request ({})", match taken { Some(true) => "taken", Some(false) => "hop gone", None => "no such hop" }));
                 }
                 _ => bail!("unknown request"),
             }
@@ -273,6 +321,7 @@ fn set_pool(shared: &Shared, request: PoolRequest) {
         pool.verifier = Some(verifier);
     }
     pool.size = request.size.min(MAX_POOL);
+    detail(format_args!("pool: size {}, {} idle, {} reserved, {} dialing", pool.size, pool.idle.len(), pool.reserved.len(), pool.dialing));
     drop(pool);
     shared.upkeep.notify_one();
 }
@@ -292,14 +341,21 @@ fn start_hop(shared: &Arc<Shared>, request: HopRequest) {
         }
     };
     if let Some(reason) = refused {
+        note(format_args!("a hop was refused: {reason}"));
         shared.replies.send(Reply::Error { id, class: "fetch_failed", error: reason.into(), presented: false, diagnostics: Trace::new().snapshot().ended(Outcome::Error) });
         return;
     }
+    detail(format_args!("hop {id}: request"));
     let shared = shared.clone();
     tokio::spawn(async move {
         let trace = Trace::new();
+        let begun = Instant::now();
         let reply = hop(&shared, &id, job, input, started, &trace).await;
         shared.hops.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+        match &reply {
+            Reply::Error { class, presented, .. } => detail(format_args!("hop {id}: ends {class} (presented {presented}) after {} ms", begun.elapsed().as_millis())),
+            reply => detail(format_args!("hop {id}: ends {} after {} ms", reply.kind(), begun.elapsed().as_millis())),
+        }
         shared.replies.send(reply);
     });
 }
@@ -315,7 +371,7 @@ async fn hop(shared: &Arc<Shared>, id: &str, job: Option<String>, input: Value, 
         return failed(node::WebError::fetch(anyhow::anyhow!("a hop waits for its token without predial")), false);
     }
     let hop = match Hop::prepare(request) {
-        Ok(hop) => hop,
+        Ok(hop) => hop.labelled(id),
         Err(error) => return failed(error, false),
     };
     let verifier = hop.verifier();
@@ -324,15 +380,19 @@ async fn hop(shared: &Arc<Shared>, id: &str, job: Option<String>, input: Value, 
     let affinity = job.clone().or_else(|| hop.token().map(token_key));
     let source = match checkout(shared, affinity.as_deref(), &verifier) {
         Some(mut link) => {
+            detail(format_args!("hop {id}: warm connection (token {})", if hop.token().is_some() { "given" } else { "to come" }));
             trace.span(Phase::PoolCheckoutWarm).finish(Outcome::Success);
             link.take();
             Source::Ready(link)
         }
         None => {
-            let (verifier, trace) = (verifier.clone(), trace.clone());
+            detail(format_args!("hop {id}: dialing (token {})", if hop.token().is_some() { "given" } else { "to come" }));
+            let (verifier, trace, id) = (verifier.clone(), trace.clone(), id.to_owned());
             Source::Dialing(tokio::spawn(async move {
                 let span = trace.span(Phase::PoolCheckoutCold);
+                let started = Instant::now();
                 let dialed = Link::dial(&verifier, Some(&trace)).await;
+                detail(format_args!("hop {id}: dial {} after {} ms", if dialed.is_ok() { "done" } else { "failed" }, started.elapsed().as_millis()));
                 span.finish(if dialed.is_ok() { Outcome::Success } else { Outcome::Error });
                 dialed.map(|mut link| {
                     link.take();
@@ -352,7 +412,17 @@ async fn hop(shared: &Arc<Shared>, id: &str, job: Option<String>, input: Value, 
                     _ => None,
                 }
             };
-            match node::wait_for_token(&hop, source, next, trace).await {
+            let waited = node::wait_for_token(&hop, source, next, trace).await;
+            detail(format_args!(
+                "hop {id}: wait for the token ended: {}",
+                match &waited {
+                    Waited::Token(..) => "token",
+                    Waited::Ended(_) => "cancelled",
+                    Waited::TimedOut(_) => "deadline",
+                    Waited::Invalid(_) => "invalid token",
+                }
+            ));
+            match waited {
                 Waited::Token(token, source) => (token, source),
                 Waited::Ended(link) => {
                     give_back(shared, None, link, false);
@@ -439,10 +509,14 @@ async fn upkeep(shared: Arc<Shared>) {
                     pool.idle.push(idle);
                 }
             }
+            let before = pool.idle.len();
             pool.idle.retain(|idle| idle.link.idle() < RETIRE_AFTER);
             // Oldest first out when there are more than wanted.
             let excess = pool.idle.len().saturating_sub(pool.size);
             pool.idle.drain(..excess);
+            if pool.idle.len() < before {
+                detail(format_args!("pool: retired {} ({} idle)", before - pool.idle.len(), pool.idle.len()));
+            }
             let mut to_ping = Vec::new();
             let mut kept = Vec::new();
             for idle in pool.idle.drain(..) {
@@ -463,14 +537,20 @@ async fn upkeep(shared: Arc<Shared>) {
                     if pool.idle.len() < pool.size {
                         pool.idle.push(idle);
                     }
+                } else {
+                    detail(format_args!("pool: a warm connection did not answer its ping"));
                 }
             });
         }
         let Some(verifier) = verifier else { continue };
+        if dials > 0 {
+            detail(format_args!("pool: dialing {dials}"));
+        }
         for _ in 0..dials {
             let (shared, verifier) = (shared.clone(), verifier.clone());
             tokio::spawn(async move {
                 // A warm connection pings at once, which gives it the verifier's long wait.
+                let started = Instant::now();
                 let dialed = async {
                     let mut link = Link::dial(&verifier, None).await?;
                     link.ping().await?;
@@ -481,17 +561,26 @@ async fn upkeep(shared: Arc<Shared>) {
                 pool.dialing -= 1;
                 match dialed {
                     Ok(link) => {
+                        if pool.failures > 0 {
+                            note(format_args!("pool: the verifier answers again after {} failed dials", pool.failures));
+                        }
+                        detail(format_args!("pool: dialed in {} ms", started.elapsed().as_millis()));
                         pool.failures = 0;
                         pool.retry_at = None;
                         if pool.verifier.as_ref() == Some(&verifier) && pool.idle.len() < pool.size {
                             pool.idle.push(Idle::new(link));
                         }
                     }
-                    Err(_) => {
+                    Err(e) => {
                         // 1, 2, 4 … 30 s between tries while the verifier cannot be reached.
                         pool.failures += 1;
                         let backoff = Duration::from_secs(1u64 << pool.failures.min(5)).min(Duration::from_secs(30));
                         pool.retry_at = Some(Instant::now() + backoff);
+                        if pool.failures == 1 {
+                            note(format_args!("pool: a warm dial failed after {} ms: {}", started.elapsed().as_millis(), node::loggable_cause(&e)));
+                        } else {
+                            detail(format_args!("pool: dial failure {} after {} ms: {}", pool.failures, started.elapsed().as_millis(), node::loggable_cause(&e)));
+                        }
                     }
                 }
             });

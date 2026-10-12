@@ -353,12 +353,32 @@ pub struct Hop {
     ip: IpAddr,
     started: Instant,
     deadline: tokio::time::Instant,
+    /// The daemon's id for the hop, for its log; empty in `relay-web`.
+    label: String,
 }
 
 impl Hop {
     pub fn prepare(request: WebRequest) -> Result<Self, WebError> {
         let (raw, ip, timeout) = validate_hop(&request).map_err(WebError::fetch)?;
-        Ok(Self { request, raw, ip, started: Instant::now(), deadline: tokio::time::Instant::now() + timeout })
+        Ok(Self { request, raw, ip, started: Instant::now(), deadline: tokio::time::Instant::now() + timeout, label: String::new() })
+    }
+
+    /// Names the hop in the daemon's log.
+    pub fn labelled(mut self, label: &str) -> Self {
+        label.clone_into(&mut self.label);
+        self
+    }
+
+    /// One verbose daemon log line about this hop.
+    fn detail(&self, line: std::fmt::Arguments) {
+        if !self.label.is_empty() {
+            crate::serve::detail(format_args!("hop {}: {line}", self.label));
+        }
+    }
+
+    /// Milliseconds since the hop was prepared.
+    fn ms(&self) -> u128 {
+        self.started.elapsed().as_millis()
     }
 
     pub fn token(&self) -> Option<&str> {
@@ -497,6 +517,7 @@ pub async fn finish(hop: &Hop, token: &str, source: Source, trace: &Trace, prese
         }
     };
     let (server, link) = tokio::join!(target, source.resolve());
+    hop.detail(format_args!("target {} at {} ms, verifier connection {}", if server.is_ok() { "connected" } else { "failed" }, hop.ms(), if link.is_some() { "in hand" } else { "to dial" }));
     let server = match server {
         Ok(server) => server,
         // Nothing went out on the verifier connection: it can serve another hop.
@@ -517,14 +538,22 @@ pub async fn finish(hop: &Hop, token: &str, source: Source, trace: &Trace, prese
         // The node learns that the token is about to go out before it does.
         presenting.await.map_err(|e| (e, false))?;
         link.conn.present(token).await.map_err(|e| (e, true))?;
+        hop.detail(format_args!("token presented at {} ms", hop.ms()));
         let (outcome, keep) = trace.measure(Phase::RelaySession, web_session_on(&mut link.conn, server, &hop.raw, host, request.hop, &request.url, trace)).await.map_err(|e| (e, true))?;
         Ok::<_, (anyhow::Error, bool)>((outcome, keep, link))
     };
     let (outcome, keep, mut link) = match tokio::time::timeout_at(hop.deadline, session).await {
         Ok(Ok(done)) => done,
-        Ok(Err((error, presented))) => return Err(Failed { error: WebError::session(error), presented, link: None }),
-        Err(_) => return Err(Failed { error: WebError::fetch(anyhow::anyhow!("relay session timed out")), presented: true, link: None }),
+        Ok(Err((error, presented))) => {
+            hop.detail(format_args!("session failed at {} ms (presented {presented}): {}", hop.ms(), loggable_cause(&error)));
+            return Err(Failed { error: WebError::session(error), presented, link: None });
+        }
+        Err(_) => {
+            hop.detail(format_args!("session timed out at {} ms", hop.ms()));
+            return Err(Failed { error: WebError::fetch(anyhow::anyhow!("relay session timed out")), presented: true, link: None });
+        }
     };
+    hop.detail(format_args!("session done at {} ms (keep {keep})", hop.ms()));
     let (target_sent_bytes, target_received_bytes) = target.bytes();
     let summary = WebSummary {
         verifier_transport: link.used(),
@@ -558,9 +587,16 @@ async fn dial_for_token(hop: &Hop, trace: &Trace) -> Result<Link> {
     loop {
         let started = Instant::now();
         match Link::dial(&hop.verifier(), Some(trace)).await {
-            Ok(link) => return Ok(link),
-            Err(e) if tries >= DIAL_TRIES || started.elapsed() > FAST_FAILURE || tokio::time::Instant::now() + pause >= hop.deadline => return Err(e),
-            Err(_) => {
+            Ok(link) => {
+                hop.detail(format_args!("dialed for the token (try {tries}) at {} ms", hop.ms()));
+                return Ok(link);
+            }
+            Err(e) if tries >= DIAL_TRIES || started.elapsed() > FAST_FAILURE || tokio::time::Instant::now() + pause >= hop.deadline => {
+                hop.detail(format_args!("dial for the token failed (try {tries}) at {} ms: {}", hop.ms(), loggable_cause(&e)));
+                return Err(e);
+            }
+            Err(e) => {
+                hop.detail(format_args!("dial for the token failed fast (try {tries}): {}", loggable_cause(&e)));
                 tokio::time::sleep(pause).await;
                 pause *= 3;
                 tries += 1;
@@ -708,11 +744,13 @@ pub async fn wait_for_token(hop: &Hop, source: Source, next: impl Future<Output 
                 dialing = None;
                 // A failed dial costs nothing yet: the hop dials again once it has its token.
                 link = dialed.ok().and_then(Result::ok);
+                hop.detail(format_args!("dial while waiting {} at {} ms", if link.is_some() { "done" } else { "failed" }, hop.ms()));
             }
             _ = tokio::time::sleep_until(ping_at.unwrap_or(hop.deadline)), if ping_at.is_some() => {
                 if let Some(mut pinged) = link.take() && pinged.ping().await.is_ok() {
                     link = Some(pinged);
                 }
+                hop.detail(format_args!("ping while waiting {} at {} ms", if link.is_some() { "answered" } else { "failed" }, hop.ms()));
             }
             _ = tokio::time::sleep_until(hop.deadline) => break Outcome::Error,
         }

@@ -120,12 +120,14 @@ func (w Web) runHelper(ctx, hopCtx context.Context, in webHopInput, input []byte
 		if result, ok := p.finish(hopCtx, in.Token); ok {
 			return result
 		}
+		daemonDetail("pre-dial of job %s ended before its token", p.job)
 	}
 	if d := daemonFor(w.Config); d != nil {
 		if result, ok := d.run(hopCtx, in); ok {
 			return result
 		}
 	}
+	daemonDetail("hop %d runs one-shot", in.Hop)
 	return runRelayWeb(hopCtx, w.Config.Prover, input)
 }
 
@@ -314,11 +316,13 @@ func (p *WebPredial) start(ctx context.Context, w Web, plan webPlan, deadline ti
 	if d := daemonFor(c); d != nil {
 		if h, err := d.startHop(in); err == nil {
 			run = &daemonPredial{d: d, h: h}
+			daemonDetail("hop %s: pre-dial of job %s", h.id, p.job)
 		}
 	}
 	if run == nil {
 		if oneShot := startOneShotPredial(ctx, c.Prover, in); oneShot != nil {
 			run = oneShot
+			daemonDetail("pre-dial of job %s runs one-shot", p.job)
 		}
 	}
 	p.mu.Lock()
@@ -385,6 +389,9 @@ func takeWebPredial(ctx context.Context, in webHopInput) *WebPredial {
 	usable := !p.used && p.run != nil && in.Hop == 0 && in.NodeHeaders == nil && sameHop(p.in, in)
 	if usable {
 		p.used = true
+	}
+	if webDaemonVerbose {
+		daemonDetail("pre-dial of job %s for hop %d: usable %v (started %v, same hop %v)", p.job, in.Hop, usable, p.run != nil, in.Hop == 0 && sameHop(p.in, in))
 	}
 	p.mu.Unlock()
 	if !usable {

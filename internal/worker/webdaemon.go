@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -50,6 +51,110 @@ var webDaemonEnabled atomic.Bool
 
 func init() { webDaemonEnabled.Store(true) }
 
+// The daemon's stderr is part of the node's log, each line prefixed "web
+// daemon:": it writes a few lines always, and with SCARLETT_WEB_DAEMON_LOG=1
+// (which the node passes on as SCARLETT_SERVE_LOG=1) every hop's steps,
+// which the node's side of each hop joins. No line carries a token, a job's
+// URL or a target address.
+var webDaemonVerbose = os.Getenv("SCARLETT_WEB_DAEMON_LOG") == "1"
+
+// daemonLogLines bounds the daemon's lines waiting for the node's stderr;
+// beyond it lines are dropped (and counted) rather than slowing the daemon.
+const daemonLogLines = 256
+
+// daemonDetail writes one verbose line about the daemon's hops.
+func daemonDetail(format string, args ...any) {
+	if webDaemonVerbose {
+		fmt.Fprintf(os.Stderr, "web daemon: node: "+format+"\n", args...)
+	}
+}
+
+// daemonLog passes the daemon's stderr to the node's, one line at a time,
+// without ever blocking the daemon, and keeps its last line.
+type daemonLog struct {
+	mu      sync.Mutex
+	partial []byte
+	last    string
+	lines   chan string
+	dropped int
+	closed  bool
+}
+
+func newDaemonLog() *daemonLog {
+	l := &daemonLog{lines: make(chan string, daemonLogLines)}
+	go func() {
+		for line := range l.lines {
+			fmt.Fprintln(os.Stderr, "web daemon:", line)
+		}
+	}()
+	return l
+}
+
+func (l *daemonLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return len(p), nil
+	}
+	l.partial = append(l.partial, p...)
+	for {
+		at := bytes.IndexByte(l.partial, '\n')
+		if at < 0 {
+			break
+		}
+		l.line(string(l.partial[:at]))
+		l.partial = l.partial[at+1:]
+	}
+	if len(l.partial) > 4<<10 {
+		l.line(string(l.partial))
+		l.partial = nil
+	}
+	return len(p), nil
+}
+
+// line queues one line, cleaned and bounded.
+func (l *daemonLog) line(raw string) {
+	line := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, strings.TrimSpace(raw))
+	if line == "" {
+		return
+	}
+	line = line[:min(len(line), 240)]
+	l.last = line
+	if l.dropped > 0 {
+		select {
+		case l.lines <- fmt.Sprintf("(%d lines dropped)", l.dropped):
+			l.dropped = 0
+		default:
+		}
+	}
+	select {
+	case l.lines <- line:
+	default:
+		l.dropped++
+	}
+}
+
+// close ends the forwarding once the daemon has exited and returns its last line.
+func (l *daemonLog) close() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return l.last
+	}
+	if len(l.partial) > 0 {
+		l.line(string(l.partial))
+		l.partial = nil
+	}
+	l.closed = true
+	close(l.lines)
+	return l.last
+}
+
 type daemonKey struct {
 	prover, verifier, verifierCA string
 	plaintextFixture             bool
@@ -85,8 +190,8 @@ type webDaemon struct {
 	ready chan struct{}
 	gone  chan struct{}
 	once  sync.Once
-	// stderr holds what a daemon said before it died: never a secret.
-	stderr *limitedBuffer
+	// log carries what the daemon says to the node's log: never a secret.
+	log *daemonLog
 
 	mu   sync.Mutex
 	hops map[string]*daemonHop
@@ -195,6 +300,9 @@ func startDaemon(key daemonKey) *webDaemon {
 	ctx, stop := context.WithCancel(context.Background())
 	d := &webDaemon{key: key, queue: make(chan []byte, daemonQueue), stop: stop, ready: make(chan struct{}), gone: make(chan struct{}), hops: map[string]*daemonHop{}, pool: -1}
 	cmd := exec.CommandContext(ctx, key.prover, "serve")
+	if webDaemonVerbose {
+		cmd.Env = append(os.Environ(), "SCARLETT_SERVE_LOG=1")
+	}
 	stdin, err := cmd.StdinPipe()
 	// Stdout is a pipe of our own, closed only once the daemon has exited, so
 	// its last replies (a presenting among them) are always read.
@@ -206,8 +314,8 @@ func startDaemon(key daemonKey) *webDaemon {
 		webDaemons.Unlock()
 		return nil
 	}
-	d.stderr = &limitedBuffer{max: maxWebStderr}
-	cmd.Stdout, cmd.Stderr = stdoutW, d.stderr
+	d.log = newDaemonLog()
+	cmd.Stdout, cmd.Stderr = stdoutW, d.log
 	exited := make(chan struct{})
 	go func() {
 		process.Run(cmd)
@@ -215,18 +323,14 @@ func startDaemon(key daemonKey) *webDaemon {
 		close(exited)
 	}()
 	go func() {
-		// A daemon that dies on its own says why, once, in the node's log.
+		// A daemon that dies on its own says so, with its last line.
 		<-exited
+		last := d.log.close()
 		d.mu.Lock()
 		stopped := d.stopped
 		d.mu.Unlock()
-		if line, _, _ := strings.Cut(strings.TrimSpace(d.stderr.String()), "\n"); !stopped && line != "" {
-			fmt.Fprintln(os.Stderr, "web helper daemon ended:", strings.Map(func(r rune) rune {
-				if r < 0x20 || r == 0x7f {
-					return ' '
-				}
-				return r
-			}, line[:min(len(line), 240)]))
+		if !stopped {
+			fmt.Fprintln(os.Stderr, "web helper daemon ended:", last)
 		}
 	}()
 	go d.write(stdin)
@@ -283,15 +387,18 @@ func (d *webDaemon) read(stdout *os.File) {
 			d.once.Do(func() { close(d.ready) })
 		case "presenting":
 			d.mu.Lock()
-			if h := d.hops[reply.ID]; h != nil {
+			h := d.hops[reply.ID]
+			if h != nil {
 				h.presented.Store(true)
 			}
 			d.mu.Unlock()
+			daemonDetail("hop %s: presenting (waited for: %v)", reply.ID, h != nil)
 		case "summary", "error", "cancelled":
 			d.mu.Lock()
 			h := d.hops[reply.ID]
 			delete(d.hops, reply.ID)
 			d.mu.Unlock()
+			daemonDetail("hop %s: %s %s (waited for: %v)", reply.ID, reply.Type, reply.Class, h != nil)
 			if h != nil {
 				h.final <- reply
 			}
@@ -383,19 +490,24 @@ func (d *webDaemon) startHop(in webHopInput) (*daemonHop, error) {
 	d.mu.Unlock()
 	if err := d.send(map[string]any{"type": "hop", "id": h.id, "input": in}); err != nil {
 		d.forget(h.id)
+		daemonDetail("hop %s: not sent: %v", h.id, err)
 		return nil, err
 	}
+	daemonDetail("hop %s: sent (hop %d, token given: %v)", h.id, in.Hop, in.Token != "")
 	return h, nil
 }
 
 func (d *webDaemon) token(h *daemonHop, token string) error {
-	return d.send(map[string]any{"type": "token", "id": h.id, "token": token})
+	err := d.send(map[string]any{"type": "token", "id": h.id, "token": token})
+	daemonDetail("hop %s: token sent (error: %v)", h.id, err)
+	return err
 }
 
 // cancel ends a hop that has no token: it sends nothing and reaches no
 // target. The daemon's answer is not waited for.
 func (d *webDaemon) cancel(h *daemonHop) {
-	d.send(map[string]any{"type": "cancel", "id": h.id})
+	err := d.send(map[string]any{"type": "cancel", "id": h.id})
+	daemonDetail("hop %s: cancel sent (error: %v)", h.id, err)
 }
 
 func (d *webDaemon) forget(id string) {
@@ -412,6 +524,9 @@ func (d *webDaemon) wait(ctx context.Context, h *daemonHop) daemonReply {
 		return reply
 	case <-ctx.Done():
 		d.forget(h.id)
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			fmt.Fprintf(os.Stderr, "web daemon: hop %s gave no answer in its time (token presented: %v)\n", h.id, h.presented.Load())
+		}
 		return daemonReply{Type: "timeout", ID: h.id, Presented: h.presented.Load()}
 	}
 }

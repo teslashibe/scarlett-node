@@ -3438,9 +3438,18 @@ pub async fn run() -> Result<()> {
 /// address; a connection that finds no place is closed at once (counted on
 /// `GET /v1/capacity`). A session slot is taken only when the token arrives.
 async fn serve(listener: TcpListener, shared: Shared, acceptor: Option<tokio_rustls::TlsAcceptor>) -> Result<()> {
+    let mut refusals_noted = None::<Instant>;
     loop {
         let (socket, peer) = listener.accept().await?;
-        let Some(waiting) = shared.0.pre_token.take(peer.ip()) else { continue };
+        let Some(waiting) = shared.0.pre_token.take(peer.ip()) else {
+            // At most one line per 10 s; GET /v1/capacity counts them all.
+            if refusals_noted.is_none_or(|at| at.elapsed() >= Duration::from_secs(10)) {
+                refusals_noted = Some(Instant::now());
+                let view = shared.0.pre_token.view();
+                println!("verifier: refused a waiting connection from {} ({} waiting; refused so far: {} for its address, {} in all)", peer.ip(), view["connections"], view["refused_per_address"], view["refused_global"]);
+            }
+            continue;
+        };
         let _ = socket.set_nodelay(true);
         let shared = shared.clone();
         let acceptor = acceptor.clone();
@@ -3453,8 +3462,8 @@ async fn serve(listener: TcpListener, shared: Shared, acceptor: Option<tokio_rus
             } else {
                 Box::new(socket)
             };
-            if handle(shared, socket, waiting, peer.ip()).await.is_err() {
-                println!("verifier: session from {peer} ended without a result");
+            if let Err(e) = handle(shared, socket, waiting, peer.ip()).await {
+                println!("verifier: session from {peer} ended without a result: {}", loggable(&e));
             }
         });
     }
