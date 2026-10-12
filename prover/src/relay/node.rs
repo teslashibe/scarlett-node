@@ -23,16 +23,16 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
     net::TcpStream,
     sync::mpsc,
 };
 
 use super::{
-    MAX_REQUEST, VERSION,
+    MAX_REQUEST, TRANSPORT, VERSION,
     ot::NodeOt,
     record, tag,
-    wire::{self, CHUNK},
+    wire::{self, CHUNK, FrameReader},
 };
 use crate::{
     dial,
@@ -170,10 +170,12 @@ async fn run_observed(request: Request, trace: &Trace) -> Result<Summary> {
     // Reach X first: presenting the token spends one of the job's attempts.
     let server = trace.measure(Phase::XTcpConnect, async { TcpStream::connect((HOST, 443)).await.context("x.com unreachable") }).await?;
     server.set_nodelay(true)?;
-    let (mut socket, traffic) = crate::control::connect_observed(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture, Some(trace)).await?;
-    socket.write_all(format!("{}\n", request.token).as_bytes()).await?;
+    let (socket, traffic) = crate::control::connect_observed(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture, Some(trace)).await?;
+    // One X session per connection: it closes when this returns.
+    let mut conn = RelayConn::new(socket);
+    conn.present(&request.token).await?;
     let response = trace.measure(Phase::RelaySession, async {
-        tokio::time::timeout(std::time::Duration::from_secs(120), session_observed(socket, server, &raw, HOST, trace)).await.context("relay session timed out")?
+        tokio::time::timeout(std::time::Duration::from_secs(120), exchange(&mut conn, server, &raw, HOST, Mode::X, trace)).await.context("relay session timed out")?.map(|(response, ..)| response)
     }).await?;
     Ok(Summary {
         verifier_transport: traffic.snapshot(),
@@ -346,9 +348,11 @@ async fn run_web_observed(input: &[u8], trace: &Trace) -> Result<WebSummary, Web
     };
     let (server, target) = crate::control::metered(server);
     let session = async {
-        let (mut socket, traffic) = crate::control::connect_observed(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture, Some(trace)).await?;
-        socket.write_all(format!("{}\n", request.token).as_bytes()).await?;
-        let outcome = trace.measure(Phase::RelaySession, web_session(socket, server, &raw, host, request.hop, &request.url, trace)).await?;
+        let (socket, traffic) = crate::control::connect_observed(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture, Some(trace)).await?;
+        // A one-shot hop: transport 2 with a single session, closed after it.
+        let mut conn = RelayConn::new(socket);
+        conn.present(&request.token).await?;
+        let (outcome, _) = trace.measure(Phase::RelaySession, web_session_on(&mut conn, server, &raw, host, request.hop, &request.url, trace)).await?;
         anyhow::Ok((outcome, traffic))
     };
     let (outcome, traffic) = match tokio::time::timeout_at(deadline, session).await {
@@ -386,6 +390,57 @@ enum Event {
     Failed(anyhow::Error),
 }
 
+/// The supplier's end of a verifier connection. Each session on it presents
+/// its own token; with transport 2 the verifier may keep a web session's
+/// connection for the next one (`"keep":true` in DONE). The connection is
+/// never reused after a failure.
+pub struct RelayConn<V> {
+    reader: FrameReader<ReadHalf<V>>,
+    writer: WriteHalf<V>,
+}
+
+impl<V: AsyncRead + AsyncWrite + Unpin> RelayConn<V> {
+    pub fn new(verifier: V) -> Self {
+        let (reader, writer) = tokio::io::split(verifier);
+        Self { reader: FrameReader::new(reader), writer }
+    }
+
+    /// Presents a session's token. Spends one of the job's sessions once the
+    /// verifier admits it.
+    pub async fn present(&mut self, token: &str) -> Result<()> {
+        self.writer.write_all(format!("{token}\n").as_bytes()).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+
+    /// Sends PING and waits for PONG, while the connection waits for a
+    /// token. The verifier's first PING on a new connection gives it the
+    /// long pre-token wait.
+    #[cfg(test)]
+    pub async fn ping(&mut self, within: Duration) -> Result<()> {
+        wire::send(&mut self.writer, wire::PING, &[]).await?;
+        match tokio::time::timeout(within, self.reader.recv()).await {
+            Ok(Ok((wire::PONG, _))) => Ok(()),
+            Ok(Ok((kind, _))) => bail!("verifier sent frame {kind} to a connection without a session"),
+            Ok(Err(e)) => Err(e.context("verifier connection ended")),
+            Err(_) => bail!("verifier did not answer a ping"),
+        }
+    }
+
+    /// Fails if, while the connection waited, the verifier closed it or
+    /// sent anything at all: nothing may arrive outside a session but a
+    /// PONG that was asked for. Never waits.
+    #[cfg(test)]
+    pub fn check_idle(&mut self) -> Result<()> {
+        use futures::FutureExt;
+        match self.reader.recv().now_or_never() {
+            None => Ok(()),
+            Some(Ok((kind, _))) => bail!("verifier sent frame {kind} to a connection without a session"),
+            Some(Err(e)) => Err(e.context("verifier connection ended")),
+        }
+    }
+}
+
 /// Runs the session over an established verifier socket and a connection to
 /// `host`, and returns the response the verifier decrypted.
 #[cfg(test)]
@@ -397,24 +452,37 @@ where
     session_observed(verifier, server, raw, host, &Trace::new()).await
 }
 
+#[cfg(test)]
 pub(crate) async fn session_observed<V, X>(verifier: V, server: X, raw: &[u8], host: &str, trace: &Trace) -> Result<Vec<u8>>
 where
     V: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     X: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    exchange(verifier, server, raw, host, Mode::X, trace).await.map(|(response, _)| response)
+    exchange(&mut RelayConn::new(verifier), server, raw, host, Mode::X, trace).await.map(|(response, ..)| response)
 }
 
 /// Runs one web hop over an established verifier socket and a connection to
 /// the target, and returns what the verifier reported for it. `raw` is the
 /// canonical request for `url`, hop number `hop`.
+#[cfg(test)]
 pub(crate) async fn web_session<V, X>(verifier: V, server: X, raw: &[u8], host: &str, hop: u32, url: &str, trace: &Trace) -> Result<HopOutcome>
 where
     V: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     X: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (_, outcome) = exchange(verifier, server, raw, host, Mode::Web { hop, url }, trace).await?;
-    outcome.context("verifier finished without reporting the hop")
+    web_session_on(&mut RelayConn::new(verifier), server, raw, host, hop, url, trace).await.map(|(outcome, _)| outcome)
+}
+
+/// One web hop on `conn`, whose token was just presented: what the
+/// verifier reported, and whether it keeps the connection for another
+/// session.
+pub(crate) async fn web_session_on<V, X>(conn: &mut RelayConn<V>, server: X, raw: &[u8], host: &str, hop: u32, url: &str, trace: &Trace) -> Result<(HopOutcome, bool)>
+where
+    V: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    X: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (_, outcome, keep) = exchange(conn, server, raw, host, Mode::Web { hop, url }, trace).await?;
+    Ok((outcome.context("verifier finished without reporting the hop")?, keep))
 }
 
 #[derive(Clone, Copy)]
@@ -425,7 +493,7 @@ enum Mode<'a> {
 
 /// What the verifier reports about a web hop once the supplier has checked
 /// the opened request record.
-#[derive(Deserialize)]
+#[derive(Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HopOutcome {
     pub hop: u32,
@@ -436,7 +504,26 @@ pub struct HopOutcome {
     pub next_url: Option<String>,
 }
 
-async fn exchange<V, X>(verifier: V, server: X, raw: &[u8], host: &str, mode: Mode<'_>, trace: &Trace) -> Result<(Vec<u8>, Option<HopOutcome>)>
+/// The HELLO that starts every session: the relay version, the hidden bits
+/// to transfer, and transport 2.
+pub(crate) fn hello(bits: usize) -> Vec<u8> {
+    format!("{{\"version\":{VERSION},\"transfers\":{bits},\"transport\":{TRANSPORT}}}").into_bytes()
+}
+
+/// DONE's payload. `keep` says the verifier waits on this connection for
+/// the supplier's next token (transport 2); anything else closes it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Done {
+    status: String,
+    #[serde(default)]
+    keep: bool,
+}
+
+/// One session on `conn`, whose token was just presented: the X response
+/// (empty for a web hop), the web hop's outcome, and whether the verifier
+/// keeps the connection for another session.
+async fn exchange<V, X>(conn: &mut RelayConn<V>, server: X, raw: &[u8], host: &str, mode: Mode<'_>, trace: &Trace) -> Result<(Vec<u8>, Option<HopOutcome>, bool)>
 where
     V: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     X: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -453,22 +540,9 @@ where
     let mut public = raw.to_vec();
     hidden.iter().for_each(|range| public[range.clone()].fill(0));
 
-    let (mut from_verifier, mut to_verifier) = tokio::io::split(verifier);
+    let RelayConn { reader: from_verifier, writer: to_verifier } = conn;
     let (mut from_server, mut to_server) = tokio::io::split(server);
     let (events, mut inbox) = mpsc::channel(16);
-    let frames = events.clone();
-    let frame_reader = tokio::spawn(async move {
-        loop {
-            let event = match wire::recv(&mut from_verifier).await {
-                Ok((kind, payload)) => Event::Frame(kind, payload),
-                Err(e) => Event::Failed(e.context("verifier connection ended")),
-            };
-            let stop = matches!(event, Event::Failed(_));
-            if frames.send(event).await.is_err() || stop {
-                break;
-            }
-        }
-    });
     let server_reader = tokio::spawn(async move {
         let mut chunk = vec![0u8; CHUNK];
         loop {
@@ -482,17 +556,17 @@ where
             }
         }
     });
-    let _readers = Abort(vec![frame_reader.abort_handle(), server_reader.abort_handle()]);
+    let _readers = Abort(vec![server_reader.abort_handle()]);
 
-    wire::send(&mut to_verifier, wire::HELLO, format!("{{\"version\":{VERSION},\"transfers\":{bits}}}").as_bytes()).await?;
+    wire::send(to_verifier, wire::HELLO, &hello(bits)).await?;
     let mut ot = None;
     let mut received = None;
     if bits > 0 {
         let (state, (kind, setup)) = NodeOt::start(bits)?;
-        wire::send(&mut to_verifier, kind, &setup).await?;
+        wire::send(to_verifier, kind, &setup).await?;
         ot = Some(state);
     } else {
-        send_request(&mut to_verifier, &public, &hidden, &[]).await?;
+        send_request(to_verifier, &public, &hidden, &[]).await?;
         ot_ready.take().expect("OT readiness is pending").finish(Outcome::Success);
         received = Some(Vec::new());
     }
@@ -504,7 +578,22 @@ where
     let mut response = Vec::new();
     let mut response_last_byte = None;
     let mut outcome: Option<HopOutcome> = None;
-    while let Some(event) = inbox.recv().await {
+    let mut server_open = true;
+    loop {
+        // FrameReader::recv is cancel-safe, so the two sources can race.
+        let event = tokio::select! {
+            frame = from_verifier.recv() => match frame {
+                Ok((kind, payload)) => Event::Frame(kind, payload),
+                Err(e) => Event::Failed(e.context("verifier connection ended")),
+            },
+            server = inbox.recv(), if server_open => match server {
+                Some(event) => event,
+                None => {
+                    server_open = false;
+                    continue;
+                }
+            },
+        };
         match event {
             Event::Failed(e) => {
                 if record_sent && !checked {
@@ -520,31 +609,31 @@ where
                     trace.milestone(Phase::ResponseFirstByte);
                     response_last_byte = Some(Instant::now());
                 }
-                let sent = wire::send(&mut to_verifier, wire::FROM_SERVER, &bytes).await;
+                let sent = wire::send(to_verifier, wire::FROM_SERVER, &bytes).await;
                 if !record_sent {
                     sent?;
                 }
             }
             Event::ServerEof => {
-                let sent = wire::send(&mut to_verifier, wire::SERVER_EOF, &[]).await;
+                let sent = wire::send(to_verifier, wire::SERVER_EOF, &[]).await;
                 if !record_sent {
                     sent?;
                 }
             }
             Event::Frame(wire::CO_CHOOSE, payload) => {
                 for (kind, frame) in ot.as_mut().context("unexpected base-OT choice")?.on_choose(&payload)? {
-                    wire::send(&mut to_verifier, kind, &frame).await?;
+                    wire::send(to_verifier, kind, &frame).await?;
                 }
             }
             Event::Frame(wire::KOS_CHI, payload) => {
                 let ot = ot.as_mut().context("unexpected OT challenge")?;
                 let (kind, check) = ot.on_chi(&payload)?;
-                wire::send(&mut to_verifier, kind, &check).await?;
+                wire::send(to_verifier, kind, &check).await?;
                 let (choices, blocks) = ot.take(bits)?;
                 if let Some(span) = ot_ready.take() {
                     span.finish(Outcome::Success);
                 }
-                send_request(&mut to_verifier, &public, &hidden, &tag::corrections(&secret, &choices)?).await?;
+                send_request(to_verifier, &public, &hidden, &tag::corrections(&secret, &choices)?).await?;
                 received = Some(blocks);
             }
             Event::Frame(wire::TO_SERVER, payload) => {
@@ -589,14 +678,17 @@ where
                     response_last_byte = Some(Instant::now());
                 }
             }
-            Event::Frame(wire::OPENING, payload) => {
+            Event::Frame(wire::OPENING, mut payload) => {
                 // Check framing once, after the verifier stopped returning data,
                 // to avoid a new repeated full-body scan for small PLAIN frames.
                 if !web && xpolicy::response_complete(&response) && let Some(at) = response_last_byte.take() {
                     trace.milestone_at(Phase::ResponseComplete, at);
                 }
                 let record = sealed.take().context("verifier opened a record that was not sent")?;
-                trace.measure_sync(Phase::OpeningCheck, || opened_as(&payload, &record, raw))?;
+                let opened = trace.measure_sync(Phase::OpeningCheck, || opened_as(&payload, &record, raw));
+                // The revealed key has done its one job.
+                record::wipe(&mut payload);
+                opened?;
                 checked = true;
             }
             Event::Frame(wire::FAILED, payload) if web => {
@@ -622,7 +714,7 @@ where
                 trace.milestone(Phase::ResponseComplete);
                 outcome = Some(reported);
             }
-            Event::Frame(wire::DONE, _) => {
+            Event::Frame(wire::DONE, payload) => {
                 if !record_sent {
                     bail!("verifier finished before the request was sent");
                 }
@@ -633,18 +725,13 @@ where
                 if web && outcome.is_none() {
                     bail!("verifier finished without reporting the hop");
                 }
-                return Ok((response, outcome));
+                // The hop stands whatever DONE says; only an explicit keep reuses the connection.
+                let keep = web && serde_json::from_slice::<Done>(&payload).is_ok_and(|done| done.status == "complete" && done.keep);
+                return Ok((response, outcome, keep));
             }
             Event::Frame(kind, _) => bail!("unexpected relay frame {kind}"),
         }
     }
-    // The verifier went away. If it had this node send a record and never
-    // showed what was in it, that is the one thing the node must not accept
-    // quietly: it cannot tell a dropped connection from a hidden request.
-    if record_sent && !checked {
-        bail!("{MISUSE}: the session ended before it opened the request record");
-    }
-    bail!("relay session ended without a result")
 }
 
 /// Start of the error a supplier reports when the verifier made it send

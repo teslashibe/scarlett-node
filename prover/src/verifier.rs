@@ -34,6 +34,7 @@
 use std::{
     collections::HashMap,
     env,
+    net::IpAddr,
     os::unix::fs::DirBuilderExt,
     path::PathBuf,
     sync::{
@@ -71,7 +72,7 @@ use tokio_util::{compat::TokioAsyncReadCompatExt, io::ReaderStream};
 
 use crate::{
     policy::{self, Verified},
-    relay::verifier::{Conn, Failure, HopClock, TimedOut, Timing, WebReader, web_session},
+    relay::verifier::{Conn, Failure, HopClock, TimedOut, Timing, TokenWait, WebReader, web_session},
     verifier_store::{self, Record, Store},
     webpolicy::{self, Framer},
     xpolicy::{self, Exchange, ProofMode, Spec},
@@ -86,6 +87,11 @@ const MAX_DURABLE_X_EXCHANGES: usize = 10;
 
 /// X and Codex always keep this many of the verifier's session slots.
 const X_CODEX_SLOTS: usize = 16;
+
+/// Connections that may wait for a token at once, all told and from one
+/// source address (SCARLETT_VERIFIER_PRE_TOKEN_LIMIT and _PER_ADDRESS).
+const PRE_TOKEN_LIMIT: usize = 2048;
+const PRE_TOKEN_PER_ADDRESS: usize = 8;
 
 struct Config {
     key: String,
@@ -104,6 +110,12 @@ struct Config {
     busy_refusals: AtomicU64,
     /// Web sessions' terminal commits, for `GET /v1/events`.
     events: crate::verifier_events::Feed,
+    /// Connections waiting for a token, and how long they may wait: a new
+    /// connection `token_wait`, one that sent PING or finished a web session
+    /// `idle_wait`.
+    pre_token: Arc<PreToken>,
+    token_wait: Duration,
+    idle_wait: Duration,
 }
 
 impl Config {
@@ -121,6 +133,9 @@ impl Config {
             web_timing: Timing::WEB,
             busy_refusals: AtomicU64::new(0),
             events: crate::verifier_events::Feed::new(),
+            pre_token: Arc::new(PreToken::new(PRE_TOKEN_LIMIT, PRE_TOKEN_PER_ADDRESS)),
+            token_wait: Duration::from_secs(10),
+            idle_wait: Duration::from_secs(60),
         }
     }
 }
@@ -628,6 +643,14 @@ impl Sessions {
     }
 }
 
+/// Where test connections come from, and their place among the waiting.
+#[cfg(test)]
+const LOCAL: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+#[cfg(test)]
+fn waiting(shared: &Shared) -> Waiting {
+    shared.0.pre_token.take(LOCAL).expect("a place to wait for a token")
+}
+
 #[cfg(test)]
 mod durable_tests {
     use super::*;
@@ -1090,7 +1113,7 @@ mod relay_tests {
         let (code, Json(created)) = create(State(s.clone()), headers(), Json(job)).await;
         assert_eq!(code, StatusCode::CREATED);
         let (mut node_end, verifier_end) = tokio::io::duplex(1 << 20);
-        let session = tokio::spawn(handle(s.clone(), Box::new(verifier_end)));
+        let session = tokio::spawn(handle(s.clone(), Box::new(verifier_end), waiting(&s), LOCAL));
         node_end.write_all(format!("{}\n", created["token"].as_str().unwrap()).as_bytes()).await.unwrap();
         let tcp = tokio::net::TcpStream::connect(x.addr).await.unwrap();
         let result = tokio::time::timeout(Duration::from_secs(30), crate::relay::node::session(node_end, tcp, &request(), xpolicy::HOST)).await.unwrap();
@@ -1146,7 +1169,7 @@ mod relay_tests {
         let s = shared(x.roots.clone());
         let (_, Json(created)) = create(State(s.clone()), headers(), Json(job("jack", Some(("relay", Some(crate::relay::POLICY)))))).await;
         let (mut node_end, verifier_end) = tokio::io::duplex(1 << 16);
-        let session = tokio::spawn(handle(s.clone(), Box::new(verifier_end)));
+        let session = tokio::spawn(handle(s.clone(), Box::new(verifier_end), waiting(&s), LOCAL));
         node_end.write_all(format!("{}\n", created["token"].as_str().unwrap()).as_bytes()).await.unwrap();
         node_end.write_all(&[0, 0, 0, 0, 0, 0, 0, 16, 1, 2, 3, 4, 5, 6, 7, 8]).await.unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(30), session).await.unwrap();
@@ -1268,7 +1291,7 @@ mod web_tests {
     /// `url` unless `raw` says otherwise.
     async fn hop(s: &Shared, origin: &Server, token: &str, index: u32, url: &str, raw: Option<Vec<u8>>) -> (Result<node::HopOutcome>, Result<()>) {
         let (mut node_end, verifier_end) = tokio::io::duplex(1 << 20);
-        let session = tokio::spawn(handle(s.clone(), Box::new(verifier_end)));
+        let session = tokio::spawn(handle(s.clone(), Box::new(verifier_end), waiting(s), LOCAL));
         node_end.write_all(format!("{token}\n").as_bytes()).await.unwrap();
         let tcp = TcpStream::connect(origin.addr).await.unwrap();
         let raw = raw.unwrap_or_else(|| webpolicy::request(url, &web_headers()));
@@ -2235,7 +2258,7 @@ mod web_tests {
         let shared_verifier = s.clone();
         tokio::spawn(async move {
             while let Ok((socket, _)) = verifier.accept().await {
-                tokio::spawn(handle(shared_verifier.clone(), Box::new(socket)));
+                tokio::spawn(handle(shared_verifier.clone(), Box::new(socket), waiting(&shared_verifier), LOCAL));
             }
         });
         // The proxy tunnels every CONNECT to the local origin.
@@ -2302,7 +2325,7 @@ mod web_tests {
         let shared_verifier = s.clone();
         tokio::spawn(async move {
             while let Ok((socket, _)) = verifier.accept().await {
-                tokio::spawn(handle(shared_verifier.clone(), Box::new(socket)));
+                tokio::spawn(handle(shared_verifier.clone(), Box::new(socket), waiting(&shared_verifier), LOCAL));
             }
         });
         // The proxy tunnels whatever it is asked for to the local origin, and
@@ -2363,6 +2386,208 @@ mod web_tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve(listener, s.clone(), None));
         addr
+    }
+
+    /// One hop on `conn` with `token`: what the verifier reported, and
+    /// whether it keeps the connection.
+    async fn hop_on(conn: &mut node::RelayConn<TcpStream>, origin: &Server, token: &str, index: u32, url: &str) -> Result<(node::HopOutcome, bool)> {
+        conn.present(token).await?;
+        let tcp = TcpStream::connect(origin.addr).await?;
+        let raw = webpolicy::request(url, &web_headers());
+        tokio::time::timeout(Duration::from_secs(30), node::web_session_on(conn, tcp, &raw, webpolicy::url_host(url), index, url, &Trace::new())).await?
+    }
+
+    /// Registers web job attempt `attempt` for `url` and returns its token.
+    async fn register_attempt(s: &Shared, attempt: &str, url: &str) -> String {
+        let (code, Json(created)) = create(State(s.clone()), headers(), Json(CreateRequest { attempt: attempt.into(), ..job(payload(url, 5), now_ms() + 60_000) })).await;
+        assert_eq!(code, StatusCode::CREATED, "{created}");
+        created["token"].as_str().unwrap().to_owned()
+    }
+
+    /// Whether the verifier closed `socket` within `within`.
+    async fn closed_within(socket: &mut TcpStream, within: Duration) -> bool {
+        let mut byte = [0u8; 1];
+        matches!(tokio::time::timeout(within, socket.read(&mut byte)).await, Ok(Ok(0) | Err(_)))
+    }
+
+    #[tokio::test]
+    async fn one_connection_serves_web_session_after_session_each_on_its_own_token() {
+        const OTHER: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nother";
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait), ("www.example.com/", OTHER, End::Wait)]), false).await;
+        let s = shared(origin.roots.clone(), None);
+        let verifier = serve_verifier(&s).await;
+        let first = register_attempt(&s, "1", "https://example.com/").await;
+        let second = register_attempt(&s, "2", "https://www.example.com/").await;
+        let mut conn = node::RelayConn::new(TcpStream::connect(verifier).await.unwrap());
+        let (outcome, keep) = hop_on(&mut conn, &origin, &first, 0, "https://example.com/").await.unwrap();
+        assert_eq!((outcome.status_code, keep), (200, true));
+        // Between sessions the connection waits for a token: it holds a waiting place, no session slot.
+        let c = capacity_view(&s).await;
+        assert_eq!((c["pre_token"]["connections"].as_u64(), c["active_connections"].as_u64()), (Some(1), Some(0)));
+        let (outcome, keep) = hop_on(&mut conn, &origin, &second, 0, "https://www.example.com/").await.unwrap();
+        assert_eq!((outcome.url.as_str(), keep), ("https://www.example.com/", true));
+        // Each job has its own receipt, complete, from its own session.
+        for (attempt, url, bytes) in [("1", "https://example.com/", 20), ("2", "https://www.example.com/", 5)] {
+            let (_, Json(v)) = status(State(s.clone()), headers(), Path(("synthetic".into(), attempt.into()))).await;
+            assert_eq!((v["complete"].as_bool(), v["hops"][0]["url"].as_str(), v["hops"][0]["body_bytes"].as_u64()), (Some(true), Some(url), Some(bytes)), "{attempt}");
+        }
+        assert_eq!(tokens(&s), 0);
+        // A used token is refused on the same connection, which then closes: nothing is spent.
+        let third = register_attempt(&s, "3", "https://example.com/").await;
+        assert!(hop_on(&mut conn, &origin, &first, 0, "https://example.com/").await.is_err());
+        let mut fresh = node::RelayConn::new(TcpStream::connect(verifier).await.unwrap());
+        assert_eq!(hop_on(&mut fresh, &origin, &third, 0, "https://example.com/").await.unwrap().0.status_code, 200);
+        // A kept connection takes web tokens only: an X token closes it unspent.
+        let x = json!({"type":"x.read","max_attempts":1,"exchanges":[{"operation":"UserByScreenName","query_id":"qid_1","variables":{"screen_name":"jack"},"features":{}}],"proof_mode":"relay","proof_policy":"x-relay-v1"});
+        let (_, Json(created)) = create(State(s.clone()), headers(), Json(CreateRequest { attempt: "x".into(), fence: None, expires_at_ms: None, ttl_seconds: Some(60), ..job(x, 0) })).await;
+        fresh.present(created["token"].as_str().unwrap()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(fresh.check_idle().is_err());
+        let (_, Json(v)) = status(State(s.clone()), headers(), Path(("synthetic".into(), "x".into()))).await;
+        assert_eq!((v["remaining_attempts"].as_u64(), tokens(&s)), (Some(1), 1));
+    }
+
+    #[tokio::test]
+    async fn waiting_connections_are_capped_per_address_and_overall_and_hold_no_session_slot() {
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        // Two waiting connections per address.
+        let s = shared_local(origin.roots.clone(), 2);
+        let verifier = serve_verifier(&s).await;
+        let mut first = TcpStream::connect(verifier).await.unwrap();
+        let mut second = TcpStream::connect(verifier).await.unwrap();
+        let mut third = TcpStream::connect(verifier).await.unwrap();
+        assert!(closed_within(&mut third, Duration::from_secs(2)).await);
+        assert!(!closed_within(&mut first, Duration::from_millis(100)).await && !closed_within(&mut second, Duration::from_millis(100)).await);
+        let c = capacity_view(&s).await;
+        assert_eq!((c["pre_token"]["connections"].as_u64(), c["pre_token"]["refused_per_address"].as_u64(), c["pre_token"]["per_address_limit"].as_u64()), (Some(2), Some(1), Some(2)));
+        // A place frees when a waiting connection goes, or presents its token.
+        drop(second);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let mut conn = node::RelayConn::new(TcpStream::connect(verifier).await.unwrap());
+        assert_eq!(hop_on(&mut conn, &origin, &token, 0, "https://example.com/").await.unwrap(), (node_outcome(), true));
+        drop((first, conn));
+
+        // The overall cap counts every address.
+        let mut config = Config::new(KEY.into(), "127.0.0.1:1".into(), Duration::from_secs(20), verifier_store::Limits::default(), 64, 48, crate::relay::verifier::tls_config(origin.roots.clone()).unwrap());
+        config.pre_token = Arc::new(PreToken::new(3, 8));
+        let s: Shared = Arc::new((config, Mutex::new(Sessions::default())));
+        let verifier = serve_verifier(&s).await;
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(TcpStream::connect(verifier).await.unwrap());
+        }
+        let mut fourth = TcpStream::connect(verifier).await.unwrap();
+        assert!(closed_within(&mut fourth, Duration::from_secs(2)).await);
+        assert_eq!(capacity_view(&s).await["pre_token"]["refused_global"].as_u64(), Some(1));
+        drop(held);
+
+        // Waiting connections hold no session slot: 64 of them, and a session still runs.
+        let s = shared_local(origin.roots.clone(), 128);
+        let verifier = serve_verifier(&s).await;
+        let mut idle = Vec::new();
+        for _ in 0..64 {
+            idle.push(TcpStream::connect(verifier).await.unwrap());
+        }
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let mut conn = node::RelayConn::new(TcpStream::connect(verifier).await.unwrap());
+        assert_eq!(hop_on(&mut conn, &origin, &token, 0, "https://example.com/").await.unwrap().0.status_code, 200);
+        assert_eq!(capacity_view(&s).await["pre_token"]["connections"].as_u64(), Some(65));
+    }
+
+    fn node_outcome() -> node::HopOutcome {
+        node::HopOutcome { hop: 0, url: "https://example.com/".into(), status_code: 200, is_final: true, next_url: None }
+    }
+
+    /// A verifier whose connections wait `token_wait` for a token, or
+    /// `idle_wait` once they sent PING or finished a session.
+    fn waits(roots: rustls::RootCertStore, token_wait: Duration, idle_wait: Duration) -> Shared {
+        let mut config = Config::new(KEY.into(), "127.0.0.1:1".into(), Duration::from_secs(20), verifier_store::Limits::default(), 64, 48, crate::relay::verifier::tls_config(roots).unwrap());
+        (config.token_wait, config.idle_wait) = (token_wait, idle_wait);
+        Arc::new((config, Mutex::new(Sessions::default())))
+    }
+
+    #[tokio::test]
+    async fn a_connection_waits_for_its_token_only_as_its_wait_allows() {
+        use crate::relay::wire::{self, FROM_SERVER, PING, PONG};
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        let s = waits(origin.roots.clone(), Duration::from_millis(300), Duration::from_millis(1200));
+        let verifier = serve_verifier(&s).await;
+        // Nothing sent: closed once the short wait ends.
+        let started = Instant::now();
+        let mut silent = TcpStream::connect(verifier).await.unwrap();
+        assert!(closed_within(&mut silent, Duration::from_secs(3)).await);
+        assert!(started.elapsed() >= Duration::from_millis(250), "{:?}", started.elapsed());
+        // A PING is answered and earns the long wait, which still ends.
+        let started = Instant::now();
+        let mut pinged = TcpStream::connect(verifier).await.unwrap();
+        wire::send(&mut pinged, PING, &[]).await.unwrap();
+        assert_eq!(wire::recv(&mut pinged).await.unwrap(), (PONG, Vec::new()));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        wire::send(&mut pinged, PING, &[]).await.unwrap();
+        assert_eq!(wire::recv(&mut pinged).await.unwrap(), (PONG, Vec::new()));
+        assert!(closed_within(&mut pinged, Duration::from_secs(3)).await);
+        assert!(started.elapsed() >= Duration::from_millis(1100), "{:?}", started.elapsed());
+        // A token after a PING runs its session as any other.
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let mut conn = node::RelayConn::new(TcpStream::connect(verifier).await.unwrap());
+        conn.ping(Duration::from_secs(2)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let (_, keep) = hop_on(&mut conn, &origin, &token, 0, "https://example.com/").await.unwrap();
+        assert!(keep);
+        // After a session the long wait applies, and it ends too.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(conn.check_idle().is_err());
+        // Anything but a token or PING ends a fresh connection at once:
+        // garbage, a PING with a payload, a target's bytes, too many PINGs.
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("garbage", b"Z".to_vec()),
+            ("upper-case token", format!("{}\n", "A".repeat(64)).into_bytes()),
+            ("unterminated token", "a".repeat(65).into_bytes()),
+            ("ping payload", vec![PING, 0, 0, 0, 1, 0]),
+            ("target bytes", vec![FROM_SERVER, 0, 0, 0, 1, 0]),
+            ("pings", [PING, 0, 0, 0, 0].repeat(17)),
+        ];
+        for (case, bytes) in cases {
+            let mut socket = TcpStream::connect(verifier).await.unwrap();
+            socket.write_all(&bytes).await.unwrap();
+            let mut seen = Vec::new();
+            let ended = tokio::time::timeout(Duration::from_secs(2), socket.read_to_end(&mut seen)).await;
+            assert!(ended.is_ok(), "{case}: still open");
+            assert!(seen.chunks(5).all(|frame| frame == [PONG, 0, 0, 0, 0]), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_is_kept_after_a_session_only_while_a_waiting_place_is_free() {
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        let s = shared_local(origin.roots.clone(), 1);
+        let verifier = serve_verifier(&s).await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let socket = TcpStream::connect(verifier).await.unwrap();
+        let hop = {
+            let origin_addr = origin.addr;
+            tokio::spawn(async move {
+                let origin = Server { addr: origin_addr, roots: rustls::RootCertStore::empty(), seen: Arc::new(Mutex::new(None)) };
+                let mut conn = node::RelayConn::new(socket);
+                let result = hop_on(&mut conn, &origin, &token, 0, "https://example.com/").await;
+                (result, conn)
+            })
+        };
+        // Once the token is admitted the connection's place is free; another connection from the address takes it.
+        while s.1.lock().unwrap().by_job.get(&job_key("synthetic", "1")).is_none_or(|e| e.in_flight != 1) {
+            tokio::task::yield_now().await;
+        }
+        let place = s.0.pre_token.take(LOCAL).expect("the place the session left");
+        let (result, mut conn) = hop.await.unwrap();
+        // The hop stands; the verifier just does not keep the connection.
+        let (outcome, keep) = result.unwrap();
+        assert_eq!((outcome.status_code, keep), (200, false));
+        assert_eq!(view(&s).await["complete"], true);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(conn.check_idle().is_err());
+        assert_eq!(capacity_view(&s).await["pre_token"]["refused_per_address"].as_u64(), Some(1));
+        drop(place);
     }
 
     /// A CONNECT proxy that tunnels every connection to `origin`.
@@ -2598,9 +2823,17 @@ mod web_tests {
         }
     }
 
+    /// As `shared` without state, with room for `per_address` waiting
+    /// connections from 127.0.0.1, where every test connection comes from.
+    fn shared_local(roots: rustls::RootCertStore, per_address: usize) -> Shared {
+        let mut config = Config::new(KEY.into(), "127.0.0.1:1".into(), Duration::from_secs(20), verifier_store::Limits::default(), 64, 48, crate::relay::verifier::tls_config(roots).unwrap());
+        config.pre_token = Arc::new(PreToken::new(PRE_TOKEN_LIMIT, per_address));
+        Arc::new((config, Mutex::new(Sessions::default())))
+    }
+
     #[tokio::test]
     async fn web_sessions_beyond_their_slots_are_refused_and_x_still_starts() {
-        let s = shared(rustls::RootCertStore::empty(), None);
+        let s = shared_local(rustls::RootCertStore::empty(), 128);
         let verifier = serve_verifier(&s).await;
         let expires = now_ms() + 60_000;
         let mut tokens = Vec::new();
@@ -2614,7 +2847,7 @@ mod web_tests {
         for token in &tokens {
             let mut socket = TcpStream::connect(verifier).await.unwrap();
             socket.write_all(format!("{token}\n").as_bytes()).await.unwrap();
-            crate::relay::wire::send(&mut socket, crate::relay::wire::HELLO, br#"{"version":1,"transfers":0}"#).await.unwrap();
+            crate::relay::wire::send(&mut socket, crate::relay::wire::HELLO, br#"{"version":1,"transfers":0,"transport":2}"#).await.unwrap();
             open.push(socket);
         }
         // 16 of them are turned away at once with FAILED verifier_busy; the
@@ -2662,7 +2895,7 @@ mod web_tests {
             let (s, token, addr) = (s.clone(), token.clone(), origin.addr);
             tokio::spawn(async move {
                 let (mut node_end, verifier_end) = tokio::io::duplex(1 << 20);
-                let session = tokio::spawn(handle(s.clone(), Box::new(verifier_end)));
+                let session = tokio::spawn(handle(s.clone(), Box::new(verifier_end), waiting(&s), LOCAL));
                 node_end.write_all(format!("{token}\n").as_bytes()).await.unwrap();
                 let tcp = TcpStream::connect(addr).await.unwrap();
                 let raw = webpolicy::request("https://example.com/", &web_headers());
@@ -2743,6 +2976,9 @@ mod web_tests {
         for (name, reason) in [("relay-failed-busy.json", "verifier_busy"), ("relay-failed-page-too-large.json", "page_too_large")] {
             assert_eq!(fixture(name), json!({"reason": reason}));
         }
+        // Transport 2 on the wire: a web hello, and DONE for a kept connection.
+        assert_eq!(serde_json::from_slice::<Value>(&node::hello(0)).unwrap(), fixture("relay-hello.json"));
+        assert_eq!(serde_json::from_slice::<Value>(crate::relay::verifier::DONE_KEEP).unwrap(), fixture("relay-done-keep.json"));
         // GET /v1/events: the complete hop above is the feed's first event.
         let (code, feed) = read_events(&s, Some("0"), Some("1"), None).await;
         assert_eq!(code, StatusCode::OK);
@@ -2818,8 +3054,12 @@ pub async fn run() -> Result<()> {
         (None, None) if plaintext && listen.parse::<std::net::SocketAddr>().is_ok_and(|a| a.ip().is_loopback()) => None,
         _ => bail!("verifier needs a TLS certificate/key or an explicit loopback plaintext fixture"),
     };
+    let pre_token_limit = bounded_env("SCARLETT_VERIFIER_PRE_TOKEN_LIMIT", PRE_TOKEN_LIMIT as u64, 16, 65_536)? as usize;
+    let pre_token_per_address = bounded_env("SCARLETT_VERIFIER_PRE_TOKEN_PER_ADDRESS", PRE_TOKEN_PER_ADDRESS as u64, 1, pre_token_limit as u64)? as usize;
     let relay_tls = crate::relay::verifier::tls_config(crate::relay::verifier::mozilla_roots()?)?;
-    let shared: Shared = Arc::new((Config::new(key, upstream, Duration::from_secs(limit), limits, concurrency, web_concurrency, relay_tls), Mutex::new(sessions)));
+    let mut config = Config::new(key, upstream, Duration::from_secs(limit), limits, concurrency, web_concurrency, relay_tls);
+    config.pre_token = Arc::new(PreToken::new(pre_token_limit, pre_token_per_address));
+    let shared: Shared = Arc::new((config, Mutex::new(sessions)));
     let cleanup = shared.clone();
     tokio::spawn(async move {
         loop {
@@ -2847,22 +3087,22 @@ pub async fn run() -> Result<()> {
     });
 
     let listener = TcpListener::bind(&listen).await.with_context(|| format!("binding {listen}"))?;
-    println!("verifier: sessions on {listen} ({concurrency}, {web_concurrency} for web), API on {api}, upstream {}", shared.0.upstream);
+    println!("verifier: sessions on {listen} ({concurrency}, {web_concurrency} for web; {pre_token_limit} waiting, {pre_token_per_address} per address), API on {api}, upstream {}", shared.0.upstream);
     serve(listener, shared, acceptor).await
 }
 
-/// Accepts supplier connections, each into one of the connection slots;
-/// a connection that finds none is closed at once.
+/// Accepts supplier connections. Each waits for its token among a bounded
+/// number of waiting connections, at most `per_address` from one source
+/// address; a connection that finds no place is closed at once (counted on
+/// `GET /v1/capacity`). A session slot is taken only when the token arrives.
 async fn serve(listener: TcpListener, shared: Shared, acceptor: Option<tokio_rustls::TlsAcceptor>) -> Result<()> {
-    let slots = shared.0.slots.clone();
     loop {
         let (socket, peer) = listener.accept().await?;
-        let Ok(slot) = slots.clone().try_acquire_owned() else { continue };
+        let Some(waiting) = shared.0.pre_token.take(peer.ip()) else { continue };
         let _ = socket.set_nodelay(true);
         let shared = shared.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            let _slot = slot;
             let socket: crate::control::Socket = if let Some(acceptor) = acceptor {
                 match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(socket)).await {
                     Ok(Ok(socket)) => Box::new(socket),
@@ -2871,10 +3111,81 @@ async fn serve(listener: TcpListener, shared: Shared, acceptor: Option<tokio_rus
             } else {
                 Box::new(socket)
             };
-            if handle(shared, socket).await.is_err() {
+            if handle(shared, socket, waiting, peer.ip()).await.is_err() {
                 println!("verifier: session from {peer} ended without a result");
             }
         });
+    }
+}
+
+/// Connections waiting for a token: those not yet in a session, and those
+/// a transport 2 web session left open for the supplier's next token. They
+/// hold none of the `concurrency` session slots, only a place here.
+struct PreToken {
+    places: Arc<tokio::sync::Semaphore>,
+    limit: usize,
+    per_address: usize,
+    by_address: Mutex<HashMap<IpAddr, usize>>,
+    refused_global: AtomicU64,
+    refused_per_address: AtomicU64,
+}
+
+/// One connection's place among the waiting.
+struct Waiting {
+    pre_token: Arc<PreToken>,
+    address: IpAddr,
+    _place: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        let mut by_address = self.pre_token.by_address.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = by_address.get_mut(&self.address) {
+            *count -= 1;
+            if *count == 0 {
+                by_address.remove(&self.address);
+            }
+        }
+    }
+}
+
+impl PreToken {
+    fn new(limit: usize, per_address: usize) -> Self {
+        Self { places: Arc::new(tokio::sync::Semaphore::new(limit)), limit, per_address, by_address: Mutex::new(HashMap::new()), refused_global: AtomicU64::new(0), refused_per_address: AtomicU64::new(0) }
+    }
+
+    /// The source a per-address count belongs to: an IPv4 address, or the
+    /// /64 of an IPv6 address, which one host can fill with addresses.
+    fn source(ip: IpAddr) -> IpAddr {
+        match ip.to_canonical() {
+            IpAddr::V6(v6) => IpAddr::V6(std::net::Ipv6Addr::from(u128::from(v6) & !((1u128 << 64) - 1))),
+            v4 => v4,
+        }
+    }
+
+    /// A place for one more waiting connection from `ip`, if there is one.
+    fn take(self: &Arc<Self>, ip: IpAddr) -> Option<Waiting> {
+        let Ok(place) = self.places.clone().try_acquire_owned() else {
+            self.refused_global.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        let address = Self::source(ip);
+        let mut by_address = self.by_address.lock().unwrap_or_else(|e| e.into_inner());
+        let count = by_address.entry(address).or_insert(0);
+        if *count >= self.per_address {
+            drop(by_address);
+            self.refused_per_address.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        *count += 1;
+        Some(Waiting { pre_token: self.clone(), address, _place: place })
+    }
+
+    fn view(&self) -> Value {
+        serde_json::json!({
+            "connections": self.limit - self.places.available_permits(), "limit": self.limit, "per_address_limit": self.per_address,
+            "refused_global": self.refused_global.load(Ordering::Relaxed), "refused_per_address": self.refused_per_address.load(Ordering::Relaxed),
+        })
     }
 }
 
@@ -3002,7 +3313,7 @@ async fn capacity(State(shared): State<Shared>, headers: HeaderMap) -> (StatusCo
     (if sessions.failed { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK }, Json(serde_json::json!({
         "healthy": !sessions.failed, "durable": sessions.store.is_some(), "concurrency":config.concurrency,
         "records":sessions.by_job.len(), "storage":storage, "limits":config.limits, "web": web,
-        "active_connections":config.concurrency - config.slots.available_permits(),
+        "active_connections":config.concurrency - config.slots.available_permits(), "pre_token": config.pre_token.view(),
         "in_flight_proofs":sessions.by_job.values().map(|entry| entry.in_flight).sum::<usize>(),
         "pending_sessions":sessions.by_token.values().filter(|key| sessions.by_job.get(*key).is_some_and(|entry| entry.expires_ms > now_ms())).count()
     })))
@@ -3297,308 +3608,395 @@ enum Job {
     Web(Arc<webpolicy::Job>, usize, String),
 }
 
-async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()> {
-    let (config, sessions) = &*shared;
-    let mut line = [0u8; 65];
-    tokio::time::timeout(Duration::from_secs(10), socket.read_exact(&mut line)).await.context("no session token")??;
-    if line[64] != b'\n' {
-        bail!("malformed session token");
+/// Admission to a session for one presented token.
+enum Admission {
+    /// The token was spent (committed) and the session's slots are held.
+    Admitted(Admitted),
+    /// A web session found no session or web slot. The supplier is told
+    /// `verifier_busy` and nothing is spent.
+    Busy(String),
+    /// An X or Codex session found no session slot; nothing is spent.
+    Full,
+}
+
+struct Admitted {
+    key: String,
+    job: Job,
+    expires: Instant,
+    body_path: PathBuf,
+    /// One of `concurrency` session slots, held for the session.
+    _active: tokio::sync::OwnedSemaphorePermit,
+    web_slot: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+/// Admits `token` under the session lock: a session slot (and a web slot
+/// for a web hop) first, then the spent token or attempt is committed before
+/// any provider work. A connection that already served a session (`reused`)
+/// takes web tokens only, and refuses any other before spending it.
+fn admit(shared: &Shared, token: &str, reused: bool) -> Result<Admission> {
+    let (config, sessions) = &**shared;
+    let mut guard = sessions.lock().unwrap();
+    let s = &mut *guard;
+    if s.failed {
+        bail!("verifier state unavailable");
     }
-    let token = std::str::from_utf8(&line[..64])?;
-    // Err(key): the job's web session must wait for a web slot.
-    let admitted = 'admit: {
-        let mut guard = sessions.lock().unwrap();
-        let s = &mut *guard;
-        if s.failed {
-            bail!("verifier state unavailable");
+    let key = s.by_token.get(token).cloned().context("unknown or used session token")?;
+    let body_path = s.body_path(&key);
+    let entry = s.by_job.get_mut(&key).context("session expired")?;
+    if reused && !matches!(entry.kind, Kind::Web(_)) {
+        bail!("a connection that served a session takes web sessions only");
+    }
+    if Instant::now() >= entry.expires {
+        s.by_token.remove(token);
+        // A web receipt keeps the hops it verified.
+        if !matches!(entry.kind, Kind::Web(_)) {
+            entry.status = Status::Expired;
         }
-        let key = s.by_token.get(token).cloned().context("unknown or used session token")?;
-        let body_path = s.body_path(&key);
-        let mut web_slot = None;
-        let entry = s.by_job.get_mut(&key).context("session expired")?;
-        if Instant::now() >= entry.expires {
+        s.commit(&key)?;
+        bail!("session expired");
+    }
+    // Waiting connections hold no session slot; a session takes one now.
+    let Ok(active) = config.slots.clone().try_acquire_owned() else {
+        return Ok(if matches!(entry.kind, Kind::Web(_)) { Admission::Busy(key) } else { Admission::Full });
+    };
+    let mut web_slot = None;
+    let job = match &entry.kind {
+        Kind::Codex => {
+            // Codex tokens are single use: removing it here blocks replays and parallel attempts.
             s.by_token.remove(token);
-            // A web receipt keeps the hops it verified.
-            if !matches!(entry.kind, Kind::Web(_)) {
-                entry.status = Status::Expired;
-            }
-            s.commit(&key)?;
-            bail!("session expired");
+            entry.status = Status::Running;
+            Job::Codex(entry.payload.clone())
         }
-        let job = match &entry.kind {
-            Kind::Codex => {
-                // Codex tokens are single use: removing it here blocks replays and parallel attempts.
+        Kind::X(specs, mode) => {
+            let Status::XRead { remaining_attempts, complete, exchanges, .. } = &mut entry.status else {
+                bail!("session is in an unexpected state")
+            };
+            let fulfilled = exchanges.iter().filter(|r| r.fulfilled).map(|r| (r.index, r.exchange.clone(), r.cursors.clone())).collect();
+            if *remaining_attempts == 0 || *complete {
                 s.by_token.remove(token);
-                entry.status = Status::Running;
-                Job::Codex(entry.payload.clone())
+                bail!("x.read session has no attempts left");
             }
-            Kind::X(specs, mode) => {
-                let Status::XRead { remaining_attempts, complete, exchanges, .. } = &mut entry.status else {
-                    bail!("session is in an unexpected state")
-                };
-                let fulfilled = exchanges.iter().filter(|r| r.fulfilled).map(|r| (r.index, r.exchange.clone(), r.cursors.clone())).collect();
-                if *remaining_attempts == 0 || *complete {
-                    s.by_token.remove(token);
-                    bail!("x.read session has no attempts left");
-                }
-                // Each connection spends one attempt; the token dies with the last one.
-                *remaining_attempts -= 1;
-                if *remaining_attempts == 0 {
-                    s.by_token.remove(token);
-                }
-                Job::X(specs.clone(), *mode, fulfilled)
+            // Each connection spends one attempt; the token dies with the last one.
+            *remaining_attempts -= 1;
+            if *remaining_attempts == 0 {
+                s.by_token.remove(token);
             }
-            Kind::Web(web) => {
-                let Status::WebRead { remaining_sessions, complete, next_url, hops, rejections, .. } = &mut entry.status else {
-                    bail!("session is in an unexpected state")
-                };
-                // Hops run one at a time, and none after the job has ended.
-                if entry.in_flight > 0 || *complete || !rejections.is_empty() || *remaining_sessions == 0 {
-                    bail!("web session cannot start a hop now");
-                }
-                // A hop takes a web slot, so X and Codex keep theirs. Without
-                // one the session spends nothing and the node tries again.
-                let Ok(slot) = config.web_slots.clone().try_acquire_owned() else {
-                    break 'admit Err(key);
-                };
-                web_slot = Some(slot);
-                let url = if hops.is_empty() { web.url.clone() } else { next_url.clone().context("web session has no authorized next hop")? };
-                // Each connection spends one session; the token dies with the last one.
-                *remaining_sessions -= 1;
-                if *remaining_sessions == 0 {
-                    s.by_token.remove(token);
-                }
-                Job::Web(web.clone(), hops.len(), url)
+            Job::X(specs.clone(), *mode, fulfilled)
+        }
+        Kind::Web(web) => {
+            let Status::WebRead { remaining_sessions, complete, next_url, hops, rejections, .. } = &mut entry.status else {
+                bail!("session is in an unexpected state")
+            };
+            // Hops run one at a time, and none after the job has ended.
+            if entry.in_flight > 0 || *complete || !rejections.is_empty() || *remaining_sessions == 0 {
+                bail!("web session cannot start a hop now");
+            }
+            // A hop takes a web slot, so X and Codex keep theirs. Without
+            // one the session spends nothing and the node tries again.
+            let Ok(slot) = config.web_slots.clone().try_acquire_owned() else {
+                return Ok(Admission::Busy(key));
+            };
+            web_slot = Some(slot);
+            let url = if hops.is_empty() { web.url.clone() } else { next_url.clone().context("web session has no authorized next hop")? };
+            // Each connection spends one session; the token dies with the last one.
+            *remaining_sessions -= 1;
+            if *remaining_sessions == 0 {
+                s.by_token.remove(token);
+            }
+            Job::Web(web.clone(), hops.len(), url)
+        }
+    };
+    entry.in_flight += 1;
+    let expires = entry.expires;
+    // A durable spent token/attempt must exist before any provider session.
+    s.commit(&key)?;
+    Ok(Admission::Admitted(Admitted { key, job, expires, body_path, _active: active, web_slot }))
+}
+
+/// Serves one supplier connection. It waits for a token among the waiting
+/// connections (`waiting`), then runs that token's session. A web session's
+/// connection may wait for the supplier's next token after DONE (transport
+/// 2), if it can take a place among the waiting again; it closes after any
+/// failure. Every session presents its own token and starts from fresh
+/// state; the last session's keys are wiped before the next token is read.
+async fn handle(shared: Shared, socket: crate::control::Socket, waiting: Waiting, peer: IpAddr) -> Result<()> {
+    let (config, sessions) = &*shared;
+    let mut conn = Conn::new(socket);
+    let mut wait = TokenWait::fresh(config.token_wait, config.idle_wait);
+    let mut waiting = Some(waiting);
+    let mut reused = false;
+    loop {
+        let Some(token) = conn.next_token(&mut wait, reused).await? else {
+            // Closed before presenting a token: a cancelled pre-dial, a pool
+            // connection retired, or a supplier done with its connection.
+            return Ok(());
+        };
+        let Admitted { key, job, expires, body_path, _active, web_slot } = match admit(&shared, &token, reused)? {
+            Admission::Admitted(admitted) => admitted,
+            Admission::Busy(key) => {
+                config.busy_refusals.fetch_add(1, Ordering::Relaxed);
+                println!("verifier: job {} web session refused: verifier_busy", key.split('\n').next().unwrap_or_default());
+                let _ = tokio::time::timeout(Duration::from_secs(5), conn.refuse("verifier_busy")).await;
+                return Ok(());
+            }
+            Admission::Full => {
+                println!("verifier: session from {peer} refused: no session slot");
+                return Ok(());
             }
         };
-        entry.in_flight += 1;
-        let expires = entry.expires;
-        // A durable spent token/attempt must exist before any provider session.
-        s.commit(&key)?;
-        Ok((key, job, expires, web_slot, body_path))
-    };
-    let (key, job, expires, web_slot, body_path) = match admitted {
-        Ok(admitted) => admitted,
-        Err(key) => {
-            config.busy_refusals.fetch_add(1, Ordering::Relaxed);
-            println!("verifier: job {} web session refused: verifier_busy", key.split('\n').next().unwrap_or_default());
-            let _ = tokio::time::timeout(Duration::from_secs(5), Conn::new(socket).refuse("verifier_busy")).await;
-            return Ok(());
-        }
-    };
+        // In a session now: the connection no longer counts as waiting.
+        drop(waiting.take());
 
-    let started = Instant::now();
-    let job_id = key.split('\n').next().unwrap_or_default().to_owned();
-    let limit = config.session_limit.min(expires.saturating_duration_since(Instant::now()));
-    match job {
-        Job::Codex(payload) => {
-            let status = match tokio::time::timeout(limit, verify(socket, &payload, &config.upstream)).await {
-                Ok(Ok(verified)) => Status::Accepted { verified, duration_ms: started.elapsed().as_millis() as u64 },
-                Ok(Err(_)) => Status::Rejected { reason: "proof_rejected".into() },
-                Err(_) => Status::Rejected { reason: "session_timeout".into() },
-            };
-            match &status {
-                Status::Accepted { verified, .. } => {
-                    println!("verifier: job {job_id} accepted, model {}", verified.model)
+        let started = Instant::now();
+        let job_id = key.split('\n').next().unwrap_or_default().to_owned();
+        let limit = config.session_limit.min(expires.saturating_duration_since(Instant::now()));
+        match job {
+            Job::Codex(payload) => {
+                let status = match tokio::time::timeout(limit, verify(conn.into_inner()?, &payload, &config.upstream)).await {
+                    Ok(Ok(verified)) => Status::Accepted { verified, duration_ms: started.elapsed().as_millis() as u64 },
+                    Ok(Err(_)) => Status::Rejected { reason: "proof_rejected".into() },
+                    Err(_) => Status::Rejected { reason: "session_timeout".into() },
+                };
+                match &status {
+                    Status::Accepted { verified, .. } => {
+                        println!("verifier: job {job_id} accepted, model {}", verified.model)
+                    }
+                    Status::Rejected { reason } => {
+                        println!("verifier: job {job_id} rejected: {reason}")
+                    }
+                    _ => {}
                 }
-                Status::Rejected { reason } => {
-                    println!("verifier: job {job_id} rejected: {reason}")
+                let mut s = sessions.lock().unwrap();
+                if s.failed {
+                    bail!("verifier state unavailable");
                 }
-                _ => {}
-            }
-            let mut s = sessions.lock().unwrap();
-            if s.failed {
-                bail!("verifier state unavailable");
-            }
-            if let Some(entry) = s.by_job.get_mut(&key) {
-                entry.in_flight = entry.in_flight.saturating_sub(1);
-                entry.status = if Instant::now() >= entry.expires { Status::Expired } else { status };
-                s.commit(&key)?;
-            }
-        }
-        Job::X(specs, mode, fulfilled) => {
-            let proof = async {
-                match mode {
-                    ProofMode::Mpc => verify_x(socket).await,
-                    // The cause names only public job fields and protocol steps, never
-                    // a hidden value, and is the one place a failed session can be diagnosed.
-                    ProofMode::Relay => relay_x(socket, config.relay_tls.clone(), &specs, &fulfilled).await.inspect_err(|e| println!("verifier: job {job_id} relay session failed: {}", loggable(e))),
-                }
-            };
-            let outcome = match tokio::time::timeout(limit, proof).await {
-                // Parse the response before taking the lock that every session shares.
-                Ok(Ok((exchange, sent_bytes, received_bytes))) => Ok((xpolicy::outcome(&exchange), exchange, sent_bytes, received_bytes)),
-                Ok(Err(_)) => Err("proof_rejected".into()),
-                Err(_) => Err("session_timeout".into()),
-            };
-            let mut guard = sessions.lock().unwrap();
-            let s = &mut *guard;
-            if s.failed {
-                bail!("verifier state unavailable");
-            }
-            if let Some(entry) = s.by_job.get_mut(&key) {
-                entry.in_flight = entry.in_flight.saturating_sub(1);
-                if Instant::now() >= entry.expires {
-                    entry.status = Status::Expired;
-                    s.by_token.retain(|_, k| *k != key);
+                if let Some(entry) = s.by_job.get_mut(&key) {
+                    entry.in_flight = entry.in_flight.saturating_sub(1);
+                    entry.status = if Instant::now() >= entry.expires { Status::Expired } else { status };
                     s.commit(&key)?;
-                    return Ok(());
                 }
-            }
-            let Some(Entry { status: Status::XRead { complete, pending, exchanges, rejections, .. }, .. }) = s.by_job.get_mut(&key) else {
                 return Ok(());
-            };
-            // Match under the lock, so concurrent proofs of one exchange cannot both fulfil it.
-            let matched = outcome.and_then(|((fulfilled, cursors), exchange, sent_bytes, received_bytes)| {
-                let done: Vec<(usize, &Exchange, &[String])> =
-                    exchanges.iter().filter(|r| r.fulfilled).map(|r| (r.index, &r.exchange, r.cursors.as_slice())).collect();
-                match xpolicy::assign(&specs, &done, &exchange) {
-                    Ok(index) => Ok(XRecord {
-                        index,
-                        fulfilled,
-                        exchange,
-                        cursors,
-                        sent_bytes,
-                        received_bytes,
-                        duration_ms: started.elapsed().as_millis() as u64,
-                    }),
-                    Err(_) => Err("exchange_mismatch".into()),
-                }
-            });
-            match matched {
-                Ok(record) => {
-                    println!(
-                        "verifier: job {job_id} proved X {} for exchange {} (HTTP {})",
-                        record.exchange.operation, record.index, record.exchange.http_status
-                    );
-                    if record.fulfilled {
-                        pending.retain(|&i| i != record.index);
-                    }
-                    exchanges.push(record);
-                    if pending.is_empty() {
-                        *complete = true;
-                        s.by_token.retain(|_, k| *k != key);
-                    }
-                }
-                Err(reason) => {
-                    println!("verifier: job {job_id} rejected an X exchange: {reason}");
-                    rejections.push(reason);
-                }
             }
-            s.commit(&key)?;
-        }
-        Job::Web(web, index, url) => {
-            let _web_slot = web_slot;
-            let host = webpolicy::url_host(&url).to_owned();
-            let authorize = |public: &[u8]| webpolicy::authorize(&web, &url, public).map(drop);
-            let started_at_ms = now_ms();
-            let hop_limit = limit.min(webpolicy::HOP_LIMIT);
-            let mut conn = Conn::new(socket);
-            let mut reader = WebReader::new(Framer::for_hop(web.max_response_bytes, web.rule(&url, index)), body_path);
-            let mut clock = HopClock::new(config.web_timing, Instant::now() + hop_limit);
-            // The clock ends the hop inside the session, so the node always
-            // gets its record opened; this only bounds a session that stops
-            // making progress some other way.
-            let session = tokio::time::timeout(hop_limit + Duration::from_secs(10), web_session(&mut conn, config.relay_tls.clone(), &host, authorize, &mut reader, &mut clock)).await;
-            let duration_ms = started.elapsed().as_millis() as u64;
-            let (reason, detail) = match session {
-                // What the node chose for this hop, from the bytes just authorized.
-                Ok(Ok(sealed)) => match (reader.finish().await, webpolicy::authorize(&web, &url, &sealed.sent)) {
-                    (Ok((response, stored)), Ok(node)) => {
-                        let is_final = !response.followable;
-                        let next_url = response.followable.then(|| response.location.clone()).flatten();
-                        let hop = WebHop {
-                            index,
-                            url: url.clone(),
-                            status_code: response.status,
-                            location: response.location.clone(),
-                            location_refused: response.location_refused.map(Into::into),
-                            head_base64: STANDARD.encode(&response.head),
-                            body_stored: is_final,
-                            body_bytes: response.body_bytes,
-                            body_sha256: hex(&response.body_sha256),
-                            response_sha256: hex(&response.response_sha256),
-                            framing: response.framing.name().into(),
-                            sent_bytes: sealed.sent.len(),
-                            received_bytes: response.received,
-                            server_name: host.clone(),
-                            tls_version: WEB_TLS_VERSION.into(),
-                            cipher_suite: WEB_CIPHER_SUITE.into(),
-                            alpn: sealed.tls.alpn.clone(),
-                            cert_chain_sha256: hex(&sealed.tls.cert_chain_sha256),
-                            leaf_cert_sha256: hex(&sealed.tls.leaf_cert_sha256),
-                            started_at_ms,
-                            duration_ms,
-                            node_user_agent: node.as_ref().map(|n| n.user_agent.clone()),
-                            node_cookie_names: node.as_ref().map(webpolicy::NodeHeaders::cookie_names),
-                            node_cookie_sha256: node.as_ref().and_then(webpolicy::NodeHeaders::cookie_sha256),
-                        };
-                        let frame = serde_json::to_vec(&HopOutcome { hop: index, url: &url, status_code: response.status, is_final, next_url: next_url.as_deref() })?;
-                        // The hop, and its body file, are durable before the node learns the next URL.
-                        {
-                            let mut guard = sessions.lock().unwrap();
-                            let s = &mut *guard;
-                            if s.failed {
-                                bail!("verifier state unavailable");
-                            }
-                            let Some(Entry { status: Status::WebRead { complete, next_url: pending, hops, .. }, in_flight, .. }) = s.by_job.get_mut(&key) else {
-                                bail!("web receipt is gone");
-                            };
-                            hops.push(hop);
-                            *pending = next_url;
-                            *in_flight = 0;
-                            if is_final {
-                                *complete = true;
-                                s.by_token.retain(|_, k| *k != key);
-                            }
-                            s.commit(&key)?;
-                        }
-                        if let Some(stored) = stored {
-                            stored.commit();
-                        }
-                        // The final hop and its body are durable: the app may take the page now.
-                        if is_final {
-                            config.events.append(&job_id, attempt_of(&key), "complete", now_ms());
-                        }
-                        println!("verifier: job {job_id} proved web hop {index} (HTTP {}, {} bytes, {duration_ms} ms)", response.status, response.body_bytes);
-                        let _ = tokio::time::timeout(Duration::from_secs(10), conn.done(Some(&frame))).await;
-                        return Ok(());
+            Job::X(specs, mode, fulfilled) => {
+                let proof = async {
+                    match mode {
+                        ProofMode::Mpc => verify_x(conn.into_inner()?).await,
+                        // The cause names only public job fields and protocol steps, never
+                        // a hidden value, and is the one place a failed session can be diagnosed.
+                        ProofMode::Relay => relay_x(&mut conn, config.relay_tls.clone(), &specs, &fulfilled).await.inspect_err(|e| println!("verifier: job {job_id} relay session failed: {}", loggable(e))),
                     }
-                    (Err(e), _) | (_, Err(e)) => {
-                        println!("verifier: job {job_id} web hop {index} could not be recorded: {}", loggable(&e));
-                        (Failure::ProofRejected.reason(), None)
-                    }
-                },
-                // Only the reason is logged: never the URL, host or anything the page said.
-                Ok(Err(e)) => (Failure::of(&e).reason(), e.downcast_ref::<TimedOut>().map(|t| t.0)),
-                Err(_) => (Failure::SessionTimeout.reason(), Some("stalled")),
-            };
-            match detail {
-                Some(detail) => println!("verifier: job {job_id} web hop {index} failed: {reason} ({detail})"),
-                None => println!("verifier: job {job_id} web hop {index} failed: {reason}"),
-            }
-            let rejection = Rejection::new(reason, reader.counts());
-            {
+                };
+                let outcome = match tokio::time::timeout(limit, proof).await {
+                    // Parse the response before taking the lock that every session shares.
+                    Ok(Ok((exchange, sent_bytes, received_bytes))) => Ok((xpolicy::outcome(&exchange), exchange, sent_bytes, received_bytes)),
+                    Ok(Err(_)) => Err("proof_rejected".into()),
+                    Err(_) => Err("session_timeout".into()),
+                };
                 let mut guard = sessions.lock().unwrap();
                 let s = &mut *guard;
                 if s.failed {
                     bail!("verifier state unavailable");
                 }
-                if let Some(Entry { status: Status::WebRead { next_url, rejections, rejection: recorded, .. }, in_flight, .. }) = s.by_job.get_mut(&key) {
-                    *in_flight = 0;
-                    *next_url = None;
-                    rejections.push(reason.into());
-                    *recorded = Some(rejection);
-                    s.by_token.retain(|_, k| *k != key);
-                    s.commit(&key)?;
-                    config.events.append(&job_id, attempt_of(&key), "rejected", now_ms());
+                if let Some(entry) = s.by_job.get_mut(&key) {
+                    entry.in_flight = entry.in_flight.saturating_sub(1);
+                    if Instant::now() >= entry.expires {
+                        entry.status = Status::Expired;
+                        s.by_token.retain(|_, k| *k != key);
+                        s.commit(&key)?;
+                        return Ok(());
+                    }
+                }
+                let Some(Entry { status: Status::XRead { complete, pending, exchanges, rejections, .. }, .. }) = s.by_job.get_mut(&key) else {
+                    return Ok(());
+                };
+                // Match under the lock, so concurrent proofs of one exchange cannot both fulfil it.
+                let matched = outcome.and_then(|((fulfilled, cursors), exchange, sent_bytes, received_bytes)| {
+                    let done: Vec<(usize, &Exchange, &[String])> =
+                        exchanges.iter().filter(|r| r.fulfilled).map(|r| (r.index, &r.exchange, r.cursors.as_slice())).collect();
+                    match xpolicy::assign(&specs, &done, &exchange) {
+                        Ok(index) => Ok(XRecord {
+                            index,
+                            fulfilled,
+                            exchange,
+                            cursors,
+                            sent_bytes,
+                            received_bytes,
+                            duration_ms: started.elapsed().as_millis() as u64,
+                        }),
+                        Err(_) => Err("exchange_mismatch".into()),
+                    }
+                });
+                match matched {
+                    Ok(record) => {
+                        println!(
+                            "verifier: job {job_id} proved X {} for exchange {} (HTTP {})",
+                            record.exchange.operation, record.index, record.exchange.http_status
+                        );
+                        if record.fulfilled {
+                            pending.retain(|&i| i != record.index);
+                        }
+                        exchanges.push(record);
+                        if pending.is_empty() {
+                            *complete = true;
+                            s.by_token.retain(|_, k| *k != key);
+                        }
+                    }
+                    Err(reason) => {
+                        println!("verifier: job {job_id} rejected an X exchange: {reason}");
+                        rejections.push(reason);
+                    }
+                }
+                s.commit(&key)?;
+                return Ok(());
+            }
+            Job::Web(web, index, url) => {
+                let hop = WebHopRun { key: &key, job_id: &job_id, web: &web, index, url: &url, body_path, started, limit };
+                match web_hop(&shared, &mut conn, hop, web_slot, _active, peer).await? {
+                    Some(next) => {
+                        waiting = Some(next);
+                        wait = TokenWait::after_session(config.idle_wait);
+                        reused = true;
+                    }
+                    None => return Ok(()),
                 }
             }
-            // The rejection is committed; now the node may learn why.
-            let _ = tokio::time::timeout(Duration::from_secs(5), conn.refuse(reason)).await;
         }
     }
-    Ok(())
+}
+
+/// One admitted web hop, as `web_hop` runs it.
+struct WebHopRun<'a> {
+    key: &'a str,
+    job_id: &'a str,
+    web: &'a Arc<webpolicy::Job>,
+    index: usize,
+    url: &'a str,
+    body_path: PathBuf,
+    started: Instant,
+    limit: Duration,
+}
+
+/// Runs one web hop and records it: the hop and its body are committed
+/// before OUTCOME, a rejection before FAILED. After a verified hop the
+/// session's slots are released and the connection may wait for the
+/// supplier's next token (`Some`) if it can take a place among the waiting
+/// connections; DONE tells the supplier which. After a failure it closes.
+async fn web_hop(shared: &Shared, conn: &mut Conn<crate::control::Socket>, hop: WebHopRun<'_>, web_slot: Option<tokio::sync::OwnedSemaphorePermit>, active: tokio::sync::OwnedSemaphorePermit, peer: IpAddr) -> Result<Option<Waiting>> {
+    let (config, sessions) = &**shared;
+    let WebHopRun { key, job_id, web, index, url, body_path, started, limit } = hop;
+    let host = webpolicy::url_host(url).to_owned();
+    let authorize = |public: &[u8]| webpolicy::authorize(web, url, public).map(drop);
+    let started_at_ms = now_ms();
+    let hop_limit = limit.min(webpolicy::HOP_LIMIT);
+    let mut reader = WebReader::new(Framer::for_hop(web.max_response_bytes, web.rule(url, index)), body_path);
+    let mut clock = HopClock::new(config.web_timing, Instant::now() + hop_limit);
+    // The clock ends the hop inside the session, so the node always
+    // gets its record opened; this only bounds a session that stops
+    // making progress some other way.
+    let session = tokio::time::timeout(hop_limit + Duration::from_secs(10), web_session(conn, config.relay_tls.clone(), &host, authorize, &mut reader, &mut clock)).await;
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let (reason, detail) = match session {
+        // What the node chose for this hop, from the bytes just authorized.
+        Ok(Ok(sealed)) => match (reader.finish().await, webpolicy::authorize(web, url, &sealed.sent)) {
+            (Ok((response, stored)), Ok(node)) => {
+                let is_final = !response.followable;
+                let next_url = response.followable.then(|| response.location.clone()).flatten();
+                let record = WebHop {
+                    index,
+                    url: url.to_owned(),
+                    status_code: response.status,
+                    location: response.location.clone(),
+                    location_refused: response.location_refused.map(Into::into),
+                    head_base64: STANDARD.encode(&response.head),
+                    body_stored: is_final,
+                    body_bytes: response.body_bytes,
+                    body_sha256: hex(&response.body_sha256),
+                    response_sha256: hex(&response.response_sha256),
+                    framing: response.framing.name().into(),
+                    sent_bytes: sealed.sent.len(),
+                    received_bytes: response.received,
+                    server_name: host.clone(),
+                    tls_version: WEB_TLS_VERSION.into(),
+                    cipher_suite: WEB_CIPHER_SUITE.into(),
+                    alpn: sealed.tls.alpn.clone(),
+                    cert_chain_sha256: hex(&sealed.tls.cert_chain_sha256),
+                    leaf_cert_sha256: hex(&sealed.tls.leaf_cert_sha256),
+                    started_at_ms,
+                    duration_ms,
+                    node_user_agent: node.as_ref().map(|n| n.user_agent.clone()),
+                    node_cookie_names: node.as_ref().map(webpolicy::NodeHeaders::cookie_names),
+                    node_cookie_sha256: node.as_ref().and_then(webpolicy::NodeHeaders::cookie_sha256),
+                };
+                let frame = serde_json::to_vec(&HopOutcome { hop: index, url, status_code: response.status, is_final, next_url: next_url.as_deref() })?;
+                // The hop, and its body file, are durable before the node learns the next URL.
+                {
+                    let mut guard = sessions.lock().unwrap();
+                    let s = &mut *guard;
+                    if s.failed {
+                        bail!("verifier state unavailable");
+                    }
+                    let Some(Entry { status: Status::WebRead { complete, next_url: pending, hops, .. }, in_flight, .. }) = s.by_job.get_mut(key) else {
+                        bail!("web receipt is gone");
+                    };
+                    hops.push(record);
+                    *pending = next_url;
+                    *in_flight = 0;
+                    if is_final {
+                        *complete = true;
+                        s.by_token.retain(|_, k| k != key);
+                    }
+                    s.commit(key)?;
+                }
+                if let Some(stored) = stored {
+                    stored.commit();
+                }
+                // The final hop and its body are durable: the app may take the page now.
+                if is_final {
+                    config.events.append(job_id, attempt_of(key), "complete", now_ms());
+                }
+                println!("verifier: job {job_id} proved web hop {index} (HTTP {}, {} bytes, {duration_ms} ms)", response.status, response.body_bytes);
+                // The session is over: its slots go back before the connection waits again.
+                drop((web_slot, active));
+                let next = config.pre_token.take(peer);
+                return Ok(match tokio::time::timeout(Duration::from_secs(10), conn.done(Some(&frame), next.is_some())).await {
+                    Ok(Ok(())) => next,
+                    _ => None,
+                });
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                println!("verifier: job {job_id} web hop {index} could not be recorded: {}", loggable(&e));
+                (Failure::ProofRejected.reason(), None)
+            }
+        },
+        // Only the reason is logged: never the URL, host or anything the page said.
+        Ok(Err(e)) => (Failure::of(&e).reason(), e.downcast_ref::<TimedOut>().map(|t| t.0)),
+        Err(_) => (Failure::SessionTimeout.reason(), Some("stalled")),
+    };
+    match detail {
+        Some(detail) => println!("verifier: job {job_id} web hop {index} failed: {reason} ({detail})"),
+        None => println!("verifier: job {job_id} web hop {index} failed: {reason}"),
+    }
+    let rejection = Rejection::new(reason, reader.counts());
+    {
+        let mut guard = sessions.lock().unwrap();
+        let s = &mut *guard;
+        if s.failed {
+            bail!("verifier state unavailable");
+        }
+        if let Some(Entry { status: Status::WebRead { next_url, rejections, rejection: recorded, .. }, in_flight, .. }) = s.by_job.get_mut(key) {
+            *in_flight = 0;
+            *next_url = None;
+            rejections.push(reason.into());
+            *recorded = Some(rejection);
+            s.by_token.retain(|_, k| k != key);
+            s.commit(key)?;
+            config.events.append(job_id, attempt_of(key), "rejected", now_ms());
+        }
+    }
+    // The rejection is committed; now the node may learn why. The connection closes.
+    drop((web_slot, active));
+    let _ = tokio::time::timeout(Duration::from_secs(5), conn.refuse(reason)).await;
+    Ok(None)
 }
 
 /// The OUTCOME frame a supplier receives for a verified web hop.
@@ -3633,12 +4031,12 @@ fn loggable(error: &anyhow::Error) -> String {
 /// A relay session: the verifier is X's TLS peer through the supplier's
 /// connection. It authorizes only a request for a read this job still wants,
 /// and what it returns went through the same policy check as an MPC-TLS proof.
-async fn relay_x(socket: crate::control::Socket, tls: Arc<rustls::ClientConfig>, specs: &[Spec], fulfilled: &[(usize, Exchange, Vec<String>)]) -> Result<(Exchange, usize, usize)> {
+async fn relay_x(conn: &mut Conn<crate::control::Socket>, tls: Arc<rustls::ClientConfig>, specs: &[Spec], fulfilled: &[(usize, Exchange, Vec<String>)]) -> Result<(Exchange, usize, usize)> {
     let authorize = |sent: &[u8], hidden: &[std::ops::Range<usize>]| {
         let done: Vec<(usize, &Exchange, &[String])> = fulfilled.iter().map(|(index, exchange, cursors)| (*index, exchange, cursors.as_slice())).collect();
         xpolicy::assign_request(specs, &done, xpolicy::check_request(sent, hidden)?).map(|_| ())
     };
-    let outcome = crate::relay::verifier::run(socket, tls, xpolicy::HOST, authorize).await?;
+    let outcome = crate::relay::verifier::run(conn, tls, xpolicy::HOST, authorize).await?;
     let exchange = xpolicy::check(xpolicy::HOST, &outcome.sent, &outcome.hidden, &outcome.received, &[])?;
     Ok((exchange, outcome.sent.len(), outcome.received.len()))
 }

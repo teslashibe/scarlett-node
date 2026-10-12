@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 
 use super::{
-    MAX_HIDDEN_BITS, MAX_REQUEST, VERSION,
+    MAX_HIDDEN_BITS, MAX_REQUEST, TRANSPORT, VERSION,
     ot::VerifierOt,
     record::{self, Keys},
     tag,
@@ -364,6 +364,56 @@ pub struct Sealed {
     pub tls: TlsInfo,
 }
 
+/// DONE's payloads: the connection waits for the supplier's next token, or closes.
+pub const DONE_KEEP: &[u8] = br#"{"status":"complete","keep":true}"#;
+pub const DONE_CLOSE: &[u8] = br#"{"status":"complete","keep":false}"#;
+
+/// The most PINGs one pre-token wait answers, and the most bytes of the last
+/// session's target traffic it discards; beyond either the connection closes.
+const MAX_PINGS: u32 = 16;
+const MAX_STRAGGLING: usize = 256 << 10;
+
+/// How long a connection may wait for its next token. A new connection has
+/// `short` unless it sends PING, which gives it `long` from when it began
+/// waiting; one that finished a session (transport 2) has `long`.
+pub struct TokenWait {
+    began: Instant,
+    deadline: Instant,
+    long: Duration,
+    extended: bool,
+    pings: u32,
+    straggling: usize,
+}
+
+impl TokenWait {
+    pub fn fresh(short: Duration, long: Duration) -> Self {
+        let began = Instant::now();
+        Self { began, deadline: began + short, long, extended: false, pings: 0, straggling: 0 }
+    }
+
+    pub fn after_session(long: Duration) -> Self {
+        let began = Instant::now();
+        Self { began, deadline: began + long, long, extended: true, pings: 0, straggling: 0 }
+    }
+
+    fn ping(&mut self) -> Result<()> {
+        self.pings += 1;
+        if self.pings > MAX_PINGS {
+            bail!("too many pings while waiting for a token");
+        }
+        if !self.extended {
+            self.extended = true;
+            self.deadline = self.began + self.long;
+        }
+        Ok(())
+    }
+}
+
+/// One exact read, by `deadline`.
+async fn exact<R: AsyncRead + Unpin>(reader: &mut FrameReader<R>, out: &mut [u8], deadline: Instant) -> Result<bool> {
+    tokio::time::timeout_at(deadline.into(), reader.read_exact(out)).await.map_err(|_| anyhow::anyhow!("no session token in time"))?
+}
+
 /// The verifier's end of one supplier connection.
 pub struct Conn<S> {
     reader: FrameReader<ReadHalf<S>>,
@@ -376,13 +426,79 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
         Self { reader: FrameReader::new(reader), writer }
     }
 
-    /// Ends a session with its result: a web hop's OUTCOME, then DONE.
-    pub async fn done(&mut self, outcome: Option<&[u8]>) -> Result<()> {
+    /// The whole connection, for a session that is not a relay session
+    /// (TLSNotary). Only `next_token` may have read from it, which never
+    /// reads ahead.
+    pub fn into_inner(self) -> Result<S> {
+        Ok(self.reader.into_inner()?.unsplit(self.writer))
+    }
+
+    /// Waits for the supplier's next token line within `wait`, answering
+    /// each PING with PONG. After a session (`after_session`) the supplier
+    /// may still be forwarding its last target's bytes; those frames are
+    /// discarded unread. `None`: the supplier closed cleanly between items.
+    /// Anything else, or the wait running out, is an error.
+    pub async fn next_token(&mut self, wait: &mut TokenWait, after_session: bool) -> Result<Option<String>> {
+        loop {
+            let mut first = [0u8; 1];
+            if !exact(&mut self.reader, &mut first, wait.deadline).await? {
+                return Ok(None);
+            }
+            match first[0] {
+                b'0'..=b'9' | b'a'..=b'f' => {
+                    let mut rest = [0u8; 64];
+                    if !exact(&mut self.reader, &mut rest, wait.deadline).await? {
+                        bail!("malformed session token");
+                    }
+                    let lower_hex = |b: &u8| b.is_ascii_digit() || (b'a'..=b'f').contains(b);
+                    if rest[63] != b'\n' || !rest[..63].iter().all(lower_hex) {
+                        bail!("malformed session token");
+                    }
+                    let mut token = String::with_capacity(64);
+                    token.push(first[0] as char);
+                    token.push_str(std::str::from_utf8(&rest[..63])?);
+                    return Ok(Some(token));
+                }
+                kind @ (wire::PING | wire::FROM_SERVER | wire::SERVER_EOF) => {
+                    let mut len = [0u8; 4];
+                    if !exact(&mut self.reader, &mut len, wait.deadline).await? {
+                        bail!("relay connection closed mid-frame");
+                    }
+                    let len = u32::from_be_bytes(len) as usize;
+                    if kind == wire::PING {
+                        if len != 0 {
+                            bail!("a ping carries nothing");
+                        }
+                        wait.ping()?;
+                        wire::send(&mut self.writer, wire::PONG, &[]).await?;
+                        continue;
+                    }
+                    // Only the last session's target traffic may still be on its way.
+                    wait.straggling += len;
+                    if !after_session || len > CHUNK || (kind == wire::SERVER_EOF && len != 0) || wait.straggling > MAX_STRAGGLING {
+                        bail!("unexpected frame while waiting for a token");
+                    }
+                    let mut discarded = vec![0u8; len];
+                    if len > 0 && !exact(&mut self.reader, &mut discarded, wait.deadline).await? {
+                        bail!("relay connection closed mid-frame");
+                    }
+                }
+                _ => bail!("expected a session token"),
+            }
+        }
+    }
+
+    /// Ends a session with its result: a web hop's OUTCOME, then DONE. With
+    /// `keep` the connection then waits for the supplier's next token; else
+    /// it closes.
+    pub async fn done(&mut self, outcome: Option<&[u8]>, keep: bool) -> Result<()> {
         if let Some(frame) = outcome {
             wire::send(&mut self.writer, wire::OUTCOME, frame).await?;
         }
-        wire::send(&mut self.writer, wire::DONE, b"{\"status\":\"complete\"}").await?;
-        self.close().await;
+        wire::send(&mut self.writer, wire::DONE, if keep { DONE_KEEP } else { DONE_CLOSE }).await?;
+        if !keep {
+            self.close().await;
+        }
         Ok(())
     }
 
@@ -412,6 +528,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Conn<S> {
 struct Hello {
     version: u8,
     transfers: usize,
+    /// Required: one-shot transport 1 is gone with node 0.1.17.
+    transport: u8,
 }
 
 struct Request {
@@ -476,17 +594,17 @@ fn parse_request(payload: &[u8], transfers: usize) -> Result<Request> {
 }
 
 /// Runs one relay session with a supplier and returns what X answered.
+/// The connection closes after it: X sessions are one per connection.
 ///
 /// `authorize` sees the public request and its hidden ranges before any key
 /// material is used for it, and must reject anything the job does not allow.
-pub async fn run<S>(socket: S, config: Arc<ClientConfig>, server_name: &str, authorize: impl Fn(&[u8], &[Range<usize>]) -> Result<()>) -> Result<Outcome>
+pub async fn run<S>(conn: &mut Conn<S>, config: Arc<ClientConfig>, server_name: &str, authorize: impl Fn(&[u8], &[Range<usize>]) -> Result<()>) -> Result<Outcome>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut conn = Conn::new(socket);
     let mut received = XReader(Vec::new());
-    let sealed = session(&mut conn, config, server_name, authorize, &mut received, None).await?;
-    conn.done(None).await?;
+    let sealed = session(conn, config, server_name, authorize, &mut received, None).await?;
+    conn.done(None, false).await?;
     Ok(Outcome { sent: sealed.sent, hidden: sealed.hidden, received: received.0 })
 }
 
@@ -542,7 +660,7 @@ where
     };
     let outcome = WebOutcome { sent: sealed.sent, response, tls: sealed.tls, body };
     let frame = conclude(&outcome)?;
-    conn.done(Some(&frame)).await?;
+    conn.done(Some(&frame), false).await?;
     Ok(outcome)
 }
 
@@ -581,7 +699,7 @@ where
         bail!("relay session must start with a hello");
     }
     let hello: Hello = serde_json::from_slice(&payload).context("invalid relay hello")?;
-    if hello.version != VERSION || hello.transfers > MAX_HIDDEN_BITS {
+    if hello.version != VERSION || hello.transfers > MAX_HIDDEN_BITS || hello.transport != TRANSPORT {
         bail!("unsupported relay hello");
     }
     if !R::HIDDEN && hello.transfers > 0 {
@@ -710,14 +828,14 @@ where
         }
 
         if sent.is_none()
-            && let (Some(parsed), Some(((key, iv, seq), _))) = (request.as_ref(), keys.as_ref())
+            && let (Some(parsed), Some((client, _))) = (request.as_ref(), keys.as_ref())
             && ot.as_ref().is_none_or(VerifierOt::ready)
         {
             let transfers = match ot.as_mut() {
                 Some(ot) => ot.take(hello.transfers)?,
                 None => Vec::new(),
             };
-            let material = tag::verifier_material(key, iv, *seq, &parsed.public, &parsed.hidden, &parsed.corrections, &transfers)?;
+            let material = tag::verifier_material(&client.key, &client.iv, client.seq, &parsed.public, &parsed.hidden, &parsed.corrections, &transfers)?;
             // From here this key and sequence number are spent: there is no
             // second material for this record, whatever happens next.
             let parsed = request.take().expect("request was just read");
@@ -753,13 +871,18 @@ where
     // its own request and nothing else. Best effort on failure: the supplier
     // treats a sealed record that is never opened as misuse.
     if sent.is_some()
-        && let Some(((key, iv, seq), _)) = keys.as_ref()
+        && let Some((client, _)) = keys.as_ref()
     {
-        let opening = wire::send(writer, wire::OPENING, &[&key[..], &iv[..], &seq.to_be_bytes()[..]].concat()).await;
+        let mut payload = [&client.key[..], &client.iv[..], &client.seq.to_be_bytes()[..]].concat();
+        let opening = wire::send(writer, wire::OPENING, &payload).await;
+        record::wipe(&mut payload);
         if outcome.is_ok() {
             opening?;
         }
     }
+    // Both keys are wiped here, as the session's state goes, before the
+    // connection could serve another session.
+    drop(keys);
     outcome?;
     let (sent, hidden) = sent.expect("loop ends only after a request was sent");
     Ok(Sealed { sent, hidden, tls: server_tls.expect("a request is sent only after the handshake") })
@@ -796,9 +919,24 @@ async fn flush_handshake<W: AsyncWrite + Unpin>(conn: &mut ClientConnection, wri
     Ok(())
 }
 
-type ClientKey = ([u8; 16], [u8; 12], u64);
+/// The client write key of the session's one request record: kept until
+/// OPENING reveals it, and wiped when dropped.
+struct ClientKey {
+    key: [u8; 16],
+    iv: [u8; 12],
+    seq: u64,
+}
+
+impl Drop for ClientKey {
+    fn drop(&mut self) {
+        record::wipe(&mut self.key);
+        record::wipe(&mut self.iv);
+        self.seq = 0;
+    }
+}
 
 /// Takes both application traffic keys out of the finished handshake.
+/// rustls wipes its own copies (`AeadKey`) when they drop.
 fn traffic_keys(conn: ClientConnection) -> Result<(ClientKey, Keys)> {
     if conn.protocol_version() != Some(rustls::ProtocolVersion::TLSv1_3) {
         bail!("server did not negotiate TLS 1.3");
@@ -806,11 +944,11 @@ fn traffic_keys(conn: ClientConnection) -> Result<(ClientKey, Keys)> {
     let secrets = conn.dangerous_extract_secrets().context("extracting TLS traffic keys")?;
     let part = |(seq, secrets): (u64, ConnectionTrafficSecrets)| -> Result<ClientKey> {
         let ConnectionTrafficSecrets::Aes128Gcm { key, iv } = secrets else { bail!("server did not negotiate AES-128-GCM") };
-        Ok((key.as_ref().try_into().context("unexpected traffic key length")?, iv.as_ref().try_into().context("unexpected traffic IV length")?, seq))
+        Ok(ClientKey { key: key.as_ref().try_into().context("unexpected traffic key length")?, iv: iv.as_ref().try_into().context("unexpected traffic IV length")?, seq })
     };
     let client = part(secrets.tx)?;
-    let (key, iv, seq) = part(secrets.rx)?;
-    Ok((client, Keys::new(&key, iv, seq)?))
+    let server = part(secrets.rx)?;
+    Ok((client, Keys::new(&server.key, server.iv, server.seq)?))
 }
 
 /// The X policy's request check alone, for tests that have no job.

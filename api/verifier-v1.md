@@ -323,3 +323,81 @@ Fixtures: `events.json`, `events-reset.json`.
   event and the node's `proven` report for the same attempt may both arrive.
 - The verifier never holds its session lock while a request waits, and has
   no outbound calls: it still holds no app credentials.
+
+## 12. Relay transport 2: kept connections, PING/PONG, waiting connections
+
+Added with node 0.1.17 (design C1, server side). One-shot transport 1 is
+gone: every relay session (web and X) declares transport 2.
+
+### 12.1 Frames
+| Kind | Byte | Direction | Payload |
+|---|---|---|---|
+| `HELLO` | 1 | supplier → verifier | `{"version":1,"transfers":<n>,"transport":2}` (`relay-hello.json`). `transport` is required and must be 2; any other hello ends the session. |
+| `DONE` | 23 | verifier → supplier | `{"status":"complete","keep":true}` or `…"keep":false}` (`relay-done-keep.json`). |
+| `PING` | 27 | supplier → verifier | empty; only while the connection waits for a token |
+| `PONG` | 28 | verifier → supplier | empty; the answer to each `PING` |
+
+Outside a session a connection carries only the token line
+(`<64 lowercase hex>\n`, as before), `PING` and `PONG`. No frame kind is a
+lowercase hex digit, so the first byte tells a token from a frame.
+
+### 12.2 Session loop
+- **keep.** After a verified web hop the verifier sends `OUTCOME` and then
+  `DONE` with `"keep":true` when the connection may wait for the
+  supplier's next token, which takes it back to the waiting state of 12.3.
+  With `"keep":false` it closes. X relay sessions always end with
+  `"keep":false`; Codex and MPC sessions are TLSNotary and close as before.
+- **Fail-closed.** After `FAILED` (including `verifier_busy`), or any
+  framing or protocol error, the verifier closes the connection. A supplier
+  reuses a connection only after an explicit `"keep":true` and never after
+  a failure; a `DONE` it cannot parse means close.
+- **Every session presents its own token,** and starts from fresh state:
+  its own rustls client to the target, keys, sequence numbers and OT. The
+  session's traffic keys are wiped from memory when it ends, before the
+  connection reads another token (rustls wipes its copies; the verifier
+  overwrites its record keys and the revealed client key in place).
+- **Web only.** A kept connection takes web tokens only. Any other kind of
+  token on it closes the connection without spending anything.
+- **Stragglers.** The supplier may still be forwarding the last target's
+  bytes when `DONE` goes out. While a kept connection waits, `FROM_SERVER`
+  and `SERVER_EOF` frames are discarded unread (at most 256 KiB per wait);
+  on a new connection they close it.
+
+### 12.3 Waiting for a token
+- A new connection must send its token or a `PING` within **10 s** of its
+  TLS handshake. Its first `PING` gives it the long wait: **60 s** from when
+  it began waiting. A kept connection waits **60 s** from `DONE`. The wait is
+  absolute: `PING`s are answered but do not extend it further, and a wait
+  answers at most 16 of them. When the wait runs out the connection closes.
+- The supplier pings every 15 s while idle and retires connections idle
+  for 45 s, well inside the 60 s.
+- **Places.** Every connection that has not presented a token, new or kept,
+  holds a waiting place: at most `SCARLETT_VERIFIER_PRE_TOKEN_LIMIT` (2,048)
+  in all and `SCARLETT_VERIFIER_PRE_TOKEN_PER_ADDRESS` (8) per source
+  address (an IPv4 address, or an IPv6 /64). A connection that finds no
+  place is closed right after the TCP accept. A kept connection needs a
+  place again at `DONE`; without one `DONE` says `"keep":false`.
+- **Session slots.** A connection takes one of `SCARLETT_VERIFIER_CONCURRENCY`
+  session slots only when its token arrives (it used to take one at TCP
+  accept), and gives it back when the session ends. A web session that
+  finds no session slot or web slot gets `FAILED {"reason":"verifier_busy"}`
+  and nothing is spent; an X or Codex session that finds no session slot is
+  closed unspent.
+
+| Variable | Default | Range |
+|---|---|---|
+| `SCARLETT_VERIFIER_PRE_TOKEN_LIMIT` | 2048 | 16 to 65,536 |
+| `SCARLETT_VERIFIER_PRE_TOKEN_PER_ADDRESS` | 8 | 1 to the limit |
+
+A local harness that runs several nodes on one address (127.0.0.1) needs a
+larger per-address limit: each node may hold two kept connections plus one
+per accept in flight.
+
+### 12.4 Capacity
+`GET /v1/capacity` (`capacity.json`): `active_connections` now counts the
+connections in a session (holding a session slot), and a new `pre_token`
+object reports the waiting connections:
+`{"connections":5,"limit":2048,"per_address_limit":8,"refused_global":0,"refused_per_address":1}`.
+The refusal counters count connections closed at accept for want of a
+place, and kept connections that could not keep one at `DONE`, since the
+verifier started.

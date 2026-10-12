@@ -248,7 +248,7 @@ where
     let config = verifier::tls_config(roots).unwrap();
     let raw = request();
     let node = tokio::spawn(async move { node::session(node_end, to_server, &raw, xpolicy::HOST).await });
-    let outcome = within(verifier::run(verifier_end, config, xpolicy::HOST, verifier::authorize_x)).await;
+    let outcome = within(verifier::run(&mut verifier::Conn::new(verifier_end), config, xpolicy::HOST, verifier::authorize_x)).await;
     // A verifier that gives up closes its side, which is how the supplier learns of it.
     let response = within(node).await.unwrap();
     (response, outcome)
@@ -321,7 +321,7 @@ async fn local_timings_preserve_relay_results_and_failed_opening_prefixes() {
         let supplier = tokio::spawn(async move {
             supplier_trace.measure(Phase::RelaySession, node::session_observed(node_end, tcp, &raw, xpolicy::HOST, &supplier_trace)).await
         });
-        let outcome = within(verifier::run(verifier_end, verifier::tls_config(server.roots).unwrap(), xpolicy::HOST, verifier::authorize_x)).await.unwrap();
+        let outcome = within(verifier::run(&mut verifier::Conn::new(verifier_end), verifier::tls_config(server.roots).unwrap(), xpolicy::HOST, verifier::authorize_x)).await.unwrap();
         assert_eq!(outcome.received, response());
         let received = within(supplier).await.unwrap();
         if corrupt_opening {
@@ -486,7 +486,7 @@ fn request_frame(public: &[u8], hidden: &[Range<usize>]) -> Vec<u8> {
 /// record. Returns how many times the verifier released record material.
 async fn rogue_supplier(server: SocketAddr, mut verifier: DuplexStream, transfers: usize, requests: Vec<Vec<u8>>) -> usize {
     let mut tcp = TcpStream::connect(server).await.unwrap();
-    wire::send(&mut verifier, wire::HELLO, format!("{{\"version\":1,\"transfers\":{transfers}}}").as_bytes()).await.unwrap();
+    wire::send(&mut verifier, wire::HELLO, format!("{{\"version\":1,\"transfers\":{transfers},\"transport\":2}}").as_bytes()).await.unwrap();
     let mut ot = None;
     let mut pending = Some(requests);
     if transfers > 0 {
@@ -573,7 +573,7 @@ async fn a_request_outside_policy_gets_no_key_material() {
         let config = verifier::tls_config(server.roots.clone()).unwrap();
         let supplier = tokio::spawn(rogue_supplier(server.addr, node_end, transfers, requests));
         // The verifier must refuse by itself, with the supplier still connected.
-        let error = within(verifier::run(verifier_end, config, xpolicy::HOST, verifier::authorize_x)).await.err().unwrap_or_else(|| panic!("{case}: verifier accepted"));
+        let error = within(verifier::run(&mut verifier::Conn::new(verifier_end), config, xpolicy::HOST, verifier::authorize_x)).await.err().unwrap_or_else(|| panic!("{case}: verifier accepted"));
         assert!(format!("{error:#}").contains(refusal), "{case}: refused for another reason: {error:#}");
         assert!(within(supplier).await.unwrap() <= allowed, "{case}: verifier released key material");
         assert!(server.seen.lock().unwrap().is_none(), "{case}: a request reached the server");
@@ -731,8 +731,8 @@ async fn a_response_cannot_be_carried_into_another_session() {
     let replay: Vec<u8> = recorded.lock().unwrap().concat();
     let (mut node_end, verifier_end) = tokio::io::duplex(1 << 20);
     let config = verifier::tls_config(server.roots.clone()).unwrap();
-    let verifier = tokio::spawn(async move { within(verifier::run(verifier_end, config, xpolicy::HOST, verifier::authorize_x)).await });
-    wire::send(&mut node_end, wire::HELLO, b"{\"version\":1,\"transfers\":0}").await.unwrap();
+    let verifier = tokio::spawn(async move { within(verifier::run(&mut verifier::Conn::new(verifier_end), config, xpolicy::HOST, verifier::authorize_x)).await });
+    wire::send(&mut node_end, wire::HELLO, b"{\"version\":1,\"transfers\":0,\"transport\":2}").await.unwrap();
     for chunk in replay.chunks(wire::CHUNK) {
         if wire::send(&mut node_end, wire::FROM_SERVER, chunk).await.is_err() {
             break;
@@ -744,24 +744,24 @@ async fn a_response_cannot_be_carried_into_another_session() {
 #[tokio::test]
 async fn malformed_or_oversized_hellos_and_stray_frames_end_the_session() {
     let server = server(response(), |_| {}).await;
-    for hello in [&b"{\"version\":2,\"transfers\":0}"[..], b"{\"version\":1,\"transfers\":999999}", b"{\"version\":1}", b"not json", b"{\"version\":1,\"transfers\":0,\"extra\":1}"] {
+    for hello in [&b"{\"version\":2,\"transfers\":0,\"transport\":2}"[..], b"{\"version\":1,\"transfers\":999999,\"transport\":2}", b"{\"version\":1}", b"not json", b"{\"version\":1,\"transfers\":0,\"transport\":2,\"extra\":1}", b"{\"version\":1,\"transfers\":0}", b"{\"version\":1,\"transfers\":0,\"transport\":1}"] {
         let (mut node_end, verifier_end) = tokio::io::duplex(1 << 16);
         wire::send(&mut node_end, wire::HELLO, hello).await.unwrap();
         let config = verifier::tls_config(server.roots.clone()).unwrap();
-        assert!(within(verifier::run(verifier_end, config, xpolicy::HOST, verifier::authorize_x)).await.is_err());
+        assert!(within(verifier::run(&mut verifier::Conn::new(verifier_end), config, xpolicy::HOST, verifier::authorize_x)).await.is_err());
     }
     for stray in [wire::KOS_CHECK, wire::CO_PAYLOAD, wire::KOS_EXTEND, wire::CO_SETUP, wire::SERVER_EOF, wire::MATERIAL] {
         let (mut node_end, verifier_end) = tokio::io::duplex(1 << 16);
-        wire::send(&mut node_end, wire::HELLO, b"{\"version\":1,\"transfers\":0}").await.unwrap();
+        wire::send(&mut node_end, wire::HELLO, b"{\"version\":1,\"transfers\":0,\"transport\":2}").await.unwrap();
         wire::send(&mut node_end, stray, &[]).await.unwrap();
         let config = verifier::tls_config(server.roots.clone()).unwrap();
-        assert!(within(verifier::run(verifier_end, config, xpolicy::HOST, verifier::authorize_x)).await.is_err(), "frame {stray}");
+        assert!(within(verifier::run(&mut verifier::Conn::new(verifier_end), config, xpolicy::HOST, verifier::authorize_x)).await.is_err(), "frame {stray}");
     }
     // A session that never says hello is refused on its first frame.
     let (mut node_end, verifier_end) = tokio::io::duplex(1 << 16);
     wire::send(&mut node_end, wire::REQUEST, &[0; 8]).await.unwrap();
     let config = verifier::tls_config(server.roots.clone()).unwrap();
-    assert!(within(verifier::run(verifier_end, config, xpolicy::HOST, verifier::authorize_x)).await.is_err());
+    assert!(within(verifier::run(&mut verifier::Conn::new(verifier_end), config, xpolicy::HOST, verifier::authorize_x)).await.is_err());
 }
 
 #[test]
@@ -826,7 +826,7 @@ async fn benchmark_synthetic_relay_latency() {
                 let raw = request();
                 node_trace.measure(Phase::RelaySession, node::session_observed(node_end, tcp, &raw, xpolicy::HOST, &node_trace)).await
             });
-            let result = within(verifier::run(verifier_end, config.clone(), xpolicy::HOST, verifier::authorize_x)).await.unwrap();
+            let result = within(verifier::run(&mut verifier::Conn::new(verifier_end), config.clone(), xpolicy::HOST, verifier::authorize_x)).await.unwrap();
             let received = within(node).await.unwrap().unwrap();
             up.abort();
             down.abort();
@@ -871,7 +871,7 @@ async fn live_x_accepts_the_jointly_sealed_record() {
     let tcp = TcpStream::connect((xpolicy::HOST, 443)).await.unwrap();
     let started = std::time::Instant::now();
     let node = tokio::spawn(async move { node::session(node_end, tcp, &raw, xpolicy::HOST).await });
-    let outcome = within(verifier::run(verifier_end, config, xpolicy::HOST, verifier::authorize_x)).await;
+    let outcome = within(verifier::run(&mut verifier::Conn::new(verifier_end), config, xpolicy::HOST, verifier::authorize_x)).await;
     let response = within(node).await.unwrap();
     match (&outcome, &response) {
         (Ok(outcome), Ok(_)) => {
@@ -1208,4 +1208,136 @@ async fn live_web_hop_is_verified() {
         ),
         _ => panic!("verifier: {:?}\nsupplier: {:?}", outcome.as_ref().err(), reported.as_ref().err()),
     }
+}
+
+/// The verifier's side of one web hop on a connection that may serve the
+/// next session: the session, then OUTCOME and DONE with `keep`, or FAILED
+/// (which closes) when it fails. Returns the response it framed.
+async fn kept_hop(conn: &mut verifier::Conn<DuplexStream>, roots: RootCertStore, url: &str, keep: bool, bodies: &BodyDir) -> Result<crate::webpolicy::Response> {
+    let request = crate::webpolicy::request(url, &web_headers());
+    let mut reader = verifier::WebReader::new(crate::webpolicy::Framer::new(1 << 20), bodies.file());
+    let mut clock = verifier::HopClock::new(verifier::Timing::WEB, std::time::Instant::now() + crate::webpolicy::HOP_LIMIT);
+    let host = crate::webpolicy::url_host(url).to_owned();
+    match verifier::web_session(conn, verifier::tls_config(roots)?, &host, exactly(&request), &mut reader, &mut clock).await {
+        Ok(_) => {
+            let (response, stored) = reader.finish().await?;
+            if let Some(stored) = stored {
+                stored.commit();
+            }
+            let frame = serde_json::to_vec(&serde_json::json!({"hop":0,"url":url,"status_code":response.status,"final":true}))?;
+            conn.done(Some(&frame), keep).await?;
+            Ok(response)
+        }
+        Err(e) => {
+            let _ = conn.refuse(Failure::of(&e).reason()).await;
+            Err(e)
+        }
+    }
+}
+
+#[tokio::test]
+async fn sessions_on_one_connection_share_no_state_and_a_failure_closes_it() {
+    const FIRST: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst";
+    const SECOND: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond";
+    // Two origins under two private CAs; the verifier trusts both.
+    let (a, b) = (web_origin(page(FIRST, End::Wait), false).await, web_origin(page(SECOND, End::Wait), false).await);
+    let mut roots = a.roots.clone();
+    roots.roots.extend(b.roots.roots.iter().cloned());
+    let (node_end, verifier_end) = tokio::io::duplex(1 << 20);
+    let bodies = BodyDir::new();
+    let verifier_side = tokio::spawn(async move {
+        let mut conn = verifier::Conn::new(verifier_end);
+        let mut wait = verifier::TokenWait::fresh(Duration::from_secs(10), Duration::from_secs(60));
+        let mut served = Vec::new();
+        for (i, url) in ["https://example.com/", "https://www.example.com/", "https://example.com/"].into_iter().enumerate() {
+            let Ok(Some(token)) = conn.next_token(&mut wait, i > 0).await else { break };
+            let result = kept_hop(&mut conn, roots.clone(), url, true, &bodies).await;
+            let failed = result.is_err();
+            served.push((token, result.map(|response| (response.status, response.body_bytes, response.received))));
+            if failed {
+                break;
+            }
+            wait = verifier::TokenWait::after_session(Duration::from_secs(60));
+        }
+        // After FAILED the verifier is done with the connection, as `handle` is.
+        served
+    });
+
+    let trace = crate::diagnostics::Trace::new();
+    let mut conn = node::RelayConn::new(node_end);
+    // Session 1 through a path that keeps a copy of the server's flight.
+    let flight = Arc::new(Mutex::new(Vec::new()));
+    let log = flight.clone();
+    let to_a = path(TcpStream::connect(a.addr).await.unwrap(), move |from_client, _, record| {
+        if !from_client {
+            log.lock().unwrap().extend_from_slice(record);
+        }
+        Verdict::Pass
+    });
+    let first = "https://example.com/";
+    conn.present(&"1".repeat(64)).await.unwrap();
+    let (outcome, keep) = within(node::web_session_on(&mut conn, to_a, &crate::webpolicy::request(first, &web_headers()), "example.com", 0, first, &trace)).await.unwrap();
+    assert_eq!((outcome.status_code, outcome.is_final, keep), (200, true, true));
+    // Session 2, another token and another origin, on the same connection.
+    let second = "https://www.example.com/";
+    conn.present(&"2".repeat(64)).await.unwrap();
+    let (outcome, keep) = within(node::web_session_on(&mut conn, TcpStream::connect(b.addr).await.unwrap(), &crate::webpolicy::request(second, &web_headers()), "www.example.com", 0, second, &trace)).await.unwrap();
+    assert_eq!((outcome.status_code, outcome.url.as_str(), keep), (200, second, true));
+    // Session 3 is fed session 1's server flight: nothing of session 1's
+    // handshake or keys carries over, so the replay fails as TLS.
+    conn.present(&"3".repeat(64)).await.unwrap();
+    let (replay, mut far) = tokio::io::duplex(1 << 20);
+    let recorded = flight.lock().unwrap().clone();
+    tokio::spawn(async move {
+        let mut hello = [0u8; 5];
+        if far.read_exact(&mut hello).await.is_ok() {
+            let _ = far.write_all(&recorded).await;
+        }
+        let mut rest = [0u8; 4096];
+        while matches!(far.read(&mut rest).await, Ok(n) if n > 0) {}
+    });
+    let error = within(node::web_session_on(&mut conn, replay, &crate::webpolicy::request(first, &web_headers()), "example.com", 0, first, &trace)).await.err().unwrap();
+    assert_eq!(error.downcast_ref::<node::Refused>(), Some(&node::Refused("tls_failed")), "{error:#}");
+    assert!(!format!("{error:#}").contains(node::MISUSE));
+    let served = within(verifier_side).await.unwrap();
+    // FAILED closed the connection: the idle check sees it, and a fourth token goes nowhere.
+    assert!(conn.check_idle().is_err());
+    let _ = conn.present(&"4".repeat(64)).await;
+    let fourth = within(node::web_session_on(&mut conn, TcpStream::connect(a.addr).await.unwrap(), &crate::webpolicy::request(first, &web_headers()), "example.com", 0, first, &trace)).await;
+    assert!(fourth.is_err());
+
+    assert_eq!(served.len(), 3);
+    let tokens: Vec<&str> = served.iter().map(|(token, _)| token.as_str()).collect();
+    assert_eq!(tokens, ["1".repeat(64), "2".repeat(64), "3".repeat(64)]);
+    assert_eq!(served[0].1.as_ref().unwrap(), &(200, 5, FIRST.len()));
+    assert_eq!(served[1].1.as_ref().unwrap(), &(200, 6, SECOND.len()));
+    assert_eq!(Failure::of(served[2].1.as_ref().unwrap_err()), Failure::TlsFailed);
+    // Each origin saw exactly its own session's request.
+    assert_eq!(a.seen.lock().unwrap().as_deref(), Some(&crate::webpolicy::request(first, &web_headers())[..]));
+    assert_eq!(b.seen.lock().unwrap().as_deref(), Some(&crate::webpolicy::request(second, &web_headers())[..]));
+}
+
+#[tokio::test]
+async fn a_verifier_that_does_not_keep_the_connection_ends_it_after_done() {
+    const PAGE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    let origin = web_origin(page(PAGE, End::Wait), false).await;
+    let (node_end, verifier_end) = tokio::io::duplex(1 << 20);
+    let bodies = BodyDir::new();
+    let roots = origin.roots.clone();
+    let verifier_side = tokio::spawn(async move {
+        let mut conn = verifier::Conn::new(verifier_end);
+        let mut wait = verifier::TokenWait::fresh(Duration::from_secs(10), Duration::from_secs(60));
+        let token = conn.next_token(&mut wait, false).await.unwrap().unwrap();
+        kept_hop(&mut conn, roots, "https://example.com/", false, &bodies).await.unwrap();
+        token
+    });
+    let mut conn = node::RelayConn::new(node_end);
+    conn.present(&"a".repeat(64)).await.unwrap();
+    let url = "https://example.com/";
+    let (_, keep) = within(node::web_session_on(&mut conn, TcpStream::connect(origin.addr).await.unwrap(), &crate::webpolicy::request(url, &web_headers()), "example.com", 0, url, &crate::diagnostics::Trace::new())).await.unwrap();
+    assert!(!keep);
+    assert_eq!(within(verifier_side).await.unwrap(), "a".repeat(64));
+    // The verifier closed its side: the idle check sees the end.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(conn.check_idle().is_err());
 }
