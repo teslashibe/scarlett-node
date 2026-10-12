@@ -1051,13 +1051,6 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 		}
 	}
 	endWorker(diagnosticOutcome(ctx, code, nil))
-	// Persist the exact report before touching the coordinator. Recovery may
-	// retry only after the authenticated replay-safe contract is confirmed.
-	if l.AcceptanceRequired && provenExecutor {
-		if err := journal.FinishProofTrafficContext(ctx, record); err != nil {
-			return code, err
-		}
-	}
 	endPrepare := diagnostics.Start(ctx, "report_prepare", 0)
 	raw, err := json.Marshal(body)
 	endPrepare(diagnosticOutcome(ctx, "", err))
@@ -1070,7 +1063,16 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	} else if c.Executor == config.ExecutorCodexTLSN || c.Executor == config.ExecutorServices {
 		kind = "proven"
 	}
-	record, err = journal.ReadyContext(ctx, record, kind, raw)
+	// Persist the exact report before touching the coordinator. Recovery may
+	// retry only after the authenticated replay-safe contract is confirmed.
+	// After a proven run the same write marks the proof traffic finished: one
+	// journal write fewer between acceptance and the report, and the samples
+	// were already final (proof_journal_complete ran inside the worker).
+	ready := journal.ReadyContext
+	if l.AcceptanceRequired && provenExecutor {
+		ready = journal.ReadyAfterProofContext
+	}
+	record, err = ready(ctx, record, kind, raw)
 	if err != nil {
 		return code, err
 	}
