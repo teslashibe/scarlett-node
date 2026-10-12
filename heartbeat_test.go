@@ -205,8 +205,12 @@ func TestRunLoopTakesSeveralOffersAndRejectsWithoutBlocking(t *testing.T) {
 			a.VerifierToken = strings.Repeat("c", 64)
 			json.NewEncoder(w).Encode(coordinator.LeaseAcceptance{Version: coordinator.Version, State: "leased", FundingAuthority: "production_receipt", Lease: a})
 		case strings.HasSuffix(r.URL.Path, "/fail"):
-			// Keep the slot taken until the test is done.
-			reportHeld <- struct{}{}
+			// Keep the slot taken until the test is done. A retried report
+			// must not block here, or the server never closes.
+			select {
+			case reportHeld <- struct{}{}:
+			default:
+			}
 			select {
 			case <-release:
 				w.WriteHeader(http.StatusNoContent)
