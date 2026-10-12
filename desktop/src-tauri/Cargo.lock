@@ -2889,10 +2889,13 @@ dependencies = [
 
 [[package]]
 name = "scarlett-node-desktop"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
+ "block2",
  "getrandom 0.4.3",
  "libc",
+ "objc2-app-kit",
+ "objc2-foundation",
  "serde",
  "serde_json",
  "sha2",
@@ -2903,6 +2906,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tempfile",
  "tokio",
+ "windows-sys 0.61.2",
  "winreg 0.55.0",
 ]
 

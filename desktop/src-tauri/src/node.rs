@@ -9,7 +9,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    process::{Child, Command},
+    process::{Child, ChildStdin, Command},
     sync::{Mutex, Notify},
 };
 
@@ -304,6 +304,24 @@ struct Login {
     home: PathBuf,
     started: Instant,
 }
+/// A line the app writes on the supervised node's owner pipe: the device is
+/// about to sleep, or has woken. The node ignores lines it does not know;
+/// only the pipe's EOF asks it to drain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnerCommand {
+    Sleep,
+    Wake,
+}
+impl OwnerCommand {
+    fn line(self) -> &'static [u8] {
+        match self {
+            Self::Sleep => b"sleep\n",
+            Self::Wake => b"wake\n",
+        }
+    }
+}
+/// The longest an owner line may take to reach the node.
+const OWNER_LINE_TIMEOUT: Duration = Duration::from_millis(250);
 pub struct Node {
     pub state: PathBuf,
     endpoints: Endpoints,
@@ -311,6 +329,10 @@ pub struct Node {
     helper: PathBuf,
     codex_binary: PathBuf,
     running: Mutex<Option<Child>>,
+    /// The supervised node's owner pipe, its stdin. It is kept apart from
+    /// the child so a sleep or wake line never waits behind a stop that is
+    /// waiting for accepted work. Its EOF asks the node to drain.
+    owner: Mutex<Option<ChildStdin>>,
     login: Mutex<Option<Login>>,
     login_error: Mutex<Option<Error>>,
     mutation: Mutex<()>,
@@ -325,10 +347,29 @@ pub struct Node {
     web: AtomicBool,
     /// The web setting the supervised child was started with.
     web_running: AtomicBool,
+    /// Web pages at once for the next child: 0 is Auto, the node's adaptive
+    /// limit.
+    web_concurrency: std::sync::atomic::AtomicU8,
     /// An explicit SCARLETT_WEB_BROWSER ("on" or "off") from the same trusted
     /// environment, passed on only with web. Unset, the node's platform
     /// default applies (on for macOS, off for Windows in this release).
     web_browser: Option<&'static str>,
+    /// Where the supervised node's stderr goes (see node_log). Without it, or
+    /// when it cannot be opened privately, stderr is discarded as before.
+    log_dir: Option<PathBuf>,
+    /// Keeps the running node's log bounded; replaced on each start.
+    log_bound: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// SCARLETT_WEB_CONCURRENCY for a Web pages at once setting. Auto (0) asks
+/// the node for its adaptive limit, which starts at 4 and moves between 2 and
+/// 16 with how its pages go; a number is a fixed limit.
+fn web_concurrency_env(setting: u8) -> String {
+    if setting == 0 {
+        "auto".into()
+    } else {
+        setting.to_string()
+    }
 }
 
 pub fn valid_id(id: &str) -> bool {
@@ -580,6 +621,10 @@ fn observation_projection(raw: &[u8]) -> Result<Value> {
         "state",
         "updated_at",
         "last_heartbeat_at",
+        // When the coordinator last answered a heartbeat.
+        "last_heartbeat_ok_at",
+        // Read only when dispatch_health lacks it.
+        "missed_streak",
         "in_flight",
         "unresolved_attempts",
         "drain_requested",
@@ -661,7 +706,34 @@ fn observation_projection(raw: &[u8]) -> Result<Value> {
             .unwrap_or_default();
         out.insert(key.into(), Value::Array(items));
     }
+    if let Some(health) = source.get("dispatch_health").and_then(dispatch_health) {
+        out.insert("dispatch_health".into(), health);
+    }
     Ok(Value::Object(out))
+}
+/// The coordinator's dispatch health for this node, from its last heartbeat
+/// reply: offers it missed in a row and, while the coordinator sends it fewer
+/// jobs, until when (RFC 3339, null when it does not).
+fn dispatch_health(value: &Value) -> Option<Value> {
+    let source = value.as_object()?;
+    let mut out = serde_json::Map::new();
+    if let Some(streak) = source
+        .get("missed_streak")
+        .and_then(Value::as_u64)
+        .filter(|n| *n <= 1_000_000)
+    {
+        out.insert("missed_streak".into(), streak.into());
+    }
+    match source.get("suspect_until") {
+        Some(Value::Null) => {
+            out.insert("suspect_until".into(), Value::Null);
+        }
+        Some(Value::String(at)) if at.len() <= 40 && !at.chars().any(char::is_control) => {
+            out.insert("suspect_until".into(), Value::String(at.clone()));
+        }
+        _ => {}
+    }
+    Some(Value::Object(out))
 }
 /// Proof modes a service advertises, reduced to the ones this app can name.
 /// Absent means MPC-TLS only, as for every node before the field existed.
@@ -724,6 +796,7 @@ impl Node {
             helper,
             codex_binary,
             running: Mutex::new(None),
+            owner: Mutex::new(None),
             login: Mutex::new(None),
             login_error: Mutex::new(None),
             mutation: Mutex::new(()),
@@ -737,8 +810,15 @@ impl Node {
             x_login_browser: None,
             web: AtomicBool::new(crate::preferences::default_serve_web()),
             web_running: AtomicBool::new(false),
+            web_concurrency: std::sync::atomic::AtomicU8::new(0),
             web_browser: None,
+            log_dir: None,
+            log_bound: std::sync::Mutex::new(None),
         }
+    }
+    pub fn with_log_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.log_dir = dir;
+        self
     }
     pub fn with_provider_runtime(mut self, resource_root: &Path) -> Self {
         self.x_login_resources = resource_root.join("runtime");
@@ -782,6 +862,15 @@ impl Node {
     /// serving as it was started until the operator stops and starts it.
     pub fn set_web(&self, enabled: bool) {
         self.web.store(enabled, Ordering::SeqCst);
+    }
+    /// Web pages at once for the next child process: 0 is Auto. Like X
+    /// concurrency, a running node keeps the value it was started with.
+    pub fn set_web_concurrency(&self, concurrency: u8) -> Result<()> {
+        if concurrency > crate::preferences::MAX_WEB_CONCURRENCY {
+            return Err(Error::InvalidInput);
+        }
+        self.web_concurrency.store(concurrency, Ordering::SeqCst);
+        Ok(())
     }
     pub fn network_url(&self, destination: &str) -> Result<String> {
         let path = match destination {
@@ -862,7 +951,10 @@ impl Node {
         #[cfg(windows)]
         cmd.creation_flags(0x08000000);
         if web {
-            cmd.env("SCARLETT_WEB_CONCURRENCY", "4");
+            cmd.env(
+                "SCARLETT_WEB_CONCURRENCY",
+                web_concurrency_env(self.web_concurrency.load(Ordering::SeqCst)),
+            );
             if let Some(browser) = self.web_browser {
                 cmd.env("SCARLETT_WEB_BROWSER", browser);
             }
@@ -1318,16 +1410,38 @@ impl Node {
             return Err(Error::AccountsUnavailable);
         }
         let mut cmd = self.command_with_web(&["desktop", "run"], web)?;
+        // The node's stderr goes to its private local log; a log that cannot
+        // be opened never stops the node from starting.
+        let log = self
+            .log_dir
+            .as_deref()
+            .and_then(|dir| crate::node_log::open(dir, &self.binary).ok());
+        let logging = log.is_some();
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(log.map_or_else(Stdio::null, Stdio::from));
         #[cfg(unix)]
         {
             cmd.process_group(0);
         }
-        *running = Some(cmd.spawn().map_err(|_| Error::RuntimeUnavailable)?);
+        let mut child = cmd.spawn().map_err(|_| Error::RuntimeUnavailable)?;
+        *self.owner.lock().await = child.stdin.take();
+        *running = Some(child);
         self.web_running.store(web, Ordering::SeqCst);
+        let bound = self
+            .log_dir
+            .clone()
+            .filter(|_| logging)
+            .map(|dir| tokio::spawn(crate::node_log::keep_bounded(dir)));
+        self.stop_log_bound(bound);
         Ok(())
+    }
+    /// Ends the previous node's log rotation, starting `next` in its place.
+    fn stop_log_bound(&self, next: Option<tokio::task::JoinHandle<()>>) {
+        let mut bound = self.log_bound.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(previous) = std::mem::replace(&mut *bound, next) {
+            previous.abort();
+        }
     }
     pub async fn control(&self, action: &str) -> Result<()> {
         match action {
@@ -1356,11 +1470,13 @@ impl Node {
                 .is_some()
             {
                 *running = None;
+                drop(self.owner.lock().await.take());
+                self.stop_log_bound(None);
                 return Ok(());
             }
             self.call(&["drain"], None, 5).await?;
             // Closing this owned pipe requests drain without signaling a stale PID.
-            drop(child.stdin.take());
+            drop(self.owner.lock().await.take());
             {
                 // Node gives accepted work up to two minutes, within its lease.
                 match tokio::time::timeout(Duration::from_secs(125), child.wait()).await {
@@ -1377,13 +1493,29 @@ impl Node {
                             }
                         }
                         child.kill().await.map_err(|_| Error::CommandFailed)?;
+                        self.stop_log_bound(None);
                         return Err(Error::CommandTimeout);
                     }
                 }
                 *running = None;
+                self.stop_log_bound(None);
             }
         }
         Ok(())
+    }
+    /// Writes one owner command to the supervised node: false when no node
+    /// runs here or it did not take the line in time. The pipe stays open.
+    pub async fn owner_command(&self, command: OwnerCommand) -> bool {
+        tokio::time::timeout(OWNER_LINE_TIMEOUT, async {
+            let mut owner = self.owner.lock().await;
+            let pipe = owner.as_mut()?;
+            pipe.write_all(command.line()).await.ok()?;
+            pipe.flush().await.ok()
+        })
+        .await
+        .ok()
+        .flatten()
+        .is_some()
     }
     pub async fn cancel_login(&self) -> Result<()> {
         if let Some(mut pending) = self.login.lock().await.take() {
@@ -1582,6 +1714,7 @@ impl Node {
             s.supervised = p.try_wait().ok().flatten().is_none();
             if !s.supervised {
                 *run = None;
+                drop(self.owner.lock().await.take());
             }
         }
         s.web_restart_pending =
@@ -2327,6 +2460,66 @@ esac
             json!("browser_downloading")
         );
     }
+    #[test]
+    fn projection_keeps_the_last_answered_heartbeat_and_dispatch_health() {
+        let status = observation_projection(br#"{"state":"running","last_heartbeat_at":"2026-10-11T10:00:01Z","last_heartbeat_ok_at":"2026-10-11T10:00:00.123456789Z","heartbeat_error_class":"timeout","dispatch_health":{"missed_streak":3,"suspect_until":"2026-10-11T10:04:00Z","node_id":"SECRET"}}"#).unwrap();
+        assert!(!status.to_string().contains("SECRET"));
+        assert!(status.get("heartbeat_error_class").is_none());
+        assert_eq!(
+            status["last_heartbeat_ok_at"],
+            json!("2026-10-11T10:00:00.123456789Z")
+        );
+        assert_eq!(
+            status["dispatch_health"],
+            json!({"missed_streak":3,"suspect_until":"2026-10-11T10:04:00Z"})
+        );
+        // Not suspect is null; a node without the fields has neither.
+        let status = observation_projection(
+            br#"{"state":"running","dispatch_health":{"missed_streak":0,"suspect_until":null}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            status["dispatch_health"],
+            json!({"missed_streak":0,"suspect_until":null})
+        );
+        let older = observation_projection(
+            br#"{"state":"running","last_heartbeat_at":"2026-10-11T10:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(older.get("dispatch_health").is_none());
+        assert!(older.get("last_heartbeat_ok_at").is_none());
+        // Malformed values are dropped one field at a time.
+        for health in [
+            json!({"missed_streak":-1,"suspect_until":5}),
+            json!({"missed_streak":1.5,"suspect_until":"2".repeat(41)}),
+            json!({"missed_streak":"3","suspect_until":"2026-10-11\n"}),
+            json!({"missed_streak":2_000_000,"suspect_until":["SECRET"]}),
+        ] {
+            let raw =
+                serde_json::to_vec(&json!({"state":"running","dispatch_health":health})).unwrap();
+            assert_eq!(
+                observation_projection(&raw).unwrap()["dispatch_health"],
+                json!({})
+            );
+        }
+        for health in [json!("SECRET"), json!([1]), json!(null)] {
+            let raw =
+                serde_json::to_vec(&json!({"state":"running","dispatch_health":health})).unwrap();
+            assert!(
+                observation_projection(&raw)
+                    .unwrap()
+                    .get("dispatch_health")
+                    .is_none()
+            );
+        }
+        // A streak beside it passes as a number, like the other scalars.
+        let status = observation_projection(
+            br#"{"state":"running","missed_streak":2,"last_heartbeat_ok_at":null}"#,
+        )
+        .unwrap();
+        assert_eq!(status["missed_streak"], json!(2));
+        assert!(status.get("last_heartbeat_ok_at").is_none());
+    }
     /// A fake bundled node that records each invocation and serves a halted,
     /// running status. `relay-resume` removes the marker unless told not to.
     #[cfg(unix)]
@@ -2798,14 +2991,34 @@ esac
                 })
                 .collect()
         };
-        // No saved setting: web is on, with the default capacity.
+        // No saved setting: web is on, with Auto, the node's adaptive limit.
         let web = env(&node);
         assert_eq!(
             web["SCARLETT_SERVICES"].as_deref(),
             Some("codex,x_read,web")
         );
-        assert_eq!(web["SCARLETT_WEB_CONCURRENCY"].as_deref(), Some("4"));
+        assert_eq!(web["SCARLETT_WEB_CONCURRENCY"].as_deref(), Some("auto"));
         assert!(!web.contains_key("SCARLETT_WEB_EGRESS_PROXY"));
+        // Web pages at once: Auto passes `auto`, a fixed number passes
+        // through, and anything above the desktop ceiling is refused without
+        // changing the saved value.
+        node.set_web_concurrency(12).unwrap();
+        assert_eq!(
+            env(&node)["SCARLETT_WEB_CONCURRENCY"].as_deref(),
+            Some("12")
+        );
+        for invalid in [crate::preferences::MAX_WEB_CONCURRENCY + 1, u8::MAX] {
+            assert_eq!(node.set_web_concurrency(invalid), Err(Error::InvalidInput));
+        }
+        assert_eq!(
+            env(&node)["SCARLETT_WEB_CONCURRENCY"].as_deref(),
+            Some("12")
+        );
+        node.set_web_concurrency(0).unwrap();
+        assert_eq!(
+            env(&node)["SCARLETT_WEB_CONCURRENCY"].as_deref(),
+            Some("auto")
+        );
         // The node's platform default applies unless the trusted environment
         // set the browser tier explicitly; it is passed on only with web.
         assert!(!web.contains_key("SCARLETT_WEB_BROWSER"));
@@ -2931,6 +3144,60 @@ esac
             node.control("shell-command").await,
             Err(Error::InvalidInput)
         );
+    }
+    /// The supervised node's stderr lands in its private log, including what
+    /// it writes while draining after the owner pipe closes, and across
+    /// restarts. Other commands' stderr is still discarded, and a log that
+    /// cannot be private never keeps the node from starting.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervised_node_stderr_goes_to_its_private_log() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("node");
+        let helper = temp.path().join("helper");
+        std::fs::write(&binary, "#!/bin/sh\ncase \"$1 $2\" in\n'accounts list') echo 'accounts stderr' >&2; printf '[]';;\n'desktop run') echo 'heartbeat: synthetic' >&2; cat >/dev/null; echo 'drained' >&2;;\n'drain ') ;;\n*) exit 1;;\nesac\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&helper, "synthetic helper fixture").unwrap();
+        let logs = temp.path().join("Logs").join("Scarlett Node");
+        let log = logs.join(crate::node_log::FILE);
+        let node = Node::new(temp.path().join("state"), binary.clone(), helper.clone())
+            .with_log_dir(Some(logs.clone()));
+        node.prepare().unwrap();
+        std::fs::write(node.state.join("identity.json"), "{}").unwrap();
+        for run in 1..=2 {
+            node.start().await.unwrap();
+            let began = Instant::now();
+            while std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .matches("heartbeat")
+                .count()
+                < run
+            {
+                assert!(began.elapsed() < Duration::from_secs(5));
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            node.stop().await.unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "heartbeat: synthetic\ndrained\n".repeat(2)
+        );
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&logs), mode(&log)), (0o700, 0o600));
+        // A log directory others can read is refused, and the node runs
+        // with its stderr discarded.
+        let shared = temp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let node = Node::new(temp.path().join("state2"), binary, helper)
+            .with_log_dir(Some(shared.clone()));
+        node.prepare().unwrap();
+        std::fs::write(node.state.join("identity.json"), "{}").unwrap();
+        node.start().await.unwrap();
+        assert!(node.snapshot().await.supervised);
+        node.stop().await.unwrap();
+        assert_eq!(std::fs::read_dir(&shared).unwrap().count(), 0);
     }
     #[cfg(unix)]
     #[tokio::test]

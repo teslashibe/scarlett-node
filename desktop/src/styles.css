@@ -59,6 +59,7 @@ main { max-width: 1120px; margin: auto; padding: 30px 28px 24px; display: flex; 
 .node-controls .actions { justify-content: flex-end; }
 #work { max-width: 280px; margin-top: 10px; }
 .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.metrics.metrics-pair { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .metric { display: flex; flex-direction: column; gap: 5px; padding: 16px 18px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); box-shadow: inset 0 1px 0 rgb(255 255 255 / 4%); }
 .metric-label { color: var(--muted); font-size: 12px; }
 .metric strong { font-size: 32px; line-height: 1.25; font-weight: 600; letter-spacing: -.035em; font-variant-numeric: tabular-nums; }

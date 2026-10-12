@@ -3,6 +3,8 @@ mod claude_auth;
 mod diagnostics;
 mod local_api;
 mod node;
+mod node_log;
+mod power;
 mod preferences;
 mod updater;
 #[cfg(windows)]
@@ -192,6 +194,7 @@ async fn save_desktop_preferences(
     let _guard = runtime.0.lock().await;
     node.save_preferences(&data).await?;
     node.set_x_concurrency(data.x_concurrency)?;
+    node.set_web_concurrency(data.web_concurrency)?;
     node.set_web(data.serve_web);
     preferences.updated(data)
 }
@@ -700,6 +703,15 @@ fn main() {
                 directory.join(format!("open-agent-api{suffix}")),
                 resources.join("runtime"),
             )));
+            // ~/Library/Logs/Scarlett Node on macOS, %LOCALAPPDATA%\Scarlett
+            // Node\logs on Windows. Without one the node's stderr is dropped.
+            let logs = if cfg!(target_os = "macos") {
+                app.path().home_dir()
+            } else {
+                app.path().local_data_dir()
+            }
+            .ok()
+            .map(|base| node_log::dir(&base));
             app.manage(Arc::new(
                 Node::from_environment(
                     state,
@@ -707,7 +719,8 @@ fn main() {
                     directory.join(format!("scarlett-prover{suffix}")),
                 )
                 .map_err(|_| "invalid desktop endpoint configuration")?
-                .with_provider_runtime(&resources),
+                .with_provider_runtime(&resources)
+                .with_log_dir(logs),
             ));
             let saved = app
                 .state::<Arc<Preferences>>()
@@ -716,7 +729,13 @@ fn main() {
             app.state::<Arc<Node>>()
                 .set_x_concurrency(saved.x_concurrency)
                 .map_err(|_| "invalid desktop X concurrency")?;
+            app.state::<Arc<Node>>()
+                .set_web_concurrency(saved.web_concurrency)
+                .map_err(|_| "invalid desktop web concurrency")?;
             app.state::<Arc<Node>>().set_web(saved.serve_web);
+            // Device sleep and wake reach the supervised node on its owner
+            // pipe; without them the node's own clock check still notices.
+            power::watch(app.state::<Arc<Node>>().inner().clone());
             let updater = Arc::new(Updater::new(
                 app.package_info().version.to_string(),
                 app.path().app_data_dir()?,
