@@ -21,6 +21,7 @@ import (
 	"github.com/teslashibe/scarlett-node/internal/attempts"
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
+	"github.com/teslashibe/scarlett-node/internal/update"
 )
 
 // The run loop treats the heartbeat as a long poll: every heartbeat asks for
@@ -32,8 +33,8 @@ func TestRunLoopLongPollsWithoutIdleSleep(t *testing.T) {
 	if err := privateFixtureMkdir(home, 0700); err != nil {
 		t.Fatal(err)
 	}
-	// An expired local credential: the node advertises exhausted and declines
-	// the offer locally, so no acceptance or report HTTP happens in this test.
+	// An expired local credential: the node rejects the offer locally, so no
+	// acceptance or report HTTP happens in this test, only the rejection.
 	if err := writePrivateFixture(filepath.Join(home, "auth.json"), syntheticCodexAuth(time.Now().Add(-time.Hour)), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +55,22 @@ func TestRunLoopLongPollsWithoutIdleSleep(t *testing.T) {
 	var mu sync.Mutex
 	var calls []call
 	var other int
+	var rejects []string
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if controlRoute(w, r) {
+			return
+		}
+		if r.URL.Path == "/api/node/v1/jobs/"+offer.JobID+"/reject" {
+			// The expired credential cannot take the offer; the node says so
+			// instead of leaving it to expire, and never accepts it.
+			var body coordinator.Rejection
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			rejects = append(rejects, body.Reason)
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		if r.URL.Path != "/api/node/v1/heartbeat" {
@@ -70,18 +86,18 @@ func TestRunLoopLongPollsWithoutIdleSleep(t *testing.T) {
 		switch len(calls) {
 		case 0:
 			// Offered work: the node must heartbeat again at once.
-			json.NewEncoder(w).Encode(map[string]any{"lease": offer})
+			json.NewEncoder(w).Encode(map[string]any{"leases": []coordinator.Lease{offer}})
 		case 1:
 			// An idle hold: the coordinator keeps the request open, then
 			// answers nothing. The node's next heartbeat follows immediately.
 			time.Sleep(300 * time.Millisecond)
-			io.WriteString(w, `{"lease":null}`)
+			io.WriteString(w, `{"leases":[]}`)
 		case 2:
 			// A failed heartbeat earns the backoff, and nothing else does.
 			w.WriteHeader(http.StatusServiceUnavailable)
 		default:
 			writer.Close()
-			io.WriteString(w, `{"lease":null}`)
+			io.WriteString(w, `{"leases":[]}`)
 		}
 		this.answered = time.Now()
 		calls = append(calls, this)
@@ -105,8 +121,8 @@ func TestRunLoopLongPollsWithoutIdleSleep(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if other != 0 || len(calls) < 4 {
-		t.Fatalf("heartbeats %d, other calls %d", len(calls), other)
+	if other != 0 || len(calls) < 4 || len(rejects) != 1 || rejects[0] != coordinator.RejectNoAccount {
+		t.Fatalf("heartbeats %d, other calls %d, rejections %v", len(calls), other, rejects)
 	}
 	for i, c := range calls {
 		if c.wait != coordinator.HeartbeatWaitSeconds {
@@ -124,56 +140,128 @@ func TestRunLoopLongPollsWithoutIdleSleep(t *testing.T) {
 	}
 }
 
-// Stopping the node aborts a heartbeat the coordinator is still holding.
-func TestRunLoopStopAbortsHeldHeartbeat(t *testing.T) {
-	dir := privateTestDir(t)
-	home := filepath.Join(dir, "codex")
-	if err := privateFixtureMkdir(home, 0700); err != nil {
-		t.Fatal(err)
+// Stopping the node, by closing its owner pipe (the desktop app's Stop or
+// Quit) or by a signal, says goodbye first and then aborts the heartbeat the
+// coordinator is still holding, promptly.
+func TestRunLoopStopSaysGoodbyeBeforeEndingHeldHeartbeat(t *testing.T) {
+	for _, viaSignal := range []bool{false, true} {
+		t.Run(map[bool]string{false: "owner-closed", true: "signal"}[viaSignal], func(t *testing.T) {
+			dir := privateTestDir(t)
+			home := filepath.Join(dir, "codex")
+			if err := privateFixtureMkdir(home, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := writePrivateFixture(filepath.Join(home, "auth.json"), syntheticCodexAuth(time.Now().Add(-time.Hour)), 0600); err != nil {
+				t.Fatal(err)
+			}
+			c := config.Config{Executor: config.ExecutorCodexTLSN, Profile: "standard", StateDir: filepath.Join(dir, "state"), CodexHome: home, Credential: "synthetic-credential", NodeID: "synthetic-node", Concurrency: 1, Bid: 100, Verifier: "locally-configured.invalid:7047", Prover: filepath.Join(dir, "synthetic-prover-never-run"), JournalLimits: attempts.DefaultLimits(), MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: 3 * time.Second}
+			fires := make(chan context.CancelFunc, 1)
+			if viaSignal {
+				restore := notifyStop
+				notifyStop = func(parent context.Context) (context.Context, context.CancelFunc) {
+					ctx, cancel := context.WithCancel(parent)
+					fires <- cancel
+					return ctx, cancel
+				}
+				t.Cleanup(func() { notifyStop = restore })
+			}
+			reader, writer := io.Pipe()
+			defer reader.Close()
+			held := make(chan struct{}, 1)
+			var mu sync.Mutex
+			var events []string
+			record := func(event string) {
+				mu.Lock()
+				events = append(events, event)
+				mu.Unlock()
+			}
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/node/v1/goodbye" {
+					var body coordinator.Goodbye
+					if json.NewDecoder(r.Body).Decode(&body) != nil || body.Version != coordinator.Version || body.NodeID != "synthetic-node" {
+						t.Error("invalid goodbye")
+					}
+					record("goodbye:" + body.Reason)
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				select {
+				case held <- struct{}{}:
+				default:
+				}
+				// Hold until the node hangs up; never answer. The body must be read
+				// for the server to notice the hang-up and cancel the context.
+				_, _ = io.Copy(io.Discard, r.Body)
+				<-r.Context().Done()
+				record("hangup")
+			}))
+			defer server.Close()
+			c.Coordinator = server.URL
+			c.CoordinatorCA = filepath.Join(privateTestDir(t), "synthetic-coordinator-ca.pem")
+			if err := writePrivateFixture(c.CoordinatorCA, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- runWithOwner(c, reader) }()
+			select {
+			case <-held:
+			case <-time.After(5 * time.Second):
+				t.Fatal("node never heartbeated")
+			}
+			stopped := time.Now()
+			if viaSignal {
+				(<-fires)()
+			} else {
+				writer.Close()
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+				if time.Since(stopped) > 2*time.Second {
+					t.Fatal("stop waited for the held heartbeat", time.Since(stopped))
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("stop did not abort the held heartbeat")
+			}
+			writer.Close()
+			want := []string{"goodbye:" + map[bool]string{false: coordinator.GoodbyeStop, true: coordinator.GoodbyeSignal}[viaSignal], "hangup"}
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				mu.Lock()
+				got := append([]string(nil), events...)
+				mu.Unlock()
+				if reflect.DeepEqual(got, want) {
+					break
+				}
+				if len(got) >= len(want) || time.Now().After(deadline) {
+					t.Fatalf("coordinator saw %v, want %v", got, want)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
 	}
-	if err := writePrivateFixture(filepath.Join(home, "auth.json"), syntheticCodexAuth(time.Now().Add(-time.Hour)), 0600); err != nil {
-		t.Fatal(err)
-	}
-	c := config.Config{Executor: config.ExecutorCodexTLSN, Profile: "standard", StateDir: filepath.Join(dir, "state"), CodexHome: home, Credential: "synthetic-credential", NodeID: "synthetic-node", Concurrency: 1, Bid: 100, Verifier: "locally-configured.invalid:7047", Prover: filepath.Join(dir, "synthetic-prover-never-run"), JournalLimits: attempts.DefaultLimits(), MaxInputBytes: 1024, MaxOutputTokens: 20, InferenceTimeout: 3 * time.Second}
-	reader, writer := io.Pipe()
-	defer reader.Close()
-	held := make(chan struct{}, 1)
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case held <- struct{}{}:
-		default:
-		}
-		// Hold until the node hangs up; never answer. The body must be read
-		// for the server to notice the hang-up and cancel the context.
+}
+
+// controlRoute answers the node's availability posts and goodbyes with 204
+// and reports whether r was one, so that fake coordinators that hold
+// heartbeats need not treat the node's own control traffic as unexpected.
+func controlRoute(w http.ResponseWriter, r *http.Request) bool {
+	switch r.URL.Path {
+	case "/api/node/v1/availability", "/api/node/v1/goodbye":
 		_, _ = io.Copy(io.Discard, r.Body)
-		<-r.Context().Done()
-	}))
-	defer server.Close()
-	c.Coordinator = server.URL
-	c.CoordinatorCA = filepath.Join(privateTestDir(t), "synthetic-coordinator-ca.pem")
-	if err := writePrivateFixture(c.CoordinatorCA, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600); err != nil {
-		t.Fatal(err)
+		w.WriteHeader(http.StatusNoContent)
+		return true
 	}
-	done := make(chan error, 1)
-	go func() { done <- runWithOwner(c, reader) }()
-	select {
-	case <-held:
-	case <-time.After(5 * time.Second):
-		t.Fatal("node never heartbeated")
-	}
-	stopped := time.Now()
-	writer.Close()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-		if time.Since(stopped) > 2*time.Second {
-			t.Fatal("stop waited for the held heartbeat", time.Since(stopped))
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("stop did not abort the held heartbeat")
-	}
+	return false
+}
+
+// testWatch is a pollWatch for one held heartbeat in a unit test: nothing
+// stops, no owner pipe, no wall-clock jump and goodbyes go nowhere.
+func testWatch(sent availability, current func() availability, post func(context.Context) (availability, error)) pollWatch {
+	return pollWatch{stop: context.Background(), sent: sent, current: current, clock: &clockWatch{}, post: post,
+		goodbye: func(string, time.Time) {}, stopReason: func() string { return coordinator.GoodbyeSignal }, drainReason: func() string { return coordinator.GoodbyeStop }}
 }
 
 // startLongPollNode runs a synthetic node that advertises available against a
@@ -231,84 +319,120 @@ func startLongPollNodeWith(t *testing.T, handler http.HandlerFunc, prepare func(
 	return c, stop
 }
 
-// An operator drain during a held heartbeat ends the hold within about a
-// second, and the node heartbeats again at once, reporting the drain, instead
-// of leaving the coordinator free to hand over a lease for up to the full hold.
-func TestRunLoopDrainEndsHeldHeartbeat(t *testing.T) {
-	type arrival struct {
-		state string
-		at    time.Time
+// A drain during a held heartbeat says goodbye within about a second and then
+// ends the hold, and the node heartbeats again at once, reporting the drain,
+// instead of leaving the coordinator free to hand over a lease for up to the
+// full hold. The goodbye says update while the desktop updater is draining
+// the node for an install, else stop.
+func TestRunLoopDrainSaysGoodbyeAndEndsHeldHeartbeat(t *testing.T) {
+	for _, updating := range []bool{false, true} {
+		t.Run(map[bool]string{false: "operator", true: "updater"}[updating], func(t *testing.T) {
+			type arrival struct {
+				state string
+				at    time.Time
+			}
+			type release struct {
+				at        time.Time
+				cancelled bool
+			}
+			arrivals := make(chan arrival, 8)
+			releases := make(chan release, 8)
+			goodbyes := make(chan string, 8)
+			var goodbyeAt atomic.Int64
+			c, stop := startLongPollNode(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/node/v1/goodbye" {
+					var body coordinator.Goodbye
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					goodbyeAt.CompareAndSwap(0, time.Now().UnixNano())
+					goodbyes <- body.Reason
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				if controlRoute(w, r) {
+					return
+				}
+				var h coordinator.Heartbeat
+				if r.URL.Path != "/api/node/v1/heartbeat" || json.NewDecoder(r.Body).Decode(&h) != nil {
+					t.Error("unexpected request", r.URL.Path)
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				arrivals <- arrival{h.State, time.Now()}
+				// Hold every heartbeat for the full hold the node asked for, as an
+				// idle coordinator does, unless the node hangs up first.
+				_, _ = io.Copy(io.Discard, r.Body)
+				this := release{}
+				select {
+				case <-r.Context().Done():
+					this.cancelled = true
+				case <-time.After(time.Duration(h.WaitSeconds) * time.Second):
+					io.WriteString(w, `{"leases":[]}`)
+				}
+				this.at = time.Now()
+				releases <- this
+			})
+			var held arrival
+			select {
+			case held = <-arrivals:
+			case <-time.After(5 * time.Second):
+				t.Fatal("node never heartbeated")
+			}
+			if held.state != "available" {
+				t.Fatalf("held heartbeat advertised %q", held.state)
+			}
+			if updating {
+				pending := &update.Pending{Phase: update.PhaseDraining, From: coordinator.NodeRelease, To: "99.0.0", Kind: "mac-app", DrainOwner: "updater", StartedAt: time.Now().Unix()}
+				if err := (update.StateFile{Path: filepath.Join(c.StateDir, "update-state.json")}).Write(update.State{Schema: 1, Pending: pending}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			drainedAt := time.Now()
+			if err := writeLocalFile(c.StateDir, "drain", []byte("drained\n")); err != nil {
+				t.Fatal(err)
+			}
+			var ended release
+			select {
+			case ended = <-releases:
+			case <-time.After(5 * time.Second):
+				t.Fatal("drain did not end the held heartbeat")
+			}
+			if !ended.cancelled {
+				t.Fatal("the coordinator answered the held heartbeat; the node never cut it short")
+			}
+			if took := ended.at.Sub(drainedAt); took > 1500*time.Millisecond {
+				t.Fatalf("drain ended the held heartbeat after %v", took)
+			}
+			select {
+			case reason := <-goodbyes:
+				if want := map[bool]string{false: coordinator.GoodbyeStop, true: coordinator.GoodbyeUpdate}[updating]; reason != want {
+					t.Fatalf("drain goodbye %q, want %q", reason, want)
+				}
+			default:
+				t.Fatal("drain ended the hold without a goodbye")
+			}
+			if at := time.Unix(0, goodbyeAt.Load()); at.After(ended.at) {
+				t.Fatalf("goodbye at %v came after the hold ended at %v", at, ended.at)
+			}
+			var after arrival
+			select {
+			case after = <-arrivals:
+			case <-time.After(5 * time.Second):
+				t.Fatal("node did not heartbeat again after the drain")
+			}
+			if after.state != "exhausted" {
+				t.Fatalf("heartbeat after the drain advertised %q", after.state)
+			}
+			// No failure backoff (one second for a local fixture) before it.
+			if gap := after.at.Sub(ended.at); gap > 500*time.Millisecond {
+				t.Fatalf("heartbeat after the drain waited %v", gap)
+			}
+			stop()
+		})
 	}
-	type release struct {
-		at        time.Time
-		cancelled bool
-	}
-	arrivals := make(chan arrival, 8)
-	releases := make(chan release, 8)
-	c, stop := startLongPollNode(t, func(w http.ResponseWriter, r *http.Request) {
-		var h coordinator.Heartbeat
-		if r.URL.Path != "/api/node/v1/heartbeat" || json.NewDecoder(r.Body).Decode(&h) != nil {
-			t.Error("unexpected request", r.URL.Path)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		arrivals <- arrival{h.State, time.Now()}
-		// Hold every heartbeat for the full hold the node asked for, as an
-		// idle coordinator does, unless the node hangs up first.
-		_, _ = io.Copy(io.Discard, r.Body)
-		this := release{}
-		select {
-		case <-r.Context().Done():
-			this.cancelled = true
-		case <-time.After(time.Duration(h.WaitSeconds) * time.Second):
-			io.WriteString(w, `{"lease":null}`)
-		}
-		this.at = time.Now()
-		releases <- this
-	})
-	var held arrival
-	select {
-	case held = <-arrivals:
-	case <-time.After(5 * time.Second):
-		t.Fatal("node never heartbeated")
-	}
-	if held.state != "available" {
-		t.Fatalf("held heartbeat advertised %q", held.state)
-	}
-	drainedAt := time.Now()
-	if err := writeLocalFile(c.StateDir, "drain", []byte("drained\n")); err != nil {
-		t.Fatal(err)
-	}
-	var ended release
-	select {
-	case ended = <-releases:
-	case <-time.After(5 * time.Second):
-		t.Fatal("drain did not end the held heartbeat")
-	}
-	if !ended.cancelled {
-		t.Fatal("the coordinator answered the held heartbeat; the node never cut it short")
-	}
-	if took := ended.at.Sub(drainedAt); took > 1500*time.Millisecond {
-		t.Fatalf("drain ended the held heartbeat after %v", took)
-	}
-	var after arrival
-	select {
-	case after = <-arrivals:
-	case <-time.After(5 * time.Second):
-		t.Fatal("node did not heartbeat again after the drain")
-	}
-	if after.state != "exhausted" {
-		t.Fatalf("heartbeat after the drain advertised %q", after.state)
-	}
-	// No failure backoff (one second for a local fixture) before it.
-	if gap := after.at.Sub(ended.at); gap > 500*time.Millisecond {
-		t.Fatalf("heartbeat after the drain waited %v", gap)
-	}
-	stop()
 }
 
 // With nothing local changing, the node leaves a held heartbeat to the
-// coordinator: the watch does not cut it short.
+// coordinator: the watch neither cuts it short nor posts availability.
 func TestRunLoopKeepsUnchangedHeldHeartbeat(t *testing.T) {
 	const hold = 2500 * time.Millisecond // several watch intervals
 	type call struct {
@@ -316,9 +440,16 @@ func TestRunLoopKeepsUnchangedHeldHeartbeat(t *testing.T) {
 		cancelled bool
 	}
 	calls := make(chan call, 8)
+	var posts atomic.Int32
 	var mu sync.Mutex
 	n := 0
 	_, stop := startLongPollNode(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/node/v1/availability" {
+			posts.Add(1)
+		}
+		if controlRoute(w, r) {
+			return
+		}
 		var h coordinator.Heartbeat
 		if r.URL.Path != "/api/node/v1/heartbeat" || json.NewDecoder(r.Body).Decode(&h) != nil {
 			t.Error("unexpected request", r.URL.Path)
@@ -336,7 +467,7 @@ func TestRunLoopKeepsUnchangedHeldHeartbeat(t *testing.T) {
 			case <-r.Context().Done():
 				this.cancelled = true
 			case <-time.After(hold):
-				io.WriteString(w, `{"lease":null}`)
+				io.WriteString(w, `{"leases":[]}`)
 			}
 		} else {
 			<-r.Context().Done()
@@ -349,8 +480,8 @@ func TestRunLoopKeepsUnchangedHeldHeartbeat(t *testing.T) {
 	case <-time.After(hold + 5*time.Second):
 		t.Fatal("held heartbeat never ended")
 	}
-	if first.cancelled || first.state != "available" {
-		t.Fatalf("held heartbeat advertised %q, cancelled %v", first.state, first.cancelled)
+	if first.cancelled || first.state != "available" || posts.Load() != 0 {
+		t.Fatalf("held heartbeat advertised %q, cancelled %v, %d availability posts", first.state, first.cancelled, posts.Load())
 	}
 	stop()
 }
@@ -388,7 +519,9 @@ func TestServiceStatesTrackOccupancyAndReferences(t *testing.T) {
 	}
 }
 
-func TestHeartbeatCompletionSignalChecksSnapshotBeforeRefreshing(t *testing.T) {
+// A completion already reflected in the held heartbeat posts nothing; a real
+// change posts the new availability once and keeps the heartbeat held.
+func TestHeartbeatCompletionSignalChecksSnapshotBeforePosting(t *testing.T) {
 	ref := coordinator.ActiveLease{JobID: "00000000-0000-4000-8000-000000000001", Attempt: "00000000-0000-4000-8000-000000000002", Fence: "00000000-0000-4000-8000-000000000003"}
 	health := func(inFlight int, refs []coordinator.ActiveLease) availability {
 		return availability{services: serviceStates([]coordinator.ServiceHealth{{Kind: "x_read", State: "ready", Capacity: 2, InFlight: inFlight, ActiveLeases: refs}})}
@@ -397,34 +530,39 @@ func TestHeartbeatCompletionSignalChecksSnapshotBeforeRefreshing(t *testing.T) {
 	defer cancel(nil)
 	changes := make(chan struct{}, 1)
 	// A completion just before the snapshot is already reflected by the sent
-	// heartbeat. Its queued notification must not drop a concurrent offer.
+	// heartbeat. Its queued notification must not post anything.
 	changes <- struct{}{}
 	sent := health(1, []coordinator.ActiveLease{ref})
 	var mu sync.Mutex
 	current := sent
 	checked := make(chan struct{}, 1)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		watchHeartbeat(ctx, cancel, sent, func() availability {
-			mu.Lock()
-			snapshot := current
-			mu.Unlock()
-			select {
-			case checked <- struct{}{}:
-			default:
-			}
-			return snapshot
-		}, changes)
-	}()
+	posted := make(chan availability, 4)
+	read := func() availability {
+		mu.Lock()
+		snapshot := current
+		mu.Unlock()
+		select {
+		case checked <- struct{}{}:
+		default:
+		}
+		return snapshot
+	}
+	watch := testWatch(sent, read, func(context.Context) (availability, error) {
+		a := read()
+		posted <- a
+		return a, nil
+	})
+	watch.changes = changes
+	done := make(chan watchResult, 1)
+	go func() { done <- watchHeartbeat(ctx, cancel, watch) }()
 	select {
 	case <-checked:
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("queued completion did not wake the snapshot check")
 	}
 	select {
-	case <-done:
-		t.Fatal("an already reflected completion cancelled the fresh heartbeat")
+	case a := <-posted:
+		t.Fatalf("an already reflected completion posted %+v", a)
 	case <-time.After(150 * time.Millisecond):
 	}
 	mu.Lock()
@@ -432,20 +570,38 @@ func TestHeartbeatCompletionSignalChecksSnapshotBeforeRefreshing(t *testing.T) {
 	mu.Unlock()
 	changes <- struct{}{}
 	select {
-	case <-done:
+	case a := <-posted:
+		if a != health(0, nil) {
+			t.Fatalf("posted %+v", a)
+		}
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("completion did not refresh the held heartbeat")
+		t.Fatal("completion did not post the freed slot")
 	}
-	if context.Cause(ctx) != errHeartbeatStale {
-		t.Fatal("completion did not mark active lease references stale")
+	select {
+	case result := <-done:
+		t.Fatalf("completion ended the held heartbeat: %+v", result)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if ctx.Err() != nil {
+		t.Fatal("completion cancelled the held heartbeat")
+	}
+	cancel(nil)
+	if result := <-done; result.cause != nil || result.goodbye {
+		t.Fatalf("watch ended %+v", result)
+	}
+	select {
+	case a := <-posted:
+		t.Fatalf("posted again after the change was advertised: %+v", a)
+	default:
 	}
 }
 
 // A worker completing while the coordinator holds an exhausted heartbeat must
-// advertise its freed slot immediately. The synthetic lease fails validation
-// locally, so this exercises acceptance, reporting and release without calling
-// a provider or launching the helper.
-func TestRunLoopCompletionRefreshesFullHeldHeartbeatWithoutBackoff(t *testing.T) {
+// advertise its freed slot immediately, as an availability post, while the
+// heartbeat stays held: the node no longer cancels its own hold. The synthetic
+// lease fails validation locally, so this exercises acceptance, reporting and
+// release without calling a provider or launching the helper.
+func TestRunLoopCompletionPostsAvailabilityWhileHeartbeatStaysHeld(t *testing.T) {
 	dir := privateTestDir(t)
 	home := filepath.Join(dir, "codex")
 	if err := privateFixtureMkdir(home, 0700); err != nil {
@@ -467,6 +623,7 @@ func TestRunLoopCompletionRefreshesFullHeldHeartbeatWithoutBackoff(t *testing.T)
 		at        time.Time
 	}
 	arrivals := make(chan arrival, 8)
+	posts := make(chan arrival, 8)
 	heldEnded := make(chan time.Time, 8)
 	reportReady := make(chan struct{}, 1)
 	allowReport := make(chan struct{})
@@ -490,12 +647,21 @@ func TestRunLoopCompletionRefreshesFullHeldHeartbeatWithoutBackoff(t *testing.T)
 			heartbeats++
 			mu.Unlock()
 			if first {
-				json.NewEncoder(w).Encode(coordinator.HeartbeatReply{Lease: &offer})
+				json.NewEncoder(w).Encode(coordinator.HeartbeatReply{Leases: []coordinator.Lease{offer}})
 				return
 			}
 			_, _ = io.Copy(io.Discard, r.Body)
 			<-r.Context().Done()
 			heldEnded <- time.Now()
+		case r.URL.Path == "/api/node/v1/availability":
+			var a coordinator.Availability
+			if json.NewDecoder(r.Body).Decode(&a) != nil {
+				t.Error("invalid availability")
+			}
+			posts <- arrival{heartbeat: coordinator.Heartbeat{Version: a.Version, NodeID: a.NodeID, State: a.State, Capacity: a.Capacity, Services: a.Services}, at: time.Now()}
+			w.WriteHeader(http.StatusNoContent)
+		case r.URL.Path == "/api/node/v1/goodbye":
+			w.WriteHeader(http.StatusNoContent)
 		case strings.HasSuffix(r.URL.Path, "/accept"):
 			accepted := offer
 			accepted.VerifierToken = strings.Repeat("c", 64)
@@ -538,20 +704,20 @@ func TestRunLoopCompletionRefreshesFullHeldHeartbeatWithoutBackoff(t *testing.T)
 		}
 		reader.Close()
 	})
-	nextHeartbeat := func() arrival {
+	next := func(ch <-chan arrival, what string) arrival {
 		t.Helper()
 		select {
-		case a := <-arrivals:
+		case a := <-ch:
 			return a
 		case <-time.After(5 * time.Second):
-			t.Fatal("node did not heartbeat")
+			t.Fatal("node did not send", what)
 			return arrival{}
 		}
 	}
-	if first := nextHeartbeat(); first.heartbeat.State != "available" {
+	if first := next(arrivals, "a heartbeat"); first.heartbeat.State != "available" {
 		t.Fatalf("initial heartbeat advertised %q", first.heartbeat.State)
 	}
-	full := nextHeartbeat()
+	full := next(arrivals, "a heartbeat")
 	if full.heartbeat.State != "exhausted" || len(full.heartbeat.Services) == 0 || full.heartbeat.Services[0].InFlight != 1 {
 		t.Fatalf("full heartbeat did not advertise its occupied slot: %+v", full.heartbeat)
 	}
@@ -559,28 +725,40 @@ func TestRunLoopCompletionRefreshesFullHeldHeartbeatWithoutBackoff(t *testing.T)
 	if len(refs) != 1 || refs[0] != (coordinator.ActiveLease{JobID: offer.JobID, Attempt: offer.Attempt, Fence: offer.Fence}) {
 		t.Fatalf("full heartbeat did not bind the occupied lease: %+v", refs)
 	}
+	if acks := full.heartbeat.OffersSeen; len(acks) != 1 || acks[0] != (coordinator.OfferRef{JobID: offer.JobID, Attempt: offer.Attempt}) {
+		t.Fatalf("full heartbeat did not acknowledge the offer: %+v", acks)
+	}
 	select {
 	case <-reportReady:
 	case <-time.After(5 * time.Second):
 		t.Fatal("synthetic worker did not reach its report")
 	}
-	// Keep the report unacknowledged: the account must remain occupied and the
-	// heartbeat must remain held until reporting finishes.
+	// Keep the report unacknowledged: the account must remain occupied, so
+	// there is nothing to post and the heartbeat stays held.
 	select {
 	case <-heldEnded:
 		t.Fatal("full heartbeat ended before reporting finished")
+	case a := <-posts:
+		t.Fatalf("availability posted before reporting finished: %+v", a.heartbeat)
 	case <-time.After(150 * time.Millisecond):
 	}
 	releasedAt := time.Now()
 	releaseReport()
-	after := nextHeartbeat()
-	if after.heartbeat.State != "available" || len(after.heartbeat.Services) == 0 || after.heartbeat.Services[0].InFlight != 0 || len(after.heartbeat.Services[0].ActiveLeases) != 0 {
-		t.Fatalf("completion did not advertise the free slot: %+v", after.heartbeat)
+	posted := next(posts, "an availability post")
+	if posted.heartbeat.State != "available" || len(posted.heartbeat.Services) == 0 || posted.heartbeat.Services[0].InFlight != 0 || len(posted.heartbeat.Services[0].ActiveLeases) != 0 || posted.heartbeat.Version != coordinator.Version {
+		t.Fatalf("completion did not post the free slot: %+v", posted.heartbeat)
 	}
 	// This is below both the one-second watcher interval and the fixture's
 	// one-second failure backoff, so it requires the completion wakeup.
-	if delay := after.at.Sub(releasedAt); delay > 500*time.Millisecond {
-		t.Fatalf("completion waited %v before advertising available", delay)
+	if delay := posted.at.Sub(releasedAt); delay > 500*time.Millisecond {
+		t.Fatalf("completion waited %v before posting available", delay)
+	}
+	select {
+	case at := <-heldEnded:
+		t.Fatalf("the node ended its held heartbeat %v after posting", at.Sub(posted.at))
+	case a := <-arrivals:
+		t.Fatalf("the node heartbeated again instead of keeping the hold: %+v", a.heartbeat)
+	case <-time.After(300 * time.Millisecond):
 	}
 }
 
@@ -656,7 +834,7 @@ func TestHeartbeatBackoffScheduleJitterAndRetryAfter(t *testing.T) {
 }
 
 // A rejected heartbeat (413) is backed off and resent unchanged, never in a
-// reduced shape. A 200 with no lease and a Retry-After, as from a coordinator
+// reduced shape. A 200 with no leases and a Retry-After, as from a coordinator
 // shutting down, and a 503 with Retry-After pause the node at least that long.
 func TestRunLoopHonoursRetryAfterAndBacksOffRejectedHeartbeat(t *testing.T) {
 	dir := privateTestDir(t)
@@ -676,6 +854,9 @@ func TestRunLoopHonoursRetryAfterAndBacksOffRejectedHeartbeat(t *testing.T) {
 	var mu sync.Mutex
 	n := 0
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if controlRoute(w, r) {
+			return
+		}
 		var h coordinator.Heartbeat
 		if r.URL.Path != "/api/node/v1/heartbeat" || json.NewDecoder(r.Body).Decode(&h) != nil {
 			t.Error("unexpected request", r.URL.Path)
@@ -694,7 +875,7 @@ func TestRunLoopHonoursRetryAfterAndBacksOffRejectedHeartbeat(t *testing.T) {
 			io.WriteString(w, `{"error":{"code":"heartbeat_too_large","message":"synthetic"}}`)
 		case 1:
 			w.Header().Set("Retry-After", "1")
-			io.WriteString(w, `{"lease":null}`)
+			io.WriteString(w, `{"leases":[]}`)
 		case 2:
 			// Answer a little after the arrival so a status save made in the
 			// pause is later than it even on a coarse wall clock: Windows can
@@ -763,24 +944,53 @@ func TestRunLoopHonoursRetryAfterAndBacksOffRejectedHeartbeat(t *testing.T) {
 }
 
 // A pause between heartbeats saves status when it starts and at each interval
-// while it lasts, and a stop ends it at once.
-func TestWaitRefreshingSavesStatusDuringPause(t *testing.T) {
+// while it lasts, a stop ends it at once, and an owner command or a jump of
+// the wall clock ends it with what woke the node.
+func TestWaitForSavesStatusAndEndsEarly(t *testing.T) {
+	restore := readClock
+	t.Cleanup(func() { readClock = restore })
 	refreshes := 0
 	started := time.Now()
-	if !waitRefreshing(context.Background(), 260*time.Millisecond, 50*time.Millisecond, func() { refreshes++ }) {
-		t.Fatal("an uninterrupted pause reported a stop")
+	if outcome, _ := waitFor(context.Background(), 260*time.Millisecond, nil, &clockWatch{}, func() { refreshes++ }); outcome != waitElapsed {
+		t.Fatal("an uninterrupted pause ended early", outcome)
 	}
-	if took := time.Since(started); took < 260*time.Millisecond || refreshes < 4 {
+	if took := time.Since(started); took < 260*time.Millisecond || refreshes != 1 {
 		t.Fatalf("paused %v with %d refreshes", took, refreshes)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	time.AfterFunc(50*time.Millisecond, cancel)
 	refreshes, started = 0, time.Now()
-	if waitRefreshing(ctx, time.Minute, time.Minute, func() { refreshes++ }) || time.Since(started) > time.Second || refreshes != 1 {
+	if outcome, _ := waitFor(ctx, time.Minute, nil, &clockWatch{}, func() { refreshes++ }); outcome != waitStopped || time.Since(started) > time.Second || refreshes != 1 {
 		t.Fatalf("stop ended the pause after %v with %d refreshes", time.Since(started), refreshes)
 	}
-	if waitRefreshing(ctx, time.Minute, time.Minute, func() { t.Error("a stopped node saved status") }) {
+	if outcome, _ := waitFor(ctx, time.Minute, nil, &clockWatch{}, func() { t.Error("a stopped node saved status") }); outcome != waitStopped {
 		t.Fatal("a stopped node paused")
+	}
+	commands := make(chan ownerCommand, 2)
+	commands <- ownerWake
+	if outcome, reason := waitFor(context.Background(), time.Minute, commands, &clockWatch{}, func() {}); outcome != waitWake || reason != "owner" {
+		t.Fatal("wake command", outcome, reason)
+	}
+	commands <- ownerSleep
+	if outcome, _ := waitFor(context.Background(), time.Minute, commands, &clockWatch{}, func() {}); outcome != waitSleep {
+		t.Fatal("sleep command", outcome)
+	}
+	// The wall clock runs a minute ahead of the monotonic one between ticks.
+	var mu sync.Mutex
+	reading := clockReading{wall: time.Now(), mono: time.Second}
+	readClock = func() clockReading {
+		mu.Lock()
+		defer mu.Unlock()
+		r := reading
+		reading.wall = reading.wall.Add(time.Minute)
+		reading.mono += time.Second
+		return r
+	}
+	watch := &clockWatch{}
+	watch.jumped()
+	started = time.Now()
+	if outcome, reason := waitFor(context.Background(), time.Minute, nil, watch, func() {}); outcome != waitWake || reason != "clock_jump" || time.Since(started) > 2*heartbeatWatchInterval {
+		t.Fatal("wall-clock jump", outcome, reason, time.Since(started))
 	}
 }
 
@@ -804,6 +1014,9 @@ func TestRunLoopResetsBackoffAfterAnsweredHeartbeat(t *testing.T) {
 	var n atomic.Int32
 	arrivals := make(chan struct{}, 8)
 	_, stop := startLongPollNode(t, func(w http.ResponseWriter, r *http.Request) {
+		if controlRoute(w, r) {
+			return
+		}
 		if r.URL.Path != "/api/node/v1/heartbeat" {
 			t.Error("unexpected request", r.URL.Path)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -818,7 +1031,7 @@ func TestRunLoopResetsBackoffAfterAnsweredHeartbeat(t *testing.T) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			io.WriteString(w, `{"error":{"code":"network_unavailable","message":"synthetic"}}`)
 		case 2:
-			io.WriteString(w, `{"lease":null}`)
+			io.WriteString(w, `{"leases":[]}`)
 		default:
 			<-r.Context().Done()
 		}
@@ -843,10 +1056,10 @@ func TestRunLoopResetsBackoffAfterAnsweredHeartbeat(t *testing.T) {
 	}
 }
 
-// A lease that reaches a draining node is rejected with a single acceptance
-// request: a busy coordinator's 503 is not retried there, so the next
-// heartbeat follows after the usual drain-rejection pause.
-func TestRunLoopDrainRejectionDoesNotRetryBusyAcceptance(t *testing.T) {
+// An offer that reaches a draining node is rejected as draining, without any
+// acceptance, and the next heartbeat follows after the usual drain-rejection
+// pause.
+func TestRunLoopRejectsOffersWhileDrainingWithoutAccepting(t *testing.T) {
 	offer := testLease()
 	offer.ServiceType, offer.AcceptanceRequired = "codex", true
 	offer.SettlementDeadline = offer.LeaseDeadline
@@ -857,14 +1070,23 @@ func TestRunLoopDrainRejectionDoesNotRetryBusyAcceptance(t *testing.T) {
 	}
 	arrivals := make(chan arrival, 8)
 	leased := make(chan time.Time, 1)
+	rejected := make(chan coordinator.Rejection, 4)
 	var accepts atomic.Int32
 	var offered atomic.Bool
 	c, stop := startLongPollNode(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/node/v1/jobs/"+offer.JobID+"/accept" {
+		switch r.URL.Path {
+		case "/api/node/v1/jobs/" + offer.JobID + "/accept":
 			accepts.Add(1)
-			w.Header().Set("Retry-After", "1")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			io.WriteString(w, `{"error":{"code":"dispatch_busy","message":"synthetic"}}`)
+			w.WriteHeader(http.StatusConflict)
+			return
+		case "/api/node/v1/jobs/" + offer.JobID + "/reject":
+			var body coordinator.Rejection
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			rejected <- body
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if controlRoute(w, r) {
 			return
 		}
 		var h coordinator.Heartbeat
@@ -876,7 +1098,7 @@ func TestRunLoopDrainRejectionDoesNotRetryBusyAcceptance(t *testing.T) {
 		_, _ = io.Copy(io.Discard, r.Body)
 		arrivals <- arrival{h.State, time.Now()}
 		if h.State == "exhausted" && offered.CompareAndSwap(false, true) {
-			json.NewEncoder(w).Encode(map[string]any{"lease": offer})
+			json.NewEncoder(w).Encode(map[string]any{"leases": []coordinator.Lease{offer}})
 			leased <- time.Now()
 			return
 		}
@@ -907,14 +1129,21 @@ func TestRunLoopDrainRejectionDoesNotRetryBusyAcceptance(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the draining node was never offered the lease")
 	}
+	select {
+	case body := <-rejected:
+		if body.Reason != coordinator.RejectDraining || body.Attempt != offer.Attempt || body.Fence != offer.Fence || body.Version != coordinator.Version {
+			t.Fatalf("rejection %+v", body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the draining node did not reject the offer")
+	}
 	after := next()
-	// The fixture's one-second drain-rejection pause, without three retry
-	// waits of a second or more before it.
+	// The fixture's one-second drain-rejection pause.
 	if gap := after.at.Sub(leasedAt); gap < time.Second || gap > 2500*time.Millisecond {
 		t.Fatalf("heartbeat after the drain rejection followed after %v", gap)
 	}
 	stop()
-	if got := accepts.Load(); got != 1 {
-		t.Fatalf("drain rejection sent %d acceptance requests, want 1", got)
+	if got := accepts.Load(); got != 0 {
+		t.Fatalf("drain rejection sent %d acceptance requests, want 0", got)
 	}
 }

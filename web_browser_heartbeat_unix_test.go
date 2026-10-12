@@ -126,6 +126,9 @@ func TestRunLoopServesWebBrowserLease(t *testing.T) {
 			parts := map[int][]byte{}
 			var partRequests []*http.Request
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if controlRoute(w, r) {
+					return
+				}
 				switch r.URL.Path {
 				case "/api/node/v1/heartbeat":
 					var h coordinator.Heartbeat
@@ -139,7 +142,7 @@ func TestRunLoopServesWebBrowserLease(t *testing.T) {
 					served = true
 					mu.Unlock()
 					if first {
-						json.NewEncoder(w).Encode(coordinator.HeartbeatReply{Lease: &offer})
+						json.NewEncoder(w).Encode(coordinator.HeartbeatReply{Leases: []coordinator.Lease{offer}})
 						return
 					}
 					select {

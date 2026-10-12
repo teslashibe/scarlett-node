@@ -553,6 +553,20 @@ func (j *Journal) Ready(r Record, kind string, body []byte) (Record, error) {
 
 // ReadyContext preserves the exact report bytes while recording local timings.
 func (j *Journal) ReadyContext(ctx context.Context, r Record, kind string, body []byte) (Record, error) {
+	return j.ready(ctx, r, kind, body, false)
+}
+
+// ReadyAfterProofContext is ReadyContext for an accepted attempt whose proven
+// worker has finished. The write that preserves the report also marks the
+// attempt's proof traffic finished, which a separate FinishProofTraffic write
+// did before it: the samples are final by then, and a ready record takes no
+// more samples either way. A crash before this write leaves a started record
+// whose traffic is not marked finished, which recovery treats the same.
+func (j *Journal) ReadyAfterProofContext(ctx context.Context, r Record, kind string, body []byte) (Record, error) {
+	return j.ready(ctx, r, kind, body, true)
+}
+
+func (j *Journal) ready(ctx context.Context, r Record, kind string, body []byte, finishProof bool) (Record, error) {
 	j.lockContext(ctx)
 	defer j.mu.Unlock()
 	old, err := j.read(filepath.Join(j.dir, key(r)+".json"))
@@ -572,6 +586,9 @@ func (j *Journal) ReadyContext(ctx context.Context, r Record, kind string, body 
 	old.Kind = kind
 	old.Body = append([]byte(nil), body...)
 	old.SubmissionSHA256 = Hash(body)
+	if finishProof && old.ProofTraffic != nil {
+		old.ProofTraffic.WorkerFinished = true
+	}
 	old.UpdatedAt = time.Now().UTC()
 	if err = j.writeContext(ctx, old); err != nil {
 		return Record{}, err

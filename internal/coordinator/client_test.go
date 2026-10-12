@@ -45,7 +45,7 @@ func TestPollChallenge(t *testing.T) {
 					if tc.expired {
 						expiry = time.Now().Add(-time.Minute)
 					}
-					json.NewEncoder(w).Encode(HeartbeatReply{Lease: &Lease{JobID: "job"}, Challenge: &Challenge{Version: Version, Nonce: tc.nonce, ExpiresAt: expiry}})
+					json.NewEncoder(w).Encode(HeartbeatReply{Leases: []Lease{{JobID: "job"}}, Challenge: &Challenge{Version: Version, Nonce: tc.nonce, ExpiresAt: expiry}})
 				case "/api/node/v1/challenge/echo":
 					echoes++
 					var body map[string]any
@@ -76,10 +76,10 @@ func TestPollChallenge(t *testing.T) {
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("error = %v", err)
 			}
-			if !tc.wantErr && (reply.Lease == nil || reply.Lease.JobID != "job") {
+			if !tc.wantErr && (len(reply.Leases) != 1 || reply.Leases[0].JobID != "job") {
 				t.Fatal("lost lease")
 			}
-			if tc.wantErr && reply.Lease != nil {
+			if tc.wantErr && len(reply.Leases) != 0 {
 				t.Fatal("returned lease despite failed challenge")
 			}
 			want := 0
@@ -126,6 +126,14 @@ func TestWireFixtures(t *testing.T) {
 		{"result.json", &Result{}},
 		{"failure.json", &Failure{}},
 		{"heartbeat-challenge.json", &HeartbeatReply{}},
+		{"heartbeat-offers-seen.json", &Heartbeat{}},
+		{"heartbeat-reply.json", &HeartbeatReply{}},
+		{"heartbeat-reply-idle.json", &HeartbeatReply{}},
+		{"availability.json", &Availability{}},
+		{"goodbye.json", &Goodbye{}},
+		{"reject.json", &Rejection{}},
+		{"error-update-required.json", &ErrorReply{}},
+		{"error-attempt-conflict.json", &ErrorReply{}},
 		{"challenge-echo.json", &ChallengeEcho{}},
 		{"error-dispatch-busy.json", &ErrorReply{}},
 		{"error-heartbeat-too-large.json", &ErrorReply{}},
@@ -313,7 +321,7 @@ func TestRetryAfterWaitJitterBounds(t *testing.T) {
 	}
 }
 
-// A 200 with a null lease reports its Retry-After to the caller; a 429 or 503
+// A 200 with no leases reports its Retry-After to the caller; a 429 or 503
 // reports it, with the status and code, on the error. Other bodies and codes
 // that are not short machine codes are not trusted into logs.
 func TestPollReportsRetryAfter(t *testing.T) {
@@ -323,8 +331,8 @@ func TestPollReportsRetryAfter(t *testing.T) {
 		wantAfter        time.Duration
 		wantCode         string
 	}{
-		{http.StatusOK, "3", `{"lease":null}`, 3 * time.Second, ""},
-		{http.StatusOK, "", `{"lease":null}`, 0, ""},
+		{http.StatusOK, "3", `{"leases":[],"node":{"missed_streak":0,"suspect_until":null}}`, 3 * time.Second, ""},
+		{http.StatusOK, "", `{"leases":[]}`, 0, ""},
 		{http.StatusTooManyRequests, "120", `{"error":{"code":"rate_limited","message":"Too many node requests."}}`, MaxRetryAfter, "rate_limited"},
 		{http.StatusServiceUnavailable, "0", `{"error":{"code":"network_unavailable","message":"x"}}`, MinRetryAfter, "network_unavailable"},
 		{http.StatusServiceUnavailable, "", `{"error":{"code":"Bad Code\n","message":"x"}}`, 0, ""},
@@ -340,7 +348,7 @@ func TestPollReportsRetryAfter(t *testing.T) {
 		reply, err := New(server.URL, "demo").Poll(context.Background(), Heartbeat{Version: Version, NodeID: "node"})
 		server.Close()
 		if tc.status == http.StatusOK {
-			if err != nil || reply.Lease != nil || reply.RetryAfter != tc.wantAfter {
+			if err != nil || len(reply.Leases) != 0 || reply.RetryAfter != tc.wantAfter {
 				t.Fatalf("200 Retry-After %q: reply %+v, err %v", tc.retryAfter, reply, err)
 			}
 			continue
@@ -357,21 +365,23 @@ func TestPollWithoutChallenge(t *testing.T) {
 		if r.URL.Path != "/api/node/v1/heartbeat" {
 			t.Fatal("unexpected echo")
 		}
-		json.NewEncoder(w).Encode(HeartbeatReply{Lease: &Lease{JobID: "demo"}})
+		json.NewEncoder(w).Encode(HeartbeatReply{Leases: []Lease{{JobID: "demo"}}})
 	}))
 	defer server.Close()
 	reply, err := New(server.URL, "demo").Poll(context.Background(), Heartbeat{Version: Version, NodeID: "node"})
-	if err != nil || reply.Lease == nil {
+	if err != nil || len(reply.Leases) != 1 {
 		t.Fatalf("legacy/demo poll: %v", err)
 	}
 }
 
 // The heartbeat is a long poll. It carries the hold it asks for, runs under its
-// own deadline of that hold plus the grace rather than the client's 10-second
-// timeout, and ctx cancellation ends it at once.
+// own deadline of that hold (with the coordinator's two-second jitter on a
+// full-length one) plus the grace rather than the client's 10-second timeout,
+// and ctx cancellation ends it at once. The node's own heartbeat gives up at
+// 22 + 3 seconds.
 func TestPollLongPollDeadlineIsWaitPlusGrace(t *testing.T) {
 	c := New("https://coordinator.example", "cred")
-	for wait, want := range map[int]time.Duration{0: 10 * time.Second, 20: 30 * time.Second, -3: 10 * time.Second} {
+	for wait, want := range map[int]time.Duration{0: 3 * time.Second, 5: 8 * time.Second, HeartbeatWaitSeconds: 25 * time.Second, -3: 3 * time.Second} {
 		if got := c.heartbeatTimeout(wait); got != want {
 			t.Fatalf("wait %d: deadline %v, want %v", wait, got, want)
 		}
@@ -386,7 +396,7 @@ func TestPollLongPollDeadlineIsWaitPlusGrace(t *testing.T) {
 		// Hold the request for most of the asked wait, then answer idle.
 		select {
 		case <-time.After(300 * time.Millisecond):
-			io.WriteString(w, `{"lease":null}`)
+			io.WriteString(w, `{"leases":[]}`)
 		case <-r.Context().Done():
 		}
 	}))

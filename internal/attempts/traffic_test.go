@@ -2,6 +2,7 @@ package attempts
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -278,5 +279,57 @@ func TestProofTrafficHoldsSixWebHops(t *testing.T) {
 	other.JobID, other.ProviderAccountID, other.ProviderService = "synthetic-other", "web", "browser"
 	if err := j.Begin(other); err == nil {
 		t.Fatal("unknown provider service accepted")
+	}
+}
+
+// Ready after a proven run marks the traffic finished in the same write that
+// keeps the report, one journal write fewer than FinishProofTraffic then
+// Ready; plain Ready, which recovery uses, leaves the marker alone. Both keep
+// the exact report bytes, and a repeat of the same report is answered as
+// before.
+func TestReadyAfterProofFinishesTrafficInOneWrite(t *testing.T) {
+	for _, afterProof := range []bool{true, false} {
+		dir := filepath.Join(t.TempDir(), "attempts")
+		j := open(t, dir)
+		r := fixture()
+		if err := j.Begin(r); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.BeginProof(r, 1); err != nil {
+			t.Fatal(err)
+		}
+		if err := j.CompleteProof(r, trafficSample(1, 3, 5)); err != nil {
+			t.Fatal(err)
+		}
+		before, err := os.Stat(filepath.Join(dir, key(r)+".json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := []byte(`{"version":"node-v2","attempt":"a1","fence":"f1"}`)
+		ready := j.ReadyContext
+		if afterProof {
+			ready = j.ReadyAfterProofContext
+		}
+		got, err := ready(context.Background(), r, "proven", body)
+		if err != nil || got.State != "ready" || !bytes.Equal(got.Body, body) || got.SubmissionSHA256 != Hash(body) {
+			t.Fatal("ready lost the report", err)
+		}
+		if got.ProofTraffic == nil || got.ProofTraffic.WorkerFinished != afterProof || got.ProofTraffic.Samples[0].State != "complete" {
+			t.Fatalf("after proof %v: traffic %+v", afterProof, got.ProofTraffic)
+		}
+		after, err := os.Stat(filepath.Join(dir, key(r)+".json"))
+		if err != nil || !after.ModTime().After(before.ModTime()) && after.Size() == before.Size() {
+			t.Fatal("ready was not written", err)
+		}
+		if again, err := ready(context.Background(), r, "proven", body); err != nil || again.SubmissionSHA256 != got.SubmissionSHA256 {
+			t.Fatal("identical report replay", err)
+		}
+		if _, err := ready(context.Background(), r, "proven", []byte(`{"version":"node-v2"}`)); !errors.Is(err, ErrConflict) {
+			t.Fatal("a different report replaced the ready one", err)
+		}
+		if err := j.CompleteProof(r, trafficSample(1, 3, 5)); !errors.Is(err, ErrConflict) {
+			t.Fatal("ready record took a sample", err)
+		}
+		j.Close()
 	}
 }

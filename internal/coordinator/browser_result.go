@@ -488,7 +488,7 @@ func (u *browserUploader) once(ctx context.Context, method, path string, body []
 	}
 	resp, err := u.client.Do(req)
 	if err != nil {
-		return 0, ctx.Err() == nil, errors.New("coordinator unavailable")
+		return 0, ctx.Err() == nil, transportError(err)
 	}
 	defer resp.Body.Close()
 	u.c.observeRelease(resp.Header)

@@ -210,8 +210,15 @@ func TestCodexAdmissionRechecksSelectedProfileBeforeAcceptance(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var calls atomic.Int32
+			var calls, rejects atomic.Int32
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// The node rejects the offer it cannot cover, and nothing else.
+				var body coordinator.Rejection
+				if r.URL.Path == "/api/node/v1/jobs/"+l.JobID+"/reject" && json.NewDecoder(r.Body).Decode(&body) == nil && body.Reason == coordinator.RejectNoAccount && body.Attempt == l.Attempt && body.Fence == l.Fence {
+					rejects.Add(1)
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
 				calls.Add(1)
 				w.WriteHeader(http.StatusInternalServerError)
 			}))
@@ -229,7 +236,7 @@ func TestCodexAdmissionRechecksSelectedProfileBeforeAcceptance(t *testing.T) {
 				t.Fatal(err)
 			}
 			code, err := submitLease(context.Background(), client, c, l, nil, j)
-			if code != codexLocalAuthExpired || err == nil || calls.Load() != 0 {
+			if code != codexLocalAuthExpired || err == nil || calls.Load() != 0 || rejects.Load() != 1 {
 				t.Fatal("invalid selected profile funded or submitted an offer")
 			}
 			if _, err := os.Stat(marker); !os.IsNotExist(err) {
@@ -265,9 +272,20 @@ func TestUnavailableCodexOfferNeverFundsThroughRejection(t *testing.T) {
 	reader, writer := io.Pipe()
 	defer reader.Close()
 	defer writer.Close()
-	var heartbeats, providerReports atomic.Int32
+	var heartbeats, providerReports, rejects atomic.Int32
 	l := communityOffer(t)
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if controlRoute(w, r) {
+			return
+		}
+		// No account can take the offer: the node rejects it at once, which
+		// funds nothing, instead of leaving it to expire.
+		var body coordinator.Rejection
+		if r.URL.Path == "/api/node/v1/jobs/"+l.JobID+"/reject" && json.NewDecoder(r.Body).Decode(&body) == nil && body.Reason == coordinator.RejectNoAccount {
+			rejects.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if r.URL.Path != "/api/node/v1/heartbeat" {
 			providerReports.Add(1)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -280,10 +298,10 @@ func TestUnavailableCodexOfferNeverFundsThroughRejection(t *testing.T) {
 		if heartbeats.Add(1) == 1 {
 			// Even an unsolicited offer delivered to a blocked node cannot
 			// trigger the rejection helper's funded acceptance.
-			json.NewEncoder(w).Encode(map[string]any{"lease": l})
+			json.NewEncoder(w).Encode(map[string]any{"leases": []coordinator.Lease{l}})
 		} else {
 			writer.Close()
-			io.WriteString(w, `{"lease":null}`)
+			io.WriteString(w, `{"leases":[]}`)
 		}
 	}))
 	defer server.Close()
@@ -296,8 +314,8 @@ func TestUnavailableCodexOfferNeverFundsThroughRejection(t *testing.T) {
 	go func() { done <- runWithOwner(c, reader) }()
 	select {
 	case err := <-done:
-		if err != nil || providerReports.Load() != 0 || heartbeats.Load() < 2 {
-			t.Fatal("blocked offer called acceptance or failure-report HTTP", err)
+		if err != nil || providerReports.Load() != 0 || heartbeats.Load() < 2 || rejects.Load() != 1 {
+			t.Fatal("blocked offer called acceptance or failure-report HTTP, or was not rejected", err, rejects.Load())
 		}
 	case <-time.After(10 * time.Second):
 		writer.Close()

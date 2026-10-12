@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "version": "0.1.17",
+  "date": "2026-10-11",
+  "title": "Faster, steadier job delivery",
+  "highlights": [
+    "Your node takes several jobs at once and tells Scarlett right away about any it cannot take, so no job waits on it",
+    "Stopping the node, an update or putting your computer to sleep hands waiting jobs to other nodes at once, and the node reconnects quickly after it wakes",
+    "This update is required: earlier versions no longer receive jobs"
+  ]
+}

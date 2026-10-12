@@ -535,7 +535,7 @@ func TestRunBrowserUploadsAndRefetches(t *testing.T) {
 	// names lowercased and cookies, set-cookie and bad values dropped.
 	call := upload.calls[0]
 	body := call.body
-	if call.jobID != l.JobID || !call.report.Equal(l.LeaseDeadline.Add(-webReportMargin)) || body.Version != "node-v1" || body.Attempt != l.Attempt || body.Fence != l.Fence || body.RequestSHA256 != l.RequestSHA256 || body.URL != l.WebRequest.URL || body.FinalURL != "https://example.com/" || body.StatusCode != 200 ||
+	if call.jobID != l.JobID || !call.report.Equal(l.LeaseDeadline.Add(-webReportMargin)) || body.Version != coordinator.Version || body.Attempt != l.Attempt || body.Fence != l.Fence || body.RequestSHA256 != l.RequestSHA256 || body.URL != l.WebRequest.URL || body.FinalURL != "https://example.com/" || body.StatusCode != 200 ||
 		body.DOM != coordinator.DOMOK || string(call.html) != renderedHTML || body.HTMLBytes != int64(len(renderedHTML)) || body.HTMLSHA256 != SHA(renderedHTML) || len(body.Parts) != 1 || body.Challenge != "solved" {
 		t.Fatalf("upload body %+v", body)
 	}
