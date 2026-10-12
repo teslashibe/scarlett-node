@@ -203,7 +203,22 @@ func eventually(t *testing.T, path string, n int) []map[string]any {
 // useWebDaemon runs this test's hops on the daemon when the mode has one.
 func useWebDaemon(t *testing.T, mode string) (daemonLog, webLog, predialLog string) {
 	t.Helper()
-	dir := t.TempDir()
+	// Not t.TempDir: a daemon a test abandoned is killed about two seconds
+	// after it is replaced and may still write its log while the test ends,
+	// so removal retries until that process is gone.
+	dir, err := os.MkdirTemp("", "webdaemon-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		for range 50 {
+			if os.RemoveAll(dir) == nil {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		t.Errorf("daemon test directory %s still busy", dir)
+	})
 	daemonLog, webLog, predialLog = filepath.Join(dir, "daemon.log"), filepath.Join(dir, "relay-web.log"), filepath.Join(dir, "predial.log")
 	t.Setenv("SCARLETT_FAKE_PROVER", mode)
 	t.Setenv("SCARLETT_FAKE_DAEMON_LOG", daemonLog)
