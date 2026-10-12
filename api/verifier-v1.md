@@ -228,3 +228,50 @@ other → `fetch_failed`. The full class set is `connect_failed`,
 failures `verifier: job <id> web hop <n> failed: <reason>` with the timing
 limit in parentheses for `session_timeout`; `verifier: job <id> web session
 refused: verifier_busy`. Never the URL, host or page content.
+
+## 10. Revocation: `DELETE /v1/sessions/{job_id}/{attempt}`
+
+Added with node 0.1.17. Key auth as for every route. The app revokes a
+registration whose token must never be presented: a hedge loser that
+registered before another node's accept won, or an attempt it supersedes.
+Sessions are keyed by attempt, so revoking one attempt never touches another
+attempt of the same job.
+
+```
+DELETE /v1/sessions/{job_id}/{attempt}
+Authorization: Bearer <SCARLETT_VERIFIER_KEY>
+
+204 No Content                               revoked now, or nothing left to revoke
+404 {"error":"unknown session"}              no such receipt (never registered, or purged)
+409 {"error":"session in flight"}            a hop or proof is running under it now
+409 {"error":"session complete"}             it holds its result: a complete web chain,
+                                             a complete X read or an accepted Codex proof
+401, 503                                     as on every route
+```
+
+Fixtures: `revoke-unknown.json`, `revoke-in-flight.json`,
+`revoke-complete.json`; a 204 has no body.
+
+A revocation, under the verifier's session lock:
+
+- removes the token, so presenting it is refused as for any unknown token,
+  and nothing reaches a target;
+- expires the receipt now (`expires_at_ms` becomes the revocation time), so it
+  is resolved: a web receipt stops being charged `web_reservation` and is
+  charged its JSON size only, and the web pool can take another page at once;
+- keeps whatever the receipt verified or rejected. `GET` reads a revoked
+  receipt as an expired one (`"status":"expired"` when it never ran), and it
+  is purged with the usual retention after its new expiry;
+- is committed before the 204. If the commit fails the answer is 503 and the
+  verifier stops, as for any state it could not write; nothing was
+  acknowledged.
+
+It is idempotent: revoking a revoked, expired or rejected session again is a
+204 that changes nothing. A revoked attempt cannot be registered again
+(`409 session already exists for this attempt`). A 409 means the session's
+outcome is the caller's: an in-flight hop ends with its own commit (complete
+or rejected) within its timing limits, and a complete page is ingested and
+released with `DELETE …/body` as before.
+
+The Caddy control route already passes `/v1/sessions/*` with any method.
+Logs: `verifier: job <id> session revoked`.

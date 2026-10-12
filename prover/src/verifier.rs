@@ -1642,6 +1642,163 @@ mod web_tests {
         assert!(sessions.by_job.contains_key(&job_key("synthetic", "2")) && sessions.by_job.contains_key(&job_key("synthetic", "4")));
     }
 
+    /// `DELETE /v1/sessions/synthetic/{attempt}`: the status and the JSON body, if any.
+    async fn revoke_attempt(s: &Shared, attempt: &str) -> (StatusCode, Value) {
+        let response = revoke(State(s.clone()), headers(), Path(("synthetic".into(), attempt.into()))).await;
+        let (parts, body) = response.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        (parts.status, if body.is_empty() { Value::Null } else { serde_json::from_slice(&body).unwrap() })
+    }
+
+    /// The web pool's charges and whether one more page fits.
+    fn web_pool(s: &Shared) -> (u64, bool) {
+        let sessions = s.1.lock().unwrap();
+        let pool = sessions.store.as_ref().unwrap().web_pool();
+        (pool.reserved_bytes, pool.can_register)
+    }
+
+    #[tokio::test]
+    async fn revoking_an_unrun_web_session_frees_its_pool_share_and_commits_first() {
+        let dir = Temp::new();
+        let s = durable(&dir.0, verifier_store::Limits::default());
+        let (baseline, _) = web_pool(&s);
+        let expires = now_ms() + 60_000;
+        let page = |attempt: &str| CreateRequest { attempt: attempt.into(), ..job(payload("https://example.com/", 5), expires) };
+        for attempt in ["1", "2"] {
+            assert_eq!(create(State(s.clone()), headers(), Json(page(attempt))).await.0, StatusCode::CREATED);
+        }
+        // The default pool holds two pages: a third waits for one to go.
+        assert_eq!(web_pool(&s), (baseline + 2 * verifier_store::WEB_RESERVATION, false));
+        assert_eq!(create(State(s.clone()), headers(), Json(page("3"))).await.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(tokens(&s), 2);
+        // A hedge loser's registration is revoked: its token is gone and its share free at once.
+        assert_eq!(revoke_attempt(&s, "1").await, (StatusCode::NO_CONTENT, Value::Null));
+        assert_eq!(tokens(&s), 1);
+        let (reserved, can_register) = web_pool(&s);
+        assert!(can_register);
+        // What stays charged is the revoked receipt's own JSON, until it is purged.
+        assert!(reserved > baseline + verifier_store::WEB_RESERVATION && reserved < baseline + verifier_store::WEB_RESERVATION + 4096, "{reserved}");
+        let v = view(&s).await;
+        assert_eq!(v["status"], "expired");
+        assert!(v["expires_at_ms"].as_u64().unwrap() <= now_ms());
+        assert_eq!(create(State(s.clone()), headers(), Json(page("3"))).await.0, StatusCode::CREATED);
+        // Again: nothing more to do, and still no content.
+        assert_eq!(revoke_attempt(&s, "1").await, (StatusCode::NO_CONTENT, Value::Null));
+        // A revoked session cannot be registered back to life.
+        let (code, Json(again)) = create(State(s.clone()), headers(), Json(page("1"))).await;
+        assert_eq!((code, again["error"].as_str()), (StatusCode::CONFLICT, Some("session already exists for this attempt")));
+        // The revocation was committed before the answer: it survives a restart.
+        drop(s);
+        let s = durable(&dir.0, verifier_store::Limits::default());
+        {
+            let sessions = s.1.lock().unwrap();
+            assert!(!sessions.by_token.values().any(|key| key == &job_key("synthetic", "1")));
+            assert_eq!(sessions.by_token.len(), 2);
+        }
+        assert!(web_pool(&s).0 < baseline + 2 * verifier_store::WEB_RESERVATION + 4096);
+        // Every session revoked and purged: the pool is back to where it started.
+        for attempt in ["2", "3"] {
+            assert_eq!(revoke_attempt(&s, attempt).await.0, StatusCode::NO_CONTENT);
+        }
+        {
+            let mut sessions = s.1.lock().unwrap();
+            for attempt in ["1", "2", "3"] {
+                let key = job_key("synthetic", attempt);
+                sessions.by_job.get_mut(&key).unwrap().expires_ms = now_ms() - verifier_store::WEB_RETENTION_MS - 1;
+                sessions.commit(&key).unwrap();
+            }
+            sessions.purge().unwrap();
+            assert!(sessions.by_job.is_empty());
+        }
+        assert_eq!(web_pool(&s), (baseline, true));
+        assert_eq!(revoke_attempt(&s, "1").await, (StatusCode::NOT_FOUND, json!({"error": "unknown session"})));
+    }
+
+    #[tokio::test]
+    async fn a_revocation_that_cannot_be_committed_is_not_acknowledged() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // Permissions do not bind root.
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Temp::new();
+        let s = durable(&dir.0, verifier_store::Limits::default());
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o500)).unwrap();
+        let answer = revoke_attempt(&s, "1").await;
+        fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(answer, (StatusCode::SERVICE_UNAVAILABLE, json!({"error": "verifier state unavailable"})));
+        // The verifier stops rather than run on a state it could not write.
+        assert_eq!(revoke_attempt(&s, "1").await.0, StatusCode::SERVICE_UNAVAILABLE);
+        drop(s);
+        // Nothing was acknowledged, and on disk the session is still live.
+        let s = durable(&dir.0, verifier_store::Limits::default());
+        assert_eq!(s.1.lock().unwrap().by_token.get(&token), Some(&job_key("synthetic", "1")));
+    }
+
+    #[tokio::test]
+    async fn sessions_with_a_running_hop_or_a_result_are_not_revoked() {
+        // A hop in flight is refused, and so is its result once it has one.
+        let stalled: Respond = Arc::new(|_: &[u8]| (Vec::new(), End::Wait));
+        let origin = web_origin(stalled, false).await;
+        let s = hurried(origin.roots.clone());
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let running = {
+            let (s, origin, token) = (s.clone(), origin.addr, token.clone());
+            tokio::spawn(async move {
+                let origin = Server { addr: origin, roots: rustls::RootCertStore::empty(), seen: Arc::new(Mutex::new(None)) };
+                hop(&s, &origin, &token, 0, "https://example.com/", None).await
+            })
+        };
+        for _ in 0..500 {
+            if s.1.lock().unwrap().by_job.get(&job_key("synthetic", "1")).is_some_and(|e| e.in_flight == 1) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(revoke_attempt(&s, "1").await, (StatusCode::CONFLICT, json!({"error": "session in flight"})));
+        let (reported, verifier) = running.await.unwrap();
+        verifier.unwrap();
+        assert!(reported.is_err());
+        // A rejected hop ended the job without a result: revoking it is a no-op that succeeds.
+        assert_eq!(revoke_attempt(&s, "1").await.0, StatusCode::NO_CONTENT);
+        match &s.1.lock().unwrap().by_job[&job_key("synthetic", "1")].status {
+            Status::WebRead { rejections, .. } => assert_eq!(rejections, &["session_timeout"]),
+            _ => panic!("not a web receipt"),
+        }
+
+        // A complete page is the caller's to ingest, and its body stays readable.
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        let s = shared(origin.roots.clone(), None);
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        hop(&s, &origin, &token, 0, "https://example.com/", None).await.1.unwrap();
+        assert_eq!(revoke_attempt(&s, "1").await, (StatusCode::CONFLICT, json!({"error": "session complete"})));
+        assert_eq!(stored(&s).await, &PAGE[PAGE.len() - 20..]);
+        assert_eq!(view(&s).await["complete"], true);
+
+        // An unrun session's token is refused once revoked, before the target sees a request.
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        let s = shared(origin.roots.clone(), None);
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        assert_eq!(revoke_attempt(&s, "1").await.0, StatusCode::NO_CONTENT);
+        let (reported, verifier) = hop(&s, &origin, &token, 0, "https://example.com/", None).await;
+        assert!(reported.is_err() && verifier.is_err());
+        assert!(origin.seen.lock().unwrap().is_none());
+
+        // X and Codex registrations revoke the same way; key auth applies.
+        let x = json!({"type":"x.read","max_attempts":1,"exchanges":[{"operation":"UserByScreenName","query_id":"qid_1","variables":{"screen_name":"jack"},"features":{}}],"proof_mode":"relay","proof_policy":"x-relay-v1"});
+        for (attempt, payload) in [("x", x), ("codex", json!({"type":"response.create","model":"synthetic-model"}))] {
+            let (code, _) = create(State(s.clone()), headers(), Json(CreateRequest { attempt: attempt.into(), ..job(payload, now_ms() + 60_000) })).await;
+            assert_eq!(code, StatusCode::CREATED);
+            assert_eq!(revoke_attempt(&s, attempt).await.0, StatusCode::NO_CONTENT, "{attempt}");
+            let (_, Json(v)) = status(State(s.clone()), headers(), Path(("synthetic".into(), attempt.into()))).await;
+            assert_eq!(v["status"], "expired", "{attempt}");
+        }
+        assert_eq!(tokens(&s), 0);
+        let response = revoke(State(s.clone()), HeaderMap::new(), Path(("synthetic".into(), "x".into()))).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(revoke_attempt(&s, "nobody").await, (StatusCode::NOT_FOUND, json!({"error": "unknown session"})));
+    }
+
     fn valid_hop(index: usize, url: &str, status: u16, location: Option<&str>, body: Option<&[u8]>) -> WebHop {
         let host = webpolicy::url_host(url).to_owned();
         WebHop {
@@ -2465,6 +2622,15 @@ mod web_tests {
         for (name, reason) in [("relay-failed-busy.json", "verifier_busy"), ("relay-failed-page-too-large.json", "page_too_large")] {
             assert_eq!(fixture(name), json!({"reason": reason}));
         }
+        // DELETE /v1/sessions/{job}/{attempt}: 204 has no body; the refusals are these.
+        assert_eq!(revoke_attempt(&s, "1").await, (StatusCode::CONFLICT, fixture("revoke-complete.json")));
+        assert_eq!(revoke_attempt(&s, "9").await, (StatusCode::NOT_FOUND, fixture("revoke-unknown.json")));
+        let running = CreateRequest { attempt: "2".into(), ..job(payload("https://example.com/", 5), now_ms() + 60_000) };
+        assert_eq!(create(State(s.clone()), headers(), Json(running)).await.0, StatusCode::CREATED);
+        s.1.lock().unwrap().by_job.get_mut(&job_key("synthetic", "2")).unwrap().in_flight = 1;
+        assert_eq!(revoke_attempt(&s, "2").await, (StatusCode::CONFLICT, fixture("revoke-in-flight.json")));
+        s.1.lock().unwrap().by_job.get_mut(&job_key("synthetic", "2")).unwrap().in_flight = 0;
+        assert_eq!(revoke_attempt(&s, "2").await, (StatusCode::NO_CONTENT, Value::Null));
     }
 }
 
@@ -2532,7 +2698,7 @@ pub async fn run() -> Result<()> {
 
     let router = Router::new()
         .route("/v1/sessions", post(create))
-        .route("/v1/sessions/{job_id}/{attempt}", get(status))
+        .route("/v1/sessions/{job_id}/{attempt}", get(status).delete(revoke))
         .route("/v1/sessions/{job_id}/{attempt}/body", get(get_body).delete(delete_body))
         .route("/v1/capacity", get(capacity))
         .with_state(shared.clone());
@@ -2855,6 +3021,72 @@ async fn delete_body(State(shared): State<Shared>, headers: HeaderMap, Path((job
         eprintln!("verifier: job {job_id} released page body could not be removed now");
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Why a session cannot be revoked: its result, or a running hop or proof,
+/// is the caller's to handle.
+#[derive(Debug, PartialEq, Eq)]
+enum Unrevocable {
+    InFlight,
+    Complete,
+}
+
+impl Sessions {
+    /// Revokes a session that is neither running nor finished with a result:
+    /// its token is removed and its receipt expires now, which releases its
+    /// reservation (a web job's web pool share with it). Verified hops and
+    /// rejections stay in the receipt. Returns whether anything changed; the
+    /// caller commits before it answers.
+    fn revoke(&mut self, key: &str) -> Result<Option<bool>, Unrevocable> {
+        let Some(entry) = self.by_job.get_mut(key) else { return Ok(None) };
+        if entry.in_flight > 0 || matches!(entry.status, Status::Running) {
+            return Err(Unrevocable::InFlight);
+        }
+        if matches!(entry.status, Status::Accepted { .. } | Status::WebRead { complete: true, .. } | Status::XRead { complete: true, .. }) {
+            return Err(Unrevocable::Complete);
+        }
+        let mut changed = false;
+        let now = now_ms();
+        if entry.expires_ms > now {
+            entry.expires_ms = now;
+            entry.expires = entry.expires.min(Instant::now());
+            changed = true;
+        }
+        let tokens = self.by_token.len();
+        self.by_token.retain(|_, k| k.as_str() != key);
+        Ok(Some(changed || self.by_token.len() != tokens))
+    }
+}
+
+/// `DELETE /v1/sessions/{job}/{attempt}`: revokes a registered session
+/// that has not run, such as a hedge loser's or a superseded attempt's, so
+/// its token can never be presented and its reservation is free at once.
+/// The revocation is committed before the answer. A session running a hop
+/// or proof, or holding its result, is refused with 409.
+async fn revoke(State(shared): State<Shared>, headers: HeaderMap, Path((job_id, attempt)): Path<(String, String)>) -> Response {
+    let (config, sessions) = &*shared;
+    if !authorized(config, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED, "verifier key required");
+    }
+    let key = job_key(&job_id, &attempt);
+    let mut s = sessions.lock().unwrap();
+    if s.failed {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "verifier state unavailable");
+    }
+    match s.revoke(&key) {
+        Ok(None) => error_response(StatusCode::NOT_FOUND, "unknown session"),
+        Err(Unrevocable::InFlight) => error_response(StatusCode::CONFLICT, "session in flight"),
+        Err(Unrevocable::Complete) => error_response(StatusCode::CONFLICT, "session complete"),
+        Ok(Some(changed)) => {
+            if changed {
+                if s.commit(&key).is_err() {
+                    return error_response(StatusCode::SERVICE_UNAVAILABLE, "verifier state unavailable");
+                }
+                println!("verifier: job {job_id} session revoked");
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+    }
 }
 
 enum Job {
