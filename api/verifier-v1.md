@@ -275,3 +275,51 @@ released with `DELETE …/body` as before.
 
 The Caddy control route already passes `/v1/sessions/*` with any method.
 Logs: `verifier: job <id> session revoked`.
+
+## 11. Event feed: `GET /v1/events`
+
+Added with node 0.1.17 (design C2). Key auth as for every route; the Caddy
+control route must pass `/v1/events`. The app long-polls it to learn that a
+web session's hop chain ended, from the verifier on loopback, without
+waiting for the node's `proven` report.
+
+```
+GET /v1/events?after=<seq>&wait=<1..25>[&epoch=<epoch>]
+Authorization: Bearer <SCARLETT_VERIFIER_KEY>
+
+200 {"epoch":"<32 hex>","events":[{"seq":41,"job_id":"…","attempt":"…","kind":"complete","committed_at_ms":1791400100000}],"next":41}
+200 {"epoch":"<32 hex>","events":[],"next":42,"reset":true}
+204                                          `wait` seconds passed with no event
+400 {"error":"invalid after"}                `after` missing or not a decimal integer
+400 {"error":"invalid wait"}                 `wait` outside 1-25 (default 20)
+401, 503                                     as on every route
+```
+
+Fixtures: `events.json`, `events-reset.json`.
+
+- **Events.** One per terminal commit of a web session (relay and browser
+  policies alike), appended only after the commit: `complete` once the
+  final hop's receipt and its body file are durable (the page can be read
+  with `GET …/body` at once), `rejected` once a hop's rejection is
+  committed. A followable redirect hop, a `verifier_busy` refusal (nothing
+  spent), a revocation and expiry are not events. X and Codex sessions
+  have none in this release.
+- **Positions.** `seq` counts from 1 in each epoch. A reply carries the
+  events with `seq > after`, oldest first, at most 1000; `next` is the last
+  one's `seq` (or `after` itself when there are none), to pass as `after`
+  next. The reply comes as soon as there is at least one event, else after
+  `wait` seconds as 204.
+- **Epoch and reset.** `epoch` is random per verifier process start. The
+  ring keeps the last 10,000 events in memory only. When `after` is not a
+  position this ring can continue from (beyond its newest event, which is
+  what a position from before a restart looks like, or older than the
+  oldest event it still holds) or the request's `epoch` is not the current
+  one, the answer is immediate: no events, `"reset":true` and the newest
+  `seq` as `next`. The consumer then re-syncs from its own records (the
+  node reports and the reconciler, which never depended on the feed) and
+  continues from `next`. Pass the last reply's `epoch` to have a restart
+  detected even when the new process's positions overlap the old ones.
+- **Ingestion stays idempotent** by attempt and fence on the app's side: an
+  event and the node's `proven` report for the same attempt may both arrive.
+- The verifier never holds its session lock while a request waits, and has
+  no outbound calls: it still holds no app credentials.

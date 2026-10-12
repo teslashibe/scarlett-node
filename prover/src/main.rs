@@ -28,6 +28,8 @@ mod relay;
 #[cfg(unix)]
 mod verifier;
 #[cfg(unix)]
+mod verifier_events;
+#[cfg(unix)]
 mod verifier_store;
 mod webpolicy;
 mod xpolicy;

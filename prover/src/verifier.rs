@@ -48,7 +48,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -102,6 +102,8 @@ struct Config {
     web_slots: Arc<tokio::sync::Semaphore>,
     web_timing: Timing,
     busy_refusals: AtomicU64,
+    /// Web sessions' terminal commits, for `GET /v1/events`.
+    events: crate::verifier_events::Feed,
 }
 
 impl Config {
@@ -118,6 +120,7 @@ impl Config {
             web_slots: Arc::new(tokio::sync::Semaphore::new(web_concurrency)),
             web_timing: Timing::WEB,
             busy_refusals: AtomicU64::new(0),
+            events: crate::verifier_events::Feed::new(),
         }
     }
 }
@@ -1714,6 +1717,124 @@ mod web_tests {
         assert_eq!(revoke_attempt(&s, "1").await, (StatusCode::NOT_FOUND, json!({"error": "unknown session"})));
     }
 
+    /// `GET /v1/events`: the status and the JSON body, if any.
+    async fn read_events(s: &Shared, after: Option<&str>, wait: Option<&str>, epoch: Option<&str>) -> (StatusCode, Value) {
+        let query = EventsQuery { after: after.map(Into::into), wait: wait.map(Into::into), epoch: epoch.map(Into::into) };
+        let response = events(State(s.clone()), headers(), Query(query)).await;
+        let (parts, body) = response.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        (parts.status, if body.is_empty() { Value::Null } else { serde_json::from_slice(&body).unwrap() })
+    }
+
+    /// The (seq, attempt, kind) of each event after `after`.
+    async fn events_after(s: &Shared, after: u64) -> Vec<(u64, String, String)> {
+        let (code, reply) = read_events(s, Some(&after.to_string()), Some("1"), None).await;
+        if code == StatusCode::NO_CONTENT {
+            return Vec::new();
+        }
+        assert_eq!((code, reply["epoch"].as_str()), (StatusCode::OK, Some(s.0.events.epoch.as_str())));
+        let events = reply["events"].as_array().unwrap();
+        assert_eq!(reply["next"], events.last().unwrap()["seq"]);
+        events
+            .iter()
+            .map(|e| {
+                assert_eq!(e["job_id"], "synthetic");
+                assert!(e["committed_at_ms"].as_u64().unwrap() <= now_ms());
+                (e["seq"].as_u64().unwrap(), e["attempt"].as_str().unwrap().to_owned(), e["kind"].as_str().unwrap().to_owned())
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn only_terminal_web_commits_become_events() {
+        const TOO_LARGE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 67108865\r\n\r\n";
+        let origin = web_origin(
+            routes(&[
+                ("example.com/", b"HTTP/1.1 301 Moved Permanently\r\nLocation: https://www.example.com/next\r\nContent-Length: 0\r\n\r\n", End::Wait),
+                ("www.example.com/next", PAGE, End::Wait),
+                ("example.com/large", TOO_LARGE, End::Wait),
+            ]),
+            false,
+        )
+        .await;
+        let s = shared(origin.roots.clone(), None);
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        // A redirect hop is verified but the chain goes on: no event.
+        hop(&s, &origin, &token, 0, "https://example.com/", None).await.0.unwrap();
+        assert!(events_after(&s, 0).await.is_empty());
+        // The final hop is: once its receipt and body are committed.
+        hop(&s, &origin, &token, 1, "https://www.example.com/next", None).await.0.unwrap();
+        assert_eq!(events_after(&s, 0).await, vec![(1, "1".to_owned(), "complete".to_owned())]);
+        assert_eq!(stored(&s).await, &PAGE[PAGE.len() - 20..]);
+        // A committed rejection is an event too.
+        let (code, Json(created)) = create(State(s.clone()), headers(), Json(CreateRequest { attempt: "2".into(), ..job(payload("https://example.com/large", 5), now_ms() + 60_000) })).await;
+        assert_eq!(code, StatusCode::CREATED);
+        let large = created["token"].as_str().unwrap().to_owned();
+        assert!(hop(&s, &origin, &large, 0, "https://example.com/large", None).await.0.is_err());
+        assert_eq!(events_after(&s, 1).await, vec![(2, "2".to_owned(), "rejected".to_owned())]);
+        // A busy refusal spends nothing and a revocation is the app's own act: neither is an event.
+        let (_, Json(created)) = create(State(s.clone()), headers(), Json(CreateRequest { attempt: "3".into(), ..job(payload("https://example.com/", 5), now_ms() + 60_000) })).await;
+        let busy = created["token"].as_str().unwrap().to_owned();
+        let held = s.0.web_slots.clone().try_acquire_many_owned(48).unwrap();
+        assert!(hop(&s, &origin, &busy, 0, "https://example.com/", None).await.0.is_err());
+        drop(held);
+        assert_eq!(revoke_attempt(&s, "3").await.0, StatusCode::NO_CONTENT);
+        assert!(events_after(&s, 2).await.is_empty());
+        assert_eq!(events_after(&s, 0).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_long_poll_wakes_at_the_next_commit_and_otherwise_ends_empty() {
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        let s = shared(origin.roots.clone(), None);
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let waiting = {
+            let s = s.clone();
+            tokio::spawn(async move {
+                let asked = Instant::now();
+                let reply = read_events(&s, Some("0"), Some("20"), None).await;
+                (reply, asked.elapsed())
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished());
+        hop(&s, &origin, &token, 0, "https://example.com/", None).await.0.unwrap();
+        let ((code, reply), took) = tokio::time::timeout(Duration::from_secs(10), waiting).await.unwrap().unwrap();
+        assert_eq!((code, reply["events"][0]["kind"].as_str(), reply["next"].as_u64()), (StatusCode::OK, Some("complete"), Some(1)));
+        assert!(took < Duration::from_secs(10), "{took:?}");
+        assert!(reply.get("reset").is_none());
+        // Nothing new within the wait: 204, about when the wait ends.
+        let asked = Instant::now();
+        assert_eq!(read_events(&s, Some("1"), Some("1"), Some(&s.0.events.epoch)).await, (StatusCode::NO_CONTENT, Value::Null));
+        assert!(asked.elapsed() >= Duration::from_millis(900));
+        // Malformed positions and waits, and key auth.
+        for (after, wait) in [(None, Some("1")), (Some("x"), Some("1")), (Some("-1"), Some("1")), (Some("1"), Some("0")), (Some("1"), Some("26")), (Some("1"), Some("1.5"))] {
+            assert_eq!(read_events(&s, after, wait, None).await.0, StatusCode::BAD_REQUEST, "{after:?} {wait:?}");
+        }
+        let query = EventsQuery { after: Some("0".into()), wait: Some("1".into()), epoch: None };
+        assert_eq!(events(State(s.clone()), HeaderMap::new(), Query(query)).await.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn positions_the_ring_cannot_continue_from_reset_to_the_newest_event() {
+        let mut config = Config::new(KEY.into(), "127.0.0.1:1".into(), Duration::from_secs(20), verifier_store::Limits::default(), 64, 48, crate::relay::verifier::tls_config(rustls::RootCertStore::empty()).unwrap());
+        config.events = crate::verifier_events::Feed::with_capacity(3);
+        let s: Shared = Arc::new((config, Mutex::new(Sessions::default())));
+        let reset = |next: u64| (StatusCode::OK, json!({"epoch": s.0.events.epoch, "events": [], "next": next, "reset": true}));
+        // A consumer that remembers a position from before a restart.
+        assert_eq!(read_events(&s, Some("7"), Some("1"), None).await, reset(0));
+        for i in 1..=5 {
+            s.0.events.append("synthetic", &i.to_string(), "complete", now_ms());
+        }
+        assert_eq!(events_after(&s, 2).await.len(), 3);
+        // Events 1 and 2 are gone: a consumer at 0 or 1 missed some.
+        assert_eq!(read_events(&s, Some("1"), Some("1"), None).await, reset(5));
+        assert_eq!(read_events(&s, Some("0"), Some("1"), None).await, reset(5));
+        // Another epoch's position, whatever its number.
+        assert_eq!(read_events(&s, Some("4"), Some("1"), Some("00000000000000000000000000000000")).await, reset(5));
+        assert_eq!(read_events(&s, Some("4"), Some("1"), Some(&s.0.events.epoch)).await.1["events"][0]["seq"], 5);
+    }
+
     #[tokio::test]
     async fn a_revocation_that_cannot_be_committed_is_not_acknowledged() {
         if unsafe { libc::geteuid() } == 0 {
@@ -2622,6 +2743,21 @@ mod web_tests {
         for (name, reason) in [("relay-failed-busy.json", "verifier_busy"), ("relay-failed-page-too-large.json", "page_too_large")] {
             assert_eq!(fixture(name), json!({"reason": reason}));
         }
+        // GET /v1/events: the complete hop above is the feed's first event.
+        let (code, feed) = read_events(&s, Some("0"), Some("1"), None).await;
+        assert_eq!(code, StatusCode::OK);
+        let sample = fixture("events.json");
+        assert_eq!(keys(&feed["events"][0]), keys(&sample["events"][0]));
+        let mut shape = feed.clone();
+        shape["events"] = json!([]);
+        let mut expected = sample.clone();
+        expected["events"] = json!([]);
+        assert_eq!(keys(&shape), keys(&expected));
+        assert!(sample["events"].as_array().unwrap().iter().all(|e| e["kind"] == "complete" || e["kind"] == "rejected"));
+        assert_eq!((feed["events"][0]["kind"].as_str(), feed["events"][0]["attempt"].as_str()), (Some("complete"), Some("1")));
+        let (_, reset) = read_events(&s, Some("9"), Some("1"), None).await;
+        assert_eq!(keys(&reset), keys(&fixture("events-reset.json")));
+        assert_eq!((reset["reset"].as_bool(), reset["events"].as_array().map(Vec::len)), (Some(true), Some(0)));
         // DELETE /v1/sessions/{job}/{attempt}: 204 has no body; the refusals are these.
         assert_eq!(revoke_attempt(&s, "1").await, (StatusCode::CONFLICT, fixture("revoke-complete.json")));
         assert_eq!(revoke_attempt(&s, "9").await, (StatusCode::NOT_FOUND, fixture("revoke-unknown.json")));
@@ -2701,6 +2837,7 @@ pub async fn run() -> Result<()> {
         .route("/v1/sessions/{job_id}/{attempt}", get(status).delete(revoke))
         .route("/v1/sessions/{job_id}/{attempt}/body", get(get_body).delete(delete_body))
         .route("/v1/capacity", get(capacity))
+        .route("/v1/events", get(events))
         .with_state(shared.clone());
     let api_listener = TcpListener::bind(&api).await.with_context(|| format!("binding {api}"))?;
     tokio::spawn(async move {
@@ -2748,6 +2885,11 @@ fn authorized(config: &Config, headers: &HeaderMap) -> bool {
 
 fn job_key(job_id: &str, attempt: &str) -> String {
     format!("{job_id}\n{attempt}")
+}
+
+/// The attempt half of a receipt key.
+fn attempt_of(key: &str) -> &str {
+    key.split_once('\n').map_or("", |(_, attempt)| attempt)
 }
 
 #[derive(Deserialize)]
@@ -2896,6 +3038,63 @@ async fn status(
     response["expires_at_ms"] = entry.expires_ms.into();
     response["request_sha256"] = verifier_store::hash(&serde_json::to_vec(&entry.payload).unwrap_or_default()).into();
     (StatusCode::OK, Json(response))
+}
+
+#[derive(Deserialize)]
+struct EventsQuery {
+    after: Option<String>,
+    wait: Option<String>,
+    epoch: Option<String>,
+}
+
+/// `GET /v1/events?after=<seq>&wait=<1..25>[&epoch=<epoch>]`: web sessions'
+/// terminal commits after `after`, as soon as there is one, or 204 once
+/// `wait` seconds (default 20) pass without one. A position this process
+/// cannot continue from, another epoch's or one behind what the ring holds,
+/// answers at once with `"reset": true` and the newest seq as `next`. The
+/// session lock is never held while waiting.
+async fn events(State(shared): State<Shared>, headers: HeaderMap, Query(query): Query<EventsQuery>) -> Response {
+    use crate::verifier_events::{MAX_REPLY, Read};
+    let (config, sessions) = &*shared;
+    if !authorized(config, &headers) {
+        return error_response(StatusCode::UNAUTHORIZED, "verifier key required");
+    }
+    if sessions.lock().unwrap().failed {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "verifier state unavailable");
+    }
+    let number = |value: &str| (!value.is_empty() && value.len() <= 20 && value.bytes().all(|b| b.is_ascii_digit())).then(|| value.parse::<u64>().ok()).flatten();
+    let Some(after) = query.after.as_deref().and_then(number) else {
+        return error_response(StatusCode::BAD_REQUEST, "invalid after");
+    };
+    let wait = match query.wait.as_deref().map(number) {
+        None => 20,
+        Some(Some(wait @ 1..=25)) => wait,
+        Some(_) => return error_response(StatusCode::BAD_REQUEST, "invalid wait"),
+    };
+    let feed = &config.events;
+    let reply = |events: Vec<crate::verifier_events::Event>, next: u64, reset: bool| {
+        let mut body = serde_json::json!({"epoch": feed.epoch, "events": events, "next": next});
+        if reset {
+            body["reset"] = true.into();
+        }
+        (StatusCode::OK, Json(body)).into_response()
+    };
+    if query.epoch.as_deref().is_some_and(|epoch| epoch != feed.epoch) {
+        return reply(Vec::new(), feed.head(), true);
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
+    // Subscribed before each read, so an event appended in between still wakes this.
+    let mut appended = feed.subscribe();
+    loop {
+        match feed.read(after, MAX_REPLY) {
+            Read::Reset { next } => return reply(Vec::new(), next, true),
+            Read::Events(events, next) if !events.is_empty() => return reply(events, next, false),
+            Read::Events(..) => {}
+        }
+        if !matches!(tokio::time::timeout_at(deadline, appended.changed()).await, Ok(Ok(()))) {
+            return StatusCode::NO_CONTENT.into_response();
+        }
+    }
 }
 
 fn error_response(status: StatusCode, error: &str) -> Response {
@@ -3357,6 +3556,10 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
                         if let Some(stored) = stored {
                             stored.commit();
                         }
+                        // The final hop and its body are durable: the app may take the page now.
+                        if is_final {
+                            config.events.append(&job_id, attempt_of(&key), "complete", now_ms());
+                        }
                         println!("verifier: job {job_id} proved web hop {index} (HTTP {}, {} bytes, {duration_ms} ms)", response.status, response.body_bytes);
                         let _ = tokio::time::timeout(Duration::from_secs(10), conn.done(Some(&frame))).await;
                         return Ok(());
@@ -3388,6 +3591,7 @@ async fn handle(shared: Shared, mut socket: crate::control::Socket) -> Result<()
                     *recorded = Some(rejection);
                     s.by_token.retain(|_, k| *k != key);
                     s.commit(&key)?;
+                    config.events.append(&job_id, attempt_of(&key), "rejected", now_ms());
                 }
             }
             // The rejection is committed; now the node may learn why.
