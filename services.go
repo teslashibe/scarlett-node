@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+	"os"
 	"os/exec"
 	"slices"
 	"sort"
@@ -48,6 +50,10 @@ type servicePool struct {
 	// web's in-flight leases, so browser capacity sits inside web capacity.
 	browser         worker.BrowserTier
 	browserInFlight int
+	// webLimit is the adaptive web limit (SCARLETT_WEB_CONCURRENCY=auto),
+	// nil when the limit is fixed or web is off. Web's slot count follows it
+	// below the configured ceiling, config.WebConcurrency.
+	webLimit *worker.WebLimiter
 }
 
 func newServicePool(c config.Config) *servicePool {
@@ -59,7 +65,59 @@ func newServicePool(c config.Config) *servicePool {
 		p.entries[kind].enabled = true
 	}
 	p.web = &pooledAccount{spec: providerAccount{"web", "web", "", c.WebConcurrency}, entry: p.entries["web"]}
+	if c.WebConcurrencyAuto && c.Enabled("web") {
+		p.webLimit = worker.NewWebLimiter(worker.WebLimitOptions{Min: config.WebAutoMin, Start: config.WebAutoStart, Max: c.WebConcurrency, OnChange: p.webLimitChanged})
+		p.entries["web"].capacity = p.webLimit.Limit()
+	}
 	return p
+}
+
+// webLimitChanged logs a change of the adaptive web limit and wakes the
+// heartbeat loop's availability check, so the next heartbeat or availability
+// post advertises the new capacity. It runs under p.mu (refreshWeb) or with
+// no pool lock (a finishing page), so it never takes p.mu.
+func (p *servicePool) webLimitChanged(change worker.WebLimitChange) {
+	fmt.Fprintf(os.Stderr, "web: pages at once %d -> %d (%s)\n", change.From, change.To, change.Reason)
+	p.notifyAvailability()
+}
+
+// webLimitStatus is status.json's web_limit: whether the web limit is fixed
+// (SCARLETT_WEB_CONCURRENCY=1-32 or unset) or adaptive (auto), the limit now,
+// and for an adaptive one why and when it last changed. Absent without web.
+type webLimitStatus struct {
+	Mode      string     `json:"limit_mode"`
+	Limit     int        `json:"limit"`
+	Reason    string     `json:"limit_reason,omitempty"`
+	ChangedAt *time.Time `json:"limit_changed_at,omitempty"`
+}
+
+func (p *servicePool) webLimitStatus() *webLimitStatus {
+	if !p.config.Enabled("web") {
+		return nil
+	}
+	if p.webLimit == nil {
+		return &webLimitStatus{Mode: "fixed", Limit: p.config.WebConcurrency}
+	}
+	s := p.webLimit.Status()
+	status := &webLimitStatus{Mode: "auto", Limit: s.Limit, Reason: s.Reason}
+	if !s.ChangedAt.IsZero() {
+		at := s.ChangedAt.UTC()
+		status.ChangedAt = &at
+	}
+	return status
+}
+
+// validWebLimitStatus checks a web_limit read back from status.json.
+func validWebLimitStatus(s *webLimitStatus) bool {
+	switch {
+	case s == nil:
+		return true
+	case s.Mode == "fixed":
+		return s.Limit >= 1 && s.Limit <= 32 && s.Reason == "" && s.ChangedAt == nil
+	case s.Mode == "auto":
+		return s.Limit >= config.WebAutoMin && s.Limit <= config.WebAutoMax && worker.ValidWebLimitReason(s.Reason) && (s.ChangedAt == nil) == (s.Reason == worker.WebLimitStart)
+	}
+	return false
 }
 func (p *servicePool) refresh(now time.Time) {
 	p.refreshWeb(now)
@@ -101,6 +159,12 @@ func (p *servicePool) health() []coordinator.ServiceHealth {
 			capacity = s.capacity
 			if s.state != "configured" && s.state != "ready" {
 				capacity = s.inFlight
+			}
+			// A lowered adaptive web limit only stops admission: pages still
+			// running keep their slots, so capacity never reads below
+			// in_flight, and nothing is free until they drain under the limit.
+			if kind == "web" {
+				capacity = max(capacity, s.inFlight)
 			}
 		}
 		if kind == "x_read" && s.enabled && !p.accountMode {
@@ -261,6 +325,12 @@ func (p *servicePool) refreshWeb(now time.Time) {
 		s.state, s.lastError = "not_added", ""
 		return
 	}
+	if p.webLimit != nil {
+		// The adaptive limit moves as pages finish and with host memory;
+		// admission follows it at once.
+		p.webLimit.Tick()
+		s.capacity = p.webLimit.Limit()
+	}
 	_, helperErr := exec.LookPath(p.config.Prover)
 	switch {
 	case helperErr != nil:
@@ -292,6 +362,10 @@ func (p *servicePool) acquireWebLocked(browser bool) (*accountLease, bool) {
 	s.inFlight++
 	c := p.config
 	c.LocalAccountID = "web"
+	if p.webLimit != nil {
+		// The worker reports this page's relay outcomes to the limit.
+		c.WebObserver = p.webLimit.Admit(s.inFlight)
+	}
 	return &accountLease{id: "web", kind: "web", config: c, account: p.web, browser: browser}, true
 }
 

@@ -40,6 +40,11 @@ type runtimeStatus struct {
 	// JournalFull is set while the attempt journal alone stops new work:
 	// unfinished attempts, or receipts too recent to prune, fill it.
 	JournalFull bool `json:"journal_full,omitempty"`
+	// WebLimit is how many web pages may run at once (web's capacity, unless
+	// pages from before a lowered limit still run) and, for
+	// SCARLETT_WEB_CONCURRENCY=auto, why and when that last changed. Local
+	// only: heartbeats carry the capacity alone.
+	WebLimit *webLimitStatus `json:"web_limit,omitempty"`
 	// Release is this build's release version. LatestRelease is the newest
 	// release the coordinator last reported; UpdateAvailable is set when it is
 	// newer than Release, and UpdateRequired while the coordinator offers this
@@ -238,6 +243,9 @@ func localCommandDir(dir, command string, output io.Writer) error {
 		}
 		if !validAccountStatuses(status.Accounts) {
 			return errors.New("invalid local account status")
+		}
+		if !validWebLimitStatus(status.WebLimit) {
+			return errors.New("invalid local web limit status")
 		}
 		if (status.LatestRelease != "" && !coordinator.ValidVersion(status.LatestRelease)) || (status.UpdateAvailable || status.UpdateRequired) && status.LatestRelease == "" {
 			return errors.New("invalid local release status")

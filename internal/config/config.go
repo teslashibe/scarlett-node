@@ -78,7 +78,15 @@ type Config struct {
 	XAccountConcurrency int
 	// WebConcurrency is how many web pages this node fetches at once
 	// (SCARLETT_WEB_CONCURRENCY, 1-32, default 4). Web needs no accounts.
+	// With WebConcurrencyAuto it is WebAutoMax, the adaptive limit's ceiling.
 	WebConcurrency int
+	// WebConcurrencyAuto is SCARLETT_WEB_CONCURRENCY=auto: the node moves its
+	// web limit between WebAutoMin and WebAutoMax, starting at WebAutoStart,
+	// from its own pages and load (internal/worker WebLimiter).
+	WebConcurrencyAuto bool
+	// WebObserver, set by the service pool on a web lease while the limit is
+	// adaptive, receives that page's relay outcomes. nil otherwise.
+	WebObserver WebObserver
 	// WebEgressProxy, when set, is the local HTTP CONNECT proxy every web
 	// target is dialled through (SCARLETT_WEB_EGRESS_PROXY), such as a
 	// residential proxy in front of a cloud server. It never leaves this node.
@@ -102,6 +110,25 @@ type Config struct {
 	InferenceTimeout time.Duration
 	MaxInputBytes    int
 	MaxOutputTokens  int
+}
+
+// The adaptive web limit (SCARLETT_WEB_CONCURRENCY=auto) stays within
+// WebAutoMin and WebAutoMax web pages at once and starts at WebAutoStart, the
+// fixed default.
+const (
+	WebAutoMin   = 2
+	WebAutoStart = 4
+	WebAutoMax   = 16
+)
+
+// WebObserver receives one web page's relay outcomes for the adaptive web
+// limit. Hop is one relay helper run: its hop code ("" when the hop was
+// proven, "verifier_busy" when the verifier turned it away), its wall time,
+// and whether it ended on a time limit. Done is the page's final code, once,
+// with whether the page ran out of its deadline.
+type WebObserver interface {
+	Hop(code string, wall time.Duration, timedOut bool)
+	Done(code string, timedOut bool)
 }
 
 var (
@@ -214,7 +241,13 @@ func Load() (Config, error) {
 			}
 			c.WebEgressProxy = proxy
 		}
-		for name, destination := range map[string]*int{"SCARLETT_CODEX_CONCURRENCY": &c.CodexConcurrency, "SCARLETT_X_CONCURRENCY": &c.XConcurrency, "SCARLETT_X_ACCOUNT_CONCURRENCY": &c.XAccountConcurrency, "SCARLETT_WEB_CONCURRENCY": &c.WebConcurrency} {
+		concurrency := map[string]*int{"SCARLETT_CODEX_CONCURRENCY": &c.CodexConcurrency, "SCARLETT_X_CONCURRENCY": &c.XConcurrency, "SCARLETT_X_ACCOUNT_CONCURRENCY": &c.XAccountConcurrency, "SCARLETT_WEB_CONCURRENCY": &c.WebConcurrency}
+		// auto hands web to the adaptive limit; its ceiling is the slot count.
+		if strings.ToLower(strings.TrimSpace(os.Getenv("SCARLETT_WEB_CONCURRENCY"))) == "auto" {
+			c.WebConcurrencyAuto, c.WebConcurrency = true, WebAutoMax
+			delete(concurrency, "SCARLETT_WEB_CONCURRENCY")
+		}
+		for name, destination := range concurrency {
 			if value := os.Getenv(name); value != "" {
 				n, e := strconv.Atoi(value)
 				if e != nil || n < 1 || n > 32 {
@@ -353,7 +386,7 @@ func (c Config) Validate() error {
 			}
 			seen[kind] = true
 		}
-		if seen["web"] && c.WebConcurrency < 1 {
+		if seen["web"] && c.WebConcurrency < 1 || c.WebConcurrencyAuto && c.WebConcurrency != WebAutoMax {
 			return errors.New("invalid independent service configuration")
 		}
 		if c.WebEgressProxy != nil && !c.WebEgressProxy.valid() {

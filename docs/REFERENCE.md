@@ -282,6 +282,49 @@ capacity of at most 96 (32 each).
 needs no account and no credential path. `SCARLETT_WEB_CONCURRENCY` (1–32,
 default 4) bounds simultaneous pages; the web entry reports it as capacity.
 
+**Adaptive limit.** `SCARLETT_WEB_CONCURRENCY=auto` (any case) replaces the
+fixed bound with an additive-increase, multiplicative-decrease limit between 2
+and 16, starting at 4 (`internal/worker/weblimit.go`). The node's slots are
+sized for 16; the limit gates admission only.
+- A page's time is the mean wall time of its proven relay hops, each measured
+  around the `relay-web` helper run (its `helper_wall` plus the hop's proof
+  journal writes). The baseline is the p50 of every proven page of the last
+  five minutes, and needs at least 20 of them.
+- **One more** after 20 healthy pages in a row at the current limit. Healthy
+  means proven with no timeout and no `verifier_busy`, admitted while at least
+  half the limit was running (as RFC 7661 and Netflix's AIMD limiter require,
+  so a node serving one page at a time never climbs), and admitted since the
+  limit last changed. The p90 of those 20 must be at most 1.25× the baseline,
+  host CPU under 70% and memory normal. A failed page that did not time out,
+  such as a refused or unreachable target, neither counts nor breaks the run.
+- **Half, never below 2**, when 3 pages time out or are turned away
+  (`verifier_busy`, counted once per page however often it retries) within
+  60 s, when the p90 of the last 20 healthy pages passes twice the baseline,
+  or under critical memory pressure (at most every 5 s). A failed helper run
+  timed out when the page's deadline ended it, or when it lasted 20 s (the
+  verifier's idle limit, after which it ends a hop as `session_timeout`,
+  `api/verifier-v1.md` §8.2) or its whole budget. Pages admitted before a
+  halving ran under the higher limit and never count toward the next one.
+- Host signals, read at most once a second: CPU is `vm.loadavg` per CPU on
+  macOS, `/proc/stat` over at least 5 s on Linux and `GetSystemTimes` on
+  Windows. Memory is tight (no growth) under 15% of physical memory
+  available and critical (halve) under 5%, from `kern.memorystatus_level` on
+  macOS, `MemAvailable` on Linux and `GlobalMemoryStatusEx` on Windows; macOS's
+  own critical pressure level is critical too, but its warn level alone is
+  not, as for the browser tier, because healthy Macs sit at warn. Unreadable
+  signals count as normal memory and unknown CPU.
+- A change applies at once. Running pages keep their slots and finish; while
+  more run than a lowered limit, the web entry reports `capacity` equal to
+  `in_flight`, so nothing is free until they drain below it. The node logs
+  `web: pages at once 4 -> 5 (healthy)` and refreshes its heartbeat. The
+  browser tier stays inside the current limit.
+- `scarlett-node status` carries `web_limit` with web on:
+  `{"limit_mode":"fixed","limit":4}`, or for `auto`
+  `{"limit_mode":"auto","limit":5,"limit_reason":"healthy","limit_changed_at":"…"}`.
+  `limit_reason` is `start` (unchanged, no `limit_changed_at`), `healthy`,
+  `timeouts`, `verifier_busy`, `latency` or `memory_pressure`. It is local
+  status only; the coordinator sees the web capacity.
+
 **Lease.** A web lease carries `web_request` (`{"operation":"scrape","url":…}`)
 and `web_payload`, the exact verifier `web.fetch` payload (`api/node-v1.openapi.yaml`,
 fixtures `lease-web-offer.json` and `lease-web.json`). Before acceptance the node
@@ -413,7 +456,8 @@ the proven re-fetch. Contract: `api/node-v1.openapi.yaml` (`WebRequest.mode`,
 on Windows in this release. Without web the tier is off whatever it says.
 `SCARLETT_WEB_BROWSER_CONCURRENCY` (1–4) sets the pages rendered at once and
 may not exceed `SCARLETT_WEB_CONCURRENCY`; unset, the runtime uses 1 below
-16 GiB of physical memory and 2 otherwise, never more than web capacity.
+16 GiB of physical memory and 2 otherwise, never more than web capacity
+(with `auto`, the current limit).
 `SCARLETT_WEB_BROWSER_IDLE_SECONDS` (30–3600, default 120) is the idle stop.
 All three need the services executor (so do the solver settings below). A desktop node with Serve web
 pages on (the default) inherits the defaults; the desktop app passes an

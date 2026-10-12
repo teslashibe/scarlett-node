@@ -799,6 +799,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 		status.Services = ad.heartbeat.Services
 		if services != nil {
 			status.Accounts = services.accountStatus()
+			status.WebLimit = services.webLimitStatus() // S4b: adaptive web limit, local status only
 		}
 		status.InFlight = len(slots)
 		if records, err := journal.Pending(); err != nil {
