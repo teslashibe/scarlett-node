@@ -2943,6 +2943,30 @@ mod web_tests {
         assert_eq!(view(&s).await["complete"], true);
     }
 
+    #[tokio::test]
+    async fn a_hop_whose_verifier_dial_fails_fast_dials_again_before_its_token() {
+        // A verifier at its cap of waiting connections closes a new one at
+        // accept, which fails the TLS handshake at once; here a verifier that
+        // is not listening yet fails the dial as fast. Nothing was sent either way.
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        let s = shared(origin.roots.clone(), None);
+        let free = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let verifier = free.local_addr().unwrap();
+        drop(free);
+        let (proxy, _) = counted_tunnel(origin.addr).await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let mut input = predial_input(verifier, proxy, 20_000);
+        input["predial"] = false.into();
+        input["token"] = token.into();
+        let hop = tokio::spawn(async move { node::run_web(&serde_json::to_vec(&input).unwrap()).await.map_err(|failure| (failure.class, format!("{:#}", failure.error))) });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::spawn(serve(TcpListener::bind(verifier).await.unwrap(), s.clone(), None));
+        let summary = tokio::time::timeout(Duration::from_secs(30), hop).await.unwrap().unwrap().unwrap();
+        assert_eq!((summary.status_code, view(&s).await["complete"].as_bool()), (200, Some(true)));
+        let dials = serde_json::to_value(&summary.diagnostics).unwrap()["spans"].as_array().unwrap().iter().filter(|span| span["phase"] == "verifier_tcp_connect").count();
+        assert!(dials >= 2, "{dials}");
+    }
+
     async fn capacity_view(s: &Shared) -> Value {
         let (_, Json(view)) = capacity(State(s.clone()), headers()).await;
         view

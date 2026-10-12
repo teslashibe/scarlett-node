@@ -513,7 +513,7 @@ pub async fn finish(hop: &Hop, token: &str, source: Source, trace: &Trace, prese
         let mut link = match link.and_then(|mut link| link.usable().then_some(link)) {
             Some(link) => link,
             None => {
-                let mut link = Link::dial(&hop.verifier(), Some(trace)).await.map_err(|e| (e, false))?;
+                let mut link = dial_for_token(hop, trace).await.map_err(|e| (e, false))?;
                 link.take();
                 link
             }
@@ -551,6 +551,30 @@ pub async fn finish(hop: &Hop, token: &str, source: Source, trace: &Trace, prese
     });
     Ok((summary, kept))
 }
+
+/// Dials the verifier for a hop that has its token. A dial that failed fast
+/// sent nothing, and is most likely a verifier at its cap of connections
+/// waiting for a token, which frees places as tokens arrive: it is tried
+/// twice more, shortly, within the hop's time. A slow failure is final.
+async fn dial_for_token(hop: &Hop, trace: &Trace) -> Result<Link> {
+    let mut pause = Duration::from_millis(50);
+    let mut tries = 1;
+    loop {
+        let started = Instant::now();
+        match Link::dial(&hop.verifier(), Some(trace)).await {
+            Ok(link) => return Ok(link),
+            Err(e) if tries >= DIAL_TRIES || started.elapsed() > FAST_FAILURE || tokio::time::Instant::now() + pause >= hop.deadline => return Err(e),
+            Err(_) => {
+                tokio::time::sleep(pause).await;
+                pause *= 3;
+                tries += 1;
+            }
+        }
+    }
+}
+
+const DIAL_TRIES: u32 = 3;
+const FAST_FAILURE: Duration = Duration::from_secs(1);
 
 /// What `relay-web` printed: a hop's summary, or the end of a pre-dial
 /// whose accept failed, which sent no token and reached no target.
