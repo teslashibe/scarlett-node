@@ -188,8 +188,12 @@ async fn run_observed(request: Request, trace: &Trace) -> Result<Summary> {
     })
 }
 
-/// Input of `scarlett-prover relay-web`: one hop of a web job, to the
-/// address the node resolved and checked.
+/// Input of `scarlett-prover relay-web` and of a `serve` hop: one hop of a
+/// web job, to the address the node resolved and checked. The token may come
+/// later, once the node's accept returned it: `relay-web` with `predial`
+/// reads it from its next stdin line, `serve` from a token request. Until
+/// then nothing is sent on the verifier connection and nothing reaches the
+/// target.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebRequest {
@@ -197,7 +201,11 @@ pub struct WebRequest {
     pub verifier_ca_file: Option<String>,
     #[serde(default)]
     pub plaintext_fixture: bool,
-    pub token: String,
+    #[serde(default)]
+    pub token: Option<String>,
+    /// `relay-web` only: dial the verifier now and wait for the token line.
+    #[serde(default)]
+    pub predial: bool,
     pub hop: u32,
     pub url: String,
     pub ip: String,
@@ -241,8 +249,15 @@ pub struct WebError {
     pub error: anyhow::Error,
 }
 
+/// A failure's cause on one bounded line, as the node logs it. It keeps the
+/// relay misuse text the node looks for, and never a URL or address
+/// (errors never carry them).
+pub fn loggable_cause(error: &anyhow::Error) -> String {
+    format!("{error:#}").chars().map(|c| if c.is_control() { ' ' } else { c }).take(2048).collect()
+}
+
 impl WebError {
-    fn fetch(error: anyhow::Error) -> Self {
+    pub fn fetch(error: anyhow::Error) -> Self {
         Self { class: "fetch_failed", error }
     }
 
@@ -285,13 +300,6 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-pub async fn run_web(input: &[u8]) -> Result<WebSummary, WebError> {
-    let diagnostics = Run::new();
-    let mut summary = run_web_observed(input, &diagnostics.trace()).await?;
-    summary.diagnostics = Some(diagnostics.success());
-    Ok(summary)
-}
-
 /// Defense in depth only: the node's egress check is the authority on
 /// which addresses a job may reach.
 fn public_address(ip: IpAddr) -> bool {
@@ -308,8 +316,8 @@ fn public_address(ip: IpAddr) -> bool {
 /// request bytes, the target and the timeout. Errors name the rule,
 /// never the URL, address or a node header value.
 fn validate_hop(request: &WebRequest) -> Result<(Vec<u8>, IpAddr, Duration)> {
-    if request.token.len() != 64 || !request.token.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("verifier token must be 64 hex characters");
+    if request.token.as_deref().is_some_and(|token| !valid_token(token)) {
+        bail!("verifier token must be 64 lowercase hex characters");
     }
     let job = webpolicy::validate_job(&request.payload)?;
     if webpolicy::canonical_url(&request.url).ok().as_deref() != Some(request.url.as_str()) {
@@ -332,36 +340,198 @@ fn validate_hop(request: &WebRequest) -> Result<(Vec<u8>, IpAddr, Duration)> {
     Ok((raw, ip, Duration::from_millis(request.timeout_ms)))
 }
 
-async fn run_web_observed(input: &[u8], trace: &Trace) -> Result<WebSummary, WebError> {
-    let request: WebRequest = serde_json::from_slice(input).context("invalid relay-web input").map_err(WebError::fetch)?;
-    let (raw, ip, timeout) = validate_hop(&request).map_err(WebError::fetch)?;
-    let started = Instant::now();
-    let deadline = tokio::time::Instant::now() + timeout;
-    let host = webpolicy::url_host(&request.url);
-    // Reach the target first: presenting the token spends one of the job's sessions.
+/// Whether `token` is a session token as the verifier issues them.
+pub fn valid_token(token: &str) -> bool {
+    token.len() == 64 && token.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A web hop checked before any connection: its request bytes, its target,
+/// and the deadline its whole run, a pre-dial wait included, keeps to.
+pub struct Hop {
+    request: WebRequest,
+    raw: Vec<u8>,
+    ip: IpAddr,
+    started: Instant,
+    deadline: tokio::time::Instant,
+}
+
+impl Hop {
+    pub fn prepare(request: WebRequest) -> Result<Self, WebError> {
+        let (raw, ip, timeout) = validate_hop(&request).map_err(WebError::fetch)?;
+        Ok(Self { request, raw, ip, started: Instant::now(), deadline: tokio::time::Instant::now() + timeout })
+    }
+
+    pub fn token(&self) -> Option<&str> {
+        self.request.token.as_deref()
+    }
+
+    /// The verifier this hop's job uses.
+    pub fn verifier(&self) -> VerifierAddress {
+        VerifierAddress { address: self.request.verifier.clone(), ca_file: self.request.verifier_ca_file.clone(), plaintext_fixture: self.request.plaintext_fixture }
+    }
+}
+
+/// Where and how to reach the verifier.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifierAddress {
+    #[serde(rename = "verifier")]
+    pub address: String,
+    #[serde(rename = "verifier_ca_file")]
+    pub ca_file: Option<String>,
+    #[serde(default)]
+    pub plaintext_fixture: bool,
+}
+
+/// How long a connection may still wait before the verifier ends its wait
+/// (api/verifier-v1.md 12.3), with room for the token to get there.
+const SHORT_WAIT: Duration = Duration::from_secs(8);
+const LONG_WAIT: Duration = Duration::from_secs(55);
+/// How long a supplier waits for a PONG.
+pub const PONG_WAIT: Duration = Duration::from_secs(5);
+
+/// A verifier connection that has not presented a token yet, with what a
+/// hop has used of it.
+pub struct Link {
+    conn: RelayConn<crate::control::Socket>,
+    traffic: crate::control::Traffic,
+    /// The payload counters when the current hop took it.
+    taken_at: (u64, u64),
+    /// When it began waiting for a token, and whether the verifier gives it the long wait.
+    waiting_since: Instant,
+    long_wait: bool,
+}
+
+impl Link {
+    /// A new connection: TCP and TLS to the verifier, nothing else.
+    pub async fn dial(verifier: &VerifierAddress, trace: Option<&Trace>) -> Result<Self> {
+        let (socket, traffic) = crate::control::connect_observed(&verifier.address, verifier.ca_file.as_deref(), verifier.plaintext_fixture, trace).await?;
+        Ok(Self { conn: RelayConn::new(socket), traffic, taken_at: (0, 0), waiting_since: Instant::now(), long_wait: false })
+    }
+
+    /// Asks for the long wait, and checks the connection is alive.
+    pub async fn ping(&mut self) -> Result<()> {
+        self.conn.ping(PONG_WAIT).await?;
+        self.long_wait = true;
+        Ok(())
+    }
+
+    /// Whether a token sent now would still find the verifier waiting: the
+    /// connection is open, has received nothing, and its wait is not nearly
+    /// over. A connection that fails this is dropped; nothing was sent on it.
+    pub fn usable(&mut self) -> bool {
+        let margin = if self.long_wait { LONG_WAIT } else { SHORT_WAIT };
+        self.waiting_since.elapsed() < margin && self.conn.check_idle().is_ok()
+    }
+
+    /// How long it has waited for a token.
+    pub fn idle(&self) -> Duration {
+        self.waiting_since.elapsed()
+    }
+
+    pub fn long_wait(&self) -> bool {
+        self.long_wait
+    }
+
+    /// The current hop takes it: its traffic counts from here.
+    pub fn take(&mut self) {
+        self.taken_at = self.traffic.bytes();
+    }
+
+    fn used(&self) -> crate::control::TrafficSnapshot {
+        let mut snapshot = self.traffic.snapshot();
+        snapshot.verifier_sent_bytes -= self.taken_at.0.min(snapshot.verifier_sent_bytes);
+        snapshot.verifier_received_bytes -= self.taken_at.1.min(snapshot.verifier_received_bytes);
+        snapshot
+    }
+}
+
+/// The verifier connection a hop starts with: none yet, one in hand, or a
+/// dial still on its way.
+pub enum Source {
+    None,
+    Ready(Link),
+    Dialing(tokio::task::JoinHandle<Result<Link>>),
+}
+
+impl Source {
+    async fn resolve(self) -> Option<Link> {
+        match self {
+            Source::None => None,
+            Source::Ready(link) => Some(link),
+            Source::Dialing(dial) => dial.await.ok().and_then(Result::ok),
+        }
+    }
+}
+
+/// A hop that ended without a summary: why, whether its token went out
+/// (after which nothing about it may be repeated), and the verifier
+/// connection when nothing was sent on it.
+pub struct Failed {
+    pub error: WebError,
+    pub presented: bool,
+    pub link: Option<Link>,
+}
+
+impl From<WebError> for Failed {
+    fn from(error: WebError) -> Self {
+        Self { error, presented: false, link: None }
+    }
+}
+
+/// Runs a hop whose token is now known. The target connection comes
+/// first, as it always has (presenting the token spends one of the job's
+/// sessions), while a dial in `source` finishes. Then a verifier
+/// connection that is still usable, else a fresh one; `presenting` is
+/// awaited right before the token goes out, and an error from it ends the
+/// hop unsent; then the session. Returns the summary and the connection
+/// when the verifier keeps it.
+pub async fn finish(hop: &Hop, token: &str, source: Source, trace: &Trace, presenting: impl Future<Output = Result<()>>) -> Result<(WebSummary, Option<Link>), Failed> {
+    if !valid_token(token) {
+        return Err(WebError::fetch(anyhow::anyhow!("verifier token must be 64 lowercase hex characters")).into());
+    }
+    let request = &hop.request;
     let dial_class = if request.proxy.is_some() { "proxy_failed" } else { "connect_failed" };
-    let server = match tokio::time::timeout_at(deadline, trace.measure(Phase::XTcpConnect, dial::target(ip, request.port, request.proxy.as_ref()))).await {
-        Ok(Ok(server)) => server,
-        Ok(Err(dial::Error::Connect(error))) => return Err(WebError { class: "connect_failed", error }),
-        Ok(Err(dial::Error::Proxy(error))) => return Err(WebError { class: "proxy_failed", error }),
-        Err(_) => return Err(WebError { class: dial_class, error: anyhow::anyhow!("target connection timed out") }),
+    let target = async {
+        match tokio::time::timeout_at(hop.deadline, trace.measure(Phase::XTcpConnect, dial::target(hop.ip, request.port, request.proxy.as_ref()))).await {
+            Ok(Ok(server)) => Ok(server),
+            Ok(Err(dial::Error::Connect(error))) => Err(WebError { class: "connect_failed", error }),
+            Ok(Err(dial::Error::Proxy(error))) => Err(WebError { class: "proxy_failed", error }),
+            Err(_) => Err(WebError { class: dial_class, error: anyhow::anyhow!("target connection timed out") }),
+        }
+    };
+    let (server, link) = tokio::join!(target, source.resolve());
+    let server = match server {
+        Ok(server) => server,
+        // Nothing went out on the verifier connection: it can serve another hop.
+        Err(error) => return Err(Failed { error, presented: false, link }),
     };
     let (server, target) = crate::control::metered(server);
+    let host = webpolicy::url_host(&request.url);
     let session = async {
-        let (socket, traffic) = crate::control::connect_observed(&request.verifier, request.verifier_ca_file.as_deref(), request.plaintext_fixture, Some(trace)).await?;
-        // A one-shot hop: transport 2 with a single session, closed after it.
-        let mut conn = RelayConn::new(socket);
-        conn.present(&request.token).await?;
-        let (outcome, _) = trace.measure(Phase::RelaySession, web_session_on(&mut conn, server, &raw, host, request.hop, &request.url, trace)).await?;
-        anyhow::Ok((outcome, traffic))
+        // A connection the verifier may already have given up on is replaced: that costs a dial, never a token.
+        let mut link = match link.and_then(|mut link| link.usable().then_some(link)) {
+            Some(link) => link,
+            None => {
+                let mut link = Link::dial(&hop.verifier(), Some(trace)).await.map_err(|e| (e, false))?;
+                link.take();
+                link
+            }
+        };
+        // The node learns that the token is about to go out before it does.
+        presenting.await.map_err(|e| (e, false))?;
+        link.conn.present(token).await.map_err(|e| (e, true))?;
+        let (outcome, keep) = trace.measure(Phase::RelaySession, web_session_on(&mut link.conn, server, &hop.raw, host, request.hop, &request.url, trace)).await.map_err(|e| (e, true))?;
+        Ok::<_, (anyhow::Error, bool)>((outcome, keep, link))
     };
-    let (outcome, traffic) = match tokio::time::timeout_at(deadline, session).await {
-        Ok(result) => result.map_err(WebError::session)?,
-        Err(_) => return Err(WebError::fetch(anyhow::anyhow!("relay session timed out"))),
+    let (outcome, keep, mut link) = match tokio::time::timeout_at(hop.deadline, session).await {
+        Ok(Ok(done)) => done,
+        Ok(Err((error, presented))) => return Err(Failed { error: WebError::session(error), presented, link: None }),
+        Err(_) => return Err(Failed { error: WebError::fetch(anyhow::anyhow!("relay session timed out")), presented: true, link: None }),
     };
     let (target_sent_bytes, target_received_bytes) = target.bytes();
-    Ok(WebSummary {
-        verifier_transport: traffic.snapshot(),
+    let summary = WebSummary {
+        verifier_transport: link.used(),
         status: "proof_sent",
         hop: outcome.hop,
         url: outcome.url,
@@ -370,10 +540,178 @@ async fn run_web_observed(input: &[u8], trace: &Trace) -> Result<WebSummary, Web
         next_url: outcome.next_url,
         target_sent_bytes,
         target_received_bytes,
-        duration_ms: started.elapsed().as_millis(),
+        duration_ms: hop.started.elapsed().as_millis(),
         diagnostics: None,
-    })
+    };
+    // A kept connection waits for the next token from now, with the long wait.
+    let kept = keep.then(|| {
+        link.waiting_since = Instant::now();
+        link.long_wait = true;
+        link
+    });
+    Ok((summary, kept))
 }
+
+/// What `relay-web` printed: a hop's summary, or the end of a pre-dial
+/// whose accept failed, which sent no token and reached no target.
+pub enum RelayWeb {
+    Hop(WebSummary),
+    Aborted(Aborted),
+}
+
+#[derive(Serialize)]
+pub struct Aborted {
+    #[serde(flatten)]
+    pub verifier_transport: crate::control::TrafficSnapshot,
+    /// `predial_aborted`: never `proof_sent`.
+    pub status: &'static str,
+    pub duration_ms: u128,
+    pub diagnostics: Option<Snapshot>,
+}
+
+/// Reads one line of at most `max` bytes, without its newline; `None` at
+/// end of input before any byte.
+async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(input: &mut R, max: usize) -> Result<Option<Vec<u8>>> {
+    use tokio::io::AsyncBufReadExt;
+    let mut line = Vec::new();
+    let read = (&mut *input).take(max as u64 + 1).read_until(b'\n', &mut line).await?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if line.last() == Some(&b'\n') {
+        line.pop();
+    }
+    if line.len() > max {
+        bail!("input line is too long");
+    }
+    Ok(Some(line))
+}
+
+/// The pre-dial token line: `{"token":"<64 lowercase hex>"}`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TokenLine {
+    token: String,
+}
+
+/// `scarlett-prover relay-web`: one hop from the first line of `input`. With
+/// `"predial": true` and no token it dials the verifier (TCP and TLS only)
+/// at once and waits, at most the hop's own time, for the token on the next
+/// line; end of input instead aborts with nothing sent and no target
+/// reached. The node starts it so before its accept and writes the token
+/// once the accept returns it (design E1).
+pub async fn relay_web<R: tokio::io::AsyncBufRead + Unpin>(input: &mut R) -> Result<RelayWeb, WebError> {
+    let diagnostics = Run::new();
+    let trace = diagnostics.trace();
+    let line = read_line(input, 1 << 20).await.context("reading relay-web input").map_err(WebError::fetch)?.unwrap_or_default();
+    let request: WebRequest = serde_json::from_slice(&line).context("invalid relay-web input").map_err(WebError::fetch)?;
+    if request.predial == request.token.is_some() {
+        return Err(WebError::fetch(anyhow::anyhow!("relay-web takes a token, or pre-dials without one")));
+    }
+    let hop = Hop::prepare(request)?;
+    let (token, source) = match hop.token() {
+        Some(token) => (token.to_owned(), Source::None),
+        None => {
+            let verifier = hop.verifier();
+            let dial_trace = trace.clone();
+            let dial = tokio::spawn(async move { Link::dial(&verifier, Some(&dial_trace)).await });
+            // The token line: `{"token":"<64 lowercase hex>"}`; end of input aborts.
+            let next = async {
+                read_line(input, 1 << 10).await.ok().flatten().map(|line| serde_json::from_slice::<TokenLine>(&line).map(|line| line.token).unwrap_or_default())
+            };
+            match wait_for_token(&hop, Source::Dialing(dial), next, &trace).await {
+                Waited::Token(token, source) => (token, source),
+                Waited::Ended(link) => {
+                    let verifier_transport = link.map(|link| link.used()).unwrap_or_else(|| crate::control::Traffic::default().snapshot());
+                    return Ok(RelayWeb::Aborted(Aborted { verifier_transport, status: "predial_aborted", duration_ms: hop.started.elapsed().as_millis(), diagnostics: Some(diagnostics.success()) }));
+                }
+                Waited::TimedOut(_) => return Err(WebError::fetch(anyhow::anyhow!("no token before the hop deadline"))),
+                Waited::Invalid(_) => return Err(WebError::fetch(anyhow::anyhow!("invalid pre-dial token line"))),
+            }
+        }
+    };
+    let (mut summary, _) = finish(&hop, &token, source, &trace, async { Ok(()) }).await.map_err(|failed| failed.error)?;
+    summary.diagnostics = Some(diagnostics.success());
+    Ok(RelayWeb::Hop(summary))
+}
+
+/// One whole `relay-web` run on `input` that must end in a hop, for tests.
+#[cfg(test)]
+pub async fn run_web(input: &[u8]) -> Result<WebSummary, WebError> {
+    match relay_web(&mut &input[..]).await? {
+        RelayWeb::Hop(summary) => Ok(summary),
+        RelayWeb::Aborted(_) => Err(WebError::fetch(anyhow::anyhow!("pre-dial aborted"))),
+    }
+}
+
+/// How a hop's wait for its token ended. Every outcome but a token hands
+/// back the verifier connection, on which nothing was sent.
+pub enum Waited {
+    Token(String, Source),
+    /// The node said no (its accept failed): end of input, or a cancel.
+    Ended(Option<Link>),
+    TimedOut(Option<Link>),
+    Invalid(Option<Link>),
+}
+
+/// Waits for a hop's token from `next` (`None`: the node ended the hop),
+/// while its verifier connection in `source` is dialed. A new connection
+/// whose wait grows long asks for the verifier's long wait with a PING; one
+/// the verifier closed meanwhile is dropped, and the hop dials again once it
+/// has its token. Bounded by the hop's deadline. Nothing is sent but PINGs.
+pub async fn wait_for_token(hop: &Hop, source: Source, next: impl Future<Output = Option<String>>, trace: &Trace) -> Waited {
+    let (mut link, mut dialing) = match source {
+        Source::None => (None, None),
+        Source::Ready(link) => (Some(link), None),
+        Source::Dialing(dial) => (None, Some(dial)),
+    };
+    let waiting = trace.span(Phase::PredialWait);
+    tokio::pin!(next);
+    let ended = loop {
+        let ping_at = link.as_ref().filter(|link| !link.long_wait()).map(|link| tokio::time::Instant::now() + KEEPALIVE_AFTER.saturating_sub(link.idle()));
+        tokio::select! {
+            token = &mut next => {
+                let Some(token) = token else { break Outcome::Cancelled };
+                if !valid_token(&token) {
+                    break Outcome::Error;
+                }
+                waiting.finish(Outcome::Success);
+                let source = match (link, dialing) {
+                    (Some(link), _) => Source::Ready(link),
+                    // The dial goes on while the target is reached.
+                    (None, Some(dial)) => Source::Dialing(dial),
+                    (None, None) => Source::None,
+                };
+                return Waited::Token(token, source);
+            }
+            dialed = async { dialing.as_mut().expect("guarded").await }, if dialing.is_some() => {
+                dialing = None;
+                // A failed dial costs nothing yet: the hop dials again once it has its token.
+                link = dialed.ok().and_then(Result::ok);
+            }
+            _ = tokio::time::sleep_until(ping_at.unwrap_or(hop.deadline)), if ping_at.is_some() => {
+                if let Some(mut pinged) = link.take() && pinged.ping().await.is_ok() {
+                    link = Some(pinged);
+                }
+            }
+            _ = tokio::time::sleep_until(hop.deadline) => break Outcome::Error,
+        }
+    };
+    if let Some(dial) = dialing {
+        dial.abort();
+    }
+    let timed_out = tokio::time::Instant::now() >= hop.deadline;
+    waiting.finish(ended);
+    match ended {
+        Outcome::Cancelled => Waited::Ended(link),
+        _ if timed_out => Waited::TimedOut(link),
+        _ => Waited::Invalid(link),
+    }
+}
+
+/// How long a new connection waits for its token before it asks for the
+/// verifier's long wait (shorter in tests).
+pub const KEEPALIVE_AFTER: Duration = if cfg!(test) { Duration::from_millis(300) } else { Duration::from_secs(5) };
 
 /// The hidden ranges of a request and the bytes in them.
 fn secrets(raw: &[u8]) -> Result<(Vec<Range<usize>>, Vec<u8>)> {
@@ -416,7 +754,6 @@ impl<V: AsyncRead + AsyncWrite + Unpin> RelayConn<V> {
     /// Sends PING and waits for PONG, while the connection waits for a
     /// token. The verifier's first PING on a new connection gives it the
     /// long pre-token wait.
-    #[cfg(test)]
     pub async fn ping(&mut self, within: Duration) -> Result<()> {
         wire::send(&mut self.writer, wire::PING, &[]).await?;
         match tokio::time::timeout(within, self.reader.recv()).await {
@@ -430,7 +767,6 @@ impl<V: AsyncRead + AsyncWrite + Unpin> RelayConn<V> {
     /// Fails if, while the connection waited, the verifier closed it or
     /// sent anything at all: nothing may arrive outside a session but a
     /// PONG that was asked for. Never waits.
-    #[cfg(test)]
     pub fn check_idle(&mut self) -> Result<()> {
         use futures::FutureExt;
         match self.reader.recv().now_or_never() {

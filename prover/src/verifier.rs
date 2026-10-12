@@ -2625,6 +2625,323 @@ mod web_tests {
         }
     }
 
+    /// A CONNECT proxy to `origin` that counts the tunnels it opened.
+    async fn counted_tunnel(origin: std::net::SocketAddr) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = proxy.local_addr().unwrap().port();
+        let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = opened.clone();
+        tokio::spawn(async move {
+            while let Ok((mut client, _)) = proxy.accept().await {
+                let count = count.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") && client.read(&mut byte).await.unwrap_or(0) == 1 {
+                        head.push(byte[0]);
+                    }
+                    if !head.ends_with(b"\r\n\r\n") {
+                        return;
+                    }
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let Ok(mut upstream) = TcpStream::connect(origin).await else { return };
+                    let _ = client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await;
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                });
+            }
+        });
+        (port, opened)
+    }
+
+    /// `relay-web` input for hop 0 of `https://example.com/` through `proxy`, without a token.
+    fn predial_input(verifier: std::net::SocketAddr, proxy: u16, timeout_ms: u64) -> Value {
+        json!({
+            "verifier": verifier.to_string(), "plaintext_fixture": true, "predial": true, "hop": 0,
+            "url": "https://example.com/", "ip": "93.184.215.14", "port": 443, "proxy": {"host": "127.0.0.1", "port": proxy},
+            "payload": payload("https://example.com/", 5), "timeout_ms": timeout_ms
+        })
+    }
+
+    /// Starts `relay-web` on a pipe and writes its first line; the returned
+    /// writer is its stdin from there on.
+    async fn start_relay_web(input: &Value) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<Result<node::RelayWeb, (&'static str, String)>>) {
+        let (mut stdin, read_end) = tokio::io::duplex(1 << 20);
+        let run = tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(read_end);
+            node::relay_web(&mut reader).await.map_err(|failure| (failure.class, format!("{:#}", failure.error)))
+        });
+        stdin.write_all(&[serde_json::to_vec(input).unwrap(), b"\n".to_vec()].concat()).await.unwrap();
+        (stdin, run)
+    }
+
+    /// The (phase, start, end) of each span of a summary's diagnostics.
+    fn spans(diagnostics: &Value) -> Vec<(String, u64, u64)> {
+        diagnostics["spans"].as_array().unwrap().iter().map(|s| (s["phase"].as_str().unwrap().to_owned(), s["start_ms"].as_u64().unwrap(), s["start_ms"].as_u64().unwrap() + s["duration_ms"].as_u64().unwrap())).collect()
+    }
+
+    #[tokio::test]
+    async fn a_predialed_hop_dials_the_verifier_first_and_presents_its_token_only_when_given() {
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        let s = shared(origin.roots.clone(), None);
+        let verifier = serve_verifier(&s).await;
+        let (proxy, tunnels) = counted_tunnel(origin.addr).await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let (mut stdin, run) = start_relay_web(&predial_input(verifier, proxy, 20_000)).await;
+        // The verifier connection is up and waiting; nothing was presented and the target is untouched.
+        for _ in 0..500 {
+            if capacity_view(&s).await["pre_token"]["connections"] == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(capacity_view(&s).await["pre_token"]["connections"], 1);
+        assert_eq!((tunnels.load(Ordering::SeqCst), tokens(&s), view(&s).await["remaining_sessions"].as_u64()), (0, 1, Some(6)));
+        assert!(origin.seen.lock().unwrap().is_none() && !run.is_finished());
+        // The accept returned the token.
+        stdin.write_all(format!("{{\"token\":\"{token}\"}}\n").as_bytes()).await.unwrap();
+        let node::RelayWeb::Hop(summary) = tokio::time::timeout(Duration::from_secs(30), run).await.unwrap().unwrap().unwrap() else { panic!("aborted") };
+        let summary = serde_json::to_value(summary).unwrap();
+        assert_eq!((summary["status"].as_str(), summary["status_code"].as_u64(), summary["final"].as_bool()), (Some("proof_sent"), Some(200), Some(true)));
+        assert_eq!((tunnels.load(Ordering::SeqCst), view(&s).await["complete"].as_bool()), (1, Some(true)));
+        // One dial, before the wait ended; the target connect after it.
+        let spans = spans(&summary["diagnostics"]);
+        let phase = |name: &str| spans.iter().filter(|(p, ..)| p == name).cloned().collect::<Vec<_>>();
+        assert_eq!(phase("verifier_tcp_connect").len(), 1);
+        let (_, _, waited) = phase("predial_wait")[0];
+        let (_, dialed_at, _) = phase("verifier_tcp_connect")[0];
+        let (_, target_at, _) = phase("x_tcp_connect")[0];
+        assert!(dialed_at <= waited && target_at >= waited, "{spans:?}");
+        assert!(summary["verifier_sent_bytes"].as_u64().unwrap() > 64);
+    }
+
+    #[tokio::test]
+    async fn a_predial_ended_before_its_token_sends_nothing_and_reaches_nothing() {
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        let s = shared(origin.roots.clone(), None);
+        let verifier = serve_verifier(&s).await;
+        let (proxy, tunnels) = counted_tunnel(origin.addr).await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        // The accept failed: the node closes stdin.
+        let (stdin, run) = start_relay_web(&predial_input(verifier, proxy, 20_000)).await;
+        for _ in 0..500 {
+            if capacity_view(&s).await["pre_token"]["connections"] == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(stdin);
+        let node::RelayWeb::Aborted(aborted) = tokio::time::timeout(Duration::from_secs(10), run).await.unwrap().unwrap().unwrap() else { panic!("ran a hop") };
+        let aborted = serde_json::to_value(aborted).unwrap();
+        assert_eq!(aborted["status"], "predial_aborted");
+        assert_eq!(spans(&aborted["diagnostics"]).iter().filter(|(p, ..)| p == "predial_wait").count(), 1);
+        for _ in 0..100 {
+            if capacity_view(&s).await["pre_token"]["connections"] == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(capacity_view(&s).await["pre_token"]["connections"], 0);
+        assert_eq!((tunnels.load(Ordering::SeqCst), tokens(&s), view(&s).await["remaining_sessions"].as_u64()), (0, 1, Some(6)));
+        assert!(origin.seen.lock().unwrap().is_none());
+        // A malformed token line, a token on the first line, a missing one, or no token in time: nothing is sent either.
+        let (mut stdin, run) = start_relay_web(&predial_input(verifier, proxy, 20_000)).await;
+        stdin.write_all(b"{\"token\":\"short\"}\n").await.unwrap();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(10), run).await.unwrap().unwrap().err().unwrap().0, "fetch_failed");
+        let mut both = predial_input(verifier, proxy, 20_000);
+        both["token"] = token.clone().into();
+        let mut neither = predial_input(verifier, proxy, 20_000);
+        neither["predial"] = false.into();
+        for input in [both, neither] {
+            let (_stdin, run) = start_relay_web(&input).await;
+            assert_eq!(tokio::time::timeout(Duration::from_secs(10), run).await.unwrap().unwrap().err().unwrap().0, "fetch_failed");
+        }
+        let started = Instant::now();
+        let (_stdin, run) = start_relay_web(&predial_input(verifier, proxy, 1000)).await;
+        let (class, error) = tokio::time::timeout(Duration::from_secs(10), run).await.unwrap().unwrap().err().unwrap();
+        assert_eq!(class, "fetch_failed");
+        assert!(error.contains("no token before the hop deadline") && started.elapsed() < Duration::from_secs(5), "{error}");
+        assert_eq!((tunnels.load(Ordering::SeqCst), tokens(&s), view(&s).await["remaining_sessions"].as_u64()), (0, 1, Some(6)));
+    }
+
+    #[tokio::test]
+    async fn a_predial_keeps_its_connection_through_a_long_wait_or_dials_again() {
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        // The verifier gives a new connection 1 s, and 10 s after a PING.
+        let s = waits(origin.roots.clone(), Duration::from_secs(1), Duration::from_secs(10));
+        let verifier = serve_verifier(&s).await;
+        let (proxy, _) = counted_tunnel(origin.addr).await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let (mut stdin, run) = start_relay_web(&predial_input(verifier, proxy, 20_000)).await;
+        // Past the short wait: the PING kept the pre-dialed connection.
+        tokio::time::sleep(Duration::from_millis(1800)).await;
+        stdin.write_all(format!("{{\"token\":\"{token}\"}}\n").as_bytes()).await.unwrap();
+        let node::RelayWeb::Hop(summary) = tokio::time::timeout(Duration::from_secs(30), run).await.unwrap().unwrap().unwrap() else { panic!("aborted") };
+        let summary = serde_json::to_value(summary).unwrap();
+        assert_eq!(spans(&summary["diagnostics"]).iter().filter(|(p, ..)| p == "verifier_tcp_connect").count(), 1);
+
+        // A pre-dialed connection the verifier closed while it waited (its wait
+        // ended before the PING) is replaced by a fresh dial once the token comes.
+        let s = waits(origin.roots.clone(), Duration::from_millis(100), Duration::from_millis(100));
+        let verifier = serve_verifier(&s).await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let (mut stdin, run) = start_relay_web(&predial_input(verifier, proxy, 20_000)).await;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        stdin.write_all(format!("{{\"token\":\"{token}\"}}\n").as_bytes()).await.unwrap();
+        let node::RelayWeb::Hop(summary) = tokio::time::timeout(Duration::from_secs(30), run).await.unwrap().unwrap().unwrap() else { panic!("aborted") };
+        let summary = serde_json::to_value(summary).unwrap();
+        assert_eq!((summary["status_code"].as_u64(), view(&s).await["complete"].as_bool()), (Some(200), Some(true)));
+        assert_eq!(spans(&summary["diagnostics"]).iter().filter(|(p, ..)| p == "verifier_tcp_connect").count(), 2);
+    }
+
+    /// A `serve` hop's input for `url` through `proxy`, with `token` if given.
+    fn daemon_input(verifier: std::net::SocketAddr, proxy: u16, hop: u32, url: &str, token: Option<&str>) -> Value {
+        let mut input = json!({
+            "verifier": verifier.to_string(), "plaintext_fixture": true, "hop": hop,
+            "url": url, "ip": "93.184.215.14", "port": 443, "proxy": {"host": "127.0.0.1", "port": proxy},
+            "payload": payload("https://example.com/", 5), "timeout_ms": 20_000
+        });
+        if let Some(token) = token {
+            input["token"] = token.into();
+        }
+        input
+    }
+
+    /// The phases of a reply's diagnostics.
+    fn phases(reply: &Value) -> Vec<String> {
+        let diagnostics = if reply["type"] == "summary" { &reply["summary"]["diagnostics"] } else { &reply["diagnostics"] };
+        spans(diagnostics).into_iter().map(|(phase, ..)| phase).collect()
+    }
+
+    async fn until_waiting(s: &Shared, connections: u64) {
+        for _ in 0..500 {
+            if capacity_view(s).await["pre_token"]["connections"].as_u64() == Some(connections) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the verifier never had {connections} waiting connections");
+    }
+
+    #[tokio::test]
+    async fn the_daemon_runs_a_hop_on_a_warm_connection_and_presents_its_token_only_once_given() {
+        use crate::serve::tests::Daemon;
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        let s = shared(origin.roots.clone(), None);
+        let verifier = serve_verifier(&s).await;
+        let (proxy, tunnels) = counted_tunnel(origin.addr).await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let mut daemon = Daemon::start().await;
+        daemon.send(json!({"type": "pool", "size": 2, "verifier": verifier.to_string(), "verifier_ca_file": null, "plaintext_fixture": true})).await;
+        until_waiting(&s, 2).await;
+        // Started before the accept: a warm connection is taken, and the pool is refilled.
+        daemon.send(json!({"type": "hop", "id": "h1", "job": "j1", "input": daemon_input(verifier, proxy, 0, "https://example.com/", None)})).await;
+        until_waiting(&s, 3).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!((tunnels.load(Ordering::SeqCst), tokens(&s), view(&s).await["remaining_sessions"].as_u64()), (0, 1, Some(6)));
+        assert!(origin.seen.lock().unwrap().is_none());
+        daemon.send(json!({"type": "token", "id": "h1", "token": token})).await;
+        let (reply, presenting) = daemon.result("h1").await;
+        assert!(presenting, "{reply}");
+        assert_eq!((reply["type"].as_str(), reply["summary"]["status"].as_str(), reply["summary"]["final"].as_bool()), (Some("summary"), Some("proof_sent"), Some(true)));
+        let phases = phases(&reply);
+        assert!(phases.contains(&"pool_checkout_warm".into()) && phases.contains(&"predial_wait".into()), "{phases:?}");
+        assert!(!phases.contains(&"verifier_tcp_connect".into()) && !phases.contains(&"pool_checkout_cold".into()), "{phases:?}");
+        assert_eq!((tunnels.load(Ordering::SeqCst), view(&s).await["complete"].as_bool()), (1, Some(true)));
+        // A hop's traffic counts only what it used of the connection.
+        assert!(reply["summary"]["verifier_sent_bytes"].as_u64().unwrap() > 64);
+        // The verifier kept the connection; the pool keeps two.
+        until_waiting(&s, 2).await;
+        assert!(daemon.close().await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn redirect_hops_reuse_the_connection_their_previous_hop_left() {
+        use crate::serve::tests::Daemon;
+        let origin = web_origin(
+            routes(&[("example.com/", b"HTTP/1.1 301 Moved Permanently\r\nLocation: https://www.example.com/next\r\nContent-Length: 0\r\n\r\n", End::Wait), ("www.example.com/next", PAGE, End::Wait)]),
+            false,
+        )
+        .await;
+        let s = shared(origin.roots.clone(), None);
+        let verifier = serve_verifier(&s).await;
+        let (proxy, _) = counted_tunnel(origin.addr).await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let mut daemon = Daemon::start().await;
+        // No warm pool: hop 0 dials.
+        daemon.send(json!({"type": "pool", "size": 0, "verifier": verifier.to_string(), "verifier_ca_file": null, "plaintext_fixture": true})).await;
+        daemon.send(json!({"type": "hop", "id": "h0", "job": "j1", "input": daemon_input(verifier, proxy, 0, "https://example.com/", Some(&token))})).await;
+        let (reply, presenting) = daemon.result("h0").await;
+        assert!(presenting);
+        assert_eq!((reply["summary"]["final"].as_bool(), reply["summary"]["next_url"].as_str()), (Some(false), Some("https://www.example.com/next")));
+        assert!(phases(&reply).contains(&"pool_checkout_cold".into()) && phases(&reply).contains(&"verifier_tcp_connect".into()));
+        // The verifier kept the connection for the job's next hop, which takes it.
+        daemon.send(json!({"type": "hop", "id": "h1", "job": "j1", "input": daemon_input(verifier, proxy, 1, "https://www.example.com/next", Some(&token))})).await;
+        let (reply, _) = daemon.result("h1").await;
+        assert_eq!((reply["summary"]["final"].as_bool(), reply["summary"]["status_code"].as_u64()), (Some(true), Some(200)));
+        assert!(phases(&reply).contains(&"pool_checkout_warm".into()) && !phases(&reply).contains(&"verifier_tcp_connect".into()), "{:?}", phases(&reply));
+        assert_eq!((view(&s).await["complete"].as_bool(), view(&s).await["hops"].as_array().map(Vec::len)), (Some(true), Some(2)));
+        assert_eq!(stored(&s).await, &PAGE[PAGE.len() - 20..]);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_or_unsent_hop_sends_no_token_and_returns_its_connection() {
+        use crate::serve::tests::Daemon;
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        let s = shared(origin.roots.clone(), None);
+        let verifier = serve_verifier(&s).await;
+        let (proxy, tunnels) = counted_tunnel(origin.addr).await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let mut daemon = Daemon::start().await;
+        daemon.send(json!({"type": "pool", "size": 1, "verifier": verifier.to_string(), "verifier_ca_file": null, "plaintext_fixture": true})).await;
+        until_waiting(&s, 1).await;
+        // The accept failed: cancelled, nothing presented, no target, the connection back in the pool.
+        daemon.send(json!({"type": "hop", "id": "h1", "input": daemon_input(verifier, proxy, 0, "https://example.com/", None)})).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        daemon.send(json!({"type": "cancel", "id": "h1"})).await;
+        let (reply, presenting) = daemon.result("h1").await;
+        assert_eq!((reply["type"].as_str(), presenting), (Some("cancelled"), false));
+        assert!(phases(&reply).contains(&"predial_wait".into()));
+        assert_eq!((tunnels.load(Ordering::SeqCst), tokens(&s), view(&s).await["remaining_sessions"].as_u64()), (0, 1, Some(6)));
+        // A token after the cancel changes nothing.
+        daemon.send(json!({"type": "token", "id": "h1", "token": token})).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!((tunnels.load(Ordering::SeqCst), tokens(&s)), (0, 1));
+        until_waiting(&s, 1).await;
+        // A target that cannot be reached fails the hop before its token: still unsent.
+        let mut input = daemon_input(verifier, proxy, 0, "https://example.com/", Some(&token));
+        input["proxy"]["port"] = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port().into();
+        daemon.send(json!({"type": "hop", "id": "h2", "input": input})).await;
+        let (reply, presenting) = daemon.result("h2").await;
+        assert_eq!((reply["type"].as_str(), reply["class"].as_str(), reply["presented"].as_bool(), presenting), (Some("error"), Some("proxy_failed"), Some(false), false));
+        assert_eq!((tokens(&s), view(&s).await["remaining_sessions"].as_u64()), (1, Some(6)));
+        // Then the hop runs, on the connection the others gave back.
+        daemon.send(json!({"type": "hop", "id": "h3", "input": daemon_input(verifier, proxy, 0, "https://example.com/", Some(&token))})).await;
+        let (reply, presenting) = daemon.result("h3").await;
+        assert!(presenting && reply["type"] == "summary", "{reply}");
+        assert!(phases(&reply).contains(&"pool_checkout_warm".into()), "{:?}", phases(&reply));
+    }
+
+    #[tokio::test]
+    async fn a_warm_connection_the_verifier_closed_is_replaced_before_the_token() {
+        use crate::serve::tests::Daemon;
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        // The verifier drops waiting connections after 300 ms, PING or not.
+        let s = waits(origin.roots.clone(), Duration::from_millis(300), Duration::from_millis(300));
+        let verifier = serve_verifier(&s).await;
+        let (proxy, _) = counted_tunnel(origin.addr).await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let mut daemon = Daemon::start().await;
+        daemon.send(json!({"type": "pool", "size": 1, "verifier": verifier.to_string(), "verifier_ca_file": null, "plaintext_fixture": true})).await;
+        until_waiting(&s, 1).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        daemon.send(json!({"type": "hop", "id": "h1", "input": daemon_input(verifier, proxy, 0, "https://example.com/", Some(&token))})).await;
+        let (reply, presenting) = daemon.result("h1").await;
+        assert!(presenting && reply["type"] == "summary", "{reply}");
+        assert!(phases(&reply).contains(&"verifier_tcp_connect".into()), "{:?}", phases(&reply));
+        assert_eq!(view(&s).await["complete"], true);
+    }
+
     async fn capacity_view(s: &Shared) -> Value {
         let (_, Json(view)) = capacity(State(s.clone()), headers()).await;
         view

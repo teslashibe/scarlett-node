@@ -401,3 +401,63 @@ object reports the waiting connections:
 The refusal counters count connections closed at accept for want of a
 place, and kept connections that could not keep one at `DONE`, since the
 verifier started.
+
+## 13. `relay-web` pre-dial (E1)
+
+With node 0.1.17 the node may start a hop's helper before it accepts the
+lease, so the verifier's TCP and TLS round trips overlap the accept.
+
+- The first stdin line is the usual input with `"predial": true` and no
+  `token`. `relay-web` then dials the verifier (TCP and TLS, nothing else)
+  and waits for a second line, `{"token":"<64 lowercase hex>"}`, at most the
+  hop's own `timeout_ms` from its start. Exactly one of `token` and
+  `predial` must be given; the input may end in a newline.
+- **No token before accept.** Until the token line arrives nothing is sent
+  on the verifier connection but, after 5 s, a `PING` that asks for the
+  verifier's long wait. Nothing reaches the target.
+- **Target first, as always.** With the token, the hop connects to the
+  target, then presents the token on the pre-dialed connection, or on a
+  fresh one if the verifier closed it meanwhile or its wait is nearly over
+  (that costs one dial, never a token). Ordering is unchanged: target TCP
+  connect, then the token, then the session.
+- **Abort.** End of input before the token line exits 0 and prints
+  `{"status":"predial_aborted", …verifier counters…, "duration_ms", "diagnostics"}`:
+  no token was sent and no target reached. A malformed token line, or no
+  token by the deadline, fails as `fetch_failed`, unsent.
+- **Diagnostics.** A helper span `predial_wait` covers the wait;
+  `control_config`, `verifier_tcp_connect` and `verifier_tls` keep measuring
+  the dial, which now overlaps it, so the dial's cost on the critical path
+  is its end minus the end of `predial_wait`, when positive.
+
+## 14. `scarlett-prover serve` (C1 node side)
+
+One long-lived helper per node process runs the node's web hops over warm
+verifier connections. Both ways: a big-endian u32 length, then that many
+bytes of JSON (at most 1 MiB). It exits when stdin ends; stdout carries
+only replies.
+
+| Request (stdin) | Meaning |
+|---|---|
+| `{"type":"pool","size":2,"verifier":"host:port","verifier_ca_file":null,"plaintext_fixture":false}` | the verifier and how many warm connections to keep, 0 to 4 (the node sends `min(2, free web slots)`) |
+| `{"type":"hop","id":"<1-64 of [A-Za-z0-9_-]>","job":"<optional>","input":{…}}` | a hop: `relay-web`'s input without `predial`, `token` optional; `job` lets a redirect hop take the connection its previous hop left |
+| `{"type":"token","id":"…","token":"<64 lowercase hex>"}` | the accept returned the token: the hop runs |
+| `{"type":"cancel","id":"…"}` | the accept failed: the hop ends unsent; ignored after a token |
+
+| Reply (stdout) | Meaning |
+|---|---|
+| `{"type":"ready","version":1}` | once, at start |
+| `{"type":"presenting","id":"…"}` | written and flushed right before the hop's token goes out. A node that never got it knows the token was not sent |
+| `{"type":"summary","id":"…","summary":{…}}` | `relay-web`'s summary; its verifier counters cover only what this hop used of the connection |
+| `{"type":"error","id":"…","class":"…","error":"…","presented":false,"diagnostics":{…}}` | `class` as `SCARLETT_WEB_ERROR`; `error` is the one-line cause (it keeps the relay misuse text) |
+| `{"type":"cancelled","id":"…","diagnostics":{…}}` | the hop ended before its token: nothing sent, no target reached |
+
+Pool policy: warm connections are dialed in the background, pinged at once
+(for the verifier's long wait) and every 15 s, retired after 45 s idle, and
+replaced the moment one is taken. A hop takes the connection its job's
+previous hop left (kept up to 10 s), else the most recently used warm one,
+else dials (spans `pool_checkout_warm` / `pool_checkout_cold`). A
+connection found closed or near the end of its wait before the token is
+sent is dropped and the hop dials fresh. After the session, a connection
+the verifier kept goes back to the pool (or is reserved for the job's next
+redirect hop); one that failed is closed. A hop that fails before its
+token (target unreachable, cancelled) gives its connection back.

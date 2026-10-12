@@ -29,6 +29,11 @@ pub enum Phase {
     ResponseComplete,
     OpeningCheck,
     ProofFinalize,
+    /// A hop started before its token (E1): from the start until the token arrived.
+    PredialWait,
+    /// `serve` took a kept or pooled verifier connection, or had to dial one.
+    PoolCheckoutWarm,
+    PoolCheckoutCold,
 }
 
 #[derive(Clone, Copy, Serialize, Debug, PartialEq)]
@@ -53,6 +58,14 @@ pub struct Snapshot {
     duration_ms: u64,
     outcome: Outcome,
     spans: Vec<Span>,
+}
+
+impl Snapshot {
+    /// The same measurements, for a run that ended as `outcome`.
+    pub fn ended(mut self, outcome: Outcome) -> Self {
+        self.outcome = outcome;
+        self
+    }
 }
 
 struct State {
