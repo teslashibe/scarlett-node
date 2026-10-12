@@ -257,7 +257,7 @@ mockIPC((command, payload) => {
     case "set_desktop_autostart": autostart = !!data.enabled; return null;
     case "desktop_status":
       observation.updated_at = new Date(Date.now() + 1).toISOString();
-      // A connected node hears back from Scarlett every few seconds.
+      // A connected node keeps hearing back from Scarlett.
       if (snapshot.supervised && observation.last_heartbeat_ok_at && scenario !== "heartbeat-late") observation.last_heartbeat_ok_at = at(4);
       snapshot.web_enabled = preferences.serve_web;
       snapshot.web_restart_pending = snapshot.supervised && webRunning !== preferences.serve_web;

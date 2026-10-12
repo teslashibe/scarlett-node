@@ -249,7 +249,7 @@ function instant(value: unknown): number | undefined {
   const at = Date.parse(value);
   return Number.isFinite(at) && at > Date.UTC(2020, 0, 1) ? at : undefined;
 }
-export function ago(ms: number): string {
+function ago(ms: number): string {
   const seconds = Math.floor(Math.max(0, ms) / 1000);
   if (seconds < 10) return "Just now";
   if (seconds < 60) return `${seconds} s ago`;
