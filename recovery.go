@@ -35,7 +35,10 @@ func recoverAttempt(ctx context.Context, client *coordinator.Client, journal *at
 	}
 	switch status.State {
 	case "accepted", "failed":
-		if r.SubmissionSHA256 != "" && status.SubmissionSHA256 != r.SubmissionSHA256 {
+		// Without a receipt the coordinator decided the attempt from the
+		// verifier's own record before this node's report reached it: the
+		// outcome is final, and the report has nothing left to change.
+		if r.SubmissionSHA256 != "" && status.SubmissionSHA256 != "" && status.SubmissionSHA256 != r.SubmissionSHA256 {
 			return errors.New("coordinator accepted a different attempt report")
 		}
 		return journal.Terminal(r)

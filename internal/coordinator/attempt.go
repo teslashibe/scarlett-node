@@ -13,6 +13,10 @@ import (
 // AttemptStatus is the authenticated coordinator's durable attempt outcome.
 // ReplaySafe explicitly promises idempotent exact-body reports for this fence.
 // A missing/older endpoint cannot authorize a report retry or provider replay.
+// An accepted or failed attempt carries SubmissionSHA256, the hash of the
+// node report the coordinator committed, unless it was decided without one:
+// a relay web job completed or rejected from the verifier's own record
+// before the node's report arrived (design C2).
 type AttemptStatus struct {
 	Version          string `json:"version"`
 	JobID            string `json:"job_id"`
@@ -58,9 +62,6 @@ func (c *Client) AttemptStatus(ctx context.Context, job, attempt, fence string) 
 		if e != nil || len(hash) != 32 || hex.EncodeToString(hash) != result.SubmissionSHA256 {
 			return result, errors.New("invalid attempt report receipt")
 		}
-	}
-	if (result.State == "accepted" || result.State == "failed") && result.SubmissionSHA256 == "" {
-		return result, errors.New("committed attempt report receipt is missing")
 	}
 	switch result.State {
 	case "live", "proof_pending", "accepted", "failed", "expired", "fenced":

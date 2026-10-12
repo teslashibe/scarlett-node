@@ -478,7 +478,9 @@ paths:
         Report retries require this explicit contract. Persistence idempotency never
         authorizes repeated provider execution. live means no committed report;
         proof_pending means the verifier owns ingestion; accepted/failed are committed
-        outcomes; expired/fenced are permanent for this attempt. Revocation denies new reports and recovery of unreported attempts. A report committed before unpairing or wallet unbinding may finish verification for the buyer; its node may read only that exact attempt status afterward. Recovery does not authorize another provider call.
+        outcomes, with submission_sha256 unless the coordinator decided a relay web
+        attempt from the verifier's own record before the node's report arrived (the
+        node then treats the attempt as done); expired/fenced are permanent for this attempt. Revocation denies new reports and recovery of unreported attempts. A report committed before unpairing or wallet unbinding may finish verification for the buyer; its node may read only that exact attempt status afterward. Recovery does not authorize another provider call.
         A restarted node reports execution_uncertain for a started attempt and must
         not rerun its provider. That failure must not automatically requeue paid work.
       responses:
@@ -1123,7 +1125,7 @@ components:
         fence: {type: string}
         state: {type: string, enum: [live, proof_pending, accepted, failed, expired, fenced]}
         replay_safe: {type: boolean, enum: [true]}
-        submission_sha256: {type: string, pattern: '^[0-9a-f]{64}$', description: Required for accepted/failed reports; exact report bytes committed by the coordinator}
+        submission_sha256: {type: string, pattern: '^[0-9a-f]{64}$', description: 'Hash of the exact report bytes the coordinator committed, for accepted/failed attempts decided by a node report; absent when the verifier''s own record decided a relay web attempt first'}
     Failure:
       type: object
       required: [version, attempt, fence, code]
