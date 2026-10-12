@@ -10,16 +10,20 @@
   },
   "exchanges": [
     {
-      "request_headers": {"Scarlett-Node-Version": "0.1.10"},
-      "response_headers": {"Scarlett-Node-Latest-Version": "0.1.10", "Scarlett-Node-Minimum-Version": "0.1.9"}
+      "request_headers": {"Scarlett-Node-Version": "0.1.18"},
+      "response_headers": {"Scarlett-Node-Latest-Version": "0.1.18", "Scarlett-Node-Minimum-Version": "0.1.17"}
     },
     {
-      "request_headers": {"Scarlett-Node-Version": "0.1.9"},
-      "response_headers": {"Scarlett-Node-Latest-Version": "0.1.10", "Scarlett-Node-Minimum-Version": "0.1.9"}
+      "request_headers": {"Scarlett-Node-Version": "0.1.17"},
+      "response_headers": {"Scarlett-Node-Latest-Version": "0.1.18", "Scarlett-Node-Minimum-Version": "0.1.17"}
     },
     {
-      "request_headers": {"Scarlett-Node-Version": "0.1.8"},
-      "response_headers": {"Scarlett-Node-Latest-Version": "0.1.10", "Scarlett-Node-Minimum-Version": "0.1.9", "Scarlett-Node-Update-Required": "true"}
+      "request_headers": {"Scarlett-Node-Version": "0.1.16"},
+      "response_headers": {"Scarlett-Node-Latest-Version": "0.1.18", "Scarlett-Node-Minimum-Version": "0.1.17", "Scarlett-Node-Update-Required": "true"}
+    },
+    {
+      "request_headers": {"Scarlett-Node-Version": "0.1.16"},
+      "response_headers": {"Scarlett-Node-Latest-Version": "0.1.16", "Scarlett-Node-Minimum-Version": "0.1.17", "Scarlett-Node-Update-Required": "true"}
     },
     {
       "request_headers": {"Scarlett-Node-Version": "0.1.16"},

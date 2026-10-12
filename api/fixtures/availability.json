@@ -1,1 +1,1 @@
-{"version":"node-v2","node_id":"synthetic-node","profile":"standard","state":"available","bid":100,"capacity":2,"services":[{"kind":"x_read","state":"ready","capacity":2,"in_flight":0,"proof_modes":["mpc","relay"]}]}
+{"version":"node-v2","node_id":"synthetic-node","profile":"standard","state":"available","bid":100,"capacity":2,"services":[{"kind":"x_read","state":"ready","capacity":2,"in_flight":0,"max_input_bytes":32768,"proof_modes":["mpc","relay"]}]}
