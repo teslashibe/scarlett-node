@@ -26,10 +26,23 @@ type desktopPreferences struct {
 	// ServeWeb serves web pages as well. It is on unless the operator turned
 	// it off, so a device that never chose serves web after updating.
 	ServeWeb bool `json:"serve_web"`
+	// WebConcurrency is "Web pages at once": 0 is Auto, the node's default
+	// (4 in this release); 1-16 is a fixed number of pages. It applies when
+	// the node next starts.
+	WebConcurrency int `json:"web_concurrency"`
+}
+
+// desktopWebConcurrencyMax bounds the desktop setting below the node's own
+// limit of 32 until the coordinator shares the verifier's web sessions out
+// between nodes.
+const desktopWebConcurrencyMax = 16
+
+func validDesktopWebConcurrency(n int) bool {
+	return n >= 0 && n <= desktopWebConcurrencyMax
 }
 
 func (p desktopPreferences) valid() bool {
-	return p.Schema == 1 && p.LocalAPIPort >= 1024 && p.LocalAPIPort <= 65535 && p.XConcurrency >= 1 && p.XConcurrency <= 8 && (p.Updates == "notify" || p.Updates == "automatic")
+	return p.Schema == 1 && p.LocalAPIPort >= 1024 && p.LocalAPIPort <= 65535 && p.XConcurrency >= 1 && p.XConcurrency <= 8 && (p.Updates == "notify" || p.Updates == "automatic") && validDesktopWebConcurrency(p.WebConcurrency)
 }
 
 func desktopPreferencesCommand(action, path string, input io.Reader, out io.Writer) error {
@@ -58,9 +71,14 @@ func desktopPreferencesCommand(action, path string, input io.Reader, out io.Writ
 	if err != nil {
 		return fail
 	}
+	webCapacityPath := filepath.Join(filepath.Dir(path), "web-capacity-preferences-v1.json")
+	webConcurrency, err := readDesktopWebConcurrency(webCapacityPath)
+	if err != nil {
+		return fail
+	}
 	p.XConcurrency = throughput.XConcurrency
 	p.Updates, p.ResumeServing = lifecycle.Updates, lifecycle.ResumeServing
-	p.ServeWeb = serveWeb
+	p.ServeWeb, p.WebConcurrency = serveWeb, webConcurrency
 	switch action {
 	case "preferences-get":
 		f, err := localfs.OpenPrivate(path)
@@ -71,7 +89,7 @@ func desktopPreferencesCommand(action, path string, input io.Reader, out io.Writ
 			}
 			p.XConcurrency = throughput.XConcurrency
 			p.Updates, p.ResumeServing = lifecycle.Updates, lifecycle.ResumeServing
-			p.ServeWeb = serveWeb
+			p.ServeWeb, p.WebConcurrency = serveWeb, webConcurrency
 		} else if !os.IsNotExist(err) {
 			return fail
 		}
@@ -89,9 +107,10 @@ func desktopPreferencesCommand(action, path string, input io.Reader, out io.Writ
 		extension, extensionErr := json.Marshal(desktopThroughputPreferences{Schema: 1, XConcurrency: p.XConcurrency})
 		lifecycleRaw, lifecycleErr := json.Marshal(desktopLifecyclePreferences{Schema: 1, Updates: p.Updates, ResumeServing: p.ResumeServing})
 		webRaw, webErr := json.Marshal(desktopWebPreferences{Schema: 1, ServeWeb: &p.ServeWeb})
-		if err != nil || extensionErr != nil || lifecycleErr != nil || webErr != nil || localfs.WriteAtomic(throughputPath, extension, true) != nil ||
+		webCapacityRaw, webCapacityErr := json.Marshal(desktopWebCapacityPreferences{Schema: 1, WebConcurrency: &p.WebConcurrency})
+		if err != nil || extensionErr != nil || lifecycleErr != nil || webErr != nil || webCapacityErr != nil || localfs.WriteAtomic(throughputPath, extension, true) != nil ||
 			localfs.WriteAtomic(lifecyclePath, lifecycleRaw, true) != nil || localfs.WriteAtomic(webPath, webRaw, true) != nil ||
-			localfs.WriteAtomic(path, raw, true) != nil {
+			localfs.WriteAtomic(webCapacityPath, webCapacityRaw, true) != nil || localfs.WriteAtomic(path, raw, true) != nil {
 			return fail
 		}
 	default:
@@ -107,6 +126,7 @@ func decodeDesktopPreferences(input io.Reader, p *desktopPreferences) bool {
 	}
 	// Existing schema-1 files have no X concurrency, lifecycle or web settings.
 	// Normalize the defaults on reads without writing or changing any account.
+	// Web pages at once defaults to Auto (zero).
 	*p = desktopPreferences{XConcurrency: 2, Updates: "notify", ServeWeb: true}
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.DisallowUnknownFields()
@@ -203,4 +223,34 @@ func readDesktopWebPreference(path string) (bool, error) {
 		return false, errors.New("invalid web preferences")
 	}
 	return *p.ServeWeb, nil
+}
+
+// "Web pages at once", in its own extension file for the same reason as the
+// web setting: every earlier release decodes its own files strictly and never
+// opens this one, so a rollback still starts. Absent, it is Auto (zero).
+type desktopWebCapacityPreferences struct {
+	Schema         int  `json:"schema"`
+	WebConcurrency *int `json:"web_concurrency"`
+}
+
+func readDesktopWebConcurrency(path string) (int, error) {
+	f, err := localfs.OpenPrivate(path)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, 1025))
+	if err != nil || len(raw) > 1024 {
+		return 0, errors.New("invalid web capacity preferences")
+	}
+	var p desktopWebCapacityPreferences
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.DisallowUnknownFields()
+	if d.Decode(&p) != nil || d.Decode(&struct{}{}) != io.EOF || p.Schema != 1 || p.WebConcurrency == nil || !validDesktopWebConcurrency(*p.WebConcurrency) {
+		return 0, errors.New("invalid web capacity preferences")
+	}
+	return *p.WebConcurrency, nil
 }

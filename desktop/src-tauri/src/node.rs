@@ -325,10 +325,24 @@ pub struct Node {
     web: AtomicBool,
     /// The web setting the supervised child was started with.
     web_running: AtomicBool,
+    /// Web pages at once for the next child: 0 is Auto (the node default).
+    web_concurrency: std::sync::atomic::AtomicU8,
     /// An explicit SCARLETT_WEB_BROWSER ("on" or "off") from the same trusted
     /// environment, passed on only with web. Unset, the node's platform
     /// default applies (on for macOS, off for Windows in this release).
     web_browser: Option<&'static str>,
+}
+
+/// Auto's page count until the node tunes its own (the node default).
+const AUTO_WEB_CONCURRENCY: u8 = 4;
+
+fn web_concurrency_env(setting: u8) -> String {
+    if setting == 0 {
+        AUTO_WEB_CONCURRENCY
+    } else {
+        setting
+    }
+    .to_string()
 }
 
 pub fn valid_id(id: &str) -> bool {
@@ -737,6 +751,7 @@ impl Node {
             x_login_browser: None,
             web: AtomicBool::new(crate::preferences::default_serve_web()),
             web_running: AtomicBool::new(false),
+            web_concurrency: std::sync::atomic::AtomicU8::new(0),
             web_browser: None,
         }
     }
@@ -782,6 +797,15 @@ impl Node {
     /// serving as it was started until the operator stops and starts it.
     pub fn set_web(&self, enabled: bool) {
         self.web.store(enabled, Ordering::SeqCst);
+    }
+    /// Web pages at once for the next child process: 0 is Auto. Like X
+    /// concurrency, a running node keeps the value it was started with.
+    pub fn set_web_concurrency(&self, concurrency: u8) -> Result<()> {
+        if concurrency > crate::preferences::MAX_WEB_CONCURRENCY {
+            return Err(Error::InvalidInput);
+        }
+        self.web_concurrency.store(concurrency, Ordering::SeqCst);
+        Ok(())
     }
     pub fn network_url(&self, destination: &str) -> Result<String> {
         let path = match destination {
@@ -862,7 +886,10 @@ impl Node {
         #[cfg(windows)]
         cmd.creation_flags(0x08000000);
         if web {
-            cmd.env("SCARLETT_WEB_CONCURRENCY", "4");
+            cmd.env(
+                "SCARLETT_WEB_CONCURRENCY",
+                web_concurrency_env(self.web_concurrency.load(Ordering::SeqCst)),
+            );
             if let Some(browser) = self.web_browser {
                 cmd.env("SCARLETT_WEB_BROWSER", browser);
             }
@@ -2806,6 +2833,27 @@ esac
         );
         assert_eq!(web["SCARLETT_WEB_CONCURRENCY"].as_deref(), Some("4"));
         assert!(!web.contains_key("SCARLETT_WEB_EGRESS_PROXY"));
+        // Web pages at once: Auto passes the node's own default, a fixed
+        // number passes through, and anything above the desktop ceiling is
+        // refused without changing the saved value.
+        node.set_web_concurrency(12).unwrap();
+        assert_eq!(
+            env(&node)["SCARLETT_WEB_CONCURRENCY"].as_deref(),
+            Some("12")
+        );
+        for invalid in [crate::preferences::MAX_WEB_CONCURRENCY + 1, u8::MAX] {
+            assert_eq!(node.set_web_concurrency(invalid), Err(Error::InvalidInput));
+        }
+        assert_eq!(
+            env(&node)["SCARLETT_WEB_CONCURRENCY"].as_deref(),
+            Some("12")
+        );
+        node.set_web_concurrency(0).unwrap();
+        assert_eq!(env(&node)["SCARLETT_WEB_CONCURRENCY"].as_deref(), Some("4"));
+        assert!(
+            include_str!("../../../internal/config/config.go")
+                .contains("c.WebConcurrency = 1, 1, 32, 4")
+        );
         // The node's platform default applies unless the trusted environment
         // set the browser tier explicitly; it is passed on only with web.
         assert!(!web.contains_key("SCARLETT_WEB_BROWSER"));

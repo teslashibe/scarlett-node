@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { layout } from "../src/layout.ts";
 import {
+  validWebConcurrency,
+  WEB_CONCURRENCY_CHOICES,
   canConnectCodex,
   canStart,
   claudeStatusText,
@@ -427,4 +430,14 @@ test("Missing web status stays unknown instead of guessing", () => {
     delete web[field];
     assert.equal(availableWebSlots(webNode(web)), undefined, field);
   }
+});
+
+test("Web pages at once offers Auto and the listed page counts only", () => {
+  assert.deepEqual([...WEB_CONCURRENCY_CHOICES], [0, 2, 4, 8, 12, 16]);
+  for (const n of WEB_CONCURRENCY_CHOICES) assert.ok(validWebConcurrency(n), String(n));
+  for (const n of [-1, 1, 3, 17, 32, 1.5, Number.NaN]) assert.equal(validWebConcurrency(n), false, String(n));
+  // The settings menu offers exactly these choices, Auto first.
+  const select = /<select id="web-concurrency">(.*?)<\/select>/.exec(layout)?.[1] ?? "";
+  assert.deepEqual([...select.matchAll(/<option value="(\d+)">/g)].map(m => Number(m[1])), [...WEB_CONCURRENCY_CHOICES]);
+  assert.match(select, /<option value="0">Auto \(recommended\)<\/option>/);
 });

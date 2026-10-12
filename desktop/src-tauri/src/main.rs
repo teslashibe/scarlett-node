@@ -192,6 +192,7 @@ async fn save_desktop_preferences(
     let _guard = runtime.0.lock().await;
     node.save_preferences(&data).await?;
     node.set_x_concurrency(data.x_concurrency)?;
+    node.set_web_concurrency(data.web_concurrency)?;
     node.set_web(data.serve_web);
     preferences.updated(data)
 }
@@ -716,6 +717,9 @@ fn main() {
             app.state::<Arc<Node>>()
                 .set_x_concurrency(saved.x_concurrency)
                 .map_err(|_| "invalid desktop X concurrency")?;
+            app.state::<Arc<Node>>()
+                .set_web_concurrency(saved.web_concurrency)
+                .map_err(|_| "invalid desktop web concurrency")?;
             app.state::<Arc<Node>>().set_web(saved.serve_web);
             let updater = Arc::new(Updater::new(
                 app.package_info().version.to_string(),

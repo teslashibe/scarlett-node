@@ -18,7 +18,7 @@ type Scenario = typeof scenarios[number];
 const requested = new URLSearchParams(location.search).get("scenario");
 const scenario: Scenario = scenarios.includes(requested as Scenario) ? requested as Scenario : "ready";
 const at = (secondsAgo = 0) => new Date(Date.now() - secondsAgo * 1000).toISOString();
-let preferences: Preferences = { schema: 1, local_api_port: 8088, background: true, x_concurrency: 2, updates: "notify", resume_serving: true, serve_web: true };
+let preferences: Preferences = { schema: 1, local_api_port: 8088, background: true, x_concurrency: 2, updates: "notify", resume_serving: true, serve_web: true, web_concurrency: 0 };
 let webRunning = true;
 let autostart = false;
 let claude: ClaudeStatus = { available: true, connected: false, pending: false };
