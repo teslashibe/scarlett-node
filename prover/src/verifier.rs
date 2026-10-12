@@ -2870,13 +2870,14 @@ mod web_tests {
         let mut daemon = Daemon::start().await;
         // No warm pool: hop 0 dials.
         daemon.send(json!({"type": "pool", "size": 0, "verifier": verifier.to_string(), "verifier_ca_file": null, "plaintext_fixture": true})).await;
-        daemon.send(json!({"type": "hop", "id": "h0", "job": "j1", "input": daemon_input(verifier, proxy, 0, "https://example.com/", Some(&token))})).await;
+        daemon.send(json!({"type": "hop", "id": "h0", "input": daemon_input(verifier, proxy, 0, "https://example.com/", Some(&token))})).await;
         let (reply, presenting) = daemon.result("h0").await;
         assert!(presenting);
         assert_eq!((reply["summary"]["final"].as_bool(), reply["summary"]["next_url"].as_str()), (Some(false), Some("https://www.example.com/next")));
         assert!(phases(&reply).contains(&"pool_checkout_cold".into()) && phases(&reply).contains(&"verifier_tcp_connect".into()));
-        // The verifier kept the connection for the job's next hop, which takes it.
-        daemon.send(json!({"type": "hop", "id": "h1", "job": "j1", "input": daemon_input(verifier, proxy, 1, "https://www.example.com/next", Some(&token))})).await;
+        // The verifier kept the connection for the job's next hop, which takes it:
+        // the hops share their token, which groups them.
+        daemon.send(json!({"type": "hop", "id": "h1", "input": daemon_input(verifier, proxy, 1, "https://www.example.com/next", Some(&token))})).await;
         let (reply, _) = daemon.result("h1").await;
         assert_eq!((reply["summary"]["final"].as_bool(), reply["summary"]["status_code"].as_u64()), (Some(true), Some(200)));
         assert!(phases(&reply).contains(&"pool_checkout_warm".into()) && !phases(&reply).contains(&"verifier_tcp_connect".into()), "{:?}", phases(&reply));

@@ -13,8 +13,9 @@
 //! - `{"type":"hop","id":"<id>","job":"<key>","input":{…}}` starts a hop:
 //!   `input` is `relay-web`'s input without `predial`, its `token`
 //!   optional. Without one the hop takes a connection and waits for
-//!   `token`. `job` (optional) groups a job's hops, so a redirect hop gets
-//!   the connection its previous hop left.
+//!   `token`. A redirect hop gets the connection its previous hop left: the
+//!   daemon groups a job's hops by their token (they share it), or by `job`
+//!   when given.
 //! - `{"type":"token","id":"<id>","token":"<64 lowercase hex>"}`: the
 //!   accept returned the token; the hop runs.
 //! - `{"type":"cancel","id":"<id>"}`: the accept failed. The hop ends; it
@@ -189,6 +190,12 @@ struct CancelRequest {
     id: String,
 }
 
+/// The key a job's hops share, from their token: never the token itself.
+fn token_key(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(token.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
 fn valid_id(id: &str) -> bool {
     (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
@@ -309,7 +316,10 @@ async fn hop(shared: &Arc<Shared>, id: &str, job: Option<String>, input: Value, 
         Err(error) => return failed(error, false),
     };
     let verifier = hop.verifier();
-    let source = match checkout(shared, job.as_deref(), &verifier) {
+    // The job's hops share their token; a hop that has it can take the
+    // connection the job's last hop left.
+    let affinity = job.clone().or_else(|| hop.token().map(token_key));
+    let source = match checkout(shared, affinity.as_deref(), &verifier) {
         Some(mut link) => {
             trace.span(Phase::PoolCheckoutWarm).finish(Outcome::Success);
             link.take();
@@ -356,11 +366,12 @@ async fn hop(shared: &Arc<Shared>, id: &str, job: Option<String>, input: Value, 
             }
         }
     };
+    let affinity = job.or_else(|| Some(token_key(&token)));
     let presenting = shared.replies.written(Reply::Presenting { id: id.to_owned() });
     match node::finish(&hop, &token, source, trace, presenting).await {
         Ok((mut summary, kept)) => {
             // The job's next hop takes the connection its redirect left.
-            give_back(shared, job.as_deref(), kept, !summary.is_final);
+            give_back(shared, affinity.as_deref(), kept, !summary.is_final);
             summary.diagnostics = Some(trace.snapshot());
             Reply::Summary { id: id.to_owned(), summary }
         }
