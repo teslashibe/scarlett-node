@@ -165,8 +165,10 @@ enum Start {
 #[serde(deny_unknown_fields)]
 struct PoolRequest {
     size: usize,
-    #[serde(flatten)]
-    verifier: VerifierAddress,
+    verifier: String,
+    verifier_ca_file: Option<String>,
+    #[serde(default)]
+    plaintext_fixture: bool,
 }
 
 #[derive(Deserialize)]
@@ -260,14 +262,15 @@ where
 }
 
 fn set_pool(shared: &Shared, request: PoolRequest) {
+    let verifier = VerifierAddress { address: request.verifier, ca_file: request.verifier_ca_file, plaintext_fixture: request.plaintext_fixture };
     let mut pool = shared.pool.lock().unwrap_or_else(|e| e.into_inner());
-    if pool.verifier.as_ref() != Some(&request.verifier) {
+    if pool.verifier.as_ref() != Some(&verifier) {
         // Another verifier: nothing from the old one is kept.
         pool.idle.clear();
         pool.reserved.clear();
         pool.failures = 0;
         pool.retry_at = None;
-        pool.verifier = Some(request.verifier);
+        pool.verifier = Some(verifier);
     }
     pool.size = request.size.min(MAX_POOL);
     drop(pool);
@@ -565,7 +568,8 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn requests_are_checked_and_ends_of_input_stop_the_daemon() {
         let mut daemon = Daemon::start().await;
-        // A hop with a bad id, a hop that cannot run, an unknown token: told, ignored.
+        // A pool request with a field it does not know ends the daemon (below);
+        // a hop with a bad id, a hop that cannot run, an unknown token: told, ignored.
         daemon.send(serde_json::json!({"type": "hop", "id": "bad id", "input": {}})).await;
         let reply = daemon.next().await;
         assert_eq!((reply["type"].as_str(), reply["class"].as_str(), reply["presented"].as_bool()), (Some("error"), Some("fetch_failed"), Some(false)));
@@ -575,9 +579,11 @@ pub(crate) mod tests {
         daemon.send(serde_json::json!({"type": "token", "id": "nobody", "token": "a".repeat(64)})).await;
         daemon.send(serde_json::json!({"type": "cancel", "id": "nobody"})).await;
         assert!(daemon.close().await.unwrap().is_ok());
-        // An unknown request ends it with an error.
-        let mut daemon = Daemon::start().await;
-        daemon.send(serde_json::json!({"type": "shell"})).await;
-        assert!(daemon.task.await.unwrap().is_err());
+        // An unknown request, or an unknown field, ends it with an error.
+        for request in [serde_json::json!({"type": "shell"}), serde_json::json!({"type": "pool", "size": 2, "verifier": "127.0.0.1:1", "verifier_ca_file": null, "extra": 1})] {
+            let mut daemon = Daemon::start().await;
+            daemon.send(request).await;
+            assert!(daemon.task.await.unwrap().is_err());
+        }
     }
 }

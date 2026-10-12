@@ -10,6 +10,11 @@ so a change here that the code does not make fails the build.
 Pre-launch rule: these shapes replace the old ones directly. There is no
 compatibility mode. Release order is app, then verifier, then node.
 
+Node 0.1.17 adds, with this verifier: revocation (section 10), the event
+feed (11), relay transport 2 with kept connections, PING/PONG and capped
+waiting connections (12), the `relay-web` pre-dial (13) and the
+`scarlett-prover serve` daemon (14).
+
 ## 1. The page ceiling
 
 | Name | Value | Meaning |
@@ -31,6 +36,10 @@ New variables, validated at startup (the verifier refuses to start otherwise):
 |---|---|---|---|
 | `SCARLETT_VERIFIER_MAX_WEB_BYTES` | 201,326,592 | 67,767,188 to 1,099,511,627,776 | `MAX_WEB_BYTES + MAX_RECORD_BYTES <= MAX_TOTAL_BYTES`, so one full X or Codex receipt always fits beside the web pool |
 | `SCARLETT_VERIFIER_WEB_CONCURRENCY` | 48 | 1 to 240 | `WEB_CONCURRENCY <= CONCURRENCY - 16`, so X and Codex always keep 16 session slots |
+
+Connections waiting for a token are capped by
+`SCARLETT_VERIFIER_PRE_TOKEN_LIMIT` and `SCARLETT_VERIFIER_PRE_TOKEN_PER_ADDRESS`
+(section 12.3).
 
 Unchanged: `SCARLETT_VERIFIER_MAX_RECORDS` (1024), `SCARLETT_VERIFIER_MAX_RECORD_BYTES`
 (67,108,864, at most that), `SCARLETT_VERIFIER_MAX_TOTAL_BYTES` (268,435,456),

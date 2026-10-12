@@ -372,14 +372,10 @@ impl Hop {
 }
 
 /// Where and how to reach the verifier.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifierAddress {
-    #[serde(rename = "verifier")]
     pub address: String,
-    #[serde(rename = "verifier_ca_file")]
     pub ca_file: Option<String>,
-    #[serde(default)]
     pub plaintext_fixture: bool,
 }
 

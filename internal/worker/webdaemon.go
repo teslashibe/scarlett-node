@@ -5,10 +5,12 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -83,12 +85,16 @@ type webDaemon struct {
 	ready chan struct{}
 	gone  chan struct{}
 	once  sync.Once
+	// stderr holds what a daemon said before it died: never a secret.
+	stderr *limitedBuffer
 
 	mu   sync.Mutex
 	hops map[string]*daemonHop
 	dead bool
-	next uint64
-	pool int
+	// stopped: the node ended it, rather than it dying on its own.
+	stopped bool
+	next    uint64
+	pool    int
 }
 
 var webDaemons = struct {
@@ -200,12 +206,28 @@ func startDaemon(key daemonKey) *webDaemon {
 		webDaemons.Unlock()
 		return nil
 	}
-	var stderr limitedBuffer
-	stderr.max = maxWebStderr
-	cmd.Stdout, cmd.Stderr = stdoutW, &stderr
+	d.stderr = &limitedBuffer{max: maxWebStderr}
+	cmd.Stdout, cmd.Stderr = stdoutW, d.stderr
+	exited := make(chan struct{})
 	go func() {
 		process.Run(cmd)
 		stdoutW.Close()
+		close(exited)
+	}()
+	go func() {
+		// A daemon that dies on its own says why, once, in the node's log.
+		<-exited
+		d.mu.Lock()
+		stopped := d.stopped
+		d.mu.Unlock()
+		if line, _, _ := strings.Cut(strings.TrimSpace(d.stderr.String()), "\n"); !stopped && line != "" {
+			fmt.Fprintln(os.Stderr, "web helper daemon ended:", strings.Map(func(r rune) rune {
+				if r < 0x20 || r == 0x7f {
+					return ' '
+				}
+				return r
+			}, line[:min(len(line), 240)]))
+		}
 	}()
 	go d.write(stdin)
 	go d.read(stdoutR)
@@ -288,6 +310,7 @@ func (d *webDaemon) fail(crashed bool) {
 		return
 	}
 	d.dead = true
+	d.stopped = !crashed
 	hops := d.hops
 	d.hops = map[string]*daemonHop{}
 	close(d.queue)
