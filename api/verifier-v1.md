@@ -10,6 +10,11 @@ so a change here that the code does not make fails the build.
 Pre-launch rule: these shapes replace the old ones directly. There is no
 compatibility mode. Release order is app, then verifier, then node.
 
+Node 0.1.17 adds, with this verifier: revocation (section 10), the event
+feed (11), relay transport 2 with kept connections, PING/PONG and capped
+waiting connections (12), the `relay-web` pre-dial (13) and the
+`scarlett-prover serve` daemon (14).
+
 ## 1. The page ceiling
 
 | Name | Value | Meaning |
@@ -31,6 +36,10 @@ New variables, validated at startup (the verifier refuses to start otherwise):
 |---|---|---|---|
 | `SCARLETT_VERIFIER_MAX_WEB_BYTES` | 201,326,592 | 67,767,188 to 1,099,511,627,776 | `MAX_WEB_BYTES + MAX_RECORD_BYTES <= MAX_TOTAL_BYTES`, so one full X or Codex receipt always fits beside the web pool |
 | `SCARLETT_VERIFIER_WEB_CONCURRENCY` | 48 | 1 to 240 | `WEB_CONCURRENCY <= CONCURRENCY - 16`, so X and Codex always keep 16 session slots |
+
+Connections waiting for a token are capped by
+`SCARLETT_VERIFIER_PRE_TOKEN_LIMIT` and `SCARLETT_VERIFIER_PRE_TOKEN_PER_ADDRESS`
+(section 12.3).
 
 Unchanged: `SCARLETT_VERIFIER_MAX_RECORDS` (1024), `SCARLETT_VERIFIER_MAX_RECORD_BYTES`
 (67,108,864, at most that), `SCARLETT_VERIFIER_MAX_TOTAL_BYTES` (268,435,456),
@@ -228,3 +237,236 @@ other → `fetch_failed`. The full class set is `connect_failed`,
 failures `verifier: job <id> web hop <n> failed: <reason>` with the timing
 limit in parentheses for `session_timeout`; `verifier: job <id> web session
 refused: verifier_busy`. Never the URL, host or page content.
+
+## 10. Revocation: `DELETE /v1/sessions/{job_id}/{attempt}`
+
+Added with node 0.1.17. Key auth as for every route. The app revokes a
+registration whose token must never be presented: a hedge loser that
+registered before another node's accept won, or an attempt it supersedes.
+Sessions are keyed by attempt, so revoking one attempt never touches another
+attempt of the same job.
+
+```
+DELETE /v1/sessions/{job_id}/{attempt}
+Authorization: Bearer <SCARLETT_VERIFIER_KEY>
+
+204 No Content                               revoked now, or nothing left to revoke
+404 {"error":"unknown session"}              no such receipt (never registered, or purged)
+409 {"error":"session in flight"}            a hop or proof is running under it now
+409 {"error":"session complete"}             it holds its result: a complete web chain,
+                                             a complete X read or an accepted Codex proof
+401, 503                                     as on every route
+```
+
+Fixtures: `revoke-unknown.json`, `revoke-in-flight.json`,
+`revoke-complete.json`; a 204 has no body.
+
+A revocation, under the verifier's session lock:
+
+- removes the token, so presenting it is refused as for any unknown token,
+  and nothing reaches a target;
+- expires the receipt now (`expires_at_ms` becomes the revocation time), so it
+  is resolved: a web receipt stops being charged `web_reservation` and is
+  charged its JSON size only, and the web pool can take another page at once;
+- keeps whatever the receipt verified or rejected. `GET` reads a revoked
+  receipt as an expired one (`"status":"expired"` when it never ran), and it
+  is purged with the usual retention after its new expiry;
+- is committed before the 204. If the commit fails the answer is 503 and the
+  verifier stops, as for any state it could not write; nothing was
+  acknowledged.
+
+It is idempotent: revoking a revoked, expired or rejected session again is a
+204 that changes nothing. A revoked attempt cannot be registered again
+(`409 session already exists for this attempt`). A 409 means the session's
+outcome is the caller's: an in-flight hop ends with its own commit (complete
+or rejected) within its timing limits, and a complete page is ingested and
+released with `DELETE …/body` as before.
+
+The Caddy control route already passes `/v1/sessions/*` with any method.
+Logs: `verifier: job <id> session revoked`.
+
+## 11. Event feed: `GET /v1/events`
+
+Added with node 0.1.17 (design C2). Key auth as for every route; the Caddy
+control route must pass `/v1/events`. The app long-polls it to learn that a
+web session's hop chain ended, from the verifier on loopback, without
+waiting for the node's `proven` report.
+
+```
+GET /v1/events?after=<seq>&wait=<1..25>[&epoch=<epoch>]
+Authorization: Bearer <SCARLETT_VERIFIER_KEY>
+
+200 {"epoch":"<32 hex>","events":[{"seq":41,"job_id":"…","attempt":"…","kind":"complete","committed_at_ms":1791400100000}],"next":41}
+200 {"epoch":"<32 hex>","events":[],"next":42,"reset":true}
+204                                          `wait` seconds passed with no event
+400 {"error":"invalid after"}                `after` missing or not a decimal integer
+400 {"error":"invalid wait"}                 `wait` outside 1-25 (default 20)
+401, 503                                     as on every route
+```
+
+Fixtures: `events.json`, `events-reset.json`.
+
+- **Events.** One per terminal commit of a web session (relay and browser
+  policies alike), appended only after the commit: `complete` once the
+  final hop's receipt and its body file are durable (the page can be read
+  with `GET …/body` at once), `rejected` once a hop's rejection is
+  committed. A followable redirect hop, a `verifier_busy` refusal (nothing
+  spent), a revocation and expiry are not events. X and Codex sessions
+  have none in this release.
+- **Positions.** `seq` counts from 1 in each epoch. A reply carries the
+  events with `seq > after`, oldest first, at most 1000; `next` is the last
+  one's `seq` (or `after` itself when there are none), to pass as `after`
+  next. The reply comes as soon as there is at least one event, else after
+  `wait` seconds as 204.
+- **Epoch and reset.** `epoch` is random per verifier process start. The
+  ring keeps the last 10,000 events in memory only. When `after` is not a
+  position this ring can continue from (beyond its newest event, which is
+  what a position from before a restart looks like, or older than the
+  oldest event it still holds) or the request's `epoch` is not the current
+  one, the answer is immediate: no events, `"reset":true` and the newest
+  `seq` as `next`. The consumer then re-syncs from its own records (the
+  node reports and the reconciler, which never depended on the feed) and
+  continues from `next`. Pass the last reply's `epoch` to have a restart
+  detected even when the new process's positions overlap the old ones.
+- **Ingestion stays idempotent** by attempt and fence on the app's side: an
+  event and the node's `proven` report for the same attempt may both arrive.
+- The verifier never holds its session lock while a request waits, and has
+  no outbound calls: it still holds no app credentials.
+
+## 12. Relay transport 2: kept connections, PING/PONG, waiting connections
+
+Added with node 0.1.17 (design C1, server side). One-shot transport 1 is
+gone: every relay session (web and X) declares transport 2.
+
+### 12.1 Frames
+| Kind | Byte | Direction | Payload |
+|---|---|---|---|
+| `HELLO` | 1 | supplier → verifier | `{"version":1,"transfers":<n>,"transport":2}` (`relay-hello.json`). `transport` is required and must be 2; any other hello ends the session. |
+| `DONE` | 23 | verifier → supplier | `{"status":"complete","keep":true}` or `…"keep":false}` (`relay-done-keep.json`). |
+| `PING` | 27 | supplier → verifier | empty; only while the connection waits for a token |
+| `PONG` | 28 | verifier → supplier | empty; the answer to each `PING` |
+
+Outside a session a connection carries only the token line
+(`<64 lowercase hex>\n`, as before), `PING` and `PONG`. No frame kind is a
+lowercase hex digit, so the first byte tells a token from a frame.
+
+### 12.2 Session loop
+- **keep.** After a verified web hop the verifier sends `OUTCOME` and then
+  `DONE` with `"keep":true` when the connection may wait for the
+  supplier's next token, which takes it back to the waiting state of 12.3.
+  With `"keep":false` it closes. X relay sessions always end with
+  `"keep":false`; Codex and MPC sessions are TLSNotary and close as before.
+- **Fail-closed.** After `FAILED` (including `verifier_busy`), or any
+  framing or protocol error, the verifier closes the connection. A supplier
+  reuses a connection only after an explicit `"keep":true` and never after
+  a failure; a `DONE` it cannot parse means close.
+- **Every session presents its own token,** and starts from fresh state:
+  its own rustls client to the target, keys, sequence numbers and OT. The
+  session's traffic keys are wiped from memory when it ends, before the
+  connection reads another token (rustls wipes its copies; the verifier
+  overwrites its record keys and the revealed client key in place).
+- **Web only.** A kept connection takes web tokens only. Any other kind of
+  token on it closes the connection without spending anything.
+- **Stragglers.** The supplier may still be forwarding the last target's
+  bytes when `DONE` goes out. While a kept connection waits, `FROM_SERVER`
+  and `SERVER_EOF` frames are discarded unread (at most 256 KiB per wait);
+  on a new connection they close it.
+
+### 12.3 Waiting for a token
+- A new connection must send its token or a `PING` within **10 s** of its
+  TLS handshake. Its first `PING` gives it the long wait: **60 s** from when
+  it began waiting. A kept connection waits **60 s** from `DONE`. The wait is
+  absolute: `PING`s are answered but do not extend it further, and a wait
+  answers at most 16 of them. When the wait runs out the connection closes.
+- The supplier pings every 15 s while idle and retires connections idle
+  for 45 s, well inside the 60 s.
+- **Places.** Every connection that has not presented a token, new or kept,
+  holds a waiting place: at most `SCARLETT_VERIFIER_PRE_TOKEN_LIMIT` (2,048)
+  in all and `SCARLETT_VERIFIER_PRE_TOKEN_PER_ADDRESS` (8) per source
+  address (an IPv4 address, or an IPv6 /64). A connection that finds no
+  place is closed right after the TCP accept. A kept connection needs a
+  place again at `DONE`; without one `DONE` says `"keep":false`.
+- **Session slots.** A connection takes one of `SCARLETT_VERIFIER_CONCURRENCY`
+  session slots only when its token arrives (it used to take one at TCP
+  accept), and gives it back when the session ends. A web session that
+  finds no session slot or web slot gets `FAILED {"reason":"verifier_busy"}`
+  and nothing is spent; an X or Codex session that finds no session slot is
+  closed unspent.
+
+| Variable | Default | Range |
+|---|---|---|
+| `SCARLETT_VERIFIER_PRE_TOKEN_LIMIT` | 2048 | 16 to 65,536 |
+| `SCARLETT_VERIFIER_PRE_TOKEN_PER_ADDRESS` | 8 | 1 to the limit |
+
+A local harness that runs several nodes on one address (127.0.0.1) needs a
+larger per-address limit: each node may hold two kept connections plus one
+per accept in flight.
+
+### 12.4 Capacity
+`GET /v1/capacity` (`capacity.json`): `active_connections` now counts the
+connections in a session (holding a session slot), and a new `pre_token`
+object reports the waiting connections:
+`{"connections":5,"limit":2048,"per_address_limit":8,"refused_global":0,"refused_per_address":1}`.
+The refusal counters count connections closed at accept for want of a
+place, and kept connections that could not keep one at `DONE`, since the
+verifier started.
+
+## 13. `relay-web` pre-dial (E1)
+
+With node 0.1.17 the node may start a hop's helper before it accepts the
+lease, so the verifier's TCP and TLS round trips overlap the accept.
+
+- The first stdin line is the usual input with `"predial": true` and no
+  `token`. `relay-web` then dials the verifier (TCP and TLS, nothing else)
+  and waits for a second line, `{"token":"<64 lowercase hex>"}`, at most the
+  hop's own `timeout_ms` from its start. Exactly one of `token` and
+  `predial` must be given; the input may end in a newline.
+- **No token before accept.** Until the token line arrives nothing is sent
+  on the verifier connection but, after 5 s, a `PING` that asks for the
+  verifier's long wait. Nothing reaches the target.
+- **Target first, as always.** With the token, the hop connects to the
+  target, then presents the token on the pre-dialed connection, or on a
+  fresh one if the verifier closed it meanwhile or its wait is nearly over
+  (that costs one dial, never a token). Ordering is unchanged: target TCP
+  connect, then the token, then the session.
+- **Abort.** End of input before the token line exits 0 and prints
+  `{"status":"predial_aborted", …verifier counters…, "duration_ms", "diagnostics"}`:
+  no token was sent and no target reached. A malformed token line, or no
+  token by the deadline, fails as `fetch_failed`, unsent.
+- **Diagnostics.** A helper span `predial_wait` covers the wait;
+  `control_config`, `verifier_tcp_connect` and `verifier_tls` keep measuring
+  the dial, which now overlaps it, so the dial's cost on the critical path
+  is its end minus the end of `predial_wait`, when positive.
+
+## 14. `scarlett-prover serve` (C1 node side)
+
+One long-lived helper per node process runs the node's web hops over warm
+verifier connections. Both ways: a big-endian u32 length, then that many
+bytes of JSON (at most 1 MiB). It exits when stdin ends; stdout carries
+only replies.
+
+| Request (stdin) | Meaning |
+|---|---|
+| `{"type":"pool","size":2,"verifier":"host:port","verifier_ca_file":null,"plaintext_fixture":false}` | the verifier and how many warm connections to keep, 0 to 4 (the node sends `min(2, free web slots)`) |
+| `{"type":"hop","id":"<1-64 of [A-Za-z0-9_-]>","job":"<optional>","input":{…}}` | a hop: `relay-web`'s input without `predial`, `token` optional; `job` lets a redirect hop take the connection its previous hop left |
+| `{"type":"token","id":"…","token":"<64 lowercase hex>"}` | the accept returned the token: the hop runs |
+| `{"type":"cancel","id":"…"}` | the accept failed: the hop ends unsent; ignored after a token |
+
+| Reply (stdout) | Meaning |
+|---|---|
+| `{"type":"ready","version":1}` | once, at start |
+| `{"type":"presenting","id":"…"}` | written and flushed right before the hop's token goes out. A node that never got it knows the token was not sent |
+| `{"type":"summary","id":"…","summary":{…}}` | `relay-web`'s summary; its verifier counters cover only what this hop used of the connection |
+| `{"type":"error","id":"…","class":"…","error":"…","presented":false,"diagnostics":{…}}` | `class` as `SCARLETT_WEB_ERROR`; `error` is the one-line cause (it keeps the relay misuse text) |
+| `{"type":"cancelled","id":"…","diagnostics":{…}}` | the hop ended before its token: nothing sent, no target reached |
+
+Pool policy: warm connections are dialed in the background, pinged at once
+(for the verifier's long wait) and every 15 s, retired after 45 s idle, and
+replaced the moment one is taken. A hop takes the connection its job's
+previous hop left (kept up to 10 s), else the most recently used warm one,
+else dials (spans `pool_checkout_warm` / `pool_checkout_cold`). A
+connection found closed or near the end of its wait before the token is
+sent is dropped and the hop dials fresh. After the session, a connection
+the verifier kept goes back to the pool (or is reserved for the job's next
+redirect hop); one that failed is closed. A hop that fails before its
+token (target unreachable, cancelled) gives its connection back.

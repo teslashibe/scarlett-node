@@ -2,6 +2,11 @@
 //! has handed over the application traffic keys. Only the verifier holds
 //! keys, so only the verifier opens records.
 
+use std::{
+    mem::ManuallyDrop,
+    sync::atomic::{Ordering, compiler_fence},
+};
+
 use anyhow::{Result, bail};
 use ring::aead::{AES_128_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 
@@ -43,16 +48,28 @@ pub fn take(buffer: &mut Vec<u8>) -> Result<Option<(u8, Vec<u8>)>> {
     Ok(Some((record[0], record)))
 }
 
-/// One direction's traffic key and position.
+/// Overwrites `bytes` with zeros in a way the compiler keeps, for key
+/// material that is about to go out of use.
+pub fn wipe(bytes: &mut [u8]) {
+    for byte in bytes.iter_mut() {
+        // SAFETY: a valid, aligned, exclusive pointer to one byte.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// One direction's traffic key and position. Wiped when dropped: a session's
+/// keys are gone from memory before its connection serves another session.
 pub struct Keys {
-    key: LessSafeKey,
+    /// Never dropped as a value: `Drop` overwrites it in place instead.
+    key: ManuallyDrop<LessSafeKey>,
     iv: [u8; 12],
     seq: u64,
 }
 
 impl Keys {
     pub fn new(key: &[u8; 16], iv: [u8; 12], seq: u64) -> Result<Self> {
-        Ok(Self { key: LessSafeKey::new(UnboundKey::new(&AES_128_GCM, key).map_err(|_| anyhow::anyhow!("invalid record key"))?), iv, seq })
+        Ok(Self { key: ManuallyDrop::new(LessSafeKey::new(UnboundKey::new(&AES_128_GCM, key).map_err(|_| anyhow::anyhow!("invalid record key"))?)), iv, seq })
     }
 
     /// Opens the next protected record. Returns its inner content type and
@@ -96,12 +113,40 @@ impl Keys {
     }
 }
 
+impl Drop for Keys {
+    fn drop(&mut self) {
+        // ring keeps the expanded key schedule inline in the key and offers
+        // no wipe, so its bytes are overwritten where they are. The key is
+        // in a ManuallyDrop and never used or dropped as a value afterwards.
+        let key: *mut LessSafeKey = &mut *self.key;
+        // SAFETY: `key` is valid and exclusive for size_of::<LessSafeKey>() bytes;
+        // after the writes nothing reads it as a LessSafeKey again.
+        unsafe { (0..size_of::<LessSafeKey>()).for_each(|i| key.cast::<u8>().add(i).write_volatile(0)) };
+        wipe(&mut self.iv);
+        // SAFETY: a valid, aligned, exclusive pointer to the u64.
+        unsafe { std::ptr::write_volatile(&mut self.seq, 0) };
+        compiler_fence(Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn keys(seq: u64) -> Keys {
         Keys::new(b"0123456789abcdef", *b"abcdefghijkl", seq).unwrap()
+    }
+
+    #[test]
+    fn wiping_leaves_only_zeros() {
+        let mut secret = *b"0123456789abcdef";
+        wipe(&mut secret);
+        assert_eq!(secret, [0; 16]);
+        // Keys wipe themselves on drop and keep working until then.
+        let (mut writer, mut reader) = (keys(7), keys(7));
+        let record = writer.seal(APPLICATION_DATA, b"x").unwrap();
+        drop(writer);
+        assert_eq!(reader.open(&record).unwrap(), (APPLICATION_DATA, b"x".to_vec()));
     }
 
     #[test]

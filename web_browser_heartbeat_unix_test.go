@@ -232,8 +232,8 @@ func TestRunLoopServesWebBrowserLease(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var in map[string]any
-			if err := json.Unmarshal(raw, &in); err != nil || in["ip"] != "93.184.215.14" {
+			in, err := relayWebInput(raw)
+			if err != nil || in["ip"] != "93.184.215.14" {
 				t.Fatalf("helper input %v", err)
 			}
 			prewarms, fetches := browser.counts()

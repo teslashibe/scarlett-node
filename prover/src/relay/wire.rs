@@ -2,6 +2,10 @@
 //! kind byte, a big-endian length and the payload. Each kind has its own
 //! size ceiling, so neither side can make the other buffer more than a
 //! session legitimately needs.
+//!
+//! Outside a session a connection carries only the supplier's token line
+//! (`<64 lowercase hex>\n`) and `PING`/`PONG`. No frame kind is a lowercase
+//! hex digit, so the first byte tells a token from a frame.
 
 use anyhow::{Result, bail};
 use serde::{Serialize, de::DeserializeOwned};
@@ -36,6 +40,11 @@ pub const OUTCOME: u8 = 25;
 /// reason comes once the hop's rejection is committed (after OPENING when a
 /// request was sealed).
 pub const FAILED: u8 = 26;
+/// Outside a session only (transport 2): the supplier's keepalive while its
+/// connection waits for a token, and the verifier's answer. Both are empty.
+/// A new connection's first PING gives it the long pre-token wait.
+pub const PING: u8 = 27;
+pub const PONG: u8 = 28;
 
 /// Largest tunnel chunk either side forwards in one frame.
 pub const CHUNK: usize = 32 << 10;
@@ -51,7 +60,7 @@ fn limit(kind: u8) -> Option<usize> {
         // The KOS matrix is 16 bytes per transfer, plus its padding rows.
         KOS_EXTEND => 16 * (MAX_HIDDEN_BITS + 1024) + 64,
         FROM_SERVER | TO_SERVER | PLAIN => CHUNK,
-        SERVER_EOF => 0,
+        SERVER_EOF | PING | PONG => 0,
         REQUEST => MAX_REQUEST + MAX_HIDDEN_BITS / 8 + 256,
         MATERIAL => MAX_RECORD + 16 * MAX_HIDDEN_BITS + 256,
         _ => return None,
@@ -72,6 +81,7 @@ pub async fn send<W: AsyncWrite + Unpin>(w: &mut W, kind: u8, payload: &[u8]) ->
     Ok(())
 }
 
+#[cfg(test)]
 pub async fn recv<R: AsyncRead + Unpin>(r: &mut R) -> Result<(u8, Vec<u8>)> {
     let mut head = [0u8; 5];
     r.read_exact(&mut head).await?;
@@ -125,6 +135,36 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     pub fn get_mut(&mut self) -> &mut R {
         self.buf.clear();
         &mut self.inner
+    }
+
+    /// Fills `out` exactly, from what is buffered first. Unlike `recv` it
+    /// never reads ahead, so after only these reads the stream can be
+    /// handed on whole. Returns false when the stream ended cleanly before
+    /// the first byte; an end within `out` is an error. Not cancel-safe.
+    pub async fn read_exact(&mut self, out: &mut [u8]) -> Result<bool> {
+        let buffered = self.buf.len().min(out.len());
+        out[..buffered].copy_from_slice(&self.buf[..buffered]);
+        self.buf.drain(..buffered);
+        let mut filled = buffered;
+        while filled < out.len() {
+            match self.inner.read(&mut out[filled..]).await {
+                Ok(0) if filled == 0 => return Ok(false),
+                // A TLS peer that closes without close_notify, between items, has still closed.
+                Err(e) if filled == 0 && e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+                Ok(0) => bail!("relay connection closed mid-frame"),
+                Ok(n) => filled += n,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(true)
+    }
+
+    /// The underlying reader, once nothing is buffered.
+    pub fn into_inner(self) -> Result<R> {
+        if !self.buf.is_empty() {
+            bail!("relay connection has unread bytes");
+        }
+        Ok(self.inner)
     }
 }
 

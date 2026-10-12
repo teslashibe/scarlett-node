@@ -205,7 +205,7 @@ pub fn outcome(e: &Exchange) -> (bool, Vec<String>) {
         return (false, Vec::new());
     }
     let Ok(value) = serde_json::from_str::<Value>(&e.body) else { return (false, Vec::new()) };
-    if !value.get("data").and_then(Value::as_object).is_some_and(|d| !d.is_empty()) {
+    if value.get("data").and_then(Value::as_object).is_none_or(|d| d.is_empty()) {
         return (false, Vec::new());
     }
     (true, bottom_cursors(&value))
@@ -387,7 +387,7 @@ fn header_lines<'a>(sent: &'a [u8], mut start: usize, head_end: usize, hidden: &
             bail!("malformed header name");
         }
         for (i, &b) in line.iter().enumerate().skip(colon + 1) {
-            if !is_hidden(start + i) && !(b == b'\t' || (0x20..0x7f).contains(&b)) {
+            if !(is_hidden(start + i) || b == b'\t' || (0x20..0x7f).contains(&b)) {
                 bail!("header {} has a control or non-ASCII byte", String::from_utf8_lossy(name));
             }
         }

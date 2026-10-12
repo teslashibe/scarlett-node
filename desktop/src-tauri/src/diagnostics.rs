@@ -155,6 +155,9 @@ const HELPER_PHASES: &[&str] = &[
     "response_complete",
     "opening_check",
     "proof_finalize",
+    "predial_wait",
+    "pool_checkout_warm",
+    "pool_checkout_cold",
 ];
 fn timestamp(s: &str) -> bool {
     let b = s.as_bytes();

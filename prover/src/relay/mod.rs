@@ -51,6 +51,10 @@ pub mod wire;
 /// Proof policy a relay job must name.
 pub const POLICY: &str = "x-relay-v1";
 pub const VERSION: u8 = 1;
+/// The relay transport every session declares in its hello. With 2 the
+/// verifier may keep a web session's connection for the supplier's next
+/// token after DONE (`"keep":true`); it closes after FAILED or any error.
+pub const TRANSPORT: u8 = 2;
 /// One TLS record carries the whole request with its content type.
 pub const MAX_REQUEST: usize = (1 << 14) - 1;
 pub const MAX_RECORD: usize = MAX_REQUEST + 1;
