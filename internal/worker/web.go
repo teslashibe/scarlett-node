@@ -460,6 +460,12 @@ func (w Web) hop(ctx context.Context, plan webPlan, token string, hop int, targe
 		case <-timer.C:
 			end("verifier_busy")
 		}
+		// A wait that overran by a few milliseconds leaves less than the
+		// second prove needs; the hop failed on a busy verifier, it did not
+		// run out of time.
+		if time.Until(deadline) < time.Second {
+			return webHopOutcome{code: "web_fetch_failed"}
+		}
 	}
 }
 

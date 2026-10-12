@@ -152,6 +152,11 @@ func TestRunLoopTakesSeveralOffersAndRejectsWithoutBlocking(t *testing.T) {
 	answered := make(chan time.Time, 1)
 	reportHeld := make(chan struct{}, 1)
 	release := make(chan struct{})
+	// Ends the held heartbeats once the rejections are in, so the next
+	// heartbeat saves status.json (it is written once per heartbeat).
+	endHolds := make(chan struct{})
+	var endHoldsOnce sync.Once
+	defer endHoldsOnce.Do(func() { close(endHolds) })
 	var releaseOnce sync.Once
 	defer releaseOnce.Do(func() { close(release) })
 	var mu sync.Mutex
@@ -178,7 +183,11 @@ func TestRunLoopTakesSeveralOffersAndRejectsWithoutBlocking(t *testing.T) {
 				return
 			}
 			_, _ = io.Copy(io.Discard, r.Body)
-			<-r.Context().Done()
+			select {
+			case <-r.Context().Done():
+			case <-endHolds:
+				io.WriteString(w, `{"leases":[],"node":{"missed_streak":0,"suspect_until":null}}`)
+			}
 		case strings.HasSuffix(r.URL.Path, "/reject"):
 			var body coordinator.Rejection
 			_ = json.NewDecoder(r.Body).Decode(&body)
@@ -239,8 +248,17 @@ func TestRunLoopTakesSeveralOffersAndRejectsWithoutBlocking(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if s := readStatus(t, node.c.StateDir); s.HeartbeatDiagnostics == nil || s.HeartbeatDiagnostics.RejectedOffers < 4 {
-		t.Fatalf("status did not count the rejections: %+v", s.HeartbeatDiagnostics)
+	// status.json is saved once per heartbeat, so the counts reach it on the
+	// heartbeat after the rejections: end the held one and wait for it.
+	endHoldsOnce.Do(func() { close(endHolds) })
+	for statusDeadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		s := readStatus(t, node.c.StateDir)
+		if s.HeartbeatDiagnostics != nil && s.HeartbeatDiagnostics.RejectedOffers >= 4 {
+			break
+		}
+		if time.Now().After(statusDeadline) {
+			t.Fatalf("status did not count the rejections: %+v", s.HeartbeatDiagnostics)
+		}
 	}
 	releaseOnce.Do(func() { close(release) })
 	node.stop()

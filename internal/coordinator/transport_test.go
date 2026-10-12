@@ -117,7 +117,9 @@ func TestCoordinatorClientSpeaksHTTP2AndReconnectsAfterReset(t *testing.T) {
 	opened = conns
 	mu.Unlock()
 	stats := c.Stats()
-	if opened != 2 || stats.Connections != 2 || stats.RTT <= 0 || stats.RTT > 5*time.Second || stats.AvailabilityPosts != 3 || stats.Goodbyes != 1 || stats.Rejections != 0 {
+	// A loopback answer can take less than one tick of Windows' clock, so
+	// its measured round trip may be exactly zero.
+	if opened != 2 || stats.Connections != 2 || stats.RTT < 0 || stats.RTT > 5*time.Second || stats.AvailabilityPosts != 3 || stats.Goodbyes != 1 || stats.Rejections != 0 {
 		t.Fatalf("after a reset: %d server connections, stats %+v", opened, stats)
 	}
 }
