@@ -31,6 +31,8 @@ import {
   webServing,
   availableWebSlots,
   hiddenBrowser,
+  lastHeartbeat,
+  missedJobs,
   type Metric,
   type XLoginStatus,
   type Account,
@@ -118,6 +120,8 @@ function render(s: Snapshot) {
   setMetric("metric-web", webServing(s));
   setText($("metric-web-capacity"), String(availableWebSlots(s) ?? "Unknown"));
   setMetric("metric-browser", hiddenBrowser(s));
+  setMetric("metric-heartbeat", lastHeartbeat(s));
+  setMetric("metric-missed", missedJobs(s));
   $("accounts-empty").hidden = accounts.length > 0 || draining.length > 0;
   setText($("accounts-empty"), accountsEmptyText(s));
   $("x-profile").toggleAttribute("disabled", busy || !browserProfilesAvailable);

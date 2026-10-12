@@ -31,6 +31,10 @@ import {
   webServing,
   availableWebSlots,
   hiddenBrowser,
+  lastHeartbeat,
+  missedJobs,
+  HEARTBEAT_LATE_MS,
+  type DispatchHealth,
   type ServiceHealth,
   type Snapshot,
 } from "../src/model.ts";
@@ -444,4 +448,67 @@ test("Web pages at once offers Auto and the listed page counts only", () => {
   // fixed number, and the settings copy says so.
   assert.match(layout, /Auto adjusts to your connection/);
   assert.doesNotMatch(layout, /Auto uses \d/);
+});
+
+// A node this app runs, reporting the given status fields.
+const connected = (extra: Partial<NonNullable<Snapshot["observation"]>> = {}, s: Partial<Snapshot> = {}): Snapshot => ({
+  ...base, supervised: true, observation: { state: "running", ...extra }, ...s,
+});
+const NOW = Date.parse("2026-10-11T12:00:00Z");
+const before = (ms: number) => new Date(NOW - ms).toISOString();
+
+test("Last heartbeat says when Scarlett last answered, in plain words", () => {
+  const seen = (ms: number) => lastHeartbeat(connected({ last_heartbeat_ok_at: before(ms) }), NOW);
+  assert.deepEqual(seen(4_000), { value: "Just now", note: "Connected to Scarlett" });
+  assert.deepEqual(seen(42_000), { value: "42 s ago", note: "Connected to Scarlett" });
+  assert.deepEqual(seen(HEARTBEAT_LATE_MS), { value: "1 min ago", note: "Connected to Scarlett" });
+  assert.deepEqual(seen(6 * 60_000), { value: "6 min ago", note: "Not reaching Scarlett · retrying" });
+  assert.deepEqual(seen(3 * 3_600_000), { value: "3 h ago", note: "Not reaching Scarlett · retrying" });
+  assert.equal(seen(3 * 86_400_000).value, "3 days ago");
+  // The node's clock may be a moment ahead of the app's.
+  assert.equal(seen(-2_000).value, "Just now");
+  // RFC 3339 with nanoseconds, as Go writes it.
+  assert.equal(lastHeartbeat(connected({ last_heartbeat_ok_at: "2026-10-11T11:59:30.123456789Z" }), NOW).value, "29 s ago");
+  // Nothing answered yet, Go's zero time, junk, or a node from before the field.
+  for (const value of [undefined, "0001-01-01T00:00:00Z", "soon", ""])
+    assert.deepEqual(lastHeartbeat(connected({ last_heartbeat_ok_at: value }), NOW), { value: "Not yet", note: "Connecting to Scarlett" });
+  // Stopped, it keeps the last answer it had.
+  const stopped: Snapshot = { ...base, observation: { state: "offline", last_heartbeat_ok_at: before(2 * 3_600_000) } };
+  assert.deepEqual(lastHeartbeat(stopped, NOW), { value: "2 h ago", note: "Node stopped" });
+  assert.deepEqual(lastHeartbeat({ ...base, observation: { state: "stopped" } }, NOW), { value: "—", note: "Sent while the node runs" });
+  // A node this app runs whose status has gone stale.
+  assert.deepEqual(lastHeartbeat({ ...stopped, supervised: true }, NOW), { value: "2 h ago", note: "Waiting for node status" });
+  assert.deepEqual(lastHeartbeat({ ...base, supervised: true, observation: { state: "offline" } }, NOW), { value: "Unknown", note: "Waiting for node status" });
+  assert.deepEqual(lastHeartbeat({ ...base, observation: null }, NOW), { value: "Unknown", note: "Waiting for node status" });
+  // A node running outside this app is reported too.
+  assert.equal(lastHeartbeat(connected({ last_heartbeat_ok_at: before(4_000) }, { supervised: false }), NOW).note, "Connected to Scarlett");
+});
+
+test("Missed jobs shows how the coordinator sees this node and tolerates older nodes", () => {
+  const health = (dispatch_health: DispatchHealth | undefined, extra = {}) => missedJobs(connected({ dispatch_health, ...extra }), NOW);
+  assert.deepEqual(health({ missed_streak: 0, suspect_until: null }), { value: "0", note: "No recent misses" });
+  assert.deepEqual(health({ missed_streak: 3, suspect_until: before(-4 * 60_000) }), { value: "3", note: "In a row · fewer jobs here for 4 min" });
+  assert.deepEqual(health({ missed_streak: 1, suspect_until: before(-30_000) }), { value: "1", note: "In a row · fewer jobs here for under a minute" });
+  // Once the suspect window ends the streak stays until the node takes a job.
+  assert.deepEqual(health({ missed_streak: 2, suspect_until: before(1_000) }), { value: "2", note: "In a row · the next job it takes clears this" });
+  assert.deepEqual(health({ missed_streak: 2 }), { value: "2", note: "In a row · the next job it takes clears this" });
+  // Older nodes and malformed values read as unknown, never as zero.
+  for (const value of [undefined, {}, { missed_streak: -1 }, { missed_streak: 1.5 }, { missed_streak: "3" as unknown as number }, { suspect_until: before(-60_000) }])
+    assert.deepEqual(health(value), { value: "Unknown", note: "Waiting for Scarlett" }, JSON.stringify(value));
+  // A streak written beside dispatch_health is read only when it lacks one.
+  assert.deepEqual(health(undefined, { missed_streak: 2 }), { value: "2", note: "In a row · the next job it takes clears this" });
+  assert.equal(health({ missed_streak: 0 }, { missed_streak: 5 }).value, "0");
+  // Stopped, or stale under this app.
+  assert.deepEqual(missedJobs({ ...base, observation: { state: "offline", dispatch_health: { missed_streak: 4 } } }, NOW), { value: "—", note: "Counted while the node runs" });
+  assert.deepEqual(missedJobs({ ...base, supervised: true, observation: { state: "offline" } }, NOW), { value: "Unknown", note: "Waiting for node status" });
+});
+
+test("The connection tiles have the values and notes render fills", () => {
+  for (const id of ["metric-heartbeat", "metric-missed"]) {
+    assert.match(layout, new RegExp(`<strong id="${id}"[^>]*>`));
+    assert.match(layout, new RegExp(`<span id="${id}-note" class="metric-note">`));
+  }
+  assert.match(layout, /<div class="metrics metrics-pair" role="group" aria-label="Connection to Scarlett">/);
+  assert.match(layout, /<span class="metric-label">Last heartbeat<\/span>/);
+  assert.match(layout, /<span class="metric-label">Missed jobs<\/span>/);
 });

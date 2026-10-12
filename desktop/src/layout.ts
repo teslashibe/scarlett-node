@@ -36,6 +36,10 @@ export const layout = `
     <div class="metric"><span class="metric-label">Web pages served</span><strong id="metric-web-served">—</strong><span id="metric-web-served-note" class="metric-note">Checking local history</span></div>
     <div class="metric"><span class="metric-label">Hidden browser</span><strong id="metric-browser" class="metric-word">—</strong><span id="metric-browser-note" class="metric-note">Checking node status</span></div>
   </div>
+  <div class="metrics metrics-pair" role="group" aria-label="Connection to Scarlett">
+    <div class="metric"><span class="metric-label">Last heartbeat</span><strong id="metric-heartbeat" class="metric-word">—</strong><span id="metric-heartbeat-note" class="metric-note">Checking node status</span></div>
+    <div class="metric"><span class="metric-label">Missed jobs</span><strong id="metric-missed" class="metric-word">—</strong><span id="metric-missed-note" class="metric-note">Checking node status</span></div>
+  </div>
   <section id="pair-section" class="panel pairing" aria-labelledby="pair-heading">
     <div class="section-head"><div><h2 id="pair-heading">Pair with Scarlett</h2><p class="section-description">Link this device to your network account</p></div><button id="setup" class="quiet">Open setup ↗</button></div>
     <p>Sign in, redeem your invite and bind your wallet in your browser. Then paste the one-time pairing code here</p>

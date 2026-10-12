@@ -621,6 +621,10 @@ fn observation_projection(raw: &[u8]) -> Result<Value> {
         "state",
         "updated_at",
         "last_heartbeat_at",
+        // When the coordinator last answered a heartbeat.
+        "last_heartbeat_ok_at",
+        // Read only when dispatch_health lacks it.
+        "missed_streak",
         "in_flight",
         "unresolved_attempts",
         "drain_requested",
@@ -702,7 +706,34 @@ fn observation_projection(raw: &[u8]) -> Result<Value> {
             .unwrap_or_default();
         out.insert(key.into(), Value::Array(items));
     }
+    if let Some(health) = source.get("dispatch_health").and_then(dispatch_health) {
+        out.insert("dispatch_health".into(), health);
+    }
     Ok(Value::Object(out))
+}
+/// The coordinator's dispatch health for this node, from its last heartbeat
+/// reply: offers it missed in a row and, while the coordinator sends it fewer
+/// jobs, until when (RFC 3339, null when it does not).
+fn dispatch_health(value: &Value) -> Option<Value> {
+    let source = value.as_object()?;
+    let mut out = serde_json::Map::new();
+    if let Some(streak) = source
+        .get("missed_streak")
+        .and_then(Value::as_u64)
+        .filter(|n| *n <= 1_000_000)
+    {
+        out.insert("missed_streak".into(), streak.into());
+    }
+    match source.get("suspect_until") {
+        Some(Value::Null) => {
+            out.insert("suspect_until".into(), Value::Null);
+        }
+        Some(Value::String(at)) if at.len() <= 40 && !at.chars().any(char::is_control) => {
+            out.insert("suspect_until".into(), Value::String(at.clone()));
+        }
+        _ => {}
+    }
+    Some(Value::Object(out))
 }
 /// Proof modes a service advertises, reduced to the ones this app can name.
 /// Absent means MPC-TLS only, as for every node before the field existed.
@@ -2428,6 +2459,66 @@ esac
             status["services"][2]["browser"]["reason"],
             json!("browser_downloading")
         );
+    }
+    #[test]
+    fn projection_keeps_the_last_answered_heartbeat_and_dispatch_health() {
+        let status = observation_projection(br#"{"state":"running","last_heartbeat_at":"2026-10-11T10:00:01Z","last_heartbeat_ok_at":"2026-10-11T10:00:00.123456789Z","heartbeat_error_class":"timeout","dispatch_health":{"missed_streak":3,"suspect_until":"2026-10-11T10:04:00Z","node_id":"SECRET"}}"#).unwrap();
+        assert!(!status.to_string().contains("SECRET"));
+        assert!(status.get("heartbeat_error_class").is_none());
+        assert_eq!(
+            status["last_heartbeat_ok_at"],
+            json!("2026-10-11T10:00:00.123456789Z")
+        );
+        assert_eq!(
+            status["dispatch_health"],
+            json!({"missed_streak":3,"suspect_until":"2026-10-11T10:04:00Z"})
+        );
+        // Not suspect is null; a node without the fields has neither.
+        let status = observation_projection(
+            br#"{"state":"running","dispatch_health":{"missed_streak":0,"suspect_until":null}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            status["dispatch_health"],
+            json!({"missed_streak":0,"suspect_until":null})
+        );
+        let older = observation_projection(
+            br#"{"state":"running","last_heartbeat_at":"2026-10-11T10:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(older.get("dispatch_health").is_none());
+        assert!(older.get("last_heartbeat_ok_at").is_none());
+        // Malformed values are dropped one field at a time.
+        for health in [
+            json!({"missed_streak":-1,"suspect_until":5}),
+            json!({"missed_streak":1.5,"suspect_until":"2".repeat(41)}),
+            json!({"missed_streak":"3","suspect_until":"2026-10-11\n"}),
+            json!({"missed_streak":2_000_000,"suspect_until":["SECRET"]}),
+        ] {
+            let raw =
+                serde_json::to_vec(&json!({"state":"running","dispatch_health":health})).unwrap();
+            assert_eq!(
+                observation_projection(&raw).unwrap()["dispatch_health"],
+                json!({})
+            );
+        }
+        for health in [json!("SECRET"), json!([1]), json!(null)] {
+            let raw =
+                serde_json::to_vec(&json!({"state":"running","dispatch_health":health})).unwrap();
+            assert!(
+                observation_projection(&raw)
+                    .unwrap()
+                    .get("dispatch_health")
+                    .is_none()
+            );
+        }
+        // A streak beside it passes as a number, like the other scalars.
+        let status = observation_projection(
+            br#"{"state":"running","missed_streak":2,"last_heartbeat_ok_at":null}"#,
+        )
+        .unwrap();
+        assert_eq!(status["missed_streak"], json!(2));
+        assert!(status.get("last_heartbeat_ok_at").is_none());
     }
     /// A fake bundled node that records each invocation and serves a halted,
     /// running status. `relay-resume` removes the marker unless told not to.

@@ -13,7 +13,8 @@ if (!import.meta.env.DEV || !["127.0.0.1", "localhost", "[::1]"].includes(locati
 
 const scenarios = ["ready", "unpaired", "relay-halted", "auth-required", "pending-login", "running-local-api",
   "available", "required", "downloading", "draining", "updated", "rolled-back",
-  "web-only", "web-off", "browser-downloading", "browser-off", "history-full"] as const;
+  "web-only", "web-off", "browser-downloading", "browser-off", "history-full",
+  "missed-jobs", "heartbeat-late", "older-node"] as const;
 type Scenario = typeof scenarios[number];
 const requested = new URLSearchParams(location.search).get("scenario");
 const scenario: Scenario = scenarios.includes(requested as Scenario) ? requested as Scenario : "ready";
@@ -41,8 +42,9 @@ const snapshot: Snapshot = {
   ],
   local_api: { available: true, running: false, ready: false, claude_enabled: false },
   observation: {
-    state: "running", updated_at: at(), last_heartbeat_at: at(), in_flight: 1,
+    state: "running", updated_at: at(), last_heartbeat_at: at(), last_heartbeat_ok_at: at(4), in_flight: 1,
     unresolved_attempts: 0, drain_requested: false, relay_halted: false,
+    dispatch_health: { missed_streak: 0, suspect_until: null },
     accounts: [
       { id: "research-codex", service: "codex", state: "ready", in_flight: 0 },
       { id: "research-x", service: "x_read", state: "ready", in_flight: 1, username: "researchdesk" },
@@ -65,6 +67,8 @@ if (scenario === "unpaired") {
   observation.state = "offline";
   observation.in_flight = 0;
   xService.in_flight = 0;
+  observation.last_heartbeat_ok_at = undefined;
+  observation.dispatch_health = undefined;
 }
 if (scenario === "relay-halted") {
   snapshot.relay_halt_marker = true;
@@ -83,6 +87,20 @@ if (scenario === "running-local-api") {
   xService.in_flight = 0;
   snapshot.local_api = { available: true, running: true, ready: true, base_url: "http://127.0.0.1:8088/v1", claude_enabled: true };
   claude.connected = true;
+  observation.last_heartbeat_ok_at = at(3600);
+}
+// Scarlett offered three jobs in a row that the node did not take in time,
+// so it sends this device fewer jobs for a few minutes.
+if (scenario === "missed-jobs") observation.dispatch_health = { missed_streak: 3, suspect_until: at(-240) };
+// The node has not reached Scarlett for six minutes; one offer went missed.
+if (scenario === "heartbeat-late") {
+  observation.last_heartbeat_ok_at = at(370);
+  observation.dispatch_health = { missed_streak: 1, suspect_until: at(60) };
+}
+// A node from before the fields existed reports neither.
+if (scenario === "older-node") {
+  observation.last_heartbeat_ok_at = undefined;
+  observation.dispatch_health = undefined;
 }
 
 if (scenario === "web-only") {
@@ -239,6 +257,8 @@ mockIPC((command, payload) => {
     case "set_desktop_autostart": autostart = !!data.enabled; return null;
     case "desktop_status":
       observation.updated_at = new Date(Date.now() + 1).toISOString();
+      // A connected node hears back from Scarlett every few seconds.
+      if (snapshot.supervised && observation.last_heartbeat_ok_at && scenario !== "heartbeat-late") observation.last_heartbeat_ok_at = at(4);
       snapshot.web_enabled = preferences.serve_web;
       snapshot.web_restart_pending = snapshot.supervised && webRunning !== preferences.serve_web;
       return structuredClone(snapshot);

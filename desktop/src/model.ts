@@ -39,6 +39,13 @@ export type BrowserHealth = {
   version?: string; // Chrome for Testing version, when ready
 };
 export type ClaudeStatus = { available: boolean; connected: boolean; pending: boolean; error?: string | null };
+// How the coordinator sees this node take its offers, from its last
+// heartbeat reply. While suspect_until is ahead it sends the node no realtime
+// work and at most one background job; any accepted job resets both.
+export type DispatchHealth = {
+  missed_streak?: number; // offers in a row the node did not take in time
+  suspect_until?: string | null; // RFC 3339, null when not suspect
+};
 export type Snapshot = {
   local_api?: { available: boolean; running: boolean; ready: boolean; base_url?: string | null; claude_enabled: boolean };
   runtime_available: boolean;
@@ -65,6 +72,11 @@ export type Snapshot = {
     in_flight?: number;
     unresolved_attempts?: number;
     last_heartbeat_at?: string;
+    // When the coordinator last answered a heartbeat. Earlier nodes omit it.
+    last_heartbeat_ok_at?: string;
+    dispatch_health?: DispatchHealth;
+    // Read only when dispatch_health lacks its streak.
+    missed_streak?: number;
     accounts?: AccountHealth[];
     services?: ServiceHealth[];
     drain_requested?: boolean;
@@ -230,6 +242,53 @@ export function hiddenBrowser(s: Snapshot): Metric {
   if (browser?.state === "unavailable")
     return BROWSER_UNAVAILABLE[browser.reason ?? ""] ?? { value: "Unavailable", note: "Browser not ready" };
   return { value: "Unknown", note: "Waiting for node status" };
+}
+// A time the node wrote, as epoch ms. Go's zero time and junk read as none.
+function instant(value: unknown): number | undefined {
+  if (typeof value !== "string") return undefined;
+  const at = Date.parse(value);
+  return Number.isFinite(at) && at > Date.UTC(2020, 0, 1) ? at : undefined;
+}
+export function ago(ms: number): string {
+  const seconds = Math.floor(Math.max(0, ms) / 1000);
+  if (seconds < 10) return "Just now";
+  if (seconds < 60) return `${seconds} s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  return hours < 48 ? `${hours} h ago` : `${Math.floor(hours / 24)} days ago`;
+}
+// Scarlett answers an idle heartbeat within about 25 s, so a minute with no
+// answer means the node is not reaching it.
+export const HEARTBEAT_LATE_MS = 60_000;
+// When Scarlett last answered this node's heartbeat.
+export function lastHeartbeat(s: Snapshot, now = Date.now()): Metric {
+  if (!s.observation) return { value: "Unknown", note: "Waiting for node status" };
+  const at = instant(s.observation.last_heartbeat_ok_at);
+  if (!nodeLive(s)) {
+    // The app runs a node whose status has gone stale.
+    if (s.supervised) return { value: at === undefined ? "Unknown" : ago(now - at), note: "Waiting for node status" };
+    return at === undefined ? { value: "—", note: "Sent while the node runs" } : { value: ago(now - at), note: "Node stopped" };
+  }
+  if (at === undefined) return { value: "Not yet", note: "Connecting to Scarlett" };
+  return { value: ago(now - at), note: now - at <= HEARTBEAT_LATE_MS ? "Connected to Scarlett" : "Not reaching Scarlett · retrying" };
+}
+const timeLeft = (ms: number) => ms < 60_000 ? "under a minute" : `${Math.ceil(ms / 60_000)} min`;
+// Offers the node missed in a row, and whether Scarlett sends it fewer jobs
+// for now, as the coordinator last told it.
+export function missedJobs(s: Snapshot, now = Date.now()): Metric {
+  if (!nodeLive(s))
+    return s.supervised ? { value: "Unknown", note: "Waiting for node status" } : { value: "—", note: "Counted while the node runs" };
+  const health = s.observation?.dispatch_health;
+  const streak = health?.missed_streak ?? s.observation?.missed_streak;
+  if (typeof streak !== "number" || !Number.isInteger(streak) || streak < 0)
+    return { value: "Unknown", note: "Waiting for Scarlett" };
+  const until = instant(health?.suspect_until);
+  if (until !== undefined && until > now)
+    return { value: String(streak), note: `In a row · fewer jobs here for ${timeLeft(until - now)}` };
+  return streak > 0
+    ? { value: String(streak), note: "In a row · the next job it takes clears this" }
+    : { value: "0", note: "No recent misses" };
 }
 export function codexAccountLimitReached(s: Snapshot): boolean {
   return (
