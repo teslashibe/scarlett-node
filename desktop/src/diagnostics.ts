@@ -62,6 +62,7 @@ const phases: Record<string, string> = {
   relay_authorization: "Relay authorization, includes remaining TLS, OT and admission",
   request_sent: "Request sent", response_first_byte: "First response byte over the proof path", response_complete: "Response complete",
   opening_check: "Opening check", proof_finalize: "Finalize proof",
+  predial_wait: "Wait for the accept, verifier already dialing", pool_checkout_warm: "Warm verifier connection", pool_checkout_cold: "New verifier connection",
   browser_fetch: "Hidden browser render", browser_upload: "Upload browser copy", verifier_busy_wait: "Verifier busy wait",
 };
 export const phase = (value: string): string => phases[value] ?? "Unknown phase";

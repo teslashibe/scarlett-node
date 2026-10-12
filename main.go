@@ -864,6 +864,10 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 			}
 			return "service_unavailable", errors.New("X account eligibility changed before acceptance")
 		}
+		// E1: a relay web offer's hop 0 dials the verifier while the accept is
+		// in flight; it gets the token only at hop 0 (worker.Web.StartPredial).
+		predial := webWorker(c).StartPredial(ctx, l)
+		defer predial.Cancel()
 		// Persist uncertainty before acceptance HTTP. A lost acknowledgement
 		// keeps this journal pending; recovery never re-executes the provider.
 		endAccept := diagnostics.Start(ctx, "accept_http", 0)
@@ -872,6 +876,7 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 		if err != nil {
 			return "", err
 		}
+		ctx = predial.Accepted(ctx, l)
 	}
 	provenExecutor := c.Executor == config.ExecutorCodexTLSN || c.Executor == config.ExecutorServices
 	if l.AcceptanceRequired && provenExecutor {

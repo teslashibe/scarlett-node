@@ -40,6 +40,32 @@ func webOfferFixture(t *testing.T) coordinator.Lease {
 	return offer
 }
 
+// relayWebInput reads what a relay-web helper got on stdin: one JSON line,
+// or for a hop started before its accept (E1) the pre-dial line and then the
+// token line, merged here into one input.
+func relayWebInput(raw []byte) (map[string]any, error) {
+	lines := bytes.Split(bytes.TrimSpace(raw), []byte("\n"))
+	var in map[string]any
+	if err := json.Unmarshal(lines[0], &in); err != nil {
+		return nil, err
+	}
+	switch len(lines) {
+	case 1:
+		return in, nil
+	case 2:
+		var token struct {
+			Token string `json:"token"`
+		}
+		if in["predial"] != true || in["token"] != nil || json.Unmarshal(lines[1], &token) != nil {
+			return nil, errors.New("invalid pre-dial helper input")
+		}
+		delete(in, "predial")
+		in["token"] = token.Token
+		return in, nil
+	}
+	return nil, errors.New("unexpected helper input")
+}
+
 // A web-only node with no accounts heartbeats its web service, accepts a web
 // offer, runs the relay-web helper against the checked address and reports
 // proven, or reports the hop-0 failure code.
@@ -152,10 +178,10 @@ func TestRunLoopServesWebLease(t *testing.T) {
 				if !bytes.Equal(body, want) {
 					t.Fatalf("proven body %s", body)
 				}
-				var in map[string]any
 				raw, err := os.ReadFile(stdin)
-				if err != nil || json.Unmarshal(raw, &in) != nil || in["ip"] != "93.184.215.14" || in["url"] != "https://example.com/" || in["token"] != strings.Repeat("ab", 32) || in["verifier"] != "verifier:7047" {
-					t.Fatalf("helper input %s %v", raw, err)
+				in, inErr := relayWebInput(raw)
+				if err != nil || inErr != nil || in["ip"] != "93.184.215.14" || in["url"] != "https://example.com/" || in["token"] != strings.Repeat("ab", 32) || in["verifier"] != "verifier:7047" {
+					t.Fatalf("helper input %s %v %v", raw, err, inErr)
 				}
 			} else {
 				var failure coordinator.Failure

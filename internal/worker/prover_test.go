@@ -18,6 +18,8 @@ import (
 func TestMain(m *testing.M) {
 	mode := os.Getenv("SCARLETT_FAKE_PROVER")
 	if mode == "" {
+		// Web hops run one-shot here unless a test turns the daemon on.
+		webDaemonEnabled.Store(false)
 		os.Exit(m.Run())
 	}
 	if marker := os.Getenv("SCARLETT_FAKE_PROVER_MARKER"); marker != "" {

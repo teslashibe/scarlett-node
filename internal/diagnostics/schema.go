@@ -109,7 +109,7 @@ func init() {
 	}
 }
 
-var helperPhases = words("helper_total", "control_config", "verifier_tcp_connect", "verifier_tls", "x_tcp_connect", "relay_session", "x_tls_ready", "ot_ready", "relay_authorization", "request_sent", "response_first_byte", "response_complete", "opening_check", "proof_finalize")
+var helperPhases = words("helper_total", "control_config", "verifier_tcp_connect", "verifier_tls", "x_tcp_connect", "relay_session", "x_tls_ready", "ot_ready", "relay_authorization", "request_sent", "response_first_byte", "response_complete", "opening_check", "proof_finalize", "predial_wait", "pool_checkout_warm", "pool_checkout_cold")
 
 func words(values ...string) map[string]bool {
 	m := make(map[string]bool, len(values))
