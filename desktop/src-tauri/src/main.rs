@@ -4,6 +4,7 @@ mod diagnostics;
 mod local_api;
 mod node;
 mod node_log;
+mod power;
 mod preferences;
 mod updater;
 #[cfg(windows)]
@@ -732,6 +733,9 @@ fn main() {
                 .set_web_concurrency(saved.web_concurrency)
                 .map_err(|_| "invalid desktop web concurrency")?;
             app.state::<Arc<Node>>().set_web(saved.serve_web);
+            // Device sleep and wake reach the supervised node on its owner
+            // pipe; without them the node's own clock check still notices.
+            power::watch(app.state::<Arc<Node>>().inner().clone());
             let updater = Arc::new(Updater::new(
                 app.package_info().version.to_string(),
                 app.path().app_data_dir()?,

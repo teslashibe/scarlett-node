@@ -9,7 +9,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    process::{Child, Command},
+    process::{Child, ChildStdin, Command},
     sync::{Mutex, Notify},
 };
 
@@ -304,6 +304,24 @@ struct Login {
     home: PathBuf,
     started: Instant,
 }
+/// A line the app writes on the supervised node's owner pipe: the device is
+/// about to sleep, or has woken. The node ignores lines it does not know;
+/// only the pipe's EOF asks it to drain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnerCommand {
+    Sleep,
+    Wake,
+}
+impl OwnerCommand {
+    fn line(self) -> &'static [u8] {
+        match self {
+            Self::Sleep => b"sleep\n",
+            Self::Wake => b"wake\n",
+        }
+    }
+}
+/// The longest an owner line may take to reach the node.
+const OWNER_LINE_TIMEOUT: Duration = Duration::from_millis(250);
 pub struct Node {
     pub state: PathBuf,
     endpoints: Endpoints,
@@ -311,6 +329,10 @@ pub struct Node {
     helper: PathBuf,
     codex_binary: PathBuf,
     running: Mutex<Option<Child>>,
+    /// The supervised node's owner pipe, its stdin. It is kept apart from
+    /// the child so a sleep or wake line never waits behind a stop that is
+    /// waiting for accepted work. Its EOF asks the node to drain.
+    owner: Mutex<Option<ChildStdin>>,
     login: Mutex<Option<Login>>,
     login_error: Mutex<Option<Error>>,
     mutation: Mutex<()>,
@@ -743,6 +765,7 @@ impl Node {
             helper,
             codex_binary,
             running: Mutex::new(None),
+            owner: Mutex::new(None),
             login: Mutex::new(None),
             login_error: Mutex::new(None),
             mutation: Mutex::new(()),
@@ -1370,7 +1393,9 @@ impl Node {
         {
             cmd.process_group(0);
         }
-        *running = Some(cmd.spawn().map_err(|_| Error::RuntimeUnavailable)?);
+        let mut child = cmd.spawn().map_err(|_| Error::RuntimeUnavailable)?;
+        *self.owner.lock().await = child.stdin.take();
+        *running = Some(child);
         self.web_running.store(web, Ordering::SeqCst);
         let bound = self
             .log_dir
@@ -1414,12 +1439,13 @@ impl Node {
                 .is_some()
             {
                 *running = None;
+                drop(self.owner.lock().await.take());
                 self.stop_log_bound(None);
                 return Ok(());
             }
             self.call(&["drain"], None, 5).await?;
             // Closing this owned pipe requests drain without signaling a stale PID.
-            drop(child.stdin.take());
+            drop(self.owner.lock().await.take());
             {
                 // Node gives accepted work up to two minutes, within its lease.
                 match tokio::time::timeout(Duration::from_secs(125), child.wait()).await {
@@ -1445,6 +1471,20 @@ impl Node {
             }
         }
         Ok(())
+    }
+    /// Writes one owner command to the supervised node: false when no node
+    /// runs here or it did not take the line in time. The pipe stays open.
+    pub async fn owner_command(&self, command: OwnerCommand) -> bool {
+        tokio::time::timeout(OWNER_LINE_TIMEOUT, async {
+            let mut owner = self.owner.lock().await;
+            let pipe = owner.as_mut()?;
+            pipe.write_all(command.line()).await.ok()?;
+            pipe.flush().await.ok()
+        })
+        .await
+        .ok()
+        .flatten()
+        .is_some()
     }
     pub async fn cancel_login(&self) -> Result<()> {
         if let Some(mut pending) = self.login.lock().await.take() {
@@ -1643,6 +1683,7 @@ impl Node {
             s.supervised = p.try_wait().ok().flatten().is_none();
             if !s.supervised {
                 *run = None;
+                drop(self.owner.lock().await.take());
             }
         }
         s.web_restart_pending =
