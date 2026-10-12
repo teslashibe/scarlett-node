@@ -440,4 +440,8 @@ test("Web pages at once offers Auto and the listed page counts only", () => {
   const select = /<select id="web-concurrency">(.*?)<\/select>/.exec(layout)?.[1] ?? "";
   assert.deepEqual([...select.matchAll(/<option value="(\d+)">/g)].map(m => Number(m[1])), [...WEB_CONCURRENCY_CHOICES]);
   assert.match(select, /<option value="0">Auto \(recommended\)<\/option>/);
+  // Auto is the node's adaptive limit (SCARLETT_WEB_CONCURRENCY=auto), not a
+  // fixed number, and the settings copy says so.
+  assert.match(layout, /Auto adjusts to your connection/);
+  assert.doesNotMatch(layout, /Auto uses \d/);
 });

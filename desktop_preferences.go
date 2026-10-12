@@ -26,9 +26,9 @@ type desktopPreferences struct {
 	// ServeWeb serves web pages as well. It is on unless the operator turned
 	// it off, so a device that never chose serves web after updating.
 	ServeWeb bool `json:"serve_web"`
-	// WebConcurrency is "Web pages at once": 0 is Auto, the node's default
-	// (4 in this release); 1-16 is a fixed number of pages. It applies when
-	// the node next starts.
+	// WebConcurrency is "Web pages at once": 0 is Auto, the node's adaptive
+	// limit (SCARLETT_WEB_CONCURRENCY=auto); 1-16 is a fixed number of pages.
+	// It applies when the node next starts.
 	WebConcurrency int `json:"web_concurrency"`
 }
 

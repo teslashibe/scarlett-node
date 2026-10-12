@@ -27,9 +27,9 @@ pub struct Data {
     /// node helper keeps it in its own file beside preferences.json.
     #[serde(default = "default_serve_web")]
     pub serve_web: bool,
-    /// "Web pages at once": 0 is Auto (the node's default, 4 in this
-    /// release), 1-16 a fixed number. The helper keeps it in its own file
-    /// beside preferences.json; it applies to the next child process.
+    /// "Web pages at once": 0 is Auto (the node's adaptive limit), 1-16 a
+    /// fixed number. The helper keeps it in its own file beside
+    /// preferences.json; it applies to the next child process.
     #[serde(default)]
     pub web_concurrency: u8,
 }

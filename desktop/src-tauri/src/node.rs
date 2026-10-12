@@ -325,7 +325,8 @@ pub struct Node {
     web: AtomicBool,
     /// The web setting the supervised child was started with.
     web_running: AtomicBool,
-    /// Web pages at once for the next child: 0 is Auto (the node default).
+    /// Web pages at once for the next child: 0 is Auto, the node's adaptive
+    /// limit.
     web_concurrency: std::sync::atomic::AtomicU8,
     /// An explicit SCARLETT_WEB_BROWSER ("on" or "off") from the same trusted
     /// environment, passed on only with web. Unset, the node's platform
@@ -333,16 +334,15 @@ pub struct Node {
     web_browser: Option<&'static str>,
 }
 
-/// Auto's page count until the node tunes its own (the node default).
-const AUTO_WEB_CONCURRENCY: u8 = 4;
-
+/// SCARLETT_WEB_CONCURRENCY for a Web pages at once setting. Auto (0) asks
+/// the node for its adaptive limit, which starts at 4 and moves between 2 and
+/// 16 with how its pages go; a number is a fixed limit.
 fn web_concurrency_env(setting: u8) -> String {
     if setting == 0 {
-        AUTO_WEB_CONCURRENCY
+        "auto".into()
     } else {
-        setting
+        setting.to_string()
     }
-    .to_string()
 }
 
 pub fn valid_id(id: &str) -> bool {
@@ -2825,17 +2825,17 @@ esac
                 })
                 .collect()
         };
-        // No saved setting: web is on, with the default capacity.
+        // No saved setting: web is on, with Auto, the node's adaptive limit.
         let web = env(&node);
         assert_eq!(
             web["SCARLETT_SERVICES"].as_deref(),
             Some("codex,x_read,web")
         );
-        assert_eq!(web["SCARLETT_WEB_CONCURRENCY"].as_deref(), Some("4"));
+        assert_eq!(web["SCARLETT_WEB_CONCURRENCY"].as_deref(), Some("auto"));
         assert!(!web.contains_key("SCARLETT_WEB_EGRESS_PROXY"));
-        // Web pages at once: Auto passes the node's own default, a fixed
-        // number passes through, and anything above the desktop ceiling is
-        // refused without changing the saved value.
+        // Web pages at once: Auto passes `auto`, a fixed number passes
+        // through, and anything above the desktop ceiling is refused without
+        // changing the saved value.
         node.set_web_concurrency(12).unwrap();
         assert_eq!(
             env(&node)["SCARLETT_WEB_CONCURRENCY"].as_deref(),
@@ -2849,10 +2849,9 @@ esac
             Some("12")
         );
         node.set_web_concurrency(0).unwrap();
-        assert_eq!(env(&node)["SCARLETT_WEB_CONCURRENCY"].as_deref(), Some("4"));
-        assert!(
-            include_str!("../../../internal/config/config.go")
-                .contains("c.WebConcurrency = 1, 1, 32, 4")
+        assert_eq!(
+            env(&node)["SCARLETT_WEB_CONCURRENCY"].as_deref(),
+            Some("auto")
         );
         // The node's platform default applies unless the trusted environment
         // set the browser tier explicitly; it is passed on only with web.

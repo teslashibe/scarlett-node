@@ -1,5 +1,5 @@
 export type Preferences = { schema: 1; local_api_port: number; background: boolean; x_concurrency: number; updates: "notify" | "automatic"; resume_serving: boolean; serve_web: boolean; web_concurrency: number };
-/** Web pages at once: 0 is Auto (the node's default, 4 in this release). */
+/** Web pages at once: 0 is Auto (SCARLETT_WEB_CONCURRENCY=auto, the node's adaptive limit). */
 export const WEB_CONCURRENCY_CHOICES = [0, 2, 4, 8, 12, 16] as const;
 export function validWebConcurrency(n: number): boolean { return (WEB_CONCURRENCY_CHOICES as readonly number[]).includes(n); }
 export type Account = {
