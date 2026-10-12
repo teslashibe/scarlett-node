@@ -66,6 +66,15 @@ type webProxyInput struct {
 // failed fetch.
 const webErrorPrefix = "SCARLETT_WEB_ERROR="
 
+// webHelperGrace is how long past a hop's timeout_ms the node waits for its
+// helper: the daemon answers within a second of it whatever happens to the
+// hop, so a daemon that has not answered by then is broken.
+const webHelperGrace = 3 * time.Second
+
+// errWebHelperOverran is the cause of a hop context that ran out on its own
+// (not because the job's context ended).
+var errWebHelperOverran = errors.New("web helper overran its hop time")
+
 // Bounds on what a helper may print. A summary carries counters and the next
 // URL only, never page content.
 const (
@@ -80,7 +89,7 @@ const (
 func (w Web) prove(ctx context.Context, plan webPlan, token string, hop int, url string, addr netip.Addr, headers *webNodeHeaders) webHopOutcome {
 	c := w.Config
 	deadline, ok := ctx.Deadline()
-	budget := min(webHopLimit, time.Until(deadline))
+	budget := min(w.hopLimit(), time.Until(deadline))
 	if !ok || budget < time.Second {
 		return webHopOutcome{code: "expired"}
 	}
@@ -95,9 +104,10 @@ func (w Web) prove(ctx context.Context, plan webPlan, token string, hop int, url
 	if err != nil {
 		return webHopOutcome{code: "prover_error"}
 	}
-	// The helper bounds itself by timeout_ms; the extra second lets it say why
-	// before it is killed. The job deadline still caps both.
-	hopCtx, cancel := context.WithTimeout(ctx, budget+time.Second)
+	// The helper bounds itself by timeout_ms; the grace lets it say why
+	// before it is killed, or the daemon answer. The job deadline still caps
+	// both. Only this context's own expiry says the helper overran.
+	hopCtx, cancel := context.WithTimeoutCause(ctx, budget+webHelperGrace, errWebHelperOverran)
 	defer cancel()
 	observe, err := beginProofObservation(ctx)
 	if err != nil {
@@ -105,7 +115,6 @@ func (w Web) prove(ctx context.Context, plan webPlan, token string, hop int, url
 	}
 	var result webHelperResult
 	defer func() { observe(result.summary(), result.err == nil) }()
-	defer webHopBusy(c)()
 	endHelper := diagnostics.Start(ctx, "helper_wall", exchange)
 	result = w.runHelper(ctx, hopCtx, in, input)
 	endHelper(diagnosticOutcome(ctx, result.err))
@@ -115,6 +124,8 @@ func (w Web) prove(ctx context.Context, plan webPlan, token string, hop int, url
 // runHelper runs the hop's helper the fastest way available. A pre-dialed
 // helper that cannot take this hop, or a daemon that died before it
 // announced the token, sent nothing; the hop then runs the next way.
+// Every hop counts busy for the warm pool's size once: a pre-dialed hop 0
+// keeps the mark its pre-dial took, any other hop takes its own.
 func (w Web) runHelper(ctx, hopCtx context.Context, in webHopInput, input []byte) webHelperResult {
 	if p := takeWebPredial(ctx, in); p != nil {
 		if result, ok := p.finish(hopCtx, in.Token); ok {
@@ -122,6 +133,7 @@ func (w Web) runHelper(ctx, hopCtx context.Context, in webHopInput, input []byte
 		}
 		daemonDetail("pre-dial of job %s ended before its token", p.job)
 	}
+	defer webHopBusy(w.Config)()
 	if d := daemonFor(w.Config); d != nil {
 		if result, ok := d.run(hopCtx, in); ok {
 			return result
@@ -304,7 +316,7 @@ func (p *WebPredial) start(ctx context.Context, w Web, plan webPlan, deadline ti
 		return
 	}
 	addr, ok := w.egress().pickWebAddr(ctx, addrs)
-	budget := min(webHopLimit, time.Until(deadline))
+	budget := min(w.hopLimit(), time.Until(deadline))
 	if !ok || budget < time.Second {
 		return
 	}

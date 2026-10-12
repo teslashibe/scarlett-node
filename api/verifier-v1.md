@@ -473,3 +473,24 @@ sent is dropped and the hop dials fresh. After the session, a connection
 the verifier kept goes back to the pool (or is reserved for the job's next
 redirect hop); one that failed is closed. A hop that fails before its
 token (target unreachable, cancelled) gives its connection back.
+
+Bounds. Every hop is answered, `summary`, `error` or `cancelled`, by its
+`timeout_ms` deadline plus 1 s, whatever it meets (a hop task that fails
+unexpectedly is answered as `fetch_failed`), and the node treats a daemon
+that misses that as stuck and restarts it. Within the deadline:
+- the target's TCP connection (or the proxy's tunnel) gets attempts of 5,
+  10 and 10 s, each on a fresh socket; only an attempt with no answer is
+  retried, and since it comes before the token a retry spends nothing;
+- a verifier dial is bounded by 10 s, and a dial that failed fast is tried
+  twice more;
+- a hop waiting for its token closes its connection before the verifier's
+  wait for it ends, and dials again once the token comes;
+- the session itself is bounded by the verifier's hop clock.
+
+The daemon's stderr is part of the node's log (each line prefixed
+`web daemon:`). It always notes the pool losing or regaining the verifier,
+a refused hop request, and a hop that stays in one step for over 15 s (120 s
+in its session). With `SCARLETT_WEB_DAEMON_LOG=1` on the node (which sets
+`SCARLETT_SERVE_LOG=1` for the daemon) both sides log every hop's steps.
+Lines carry hop ids, steps, classes and times: never a token, job URL or
+target address.

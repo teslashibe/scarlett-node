@@ -517,15 +517,20 @@ func (d *webDaemon) forget(id string) {
 }
 
 // wait returns the hop's final reply, or, when ctx ends first, a "timeout"
-// that says whether its token was announced.
+// that says whether its token was announced. The daemon answers every hop
+// within a second of its deadline, whatever the hop met; a hop context that
+// ran out on its own (errWebHelperOverran) found it stuck, and it is
+// restarted: its other hops end as if it had died, and the next hop gets a
+// fresh one. The slot is never held past the hop's time.
 func (d *webDaemon) wait(ctx context.Context, h *daemonHop) daemonReply {
 	select {
 	case reply := <-h.final:
 		return reply
 	case <-ctx.Done():
 		d.forget(h.id)
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			fmt.Fprintf(os.Stderr, "web daemon: hop %s gave no answer in its time (token presented: %v)\n", h.id, h.presented.Load())
+		if context.Cause(ctx) == errWebHelperOverran {
+			fmt.Fprintf(os.Stderr, "web daemon: hop %s got no answer by its deadline (token presented: %v); restarting the daemon\n", h.id, h.presented.Load())
+			d.fail(true)
 		}
 		return daemonReply{Type: "timeout", ID: h.id, Presented: h.presented.Load()}
 	}

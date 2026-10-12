@@ -296,6 +296,7 @@ Settings come from the environment, typically via `~/.config/scarlett-node/node.
 | `SCARLETT_WEB_BROWSER` | `on` or `off`: the hidden browser tier for web jobs in browser mode. Default `on` with web on macOS and Linux, `off` on Windows |
 | `SCARLETT_WEB_BROWSER_CONCURRENCY` | Pages the browser renders at once, 1–4 and at most `SCARLETT_WEB_CONCURRENCY` (with `auto`, at most its current limit); default 1 below 16 GiB of memory, else 2 |
 | `SCARLETT_WEB_BROWSER_IDLE_SECONDS` | How long an idle browser stays up, 30–3600 (default 120) |
+| `SCARLETT_WEB_DAEMON_LOG` | `1` logs every web hop's steps on the node and in its relay helper daemon (`web daemon:` lines in the node log); without it the daemon logs only stuck hops and verifier trouble. Never logs tokens, URLs or target addresses |
 | `SCARLETT_WEB_SOLVERS` | Optional operator-paid captcha solvers for the browser tier: a comma list of `capmonster`, `capsolver` and `2captcha` (needs the browser tier) |
 | `SCARLETT_WEB_SOLVER_CAPMONSTER_KEY_FILE`, `SCARLETT_WEB_SOLVER_CAPSOLVER_KEY_FILE`, `SCARLETT_WEB_SOLVER_2CAPTCHA_KEY_FILE` | Absolute path of each listed provider's key file: a private (0600) regular file holding the key alone; never logged or reported |
 | `SCARLETT_WEB_SOLVER_MAX_SOLVES_PER_FETCH` | Paid solves per page, 1–4 (default 2) |

@@ -35,6 +35,8 @@ type Web struct {
 	Browser BrowserTier
 	// busyWait overrides webBusyBackoff; tests shorten it.
 	busyWait func(try int) time.Duration
+	// hopTime overrides webHopLimit; tests shorten it.
+	hopTime time.Duration
 	// Upload stores a browser result before report: the DOM's gzip parts
 	// from gzipPath (with manifest.DOM "ok") and then the manifest. nil never
 	// stores one.
@@ -343,6 +345,13 @@ func wireReport(code string) WebReport {
 		return WebReport{Code: code, Stage: "wire", ObservedBytes: maxWebResponseBytes + 1}
 	}
 	return WebReport{Code: code}
+}
+
+func (w Web) hopLimit() time.Duration {
+	if w.hopTime > 0 {
+		return w.hopTime
+	}
+	return webHopLimit
 }
 
 func (w Web) egress() *WebEgress {

@@ -90,8 +90,12 @@ func fakeWebDaemon(mode string) {
 	write(map[string]any{"type": "ready", "version": 1})
 	waiting := map[string]webHopInput{}
 	answer := func(id string, in webHopInput) {
-		if mode == "web-daemon-crash-before" {
+		switch mode {
+		case "web-daemon-crash-before":
 			os.Exit(3)
+		case "web-daemon-silent":
+			// Stuck: the hop is never answered.
+			return
 		}
 		write(map[string]any{"type": "presenting", "id": id})
 		summary := map[string]any{"status": "proof_sent", "verifier_sent_bytes": 900 + in.Hop, "verifier_received_bytes": 4000, "verifier_transport_layer": "tcp_payload", "hop": in.Hop, "status_code": 200, "final": true, "target_sent_bytes": 300, "target_received_bytes": 4000, "duration_ms": 12, "diagnostics": json.RawMessage(`{"version":1,"duration_ms":10,"outcome":"success","spans":[{"phase":"pool_checkout_warm","start_ms":0,"duration_ms":0,"outcome":"success"},{"phase":"x_tcp_connect","start_ms":0,"duration_ms":3,"outcome":"success"}]}`)}
@@ -100,6 +104,9 @@ func fakeWebDaemon(mode string) {
 			os.Exit(3)
 		case "web-daemon-misuse":
 			write(map[string]any{"type": "error", "id": id, "class": "fetch_failed", "error": relayMisuseMarker + ": synthetic", "presented": true, "diagnostics": json.RawMessage(`{"version":1,"duration_ms":4,"outcome":"error","spans":[]}`)})
+			return
+		case "web-daemon-too-large":
+			write(map[string]any{"type": "error", "id": id, "class": "page_too_large", "error": "verifier ended the hop: page_too_large", "presented": true, "diagnostics": json.RawMessage(`{"version":1,"duration_ms":40,"outcome":"error","spans":[{"phase":"relay_session","start_ms":2,"duration_ms":38,"outcome":"error"}]}`)})
 			return
 		case "web-daemon-chain":
 			switch in.Hop {
@@ -442,6 +449,161 @@ func TestWebPredialEndsUnsentWhenItCannotServeTheHop(t *testing.T) {
 	if lines := eventually(t, predialLog, 2); lines[1]["event"] != "aborted" {
 		t.Fatal("pre-dial for another lease", lines)
 	}
+}
+
+// Hang mode A (cross-binary e2e, 2026-10-12): a hop the daemon never
+// answers must end with its hop time, freeing its slot, and the daemon that
+// broke its promise to answer by then is replaced.
+func TestWebHopTheDaemonNeverAnswersEndsAndTheDaemonIsReplaced(t *testing.T) {
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	daemonLog, webLog, _ := useWebDaemon(t, "web-daemon-silent")
+	w := webWorkerFor(publicAnswers)
+	w.hopTime = time.Second
+	stuck := daemonFor(w.Config)
+	if stuck == nil {
+		t.Fatal("no daemon")
+	}
+	started := time.Now()
+	report := w.Report(context.Background(), webFixtureLease(t))
+	if elapsed := time.Since(started); report.Code != "web_fetch_failed" || elapsed < w.hopTime+webHelperGrace || elapsed > w.hopTime+webHelperGrace+3*time.Second {
+		t.Fatalf("report %+v after %s", report, elapsed)
+	}
+	// Never repeated one-shot: the hop's time is spent.
+	if lines := fakeLines(t, webLog); len(lines) != 0 {
+		t.Fatal("one-shot runs", lines)
+	}
+	webDaemons.Lock()
+	crashes, running := len(webDaemons.crashes[daemonKeyOf(w.Config)]), webDaemons.running[daemonKeyOf(w.Config)]
+	webDaemons.Unlock()
+	if crashes != 1 || running == stuck {
+		t.Fatalf("the stuck daemon was not replaced: %d crashes", crashes)
+	}
+	if fresh := daemonFor(w.Config); fresh == nil || fresh == stuck {
+		t.Fatal("no fresh daemon for the next hop")
+	}
+	if hops := countType(fakeLines(t, daemonLog), "hop"); hops != 1 {
+		t.Fatal("hops sent", hops)
+	}
+}
+
+// The same for a pre-dialed hop 0: its token goes to the daemon after the
+// accept and is never answered.
+func TestWebPredialWhoseTokenIsNeverAnsweredEnds(t *testing.T) {
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	daemonLog, webLog, _ := useWebDaemon(t, "web-daemon-silent")
+	w := webWorkerFor(publicAnswers)
+	w.hopTime = time.Second
+	offer := webOffer(t)
+	p := w.StartPredial(context.Background(), offer)
+	eventually(t, daemonLog, 2)
+	accepted := webFixtureLease(t)
+	accepted.LeaseDeadline, accepted.SettlementDeadline = offer.LeaseDeadline, offer.SettlementDeadline
+	started := time.Now()
+	report := w.Report(p.Accepted(context.Background(), accepted), accepted)
+	p.Cancel()
+	if elapsed := time.Since(started); report.Code != "web_fetch_failed" || elapsed > w.hopTime+webHelperGrace+3*time.Second {
+		t.Fatalf("report %+v after %s", report, elapsed)
+	}
+	if tokens := countType(fakeLines(t, daemonLog), "token"); tokens != 1 {
+		t.Fatal("tokens sent", tokens)
+	}
+	if lines := fakeLines(t, webLog); len(lines) != 0 {
+		t.Fatal("one-shot runs", lines)
+	}
+	if webBusy.Load() != 0 {
+		t.Fatal("hops still counted busy", webBusy.Load())
+	}
+}
+
+// Hang mode B: the daemon's answer that the verifier refused the page as too
+// large reaches the report at once.
+func TestWebDaemonPageTooLargeReachesTheReport(t *testing.T) {
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	_, webLog, _ := useWebDaemon(t, "web-daemon-too-large")
+	started := time.Now()
+	report := webWorkerFor(publicAnswers).Report(context.Background(), webFixtureLease(t))
+	if report != (WebReport{Code: "page_too_large", Stage: "wire", ObservedBytes: coordinator.PageMax + 1}) || time.Since(started) > 5*time.Second {
+		t.Fatalf("report %+v after %s", report, time.Since(started))
+	}
+	if lines := fakeLines(t, webLog); len(lines) != 0 {
+		t.Fatal("a presented hop ran again", lines)
+	}
+	if webBusy.Load() != 0 {
+		t.Fatal("hops still counted busy", webBusy.Load())
+	}
+}
+
+// A pre-dialed hop 0 counts once toward the warm pool's size, from its
+// pre-dial to its end: the pool is not shrunk and grown again around it.
+func TestWebPredialedHopCountsOnceForTheWarmPool(t *testing.T) {
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	daemonLog, _, _ := useWebDaemon(t, "web-daemon-final")
+	w := webWorkerFor(publicAnswers)
+	w.Config.WebConcurrency = 3
+	offer := webOffer(t)
+	p := w.StartPredial(context.Background(), offer)
+	eventually(t, daemonLog, 2)
+	accepted := webFixtureLease(t)
+	accepted.LeaseDeadline, accepted.SettlementDeadline = offer.LeaseDeadline, offer.SettlementDeadline
+	if report := w.Report(p.Accepted(context.Background(), accepted), accepted); report.Code != "" {
+		t.Fatal(report.Code)
+	}
+	p.Cancel()
+	var sizes []any
+	for _, line := range fakeLines(t, daemonLog) {
+		if line["type"] == "pool" {
+			sizes = append(sizes, line["size"])
+		}
+	}
+	// 3 slots, one job: min(2, 3-1) = 2 throughout.
+	if len(sizes) != 1 || sizes[0] != float64(2) {
+		t.Fatal("pool sizes", sizes)
+	}
+	if webBusy.Load() != 0 {
+		t.Fatal("hops still counted busy", webBusy.Load())
+	}
+}
+
+func TestDaemonLogPassesLinesOnCleanAndBounded(t *testing.T) {
+	l := &daemonLog{lines: make(chan string, 4)}
+	l.Write([]byte("first\npart"))
+	l.Write([]byte("ial line\x1b[31m\nthird\n"))
+	if got := []string{<-l.lines, <-l.lines, <-l.lines}; got[0] != "first" || got[1] != "partial line [31m" || got[2] != "third" {
+		t.Fatal(got)
+	}
+	// A full queue drops lines rather than blocking the daemon, and says so.
+	for i := 0; i < 6; i++ {
+		l.Write([]byte(fmt.Sprintf("line %d\n", i)))
+	}
+	if l.dropped != 2 {
+		t.Fatal("dropped", l.dropped)
+	}
+	for i := 0; i < 4; i++ {
+		<-l.lines
+	}
+	l.Write([]byte(strings.Repeat("x", 300) + "\n"))
+	if dropped, line := <-l.lines, <-l.lines; dropped != "(2 lines dropped)" || len(line) != 240 {
+		t.Fatal(dropped, len(line))
+	}
+	l.Write([]byte("last words"))
+	if last := l.close(); last != "last words" {
+		t.Fatal(last)
+	}
+	l.Write([]byte("after the end\n"))
+}
+
+func countType(lines []map[string]any, kind string) int {
+	n := 0
+	for _, line := range lines {
+		if line["type"] == kind {
+			n++
+		}
+	}
+	return n
 }
 
 func TestOnlyRelayWebOffersArePredialed(t *testing.T) {
