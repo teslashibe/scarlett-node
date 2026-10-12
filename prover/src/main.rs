@@ -12,6 +12,9 @@
 //! `scarlett-prover verifier` runs the validator service (see verifier.rs).
 //! `scarlett-prover fake-openai <addr> <ca-out>` is for impersonation tests.
 
+// Test tables keep single-range lists, closure tables and long helpers as they read best.
+#![cfg_attr(test, allow(clippy::single_range_in_vec_init, clippy::type_complexity, clippy::too_many_arguments))]
+
 #[cfg(unix)]
 mod body;
 mod control;

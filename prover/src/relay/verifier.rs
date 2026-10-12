@@ -592,7 +592,7 @@ where
     let mut tls = Some(ClientConnection::new(config, ServerName::try_from(server_name.to_owned())?).map_err(|e| R::tag(e.into(), Failure::TlsFailed))?);
     let mut to_server = 0usize;
     let mut from_server = 0usize;
-    let mut keys: Option<(([u8; 16], [u8; 12], u64), Keys)> = None;
+    let mut keys: Option<(ClientKey, Keys)> = None;
     let mut server_tls: Option<TlsInfo> = None;
     let mut inbound = Vec::new();
     let mut request: Option<Request> = None;

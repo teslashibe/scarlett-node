@@ -1631,7 +1631,7 @@ mod web_tests {
             age(&mut sessions, "2", verifier_store::WEB_RETENTION_MS - 60_000);
             assert_eq!(sessions.purge().unwrap().len(), 1);
             assert!(!sessions.by_job.contains_key(&job_key("synthetic", "1")) && sessions.by_job.contains_key(&job_key("synthetic", "2")));
-            assert!(verifier_store::WEB_RETENTION_MS < verifier_store::RETENTION_MS);
+            const { assert!(verifier_store::WEB_RETENTION_MS < verifier_store::RETENTION_MS) };
             // Attempt 3 ages while the verifier is down and leaves on restart.
             age(&mut sessions, "3", verifier_store::WEB_RETENTION_MS + 1);
         }

@@ -152,7 +152,7 @@ pub fn corrections(secret: &[u8], choices: &[bool]) -> Result<Vec<bool>> {
 /// hidden bytes and finishing the tag. Returns the full TLS record.
 pub fn node_record(material: &Material, hidden: &[Range<usize>], secret: &[u8], received: &[[u8; 16]]) -> Result<Vec<u8>> {
     let len = material.ciphertext.len();
-    if len < 2 || len > MAX_REQUEST + 1 {
+    if !(2..=MAX_REQUEST + 1).contains(&len) {
         bail!("verifier sent an invalid request ciphertext");
     }
     let bits = hidden_bits(len - 1, hidden)?;
