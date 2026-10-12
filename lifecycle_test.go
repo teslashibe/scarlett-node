@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -184,26 +183,34 @@ func TestRelayResumeUpdatesLiveHeartbeatWithoutInterruptingWork(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(nil)
 	changes := make(chan struct{}, 1)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		watchHeartbeat(ctx, cancel, sent, func() availability {
-			return availability{services: serviceStates(p.health())}
-		}, changes)
-	}()
+	current := func() availability { return availability{services: serviceStates(p.health())} }
+	posted := make(chan availability, 1)
+	watch := testWatch(sent, current, func(context.Context) (availability, error) {
+		a := current()
+		posted <- a
+		return a, nil
+	})
+	watch.changes = changes
+	done := make(chan watchResult, 1)
+	go func() { done <- watchHeartbeat(ctx, cancel, watch) }()
 	var output bytes.Buffer
 	if err := localCommand("relay-resume", &output); err != nil {
 		t.Fatal(err)
 	}
 	changes <- struct{}{}
 	select {
-	case <-done:
+	case a := <-posted:
+		if a == sent {
+			t.Fatal("relay resume posted an unchanged availability")
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("held heartbeat did not pick up relay resume")
 	}
-	if !errors.Is(context.Cause(ctx), errHeartbeatStale) {
-		t.Fatalf("held heartbeat ended with %v", context.Cause(ctx))
+	if ctx.Err() != nil {
+		t.Fatalf("relay resume ended the held heartbeat: %v", context.Cause(ctx))
 	}
+	cancel(nil)
+	<-done
 	health := healthKind(t, p, "x_read")
 	if !reflect.DeepEqual(health.ProofModes, []string{"mpc", "relay"}) || health.InFlight != 1 {
 		t.Fatalf("resumed heartbeat lost relay or active work: modes %v, in flight %d", health.ProofModes, health.InFlight)

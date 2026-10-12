@@ -38,6 +38,9 @@ func actualServicesCLIHeartbeat(t *testing.T, binary string, empty bool) {
 	seen := make(chan coordinator.Heartbeat, 1)
 	credential := strings.Repeat("ab", 32)
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer "+credential && controlRoute(w, r) {
+			return
+		}
 		if r.URL.Path != "/api/node/v1/heartbeat" || r.Header.Get("Authorization") != "Bearer "+credential {
 			t.Error("unexpected CLI request")
 			w.WriteHeader(403)
@@ -51,7 +54,7 @@ func actualServicesCLIHeartbeat(t *testing.T, binary string, empty bool) {
 		case seen <- h:
 		default:
 		}
-		io.WriteString(w, `{"lease":null}`)
+		io.WriteString(w, `{"leases":[]}`)
 	}))
 	defer server.Close()
 	dir := t.TempDir()

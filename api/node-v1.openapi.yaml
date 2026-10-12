@@ -1,11 +1,15 @@
 openapi: 3.0.3
 info:
   title: Scarlett supplier node wire API
-  version: node-v1
+  version: node-v2
   description: >-
     Portable proposed supplier/coordinator contract. The coordinator must authenticate bearer
     credentials, atomically fence attempts, validate input and output hashes, and commit signed job IDs
-    before issuing leases; these server behaviors are not implemented in this repository.
+    before issuing leases; these server behaviors are not implemented in this repository. Protocol
+    node-v2 (Scarlett Node 0.1.17 and later) is the version string in every body; the routes keep their
+    /api/node/v1 prefix. Unknown body fields are rejected. A heartbeat in an older protocol is held for
+    its wait_seconds and answered 426 update_required with Scarlett-Node-Update-Required: true
+    (api/fixtures/version-headers.json).
 servers:
   - url: https://coordinator.example
 paths:
@@ -20,7 +24,7 @@ paths:
               type: object
               required: [version, code, profile]
               properties:
-                version: {type: string, enum: [node-v1]}
+                version: {type: string, enum: [node-v2]}
                 code: {type: string}
                 profile: {type: string}
       responses:
@@ -32,19 +36,31 @@ paths:
   /api/node/v1/heartbeat:
     post:
       security: [{nodeBearer: []}]
-      summary: Report availability and long-poll for at most one lease
+      summary: Report availability, acknowledge offers and long-poll for up to eight leases
       description: >-
-        The coordinator records the report first, then answers with an offer as soon as one
-        exists. While nothing is offerable it holds the request open for up to wait_seconds
-        (clamped to 20, under its 30-second heartbeat staleness rule) and answers the moment a
-        job for this node is funded, or with a null lease at the deadline. The node heartbeats
-        again immediately after any answer; the hold is its only idle wait. A node must bound
-        the request by wait_seconds plus a transport grace, never by a short fixed timeout.
-        After a failed heartbeat the node backs off exponentially from one second, doubling to
-        a 15-second cap with equal jitter, and resets after any 200. A Retry-After on a 429 or
-        503, or on a 200 with a null lease, makes it wait at least that long (clamped to 1–60
-        seconds) plus jitter. A rejected heartbeat (400 or 413) is logged and backed off; the
-        node never resends it in a reduced shape.
+        The coordinator records the report first, then answers with offers as soon as any
+        exist: up to min(8, free slots) leases in one answer. While nothing is offerable it holds
+        the request open for up to wait_seconds (clamped to 20, and a full-length hold jittered by
+        up to two seconds either way, under its 30-second heartbeat staleness rule) and answers
+        the moment a job for this node is funded, or with no leases at the deadline. The node
+        heartbeats again immediately after any answer; the hold is its only idle wait. A node
+        must bound the request by the longest hold plus a transport grace, never by a short
+        fixed timeout: Scarlett Node gives up at 22 + 3 seconds, and pings its HTTP/2 connection
+        after 10 seconds without a frame, closing it when no answer comes within 5. The node
+        never cuts its own hold short because what it advertised changed: it posts
+        /api/node/v1/availability instead, and the coordinator looks for offers for the held
+        heartbeat again at once. It ends a hold itself only to leave (a goodbye first) or after
+        waking from sleep. offers_seen acknowledges every offer in the answers the node received
+        since its previous heartbeat request started, recorded the moment an answer is decoded,
+        before the node judges the offer; the coordinator sends again, in this answer, an offer
+        it delivered before the previous heartbeat request started that this request does not
+        acknowledge. Every offer the node received but will not take is rejected
+        (/api/node/v1/jobs/{job_id}/reject), never left to expire. After a failed heartbeat the
+        node backs off exponentially from one second, doubling to a 15-second cap with equal
+        jitter, and resets after any 200. A Retry-After on a 429 or 503, or on a 200 with no
+        leases, makes it wait at least that long (clamped to 1–60 seconds) plus jitter. A
+        rejected heartbeat (400 or 413) is logged and backed off; the node never resends it in a
+        reduced shape.
       requestBody:
         required: true
         content:
@@ -53,22 +69,14 @@ paths:
       responses:
         '200':
           description: >-
-            Lease or null; no implicit acceptance. A coordinator that is shutting down answers a
-            held heartbeat at once with a null lease and a jittered Retry-After of one to five
-            seconds.
+            Offers, possibly none; no implicit acceptance. A coordinator that is shutting down
+            answers a held heartbeat at once with no leases and a jittered Retry-After of one to
+            five seconds; a goodbye answers the node's held heartbeats at once with no leases.
           headers:
             Retry-After: {$ref: '#/components/headers/RetryAfter'}
           content:
             application/json:
-              schema:
-                type: object
-                required: [lease]
-                properties:
-                  challenge:
-                    $ref: '#/components/schemas/Challenge'
-                  lease:
-                    nullable: true
-                    allOf: [{$ref: '#/components/schemas/Lease'}]
+              schema: {$ref: '#/components/schemas/HeartbeatReply'}
         '400':
           description: Invalid heartbeat
           content:
@@ -77,6 +85,14 @@ paths:
         '401': {description: Invalid or revoked node credential}
         '413':
           description: Heartbeat body larger than 32 KiB (heartbeat_too_large)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '426':
+          description: >-
+            A heartbeat in an older protocol than node-v2 (update_required), answered after the
+            hold it asked for, with Scarlett-Node-Update-Required: true. The node keeps
+            heartbeating, reports update_required in its status and is offered nothing new.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
@@ -94,6 +110,67 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
+  /api/node/v1/availability:
+    post:
+      security: [{nodeBearer: []}]
+      summary: Update what the node advertises while its heartbeat is held
+      description: >-
+        The node's report without the hold or acknowledgements, validated as a heartbeat. The
+        coordinator stores state, capacity and services and has the node's held heartbeats look
+        for offers again at once (in every API process). It does not count as a heartbeat: it
+        moves neither the heartbeat time nor the poll end. The node sends one when what it
+        advertised changes during a hold (a worker finishing, an account becoming ready, a drain
+        lifted), starting at most one every 250 ms with the newest state; a failed post ends the
+        hold instead, so the next heartbeat carries the change.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Availability'}
+      responses:
+        '204': {description: Stored; held heartbeats look for offers again}
+        '400':
+          description: Invalid report
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {description: Invalid or revoked node credential}
+        '413':
+          description: Report larger than 32 KiB
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429':
+          description: Too many node requests (rate_limited)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+  /api/node/v1/goodbye:
+    post:
+      security: [{nodeBearer: []}]
+      summary: Tell the coordinator the node is going away for now
+      description: >-
+        The coordinator marks the node offline and its poll ended, answers its held heartbeats at
+        once with no leases, and hedges or reassigns at once every assignment the node has not
+        accepted (none of which counts as a missed offer); accepted work goes on, and the node's
+        next heartbeat brings it back. Scarlett Node says goodbye, within one second and best
+        effort, before it cancels its held heartbeat: on SIGTERM or Ctrl-C (signal), when its
+        owner pipe closes, which is the desktop app's Stop or Quit (stop), when a drain begins
+        (update while the desktop updater drains it for an install, else stop) and before the
+        machine sleeps (sleep). quit is reserved for a desktop app that tells Quit from Stop.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Goodbye'}
+      responses:
+        '204': {description: Recorded}
+        '400':
+          description: Invalid goodbye
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {description: Invalid or revoked node credential}
   /api/node/v1/challenge/echo:
     post:
       security: [{nodeBearer: []}]
@@ -127,6 +204,9 @@ paths:
         ownership, revocation and exclusive deadline before committing acceptance. Registration may
         be repeated with identical bindings after uncertainty; provider execution may not be replayed.
         A lost acceptance reply leaves provider work unstarted and requires attempt reconciliation.
+        An offer is one assignment of the job: the coordinator may offer the same job to up to
+        two more nodes (hedging) and the first acceptance wins; a lost hedge or a superseded
+        assignment is answered 409 attempt_conflict, which the node treats as final.
         Acceptance of the exact attempt and fence is idempotent, so on a 503 dispatch_busy or
         network_unavailable the node repeats the same request inside the same acceptance, at
         most three times, each after the Retry-After (clamped to 1–60 seconds, one second when
@@ -147,7 +227,7 @@ paths:
               additionalProperties: false
               required: [version, attempt, fence, request_sha256, terms_sha256]
               properties:
-                version: {type: string, enum: [node-v1]}
+                version: {type: string, enum: [node-v2]}
                 attempt: {type: string}
                 fence: {type: string}
                 request_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
@@ -173,6 +253,38 @@ paths:
             (network_unavailable)
           headers:
             Retry-After: {$ref: '#/components/headers/RetryAfter'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+  /api/node/v1/jobs/{job_id}/reject:
+    post:
+      security: [{nodeBearer: []}]
+      parameters: [{$ref: '#/components/parameters/JobID'}]
+      summary: Reject an offer this node will not accept
+      description: >-
+        For an offer the node received and never sent an acceptance for. The coordinator ends
+        that assignment as rejected and hedges or reassigns the job at once; a rejection is not a
+        missed offer. Scarlett Node rejects every offer it will not take instead of leaving it to
+        expire: one that fails its local offer checks or does not decode (invalid_offer), any
+        while it is drained or stopping (draining), one for which no worker slot, or for web no
+        web or browser slot, is free (no_slot), one no local account can take (no_account), and
+        another attempt of a job it already runs (busy). Best effort: an undelivered rejection
+        leaves the job to the coordinator's own timers.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Rejection'}
+      responses:
+        '204': {description: The assignment ended; the job moves on}
+        '400':
+          description: Invalid rejection
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {description: Invalid or revoked node credential}
+        '409':
+          description: attempt_conflict, the attempt is not this node's open, unaccepted assignment; final
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
@@ -432,16 +544,16 @@ components:
       type: object
       required: [version, node_id, supplier_pubkey, credential]
       properties:
-        version: {type: string, enum: [node-v1]}
+        version: {type: string, enum: [node-v2]}
         node_id: {type: string}
         supplier_pubkey: {type: string}
         credential: {type: string}
     Heartbeat:
       type: object
-      required: [version, node_id, profile, state, wait_seconds]
+      required: [version, node_id, profile, state, wait_seconds, offers_seen]
       description: Legacy nodes share catalog capacity. Services-mode nodes report independently enabled Codex, X and web capacities and states; all health is node-reported, not verifier acceptance or payment evidence.
       properties:
-        version: {type: string, enum: [node-v1]}
+        version: {type: string, enum: [node-v2]}
         node_id: {type: string}
         profile: {type: string}
         state: {type: string, enum: [available, exhausted], description: exhausted means the node's gateway recently had no capacity; the coordinator offers it no lease until it reports available again.}
@@ -453,6 +565,82 @@ components:
           maxItems: 3
           description: Each kind (codex, x_read, web) is unique; disabled kinds report not_added with zero capacity and in-flight count
           items: {$ref: '#/components/schemas/ServiceHealth'}
+        offers_seen:
+          type: array
+          maxItems: 64
+          uniqueItems: true
+          description: >-
+            Required, and empty when there is nothing to acknowledge. Every offer in the answers
+            the node received since its previous heartbeat request started, each once, recorded
+            the moment an answer is decoded and before the node judges the offer (an offer it
+            rejects or cannot decode included). A heartbeat that is not answered 200 hands its
+            acknowledgements to the next one.
+          items: {$ref: '#/components/schemas/OfferRef'}
+    OfferRef:
+      type: object
+      additionalProperties: false
+      required: [job_id, attempt]
+      properties:
+        job_id: {type: string, format: uuid, description: Canonical non-nil UUID}
+        attempt: {type: string, format: uuid, description: "The offered assignment's attempt: canonical non-nil UUID"}
+    HeartbeatReply:
+      type: object
+      required: [leases, node]
+      properties:
+        leases:
+          type: array
+          maxItems: 8
+          description: Up to min(8, free slots) offers. The node rejects each one it will not take.
+          items: {$ref: '#/components/schemas/Lease'}
+        node: {$ref: '#/components/schemas/NodeHealth'}
+        challenge: {$ref: '#/components/schemas/Challenge'}
+    NodeHealth:
+      type: object
+      additionalProperties: false
+      required: [missed_streak, suspect_until]
+      description: >-
+        The coordinator's dispatch health for this node. missed_streak counts offers in a row
+        that the node neither accepted nor acknowledged within three seconds; a rejection, a lost
+        hedge or a goodbye is no miss, and any acceptance resets it. While suspect_until is
+        ahead (30 seconds doubling with each miss, at most ten minutes), the coordinator sends
+        the node no realtime work and at most one background job. Scarlett Node shows both in
+        status.json (dispatch_health).
+      properties:
+        missed_streak: {type: integer, minimum: 0, maximum: 32767}
+        suspect_until: {type: string, format: date-time, nullable: true}
+    Availability:
+      type: object
+      additionalProperties: false
+      required: [version, node_id, profile, state, bid, capacity]
+      description: The heartbeat's report without wait_seconds or offers_seen, validated as a heartbeat.
+      properties:
+        version: {type: string, enum: [node-v2]}
+        node_id: {type: string}
+        profile: {type: string}
+        state: {type: string, enum: [available, exhausted]}
+        bid: {type: integer, minimum: 0, maximum: 1000000000}
+        capacity: {type: integer, minimum: 0, maximum: 96}
+        services:
+          type: array
+          maxItems: 3
+          items: {$ref: '#/components/schemas/ServiceHealth'}
+    Goodbye:
+      type: object
+      additionalProperties: false
+      required: [version, node_id, reason]
+      properties:
+        version: {type: string, enum: [node-v2]}
+        node_id: {type: string, description: Must match the authenticated credential owner.}
+        reason: {type: string, enum: [stop, quit, signal, update, sleep]}
+    Rejection:
+      type: object
+      additionalProperties: false
+      required: [version, attempt, fence, reason]
+      properties:
+        version: {type: string, enum: [node-v2]}
+        attempt: {type: string, format: uuid}
+        fence: {type: string, format: uuid}
+        reason: {type: string, enum: [invalid_offer, draining, no_slot, no_account, busy, other]}
     ServiceHealth:
       type: object
       additionalProperties: false
@@ -584,7 +772,7 @@ components:
       type: object
       required: [version, nonce, expires_at]
       properties:
-        version: {type: string, enum: [node-v1]}
+        version: {type: string, enum: [node-v2]}
         nonce: {type: string, pattern: '^[0-9a-f]{64}$', description: App-generated random 32-byte nonce; never supplied by a job.}
         expires_at: {type: string, format: date-time, description: App-enforced freshness deadline; node rejects locally expired challenges.}
     ChallengeEcho:
@@ -592,7 +780,7 @@ components:
       required: [version, node_id, nonce]
       additionalProperties: false
       properties:
-        version: {type: string, enum: [node-v1]}
+        version: {type: string, enum: [node-v2]}
         node_id: {type: string, description: Must match the authenticated credential owner.}
         nonce: {type: string, pattern: '^[0-9a-f]{64}$'}
     LeaseAcceptance:
@@ -600,7 +788,7 @@ components:
       additionalProperties: false
       required: [version, state, funding_authority, lease]
       properties:
-        version: {type: string, enum: [node-v1]}
+        version: {type: string, enum: [node-v2]}
         state: {type: string, enum: [leased]}
         funding_authority: {type: string, enum: [production_receipt], description: Normalized trusted payment-adapter evidence; never prototype funds}
         lease: {$ref: '#/components/schemas/Lease'}
@@ -640,7 +828,7 @@ components:
             max_input_tokens: {type: integer, maximum: 0}
             max_output_tokens: {type: integer, maximum: 0}
       properties:
-        version: {type: string, enum: [node-v1]}
+        version: {type: string, enum: [node-v2]}
         acceptance_required: {type: boolean, description: Required true for community provider work; token-free offers need funded acceptance before execution}
         request_sha256: {type: string, pattern: '^[0-9a-f]{64}$', description: Canonical exact verifier request digest}
         job_id: {type: string}
@@ -807,7 +995,7 @@ components:
         page finished, so final_url and content_type are empty, status_code is 0, headers,
         set_cookie_names and redirects are empty and challenge is none.
       properties:
-        version: {type: string, enum: [node-v1]}
+        version: {type: string, enum: [node-v2]}
         attempt: {type: string, format: uuid}
         fence: {type: string, format: uuid}
         request_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
@@ -900,7 +1088,7 @@ components:
         duration_ms is never reward latency.
       required: [version, job_id, attempt, fence, input_sha256, output_sha256, output, resolved_model_id, input_tokens, output_tokens, duration_ms, usage_available, usage_source, execution_mode]
       properties:
-        version: {type: string, enum: [node-v1]}
+        version: {type: string, enum: [node-v2]}
         job_id: {type: string}
         attempt: {type: string}
         fence: {type: string}
@@ -921,7 +1109,7 @@ components:
       required: [version, attempt, fence]
       additionalProperties: false
       properties:
-        version: {type: string, enum: [node-v1]}
+        version: {type: string, enum: [node-v2]}
         attempt: {type: string}
         fence: {type: string}
     AttemptStatus:
@@ -929,7 +1117,7 @@ components:
       additionalProperties: false
       required: [version, job_id, attempt, fence, state, replay_safe]
       properties:
-        version: {type: string, enum: [node-v1]}
+        version: {type: string, enum: [node-v2]}
         job_id: {type: string}
         attempt: {type: string}
         fence: {type: string}
@@ -940,7 +1128,7 @@ components:
       type: object
       required: [version, attempt, fence, code]
       properties:
-        version: {type: string, enum: [node-v1]}
+        version: {type: string, enum: [node-v2]}
         attempt: {type: string}
         fence: {type: string}
         code: {type: string, enum: [invalid_lease, expired, gateway_error, capacity_unavailable, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds, prover_error, execution_uncertain, auth_required, service_unavailable, x_rate_limited, x_incomplete, x_request_failed, relay_misuse, web_egress_denied, web_dns_failed, web_connect_failed, web_proxy_failed, web_fetch_failed, web_browser_unavailable, web_browser_failed, page_too_large], description: relay_misuse means the node caught its verifier sealing something other than the node's own request in a keyed-relay session, or closing the session without opening the record; the node then stops serving relay until its operator clears the halt. execution_uncertain means a provider call might have occurred before interruption and must not automatically requeue paid work. Transport failure alone does not prove a call never ran; capacity_unavailable must not authorize an ambiguous provider retry. Web codes describe the first hop only (a later hop failing after a verified first hop is reported proven); web_egress_denied means the page host resolved to a private, reserved or local address, or its URL failed node validation; web_dns_failed means the host did not resolve within 5 seconds; web_connect_failed means the node could not open TCP to the checked address, before any verifier session; web_proxy_failed means the local CONNECT proxy was unreachable, refused authentication or did not answer 200; web_fetch_failed means the verified session failed after the token was presented (TLS, framing, a verifier refusal, or a verifier that stayed busy for the whole hop budget). page_too_large means the page is over the 64 MiB ceiling: stage wire when the first hop's verifier refused the entity as too large (relay-web class page_too_large), stage dom when a browser job's DOM was larger than 67108864 bytes and neither its manifest was stored nor a re-fetch hop verified; stage and observed_bytes are present exactly with it, and observed_bytes is a lower bound (the coordinator prefers the verifier's own byte counts). For browser web jobs, web_browser_unavailable means the browser tier was not ready or its helper could not start, and web_browser_failed means the browser failed (navigation, TLS, crash, timeout or a memory kill) with no browser copy stored and no verified re-fetch hop; neither changes the web state.}

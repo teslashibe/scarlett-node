@@ -214,14 +214,15 @@ func readFailureCode(t *testing.T, name string) string {
 
 // The core web fixtures, which the app and verifier pin, keep their bytes.
 // Large pages (node 0.1.13) changed both leases' max_response_bytes to the
-// 64 MiB page ceiling and so their request_sha256; nothing else in them
-// changed.
+// 64 MiB page ceiling and so their request_sha256. Protocol node-v2 (node
+// 0.1.17) changed every body's version to node-v2 and gave the heartbeat its
+// required offers_seen; the digests inside the leases did not change.
 func TestCoreWebFixturesUnchanged(t *testing.T) {
 	for name, want := range map[string]string{
-		"lease-web-offer.json": "541ac07c8776ea88974cbe454c42c987e4c6d8c83a5ba82e3862482f5417ca15",
-		"lease-web.json":       "197f0f5a8b47aaddf08a7b6e02d2d83021aa818e3def350e35b2d7d3fce3d8a6",
-		"heartbeat-web.json":   "b0c3866d9babd74be4a03d815f7320ba428d77b1431c8d525abcba72757b5a65",
-		"failure-web.json":     "ede9d412a9524c44cae1a5cfc9dc9105407b3a360914f3d4aa100c27da56c8d8",
+		"lease-web-offer.json": "0d5c6043557d466af73d8ceb665f02a7990bf989439bb3a93223f81df2bd2feb",
+		"lease-web.json":       "615630450fc2660e1b5dbbfb17b5a07ced75ead5be6af7e31d2d1101b9f36519",
+		"heartbeat-web.json":   "6088d8aae3f0e2602d695183aed93a8d3a7286b1798db51b8b589381fdb027d1",
+		"failure-web.json":     "04b01092dad25c3d88396f5decdc3443ad6d8bb7853fe69559ef78ee727dcb85",
 	} {
 		raw, err := os.ReadFile("../../api/fixtures/" + name)
 		if err != nil {

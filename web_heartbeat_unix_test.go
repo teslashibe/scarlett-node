@@ -81,6 +81,9 @@ func TestRunLoopServesWebLease(t *testing.T) {
 			var mu sync.Mutex
 			served := false
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if controlRoute(w, r) {
+					return
+				}
 				switch {
 				case r.URL.Path == "/api/node/v1/heartbeat":
 					var h coordinator.Heartbeat
@@ -94,7 +97,7 @@ func TestRunLoopServesWebLease(t *testing.T) {
 					served = true
 					mu.Unlock()
 					if first {
-						json.NewEncoder(w).Encode(coordinator.HeartbeatReply{Lease: &offer})
+						json.NewEncoder(w).Encode(coordinator.HeartbeatReply{Leases: []coordinator.Lease{offer}})
 						return
 					}
 					select {

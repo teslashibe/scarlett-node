@@ -9,11 +9,9 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/teslashibe/scarlett-node/internal/attempts"
@@ -159,14 +157,6 @@ func currentBrowser() worker.BrowserTier {
 	return held.tier
 }
 
-// heartbeatWatchInterval is how often the node rechecks, while the coordinator
-// holds a heartbeat, whether what that heartbeat advertised still holds.
-const heartbeatWatchInterval = time.Second
-
-// errHeartbeatStale ends a held heartbeat whose advertised availability the
-// node has since changed. It is not a coordinator failure and earns no backoff.
-var errHeartbeatStale = errors.New("heartbeat availability changed while held")
-
 // Failed heartbeats back off from heartbeatBackoffBase, doubling to
 // heartbeatBackoffCap: well inside the coordinator's 30-second staleness rule,
 // so no single pause outlasts a node's freshness at the coordinator.
@@ -220,96 +210,6 @@ var newHeartbeatBackoff = func(localFixture bool) heartbeatBackoff {
 		return heartbeatBackoff{fixed: time.Second}
 	}
 	return heartbeatBackoff{}
-}
-
-// heartbeatStatusRefresh is how often a pause between heartbeats rewrites
-// status.json, well inside statusFresh.
-const heartbeatStatusRefresh = 10 * time.Second
-
-// waitRefreshing waits d, calling refresh when it starts and every interval
-// meanwhile. It reports false if ctx ended first.
-func waitRefreshing(ctx context.Context, d, every time.Duration, refresh func()) bool {
-	if ctx.Err() != nil {
-		return false
-	}
-	refresh()
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	ticker := time.NewTicker(every)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return false
-		case <-timer.C:
-			return true
-		case <-ticker.C:
-			refresh()
-		}
-	}
-}
-
-// availability is every local input to a heartbeat's advertised state that can
-// change while the coordinator holds it: an operator drain, a rest after the
-// gateway ran out of capacity, the local Codex admission guard, and each
-// service's health, including occupancy and active coordinator lease references.
-type availability struct {
-	drained, drainUnreadable, resting, codexBlocked bool
-	services                                        string
-}
-
-// serviceStates snapshots service admission and occupancy. health returns
-// services and active lease references in a stable order. The exact in-flight
-// count and references matter even while a service remains offerable or blocked:
-// the coordinator uses both to account for occupied capacity conservatively.
-func serviceStates(health []coordinator.ServiceHealth) string {
-	// ServiceHealth contains only JSON-safe scalar values and slices.
-	snapshot, _ := json.Marshal(health)
-	return string(snapshot)
-}
-
-// watchHeartbeat cancels a held heartbeat with errHeartbeatStale as soon as
-// current() no longer matches what it advertised. A worker completion wakes the
-// check immediately; an already reflected completion leaves the heartbeat held.
-// Otherwise the coordinator could see the old state for HeartbeatWaitSeconds
-// or return a lease after admission stopped.
-func watchHeartbeat(ctx context.Context, cancel context.CancelCauseFunc, sent availability, current func() availability, changes <-chan struct{}) {
-	tick := time.NewTicker(heartbeatWatchInterval)
-	defer tick.Stop()
-	var health []coordinator.ServiceHealth
-	_ = json.Unmarshal([]byte(sent.services), &health)
-	var deadline time.Time
-	for _, service := range health {
-		candidates := []*time.Time{service.NextReadyAt}
-		for _, operation := range service.OperationAvailability {
-			candidates = append(candidates, operation.NextReadyAt)
-		}
-		for _, at := range candidates {
-			if at != nil && at.After(time.Now()) && (deadline.IsZero() || at.Before(deadline)) {
-				deadline = *at
-			}
-		}
-	}
-	var ready <-chan time.Time
-	if !deadline.IsZero() {
-		timer := time.NewTimer(max(0, time.Until(deadline)))
-		defer timer.Stop()
-		ready = timer.C
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-tick.C:
-		case <-changes:
-		case <-ready:
-			ready = nil
-		}
-		if current() != sent {
-			cancel(errHeartbeatStale)
-			return
-		}
-	}
 }
 
 // xKeepInterval is how often the node checks that every X account still has a
@@ -393,11 +293,26 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	if c.LocalFixture {
 		drainRejectDelay = time.Second
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	// A stop is SIGTERM or Ctrl-C, or the desktop app closing the owner pipe
+	// (its Stop or Quit). The held heartbeat does not hang off ctx: the node
+	// says goodbye first and only then ends the hold itself.
+	signals, stopSignals := notifyStop(context.Background())
+	defer stopSignals()
+	ctx, stopRun := context.WithCancelCause(signals)
+	defer stopRun(nil)
+	ownerDone := make(chan struct{})
+	defer close(ownerDone)
+	var commands chan ownerCommand
 	if owner != nil {
-		go func() { _, _ = io.Copy(io.Discard, owner); stop() }()
+		commands = make(chan ownerCommand, 4)
+		go readOwner(owner, commands, ownerDone, func() { stopRun(errOwnerClosed) })
 	}
-	defer stop()
+	stopReason := func() string {
+		if errors.Is(context.Cause(ctx), errOwnerClosed) {
+			return coordinator.GoodbyeStop
+		}
+		return coordinator.GoodbyeSignal
+	}
 	workCtx, cancelWork := context.WithCancel(context.Background())
 	defer cancelWork()
 	var diagnosticStore *diagnostics.Store
@@ -481,6 +396,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	slots := make(chan struct{}, capacity)
 	var running sync.WaitGroup
 	status := runtimeStatus{Version: coordinator.Version, State: "running", NodeID: nodeID, Release: coordinator.NodeRelease, Services: []coordinator.ServiceHealth{}}
+	counters := &heartbeatCounters{}
 	defer func() {
 		status.State = "draining"
 		status.InFlight = len(slots)
@@ -488,6 +404,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			status.Services = services.health()
 			status.Accounts = services.accountStatus()
 		}
+		status.HeartbeatDiagnostics = counters.snapshot(client.Stats())
 		_ = saveRuntimeStatus(c.StateDir, status)
 		waitForWorkers(&running, cancelWork, 2*time.Minute)
 		status.State = "stopped"
@@ -503,73 +420,32 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	}()
 	var mu sync.Mutex
 	var restUntil time.Time
-	inFlight := map[string]struct{}{}
+	// inFlight maps each job a worker holds to its attempt.
+	inFlight := map[string]string{}
 	legacyCodexBlocked := false
-	// currentAvailability rereads, without the loop's side effects, what a
-	// heartbeat's advertised state is built from.
-	currentAvailability := func() availability {
+	// advertise builds what a heartbeat or an availability post reports from
+	// every local input, without the loop's side effects. It is safe to call
+	// from the watch while the loop is polling.
+	advertise := func() (advertisement, error) {
 		drained, err := drainRequested(c.StateDir)
 		if err != nil {
-			// Never equal to what a heartbeat advertised: the hold ends and
-			// the loop reports the unreadable marker.
-			return availability{drainUnreadable: true}
+			return advertisement{}, err
 		}
+		now := time.Now()
 		mu.Lock()
-		resting := time.Now().Before(restUntil)
+		resting := now.Before(restUntil)
 		mu.Unlock()
-		a := availability{drained: drained, resting: resting, codexBlocked: legacyCodexAdmissionBlocked(c, time.Now())}
-		if services != nil {
-			a.services = serviceStates(services.health())
+		codexBlocked := legacyCodexAdmissionBlocked(c, now)
+		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: nodeID, Profile: c.Profile, State: "available", Bid: c.Bid, Capacity: capacity}
+		// Legacy reports have no typed service health and their capacity must
+		// stay positive; exhausted alone stops dispatch.
+		if resting || codexBlocked {
+			h.State = "exhausted"
 		}
-		return a
-	}
-	// pause waits d before the next heartbeat and reports false if the node is
-	// stopping. The loop saves status.json once per heartbeat, but a pause can
-	// outlast statusFresh (a Retry-After asks for up to 90 seconds with
-	// jitter), so the snapshot is saved again when a pause starts and every
-	// heartbeatStatusRefresh while it lasts: a node that is only waiting never
-	// reads as offline.
-	pause := func(d time.Duration) bool {
-		return waitRefreshing(ctx, d, heartbeatStatusRefresh, func() { _ = saveRuntimeStatus(c.StateDir, status) })
-	}
-	lastRecovery := time.Now()
-	for ctx.Err() == nil {
-		drained, err := drainRequested(c.StateDir)
-		if err != nil {
-			return err
-		}
-		if time.Since(lastRecovery) >= 30*time.Second {
-			if err := journal.Purge(time.Now()); err != nil {
-				return err
-			}
-			if err := reconcileIdle(ctx, client, journal, active.snapshot()); err != nil {
-				return err
-			}
-			lastRecovery = time.Now()
-		}
-		mu.Lock()
-		state := "available"
-		resting := time.Now().Before(restUntil)
-		if resting {
-			state = "exhausted"
-		}
-		mu.Unlock()
-		// Legacy reports have no typed service health and node-v1 requires
-		// their capacity to stay positive; exhausted alone stops dispatch.
-		if blocked := legacyCodexAdmissionBlocked(c, time.Now()); blocked != legacyCodexBlocked {
-			legacyCodexBlocked = blocked
-			if blocked {
-				fmt.Fprintln(os.Stderr, "codex: local credential cannot cover a funded offer; advertising exhausted until it is renewed")
-			}
-		}
-		if legacyCodexBlocked {
-			state = "exhausted"
-		}
-		h := coordinator.Heartbeat{Version: coordinator.Version, NodeID: nodeID, Profile: c.Profile, State: state, Bid: c.Bid, Capacity: capacity, WaitSeconds: coordinator.HeartbeatWaitSeconds}
-		sent := availability{drained: drained, resting: resting, codexBlocked: legacyCodexBlocked}
+		ad := advertisement{drained: drained, codexBlocked: codexBlocked, availability: availability{drained: drained, resting: resting, codexBlocked: codexBlocked}}
 		if services != nil {
 			h.Services = services.health()
-			sent.services = serviceStates(h.Services)
+			ad.availability.services = serviceStates(h.Services)
 			h.Capacity = 0
 			for _, service := range h.Services {
 				h.Capacity += service.Capacity
@@ -589,39 +465,338 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 				}
 			}
 		}
-		status.State = "running"
 		if drained {
 			h.State = "exhausted"
-			status.State = "draining"
 		}
 		if drained || resting {
 			blockOperationAvailability(h.Services)
 		}
-		journalCapacity, err := journal.Capacity()
-		if err != nil {
-			return err
+		if ad.journal, err = journal.Capacity(); err != nil {
+			return advertisement{}, err
 		}
-		status.JournalCapacity = &journalCapacity
 		// In-flight goroutines may not have called Begin yet. Reserve one
 		// additional slot for each before advertising new admission capacity.
 		// Finished receipts count only if recent ones fill terminal storage.
-		journalFull := journalCapacity.AvailableRecords <= len(slots)
-		if journalFull != status.JournalFull {
-			if journalFull {
-				fmt.Fprintln(os.Stderr, "journal: receipt journal full; advertising exhausted until receipts clear")
-			} else {
-				fmt.Fprintln(os.Stderr, "journal: receipt journal has room again")
-			}
-		}
-		status.JournalFull = journalFull
-		if journalFull {
+		ad.journalFull = ad.journal.AvailableRecords <= len(slots)
+		ad.availability.journalFull = ad.journalFull
+		if ad.journalFull {
 			h.State = "exhausted"
 			for i := range h.Services {
 				h.Services[i].State = "exhausted"
 			}
 			blockOperationAvailability(h.Services)
 		}
-		status.Services = h.Services
+		ad.heartbeat = h
+		return ad, nil
+	}
+	// current is what the watch compares with what the coordinator was told.
+	// An unreadable drain marker or journal never equals an advertisement: the
+	// hold ends and the loop reports the error.
+	current := func() availability {
+		ad, err := advertise()
+		if err != nil {
+			return availability{drainUnreadable: true}
+		}
+		return ad.availability
+	}
+	postAvailability := func(ctx context.Context) (availability, error) {
+		ad, err := advertise()
+		if err == nil {
+			err = client.Availability(ctx, coordinator.AvailabilityOf(ad.heartbeat))
+		}
+		if err != nil {
+			// The watch ends the hold instead, so the next heartbeat carries
+			// what could not be posted.
+			fmt.Fprintln(os.Stderr, "availability:", err)
+		}
+		return ad.availability, err
+	}
+	goodbye := func(reason string, deadline time.Time) {
+		goodbyeCtx, cancel := context.WithDeadline(context.Background(), deadline)
+		defer cancel()
+		if err := client.Goodbye(goodbyeCtx, nodeID, reason); err != nil {
+			fmt.Fprintln(os.Stderr, "goodbye:", err)
+		}
+	}
+	// saidGoodbye is set from a goodbye until the next heartbeat brings the
+	// node back, so a stop right after a sleep or a drain says it once.
+	saidGoodbye := false
+	sayGoodbye := func(reason string) {
+		if !saidGoodbye {
+			goodbye(reason, time.Now().Add(coordinator.GoodbyeTimeout))
+			saidGoodbye = true
+		}
+	}
+	// Whatever ends the run says goodbye first, before the accepted work's
+	// drain: the coordinator moves this node's unaccepted offers elsewhere.
+	defer func() {
+		reason := coordinator.GoodbyeStop
+		if ctx.Err() != nil {
+			reason = stopReason()
+		}
+		sayGoodbye(reason)
+	}()
+	// reject declines an offer the node never accepted, in the background so
+	// that neither a slot nor the coordinator holds up the loop.
+	reject := func(offer coordinator.OfferAttempt, reason string) {
+		fmt.Fprintln(os.Stderr, "offer: rejected ("+reason+")")
+		running.Add(1)
+		go func() {
+			defer running.Done()
+			rejectCtx, cancel := context.WithTimeout(workCtx, rejectTimeout)
+			defer cancel()
+			if err := client.Reject(rejectCtx, offer, reason); err != nil {
+				fmt.Fprintln(os.Stderr, "offer: rejection not delivered:", err)
+			}
+		}()
+	}
+	// start runs one offer that passed the loop's checks: it takes a slot and,
+	// with services, an account, or rejects the offer when either is taken.
+	start := func(l coordinator.Lease) {
+		observation := beginLeaseDiagnostics(diagnosticStore, l)
+		attemptCtx := observation.Context(workCtx)
+		endWorkerAcquire := diagnostics.Start(attemptCtx, "worker_acquire", 0)
+		select {
+		case slots <- struct{}{}:
+			endWorkerAcquire("success")
+		default:
+			// The coordinator counts this node's open leases against its
+			// capacity and sends no more offers than free slots, so a full node
+			// means its view was stale. Rejecting moves the job at once.
+			endWorkerAcquire("rejected")
+			observation.Finish("rejected")
+			if l.AcceptanceRequired {
+				reject(l.OfferAttempt(), coordinator.RejectNoSlot)
+			} else if err := rejectLease(coordinator.WithoutAcceptRetry(workCtx), client, journal, l, "service_unavailable"); err != nil {
+				fmt.Fprintln(os.Stderr, "rejection:", err)
+			}
+			return
+		}
+		selected := c
+		var account *accountLease
+		serviceAvailable := true
+		if services != nil {
+			endAccountAcquire := diagnostics.Start(attemptCtx, "account_acquire", 0)
+			if l.ServiceType == "x_read" && l.XRequest != nil {
+				account, serviceAvailable = services.acquireAccount(l.ServiceType, l.XRequest.Operation)
+			} else if l.ServiceType == "web" && l.WebRequest != nil && l.WebRequest.Mode == "browser" {
+				// A browser job holds a browser slot inside its web slot.
+				account, serviceAvailable = services.acquireAccount(l.ServiceType, "browser")
+			} else {
+				account, serviceAvailable = services.acquireAccount(l.ServiceType)
+			}
+			if serviceAvailable {
+				endAccountAcquire("success")
+				services.bindCoordinatorLease(account, l)
+				selected = account.config
+			} else {
+				endAccountAcquire("service_unavailable")
+			}
+		}
+		if !serviceAvailable && l.AcceptanceRequired {
+			// No local account (for web, no web or browser slot) can take it:
+			// the coordinator moves it now rather than at its deadline.
+			<-slots
+			observation.Finish("rejected")
+			reason := coordinator.RejectNoAccount
+			if l.ServiceType == "web" {
+				reason = coordinator.RejectNoSlot
+			}
+			reject(l.OfferAttempt(), reason)
+			return
+		}
+		mu.Lock()
+		inFlight[l.JobID] = l.Attempt
+		mu.Unlock()
+		// Only this loop adds keys, so its reconciliation snapshot covers
+		// every attempt a worker may still be executing.
+		key := attempts.Record{JobID: l.JobID, Attempt: l.Attempt, Fence: l.Fence}.Key()
+		active.add(key)
+		running.Add(1)
+		go func() {
+			defer running.Done()
+			defer active.done(key)
+			defer func() {
+				<-slots
+				// Account release and any node-wide rest are already final.
+				// Post the freed slot and active lease references while the
+				// heartbeat stays held. Completions coalesce.
+				select {
+				case availabilityChanges <- struct{}{}:
+				default:
+				}
+			}()
+			defer func() {
+				mu.Lock()
+				delete(inFlight, l.JobID)
+				mu.Unlock()
+			}()
+			var code string
+			var err error
+			if !serviceAvailable {
+				// A legacy lease without funded acceptance is failed at once.
+				code = "service_unavailable"
+				err = rejectLease(attemptCtx, client, journal, l, code)
+			} else {
+				code, err = submitLease(attemptCtx, client, selected, l, local, journal)
+				if services != nil {
+					if err != nil && code == "" {
+						services.finishAccount(account, "report_pending")
+					} else {
+						services.finishAccount(account, code)
+					}
+				}
+			}
+			observation.Finish(diagnosticOutcome(attemptCtx, code, err))
+			if restsNode(services != nil, code) {
+				mu.Lock()
+				restUntil = time.Now().Add(capacityRest)
+				mu.Unlock()
+			}
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "submit:", err)
+			} else if c.LocalFixture {
+				fmt.Printf("fixture job %s: %s\n", l.JobID, map[bool]string{true: "failed (" + code + ")", false: "submitted"}[code != ""])
+			}
+		}()
+	}
+	// takeOffers starts or rejects every offer in a heartbeat answer, never
+	// waiting for a slot or the coordinator. It reports whether it rejected an
+	// offer because the node is draining or stopping.
+	takeOffers := func(reply coordinator.HeartbeatReply) (bool, error) {
+		for _, offer := range reply.Unreadable {
+			reject(offer, coordinator.RejectInvalidOffer)
+		}
+		if len(reply.Leases) == 0 {
+			return false, nil
+		}
+		// Read again after polling: drain may have arrived while the request
+		// was in flight. Never start newly delivered work while draining.
+		drained, err := drainRequested(c.StateDir)
+		if err != nil {
+			return false, err
+		}
+		draining := drained || ctx.Err() != nil
+		rejectedForDrain := false
+		for _, l := range reply.Leases {
+			// The coordinator sends an offer again until a heartbeat
+			// acknowledges it, and another API process may hand it over once
+			// more; an attempt already running here is never started twice.
+			mu.Lock()
+			attempt, held := inFlight[l.JobID]
+			mu.Unlock()
+			if held {
+				if attempt != l.Attempt {
+					reject(l.OfferAttempt(), coordinator.RejectBusy)
+				}
+				continue
+			}
+			if draining {
+				rejectedForDrain = true
+				if l.AcceptanceRequired {
+					reject(l.OfferAttempt(), coordinator.RejectDraining)
+				} else if err := rejectLease(coordinator.WithoutAcceptRetry(workCtx), client, journal, l, "service_unavailable"); err != nil {
+					fmt.Fprintln(os.Stderr, "drain rejection:", err)
+				}
+				continue
+			}
+			if l.AcceptanceRequired {
+				if err := coordinator.ValidOffer(l, time.Now()); err != nil {
+					// Never left to expire in silence: the coordinator moves
+					// the job at once and counts the rejection.
+					reject(l.OfferAttempt(), coordinator.RejectInvalidOffer)
+					continue
+				}
+			}
+			start(l)
+		}
+		return rejectedForDrain, nil
+	}
+	clock := &clockWatch{}
+	clock.jumped()
+	refresh := func() {
+		status.HeartbeatDiagnostics = counters.snapshot(client.Stats())
+		_ = saveRuntimeStatus(c.StateDir, status)
+	}
+	// wake runs after a wake command, a wall-clock jump or a sleep pause that
+	// ran out: the pooled connection may be dead, so the next heartbeat goes
+	// out at once on a new one and without the failure backoff.
+	wake := func(reason string) {
+		client.ResetConnections()
+		failures.reset()
+		counters.wake(reason)
+		fmt.Fprintln(os.Stderr, "heartbeat: awake ("+reason+"); reconnecting")
+	}
+	// sleep holds heartbeats after a goodbye for sleep until a wake command,
+	// a wall-clock jump, sleepPauseLimit or a stop. It reports false on a stop.
+	sleep := func() bool {
+		counters.sleeps.Add(1)
+		for {
+			outcome, reason := waitFor(ctx, sleepPauseLimit, commands, clock, refresh)
+			switch outcome {
+			case waitStopped:
+				return false
+			case waitWake:
+				wake(reason)
+				return true
+			case waitElapsed:
+				wake("timeout")
+				return true
+			}
+		}
+	}
+	// pause waits d before the next heartbeat and reports false if the node is
+	// stopping. A sleep command, a wake command or a wall-clock jump ends it
+	// early, as during a held heartbeat.
+	pause := func(d time.Duration) bool {
+		outcome, reason := waitFor(ctx, d, commands, clock, refresh)
+		switch outcome {
+		case waitStopped:
+			return false
+		case waitWake:
+			wake(reason)
+		case waitSleep:
+			sayGoodbye(coordinator.GoodbyeSleep)
+			return sleep()
+		}
+		return true
+	}
+	lastRecovery := time.Now()
+	advertisedDrained, firstHeartbeat := false, true
+	for ctx.Err() == nil {
+		if time.Since(lastRecovery) >= 30*time.Second {
+			if err := journal.Purge(time.Now()); err != nil {
+				return err
+			}
+			if err := reconcileIdle(ctx, client, journal, active.snapshot()); err != nil {
+				return err
+			}
+			lastRecovery = time.Now()
+		}
+		ad, err := advertise()
+		if err != nil {
+			return err
+		}
+		if ad.codexBlocked != legacyCodexBlocked {
+			legacyCodexBlocked = ad.codexBlocked
+			if ad.codexBlocked {
+				fmt.Fprintln(os.Stderr, "codex: local credential cannot cover a funded offer; advertising exhausted until it is renewed")
+			}
+		}
+		if ad.journalFull != status.JournalFull {
+			if ad.journalFull {
+				fmt.Fprintln(os.Stderr, "journal: receipt journal full; advertising exhausted until receipts clear")
+			} else {
+				fmt.Fprintln(os.Stderr, "journal: receipt journal has room again")
+			}
+		}
+		status.State = "running"
+		if ad.drained {
+			status.State = "draining"
+		}
+		status.JournalCapacity = &ad.journal
+		status.JournalFull = ad.journalFull
+		status.Services = ad.heartbeat.Services
 		if services != nil {
 			status.Accounts = services.accountStatus()
 		}
@@ -633,183 +808,116 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 		}
 		status.RelayHalted = worker.RelayHalted()
 		status.observeRelease(client.Release())
+		status.HeartbeatDiagnostics = counters.snapshot(client.Stats())
 		if err := saveRuntimeStatus(c.StateDir, status); err != nil {
 			return err
 		}
-		// The coordinator may hold this heartbeat for HeartbeatWaitSeconds. If
-		// the node changes what it advertised meanwhile, end the hold so the
-		// next heartbeat carries the change at once. A lease answered in that
-		// same instant is lost as on a dropped connection, and its offer
-		// expires at the coordinator.
-		pollCtx, cancelPoll := context.WithCancelCause(ctx)
-		watched := make(chan struct{})
+		// A drain that began between holds says goodbye before the heartbeat
+		// that reports it; the watch covers one during a hold.
+		if ad.drained && !advertisedDrained && !firstHeartbeat {
+			sayGoodbye(drainGoodbyeReason(c.StateDir))
+		}
+		advertisedDrained, firstHeartbeat = ad.drained, false
+		// The coordinator may hold this heartbeat for HeartbeatWaitSeconds. A
+		// change to what it advertised is posted as availability while the
+		// hold goes on; only a stop, a drain, a sleep or a wake ends it early.
+		h := ad.heartbeat
+		h.WaitSeconds = coordinator.HeartbeatWaitSeconds
+		saidGoodbye = false
+		pollCtx, cancelPoll := context.WithCancelCause(context.Background())
+		watched := make(chan watchResult, 1)
 		go func() {
-			defer close(watched)
-			watchHeartbeat(pollCtx, cancelPoll, sent, currentAvailability, availabilityChanges)
+			watched <- watchHeartbeat(pollCtx, cancelPoll, pollWatch{stop: ctx, sent: ad.availability, current: current, changes: availabilityChanges, owner: commands, clock: clock,
+				post: postAvailability, goodbye: goodbye, stopReason: stopReason, drainReason: func() string { return drainGoodbyeReason(c.StateDir) }})
 		}()
+		counters.polls.Add(1)
+		polled := time.Now()
 		reply, err := client.Poll(pollCtx, h)
-		stale := err != nil && errors.Is(context.Cause(pollCtx), errHeartbeatStale)
 		cancelPoll(nil)
-		<-watched
-		if stale {
+		watch := <-watched
+		saidGoodbye = saidGoodbye || watch.goodbye
+		status.observeRelease(client.Release())
+		if err == nil {
+			failures.reset()
+			at := time.Now().UTC()
+			status.LastHeartbeatAt, status.LastHeartbeatOKAt, status.HeartbeatErrorClass = at, &at, ""
+			counters.lastPoll.Store(int64(time.Since(polled)))
+			if reply.Node != nil {
+				status.observeDispatch(*reply.Node, time.Now())
+			}
+		}
+		// Offers first, whatever ended the hold: none is left to expire
+		// unanswered, and none starts while the node drains or stops.
+		drainRejected, offerErr := takeOffers(reply)
+		if offerErr != nil {
+			return offerErr
+		}
+		switch watch.cause {
+		case errPollStopping:
+			continue
+		case errPollSleep:
+			sleep()
+			continue
+		case errPollWake:
+			wake(watch.wakeReason)
+			continue
+		case errPollDrained, errHeartbeatStale:
 			// The node cut the hold short itself: heartbeat again now, with
 			// the new state, rather than backing off as after a failure.
 			continue
 		}
 		if err != nil {
+			if ctx.Err() != nil {
+				continue
+			}
 			// A rejected heartbeat (400 or 413) is logged and backed off like
 			// any other failure; the node never resends it in a reduced shape.
 			fmt.Fprintln(os.Stderr, "heartbeat:", err)
-		} else if reply.Lease != nil {
-			failures.reset()
-			status.LastHeartbeatAt = time.Now().UTC()
-			// Read again after polling: drain may have arrived while the request
-			// was in flight. Never start newly delivered work while draining.
-			drained, err = drainRequested(c.StateDir)
-			if err != nil {
-				return err
-			}
-			if drained || ctx.Err() != nil {
-				// The acceptance is sent once, never retried: it only precedes
-				// an immediate service_unavailable report, and a busy
-				// coordinator must not hold up the next heartbeat or a stop.
-				if err := rejectLease(coordinator.WithoutAcceptRetry(workCtx), client, journal, *reply.Lease, "service_unavailable"); err != nil {
-					fmt.Fprintln(os.Stderr, "drain rejection:", err)
-				}
-				if !pause(drainRejectDelay) {
-					return nil
-				}
-				continue
-			}
-			l := *reply.Lease
-			// The node heartbeats again the instant it holds an offer, while the
-			// attempt is still being accepted. The coordinator leaves a
-			// just-delivered offer out of that heartbeat, but another API process
-			// may hand it over once more; an attempt already running here is
-			// never started twice.
-			mu.Lock()
-			_, duplicate := inFlight[l.JobID]
-			if !duplicate {
-				inFlight[l.JobID] = struct{}{}
-			}
-			mu.Unlock()
-			if duplicate {
-				continue
-			}
-			observation := beginLeaseDiagnostics(diagnosticStore, l)
-			attemptCtx := observation.Context(workCtx)
-			endWorkerAcquire := diagnostics.Start(attemptCtx, "worker_acquire", 0)
-			// The coordinator counts this node's open leases against its capacity,
-			// so a slot frees up as soon as an earlier result is recorded.
-			select {
-			case slots <- struct{}{}:
-				endWorkerAcquire("success")
-			case <-ctx.Done():
-				endWorkerAcquire("cancelled")
-				observation.Finish("cancelled")
-				mu.Lock()
-				delete(inFlight, l.JobID)
-				mu.Unlock()
-				return nil
-			}
-			selected := c
-			var account *accountLease
-			serviceAvailable := true
-			if services != nil {
-				endAccountAcquire := diagnostics.Start(attemptCtx, "account_acquire", 0)
-				if l.ServiceType == "x_read" && l.XRequest != nil {
-					account, serviceAvailable = services.acquireAccount(l.ServiceType, l.XRequest.Operation)
-				} else if l.ServiceType == "web" && l.WebRequest != nil && l.WebRequest.Mode == "browser" {
-					// A browser job holds a browser slot inside its web slot.
-					account, serviceAvailable = services.acquireAccount(l.ServiceType, "browser")
-				} else {
-					account, serviceAvailable = services.acquireAccount(l.ServiceType)
-				}
-				if serviceAvailable {
-					endAccountAcquire("success")
-				} else {
-					endAccountAcquire("service_unavailable")
-				}
-				if serviceAvailable {
-					services.bindCoordinatorLease(account, l)
-					selected = account.config
-				}
-			}
-			// Only this loop adds keys, so its reconciliation snapshot covers
-			// every attempt a worker may still be executing.
-			key := attempts.Record{JobID: l.JobID, Attempt: l.Attempt, Fence: l.Fence}.Key()
-			active.add(key)
-			running.Add(1)
-			go func() {
-				defer running.Done()
-				defer active.done(key)
-				defer func() {
-					<-slots
-					// Account release and any node-wide rest are already final. Refresh
-					// the held heartbeat's capacity and active lease references now
-					// that the worker slot is free. Completions coalesce while the
-					// loop prepares its next heartbeat.
-					select {
-					case availabilityChanges <- struct{}{}:
-					default:
-					}
-				}()
-				defer func() {
-					mu.Lock()
-					delete(inFlight, l.JobID)
-					mu.Unlock()
-				}()
-				var code string
-				var err error
-				if !serviceAvailable {
-					code = "service_unavailable"
-					if l.AcceptanceRequired && (l.ServiceType == "codex" || l.ServiceType == "x_read" || l.ServiceType == "web") {
-						// No selected valid profile: leave the unaccepted offer to
-						// expire rather than funding it through rejectLease.
-						err = errors.New("provider offer has no locally eligible account")
-					} else {
-						err = rejectLease(attemptCtx, client, journal, l, code)
-					}
-				} else {
-					code, err = submitLease(attemptCtx, client, selected, l, local, journal)
-					if services != nil {
-						if err != nil && code == "" {
-							services.finishAccount(account, "report_pending")
-						} else {
-							services.finishAccount(account, code)
-						}
-					}
-				}
-				observation.Finish(diagnosticOutcome(attemptCtx, code, err))
-				if restsNode(services != nil, code) {
-					mu.Lock()
-					restUntil = time.Now().Add(capacityRest)
-					mu.Unlock()
-				}
-				if err != nil {
-					fmt.Fprintln(os.Stderr, "submit:", err)
-				} else if c.LocalFixture {
-					fmt.Printf("fixture job %s: %s\n", l.JobID, map[bool]string{true: "failed (" + code + ")", false: "submitted"}[code != ""])
-				}
-			}()
-			// Heartbeat again at once: the coordinator may hold more work.
+			status.HeartbeatErrorClass = coordinator.ErrorClass(err)
+			counters.failures.Add(1)
+			pause(failures.next(err))
 			continue
-		} else {
+		}
+		switch {
+		case drainRejected:
+			// A drained node is offered nothing; pace a coordinator that
+			// sends offers anyway.
+			pause(drainRejectDelay)
+		case len(reply.Leases) == 0 && reply.RetryAfter > 0:
 			// An idle hold ended with nothing to do; the next long poll is the
 			// wait, so loop straight into it. A coordinator that is shutting
 			// down answers at once and asks, with Retry-After, for a pause.
-			failures.reset()
-			status.LastHeartbeatAt = time.Now().UTC()
-			if reply.RetryAfter > 0 && !pause(coordinator.RetryAfterWait(reply.RetryAfter)) {
-				return nil
-			}
-			continue
+			pause(coordinator.RetryAfterWait(reply.RetryAfter))
 		}
-		if !pause(failures.next(err)) {
-			return nil
-		}
+		// Otherwise heartbeat again at once: the coordinator may hold more work.
 	}
 	return nil
+}
+
+// advertisement is what a heartbeat or an availability post reports, with the
+// local inputs it was built from.
+type advertisement struct {
+	heartbeat    coordinator.Heartbeat // without the hold or acknowledgements
+	availability availability
+	drained      bool
+	codexBlocked bool
+	journal      attempts.Capacity
+	journalFull  bool
+}
+
+// servableDeclineReason is the rejection reason for an offer whose proof
+// mode the node will not serve. A keyed-relay halt or a browser tier that is
+// not ready is the node's own state, which changed after it advertised; only
+// an offer for a mode the node never advertised is invalid.
+func servableDeclineReason(c config.Config, l coordinator.Lease) string {
+	browser := currentBrowser()
+	switch {
+	case worker.RelayHalted():
+		return coordinator.RejectOther
+	case l.ServiceType == "web" && l.WebRequest != nil && l.WebRequest.Mode == "browser" && !(c.WebBrowser && browser != nil && browser.Status().Ready):
+		return coordinator.RejectNoSlot
+	}
+	return coordinator.RejectInvalidOffer
 }
 
 func submitLease(ctx context.Context, client *coordinator.Client, c config.Config, l coordinator.Lease, local worker.Completer, journal *attempts.Journal) (string, error) {
@@ -821,11 +929,13 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	}
 	// Decline a proof mode this node does not serve before accepting funds for it.
 	if l.ServiceType == "x_read" && !worker.XOfferServable(c, l.XPayload) {
+		declineOffer(ctx, client, l, servableDeclineReason(c, l))
 		return "invalid_lease", errors.New("x_read offer asks for a proof mode this node does not serve")
 	}
 	// For a browser offer, or a relay offer with the pre-warm hint, this also
 	// starts the browser while the node accepts.
 	if l.ServiceType == "web" && !worker.WebOfferServable(c, l, currentBrowser()) {
+		declineOffer(ctx, client, l, servableDeclineReason(c, l))
 		return "invalid_lease", errors.New("web offer asks for a proof mode this node does not serve")
 	}
 	record, err := attemptRecord(l)
@@ -840,28 +950,33 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	// redelivery is judged afresh. rejectLease would fund acceptance.
 	if l.AcceptanceRequired {
 		if err := coordinator.ValidOffer(l, time.Now()); err != nil {
+			declineOffer(ctx, client, l, coordinator.RejectInvalidOffer)
 			return "invalid_lease", err
 		}
 	}
 	if err := journal.BeginContext(ctx, record); err != nil {
+		// No rejection: the attempt may already be recorded here, accepted
+		// or with its acceptance in doubt.
 		return "", err
 	}
 	if l.AcceptanceRequired {
 		// No acceptance HTTP or provider execution happens on either local
-		// refusal below. Keep terminal replay metadata for this pinned attempt;
-		// let its offer expire remotely.
+		// refusal below. Keep terminal replay metadata for this pinned attempt
+		// and reject the offer, so the coordinator moves it at once.
 		if l.ServiceType == "codex" && !codexAdmissionValid(c.CodexHome, l.LeaseDeadline) {
 			// The offer itself is valid, so the selected local credential is what
 			// fell short. This is local expiry evidence, never a provider denial.
 			if err := journal.TerminalContext(ctx, record); err != nil {
 				return codexLocalAuthExpired, err
 			}
+			declineOffer(ctx, client, l, coordinator.RejectNoAccount)
 			return codexLocalAuthExpired, errors.New("Codex credential validity is insufficient for the offered deadline")
 		}
 		if l.ServiceType == "x_read" && (l.XRequest == nil || c.AccountReady != nil && !c.AccountReady(l.XRequest.Operation)) {
 			if err := journal.TerminalContext(ctx, record); err != nil {
 				return "service_unavailable", err
 			}
+			declineOffer(ctx, client, l, coordinator.RejectNoAccount)
 			return "service_unavailable", errors.New("X account eligibility changed before acceptance")
 		}
 		// Persist uncertainty before acceptance HTTP. A lost acknowledgement

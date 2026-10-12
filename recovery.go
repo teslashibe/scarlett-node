@@ -121,6 +121,22 @@ func rejectLease(ctx context.Context, client *coordinator.Client, journal *attem
 	return submitRecord(ctx, client, journal, r)
 }
 
+// declineOffer rejects a funded offer this node will not accept after all, so
+// that the coordinator moves the job at once instead of waiting for a timer
+// or the deadline. It is only for offers no acceptance was sent for, and is
+// best effort: a failure is logged and the coordinator's timers cover it.
+func declineOffer(ctx context.Context, client *coordinator.Client, l coordinator.Lease, reason string) {
+	if client == nil || !l.AcceptanceRequired {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rejectTimeout)
+	defer cancel()
+	fmt.Fprintln(os.Stderr, "offer: rejected ("+reason+")")
+	if err := client.Reject(ctx, l.OfferAttempt(), reason); err != nil {
+		fmt.Fprintln(os.Stderr, "offer: rejection not delivered:", err)
+	}
+}
+
 // activeAttempts counts attempt keys whose worker goroutine has not returned.
 type activeAttempts struct {
 	mu   sync.Mutex

@@ -3,6 +3,7 @@ package coordinator
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,15 +15,19 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/google/uuid"
 )
 
-const Version = "node-v1"
+// Version is the node-coordinator protocol in every body. The routes keep
+// their /api/node/v1 prefix. A coordinator answers a heartbeat in an older
+// protocol with 426 update_required.
+const Version = "node-v2"
 
 // A lease repeats its bounded prompt in the exact 64 KiB verifier request.
 // Leave room for that duplication and the acceptance/identity envelope.
 const maxReplyBytes = 144 << 10
+
+// A heartbeat answer carries up to MaxLeasesPerReply leases.
+const maxHeartbeatReplyBytes = MaxLeasesPerReply*maxReplyBytes + 8<<10
 
 type PairReply struct {
 	Version        string `json:"version"`
@@ -116,13 +121,7 @@ type ActiveLease struct {
 }
 
 func (l ActiveLease) Valid() bool {
-	for _, value := range []string{l.JobID, l.Attempt, l.Fence} {
-		id, err := uuid.Parse(value)
-		if err != nil || id == uuid.Nil || id.String() != value {
-			return false
-		}
-	}
-	return true
+	return canonicalUUID(l.JobID) && canonicalUUID(l.Attempt) && canonicalUUID(l.Fence)
 }
 
 type ServiceHealth struct {
@@ -228,6 +227,13 @@ type Heartbeat struct {
 	// this node is funded. The coordinator clamps it to [0, 20]; the node sends
 	// HeartbeatWaitSeconds.
 	WaitSeconds int `json:"wait_seconds"`
+	// OffersSeen acknowledges every offer in the answers the node received
+	// since its previous heartbeat request started, at most MaxOffersSeen and
+	// each once, recorded the moment an answer is decoded and before the node
+	// judges the offer. The coordinator sends an offer again when a later
+	// heartbeat does not acknowledge it. Required, and [] when empty; Poll
+	// fills it.
+	OffersSeen []OfferRef `json:"offers_seen"`
 }
 
 // HeartbeatWaitSeconds is the hold the node asks for. The coordinator treats a
@@ -235,10 +241,17 @@ type Heartbeat struct {
 // trip must stay well inside that.
 const HeartbeatWaitSeconds = 20
 
-// HeartbeatGrace is how much longer than the requested hold a heartbeat may
-// take before the node gives up on it: transport, queueing and the
-// coordinator's own work on the reply.
-const HeartbeatGrace = 10 * time.Second
+// HeartbeatHoldJitter is how much longer than HeartbeatWaitSeconds the
+// coordinator may hold a full-length heartbeat: it spreads such holds by up to
+// two seconds either way.
+const HeartbeatHoldJitter = 2 * time.Second
+
+// HeartbeatGrace is how much longer than the longest hold a heartbeat may take
+// before the node gives up on it: transport, queueing and the coordinator's
+// own work on the reply. A heartbeat stuck on a connection that died quietly
+// fails at 22 + 3 seconds; the HTTP/2 health check usually finds the dead
+// connection first.
+const HeartbeatGrace = 3 * time.Second
 
 type Challenge struct {
 	Version   string    `json:"version"`
@@ -253,18 +266,41 @@ type ChallengeEcho struct {
 }
 
 type HeartbeatReply struct {
-	Lease     *Lease     `json:"lease"`
-	Challenge *Challenge `json:"challenge,omitempty"`
+	// Leases are the offers in this answer: up to MaxLeasesPerReply, and no
+	// more than the free slots the heartbeat advertised.
+	Leases []Lease `json:"leases"`
+	// Node is the coordinator's dispatch health for this node.
+	Node      *NodeHealth `json:"node,omitempty"`
+	Challenge *Challenge  `json:"challenge,omitempty"`
+	// Unreadable names the offers in this answer that did not decode as a
+	// lease. They are acknowledged like the others, and the node rejects them
+	// as invalid_offer instead of leaving them to expire. Never part of the
+	// body.
+	Unreadable []OfferAttempt `json:"-"`
 	// RetryAfter is the reply's Retry-After header, clamped, or zero when it
 	// has none. A coordinator that is shutting down answers a held heartbeat
 	// at once with no lease and a short Retry-After. Never part of the body.
 	RetryAfter time.Duration `json:"-"`
 }
 
+// NodeHealth is how the coordinator sees this node take its offers.
+// MissedStreak counts the offers in a row that the node neither accepted nor
+// acknowledged in time. While SuspectUntil (RFC 3339, null when not suspect)
+// is ahead, the coordinator sends the node no realtime work and at most one
+// background job. Any acceptance resets both.
+type NodeHealth struct {
+	MissedStreak int        `json:"missed_streak"`
+	SuspectUntil *time.Time `json:"suspect_until"`
+}
+
 // ErrHeartbeatRejected is a heartbeat the coordinator refused as invalid (400)
 // or too large (413). Resending the same report cannot succeed, so the node
 // logs it and backs off; it never resends a reduced shape.
 var ErrHeartbeatRejected = errors.New("coordinator rejected the heartbeat")
+
+// ErrInvalidResponse is a coordinator answer the node could not read: too
+// large, or not the JSON the route promises.
+var ErrInvalidResponse = errors.New("invalid coordinator response")
 
 // A Retry-After from the coordinator is clamped to [MinRetryAfter,
 // MaxRetryAfter] before the node waits on it.
@@ -364,13 +400,30 @@ func RetryAfterWait(retryAfter time.Duration) time.Duration {
 // Poll echoes an app-issued challenge before returning any lease to inference.
 // The app owns single-use validation and RTT timing; the node supplies no duration.
 // The heartbeat is a long poll: it may legitimately stay open for the hold the
-// node asked for, so it runs under its own deadline of wait plus HeartbeatGrace
-// rather than the client's 10-second timeout, and ctx cancellation aborts it.
+// node asked for, so it runs under its own deadline of the longest hold plus
+// HeartbeatGrace rather than the client's 10-second timeout, and ctx
+// cancellation aborts it.
+//
+// Poll sets h.OffersSeen from the offers recorded since the last heartbeat,
+// and records the offers of a decoded answer before it returns or checks
+// anything else. A heartbeat that is not answered 200 hands its
+// acknowledgements to the next one.
 func (c *Client) Poll(ctx context.Context, h Heartbeat) (HeartbeatReply, error) {
-	var reply HeartbeatReply
+	if c.seen == nil {
+		c.seen = &offersSeen{}
+	}
+	h.OffersSeen = c.seen.take()
+	var wire struct {
+		Leases    []json.RawMessage `json:"leases"`
+		Node      *NodeHealth       `json:"node"`
+		Challenge *Challenge        `json:"challenge"`
+	}
 	pollCtx, cancel := context.WithTimeout(ctx, c.heartbeatTimeout(h.WaitSeconds))
 	defer cancel()
-	status, header, err := c.post(pollCtx, "/api/node/v1/heartbeat", h, &reply, true)
+	status, header, err := c.post(pollCtx, "/api/node/v1/heartbeat", h, &wire, true)
+	if status != http.StatusOK {
+		c.seen.restore(h.OffersSeen)
+	}
 	if status == http.StatusBadRequest || status == http.StatusRequestEntityTooLarge {
 		return HeartbeatReply{}, fmt.Errorf("%w: %w", ErrHeartbeatRejected, err)
 	}
@@ -378,9 +431,26 @@ func (c *Client) Poll(ctx context.Context, h Heartbeat) (HeartbeatReply, error) 
 		return HeartbeatReply{}, err
 	}
 	if status != http.StatusOK {
-		return HeartbeatReply{}, errors.New("unexpected heartbeat status")
+		return HeartbeatReply{}, fmt.Errorf("%w: heartbeat status %d", ErrInvalidResponse, status)
 	}
-	reply.RetryAfter = retryAfter(header, time.Now())
+	reply := HeartbeatReply{Leases: []Lease{}, Node: wire.Node, Challenge: wire.Challenge, RetryAfter: retryAfter(header, time.Now())}
+	refs := make([]OfferRef, 0, len(wire.Leases))
+	for _, raw := range wire.Leases {
+		var id struct {
+			JobID   string `json:"job_id"`
+			Attempt string `json:"attempt"`
+			Fence   string `json:"fence"`
+		}
+		_ = json.Unmarshal(raw, &id)
+		refs = append(refs, OfferRef{JobID: id.JobID, Attempt: id.Attempt})
+		var l Lease
+		if json.Unmarshal(raw, &l) != nil {
+			reply.Unreadable = append(reply.Unreadable, OfferAttempt{JobID: id.JobID, Attempt: id.Attempt, Fence: id.Fence})
+			continue
+		}
+		reply.Leases = append(reply.Leases, l)
+	}
+	c.seen.record(refs...)
 	if reply.Challenge == nil {
 		return reply, nil
 	}
@@ -418,16 +488,25 @@ type Client struct {
 	uploadBackoff []time.Duration
 	// release holds the coordinator's last release notice; see Release.
 	release *releaseState
+	// seen holds the offers the next heartbeat acknowledges.
+	seen *offersSeen
+	// stats counts connections, round trips and calls; see Stats.
+	stats *clientStats
 }
 
 // heartbeatTimeout is the deadline of one heartbeat: the hold the node asked
-// for plus the grace for transport and the coordinator's reply.
+// for, with the coordinator's jitter on a full-length hold, plus the grace for
+// transport and the coordinator's reply.
 func (c *Client) heartbeatTimeout(waitSeconds int) time.Duration {
 	grace := HeartbeatGrace
 	if c.heartbeatGrace > 0 {
 		grace = c.heartbeatGrace
 	}
-	return time.Duration(max(waitSeconds, 0))*time.Second + grace
+	hold := time.Duration(max(waitSeconds, 0)) * time.Second
+	if waitSeconds >= HeartbeatWaitSeconds {
+		hold += HeartbeatHoldJitter
+	}
+	return hold + grace
 }
 
 func (c *Client) allowEcho(origin *url.URL) bool {
@@ -447,8 +526,16 @@ func (c *Client) allowEcho(origin *url.URL) bool {
 	}
 }
 
+// New returns a client for one coordinator with its own transport: the
+// default transport's settings plus HTTP/2 health checks, never shared with
+// provider or verifier traffic.
 func New(origin, credential string) *Client {
-	return &Client{Origin: origin, Credential: credential, release: &releaseState{}, HTTP: &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	return newClient(origin, credential, nil)
+}
+
+func newClient(origin, credential string, tlsConfig *tls.Config) *Client {
+	return &Client{Origin: origin, Credential: credential, release: &releaseState{}, seen: &offersSeen{}, stats: &clientStats{},
+		HTTP: &http.Client{Timeout: 10 * time.Second, Transport: newCoordinatorTransport(tlsConfig), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 }
 
 // Post sends one report under the client's 10-second timeout. An answer
@@ -459,8 +546,10 @@ func (c *Client) Post(ctx context.Context, path string, body any, out any) (int,
 }
 
 // post is Post, or with longPoll the same request bounded only by ctx: the
-// client's timeout would cut a heartbeat hold short. It also returns the
-// response headers, which carry Retry-After.
+// client's timeout would cut a heartbeat hold short, and the answer may carry
+// MaxLeasesPerReply leases. It also returns the response headers, which carry
+// Retry-After. A request that gets no HTTP answer fails with a
+// *TransportError.
 func (c *Client) post(ctx context.Context, path string, body any, out any, longPoll bool) (int, http.Header, error) {
 	var raw []byte
 	var err error
@@ -478,7 +567,7 @@ func (c *Client) post(ctx context.Context, path string, body any, out any, longP
 	if len(raw) > 131072 {
 		return 0, nil, errors.New("request too large")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Origin+path, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(c.traced(ctx, longPoll), http.MethodPost, c.Origin+path, bytes.NewReader(raw))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -489,15 +578,17 @@ func (c *Client) post(ctx context.Context, path string, body any, out any, longP
 		req.Header.Set("Authorization", "Bearer "+c.Credential)
 	}
 	client := c.HTTP
+	limit := int64(maxReplyBytes)
 	if longPoll {
 		// Same transport and TLS roots; only the overall timeout is lifted.
 		unbounded := *c.HTTP
 		unbounded.Timeout = 0
 		client = &unbounded
+		limit = maxHeartbeatReplyBytes
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, nil, errors.New("coordinator unavailable")
+		return 0, nil, transportError(err)
 	}
 	defer resp.Body.Close()
 	c.observeRelease(resp.Header)
@@ -508,12 +599,15 @@ func (c *Client) post(ctx context.Context, path string, body any, out any, longP
 		return resp.StatusCode, resp.Header, statusError(resp)
 	}
 	if out != nil {
-		data, err := io.ReadAll(io.LimitReader(resp.Body, maxReplyBytes+1))
-		if err != nil || len(data) > maxReplyBytes {
-			return resp.StatusCode, resp.Header, errors.New("coordinator response too large")
+		data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+		if err != nil {
+			return resp.StatusCode, resp.Header, transportError(err)
+		}
+		if int64(len(data)) > limit {
+			return resp.StatusCode, resp.Header, fmt.Errorf("%w: too large", ErrInvalidResponse)
 		}
 		if err = json.Unmarshal(data, out); err != nil {
-			return resp.StatusCode, resp.Header, errors.New("invalid coordinator response")
+			return resp.StatusCode, resp.Header, ErrInvalidResponse
 		}
 	}
 	return resp.StatusCode, resp.Header, nil

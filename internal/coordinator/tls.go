@@ -5,18 +5,17 @@ import (
 	"crypto/x509"
 	"errors"
 	"io"
-	"net/http"
 	"net/url"
 	"os"
 )
 
 // NewWithCA optionally adds an operator-configured CA bundle to the system
 // roots for this coordinator only. HTTPS and hostname verification remain
-// required; provider transports never inherit these added roots.
+// required; provider transports never inherit these added roots. The
+// transport keeps New's HTTP/2 health checks either way.
 func NewWithCA(origin, credential, path string) (*Client, error) {
-	client := New(origin, credential)
 	if path == "" {
-		return client, nil
+		return New(origin, credential), nil
 	}
 	parsed, err := url.Parse(origin)
 	if err != nil || parsed.Scheme != "https" {
@@ -42,8 +41,5 @@ func NewWithCA(origin, credential, path string) (*Client, error) {
 	if !roots.AppendCertsFromPEM(pem) {
 		return nil, errors.New("coordinator CA bundle contains no certificates")
 	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
-	client.HTTP.Transport = transport
-	return client, nil
+	return newClient(origin, credential, &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}), nil
 }
