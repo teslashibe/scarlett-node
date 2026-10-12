@@ -16,6 +16,7 @@
 use std::{
     net::IpAddr,
     ops::Range,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -38,6 +39,7 @@ use crate::{
     dial,
     diagnostics::{Outcome, Phase, Run, Snapshot, Trace},
     policy::find,
+    serve::{Step, Steps},
     webpolicy,
     xpolicy::{self, HOST},
     xprove::{MAX_RECV, Request},
@@ -353,32 +355,45 @@ pub struct Hop {
     ip: IpAddr,
     started: Instant,
     deadline: tokio::time::Instant,
-    /// The daemon's id for the hop, for its log; empty in `relay-web`.
-    label: String,
+    /// The daemon's id for the hop and where it notes the hop's steps; none
+    /// in `relay-web`.
+    log: Option<(String, Arc<Steps>)>,
 }
 
 impl Hop {
     pub fn prepare(request: WebRequest) -> Result<Self, WebError> {
         let (raw, ip, timeout) = validate_hop(&request).map_err(WebError::fetch)?;
-        Ok(Self { request, raw, ip, started: Instant::now(), deadline: tokio::time::Instant::now() + timeout, label: String::new() })
+        Ok(Self { request, raw, ip, started: Instant::now(), deadline: tokio::time::Instant::now() + timeout, log: None })
     }
 
-    /// Names the hop in the daemon's log.
-    pub fn labelled(mut self, label: &str) -> Self {
-        label.clone_into(&mut self.label);
+    /// Names the hop in the daemon's log and notes its steps in `steps`.
+    pub fn logged(mut self, id: &str, steps: Arc<Steps>) -> Self {
+        self.log = Some((id.to_owned(), steps));
         self
     }
 
     /// One verbose daemon log line about this hop.
     fn detail(&self, line: std::fmt::Arguments) {
-        if !self.label.is_empty() {
-            crate::serve::detail(format_args!("hop {}: {line}", self.label));
+        if let Some((id, _)) = &self.log {
+            crate::serve::detail(format_args!("hop {id}: {line}"));
+        }
+    }
+
+    /// Notes the step the hop is in now, for the daemon's stuck-hop watch.
+    fn step(&self, step: Step) {
+        if let Some((id, steps)) = &self.log {
+            steps.set(id, step);
         }
     }
 
     /// Milliseconds since the hop was prepared.
     fn ms(&self) -> u128 {
         self.started.elapsed().as_millis()
+    }
+
+    /// When the whole hop, any wait for its token included, must be over.
+    pub fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
     }
 
     pub fn token(&self) -> Option<&str> {
@@ -436,8 +451,13 @@ impl Link {
     /// connection is open, has received nothing, and its wait is not nearly
     /// over. A connection that fails this is dropped; nothing was sent on it.
     pub fn usable(&mut self) -> bool {
-        let margin = if self.long_wait { LONG_WAIT } else { SHORT_WAIT };
-        self.waiting_since.elapsed() < margin && self.conn.check_idle().is_ok()
+        Instant::now() < self.usable_until() && self.conn.check_idle().is_ok()
+    }
+
+    /// When the verifier's wait for this connection's token is nearly over:
+    /// from then on a token is no longer sent on it.
+    pub fn usable_until(&self) -> Instant {
+        self.waiting_since + if self.long_wait { LONG_WAIT } else { SHORT_WAIT }
     }
 
     /// How long it has waited for a token.
@@ -507,16 +527,8 @@ pub async fn finish(hop: &Hop, token: &str, source: Source, trace: &Trace, prese
         return Err(WebError::fetch(anyhow::anyhow!("verifier token must be 64 lowercase hex characters")).into());
     }
     let request = &hop.request;
-    let dial_class = if request.proxy.is_some() { "proxy_failed" } else { "connect_failed" };
-    let target = async {
-        match tokio::time::timeout_at(hop.deadline, trace.measure(Phase::XTcpConnect, dial::target(hop.ip, request.port, request.proxy.as_ref()))).await {
-            Ok(Ok(server)) => Ok(server),
-            Ok(Err(dial::Error::Connect(error))) => Err(WebError { class: "connect_failed", error }),
-            Ok(Err(dial::Error::Proxy(error))) => Err(WebError { class: "proxy_failed", error }),
-            Err(_) => Err(WebError { class: dial_class, error: anyhow::anyhow!("target connection timed out") }),
-        }
-    };
-    let (server, link) = tokio::join!(target, source.resolve());
+    hop.step(Step::Connecting);
+    let (server, link) = tokio::join!(connect_target(hop, trace), source.resolve());
     hop.detail(format_args!("target {} at {} ms, verifier connection {}", if server.is_ok() { "connected" } else { "failed" }, hop.ms(), if link.is_some() { "in hand" } else { "to dial" }));
     let server = match server {
         Ok(server) => server,
@@ -530,14 +542,17 @@ pub async fn finish(hop: &Hop, token: &str, source: Source, trace: &Trace, prese
         let mut link = match link.and_then(|mut link| link.usable().then_some(link)) {
             Some(link) => link,
             None => {
+                hop.step(Step::Dialing);
                 let mut link = dial_for_token(hop, trace).await.map_err(|e| (e, false))?;
                 link.take();
                 link
             }
         };
         // The node learns that the token is about to go out before it does.
+        hop.step(Step::Presenting);
         presenting.await.map_err(|e| (e, false))?;
         link.conn.present(token).await.map_err(|e| (e, true))?;
+        hop.step(Step::InSession);
         hop.detail(format_args!("token presented at {} ms", hop.ms()));
         let (outcome, keep) = trace.measure(Phase::RelaySession, web_session_on(&mut link.conn, server, &hop.raw, host, request.hop, &request.url, trace)).await.map_err(|e| (e, true))?;
         Ok::<_, (anyhow::Error, bool)>((outcome, keep, link))
@@ -575,6 +590,38 @@ pub async fn finish(hop: &Hop, token: &str, source: Source, trace: &Trace, prese
         link
     });
     Ok((summary, kept))
+}
+
+/// How long one attempt at the target's TCP connection (or at the proxy's
+/// tunnel to it) may take: a connection that gets no answer is tried again
+/// on a fresh socket, and so a new source port, while the hop has time. One
+/// the target or the proxy turns away is not. Nothing has gone to the
+/// verifier yet, so a retry costs time only (shorter in tests).
+const CONNECT_ATTEMPTS: [Duration; 3] = if cfg!(test) {
+    [Duration::from_secs(1), Duration::from_secs(1), Duration::from_secs(1)]
+} else {
+    [Duration::from_secs(5), Duration::from_secs(10), Duration::from_secs(10)]
+};
+
+/// The hop's TCP connection to its target, which comes before its token.
+async fn connect_target(hop: &Hop, trace: &Trace) -> Result<TcpStream, WebError> {
+    let request = &hop.request;
+    let class = if request.proxy.is_some() { "proxy_failed" } else { "connect_failed" };
+    trace
+        .measure(Phase::XTcpConnect, async {
+            for (attempt, limit) in CONNECT_ATTEMPTS.into_iter().enumerate() {
+                let until = (tokio::time::Instant::now() + limit).min(hop.deadline);
+                match tokio::time::timeout_at(until, dial::target(hop.ip, request.port, request.proxy.as_ref())).await {
+                    Ok(Ok(server)) => return Ok(server),
+                    Ok(Err(dial::Error::Connect(error))) => return Err(WebError { class: "connect_failed", error }),
+                    Ok(Err(dial::Error::Proxy(error))) => return Err(WebError { class: "proxy_failed", error }),
+                    Err(_) if tokio::time::Instant::now() >= hop.deadline => break,
+                    Err(_) => hop.detail(format_args!("target connection attempt {} had no answer in {} ms", attempt + 1, limit.as_millis())),
+                }
+            }
+            Err(WebError { class, error: anyhow::anyhow!("target connection timed out") })
+        })
+        .await
 }
 
 /// Dials the verifier for a hop that has its token. A dial that failed fast
@@ -725,6 +772,10 @@ pub async fn wait_for_token(hop: &Hop, source: Source, next: impl Future<Output 
     tokio::pin!(next);
     let ended = loop {
         let ping_at = link.as_ref().filter(|link| !link.long_wait()).map(|link| tokio::time::Instant::now() + KEEPALIVE_AFTER.saturating_sub(link.idle()));
+        // A connection whose wait the verifier is about to end is closed:
+        // holding it would keep a place among the verifier's waiting
+        // connections for nothing. The hop dials again once it has its token.
+        let expires_at = link.as_ref().map(|link| tokio::time::Instant::from_std(link.usable_until()));
         tokio::select! {
             token = &mut next => {
                 let Some(token) = token else { break Outcome::Cancelled };
@@ -751,6 +802,10 @@ pub async fn wait_for_token(hop: &Hop, source: Source, next: impl Future<Output 
                     link = Some(pinged);
                 }
                 hop.detail(format_args!("ping while waiting {} at {} ms", if link.is_some() { "answered" } else { "failed" }, hop.ms()));
+            }
+            _ = tokio::time::sleep_until(expires_at.unwrap_or(hop.deadline)), if expires_at.is_some() => {
+                link = None;
+                hop.detail(format_args!("closed its connection, whose wait was nearly over, at {} ms", hop.ms()));
             }
             _ = tokio::time::sleep_until(hop.deadline) => break Outcome::Error,
         }

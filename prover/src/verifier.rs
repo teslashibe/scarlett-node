@@ -2970,6 +2970,162 @@ mod web_tests {
         assert!(dials >= 2, "{dials}");
     }
 
+    /// A CONNECT proxy that takes connections and never answers: to a hop it
+    /// is a target that never answers its TCP connection.
+    async fn silent_proxy() -> u16 {
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = proxy.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((client, _)) = proxy.accept().await {
+                held.push(client);
+            }
+        });
+        port
+    }
+
+    // Hang mode A (cross-binary e2e, 2026-10-12): a hop held a pre-token
+    // verifier connection for 60 s and never answered, because nothing but
+    // the hop's whole budget (up to 280 s) bounded its target connect.
+    #[tokio::test]
+    async fn a_hop_whose_target_never_answers_ends_unsent_within_its_connect_time() {
+        use crate::serve::tests::Daemon;
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        let s = shared(origin.roots.clone(), None);
+        let verifier = serve_verifier(&s).await;
+        let (proxy, _) = counted_tunnel(origin.addr).await;
+        let silent = silent_proxy().await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let mut daemon = Daemon::start().await;
+        daemon.send(json!({"type": "pool", "size": 1, "verifier": verifier.to_string(), "verifier_ca_file": null, "plaintext_fixture": true})).await;
+        until_waiting(&s, 1).await;
+        // Pre-dialed on the warm connection; the token comes; the target never answers.
+        daemon.send(json!({"type": "hop", "id": "h1", "input": daemon_input(verifier, silent, 0, "https://example.com/", None)})).await;
+        daemon.send(json!({"type": "token", "id": "h1", "token": token})).await;
+        let started = Instant::now();
+        let (reply, presenting) = daemon.result("h1").await;
+        // Its budget is 20 s; the connect gives up after 3 attempts of 1 s here (5, 10 and 10 s in production).
+        assert!(started.elapsed() < Duration::from_secs(6), "{:?}", started.elapsed());
+        assert_eq!((reply["type"].as_str(), reply["class"].as_str(), reply["presented"].as_bool(), presenting), (Some("error"), Some("proxy_failed"), Some(false), false), "{reply}");
+        assert!(reply["error"].as_str().unwrap().contains("target connection timed out"), "{reply}");
+        // Nothing was spent, and the connection it held went back to the pool.
+        assert_eq!((tokens(&s), view(&s).await["remaining_sessions"].as_u64()), (1, Some(6)));
+        until_waiting(&s, 1).await;
+        // The same token then runs the hop to a target that answers.
+        daemon.send(json!({"type": "hop", "id": "h2", "input": daemon_input(verifier, proxy, 0, "https://example.com/", Some(&token))})).await;
+        let (reply, presenting) = daemon.result("h2").await;
+        assert!(presenting && reply["type"] == "summary", "{reply}");
+        assert_eq!(view(&s).await["complete"], true);
+    }
+
+    #[tokio::test]
+    async fn a_hop_with_its_token_whose_target_never_answers_ends_unsent_too() {
+        use crate::serve::tests::Daemon;
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        let s = shared(origin.roots.clone(), None);
+        let verifier = serve_verifier(&s).await;
+        let silent = silent_proxy().await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let mut daemon = Daemon::start().await;
+        daemon.send(json!({"type": "pool", "size": 0, "verifier": verifier.to_string(), "verifier_ca_file": null, "plaintext_fixture": true})).await;
+        let started = Instant::now();
+        daemon.send(json!({"type": "hop", "id": "h1", "input": daemon_input(verifier, silent, 0, "https://example.com/", Some(&token))})).await;
+        let (reply, presenting) = daemon.result("h1").await;
+        assert!(started.elapsed() < Duration::from_secs(6), "{:?}", started.elapsed());
+        assert_eq!((reply["type"].as_str(), reply["class"].as_str(), reply["presented"].as_bool(), presenting), (Some("error"), Some("proxy_failed"), Some(false), false), "{reply}");
+        // Its cold dial is closed, not left waiting.
+        until_waiting(&s, 0).await;
+        assert_eq!(tokens(&s), 1);
+    }
+
+    #[tokio::test]
+    async fn a_hop_whose_token_never_comes_ends_at_its_deadline_and_frees_its_connection() {
+        use crate::serve::tests::Daemon;
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        let s = shared(origin.roots.clone(), None);
+        let verifier = serve_verifier(&s).await;
+        let (proxy, tunnels) = counted_tunnel(origin.addr).await;
+        register(&s, payload("https://example.com/", 5)).await;
+        let mut daemon = Daemon::start().await;
+        daemon.send(json!({"type": "pool", "size": 0, "verifier": verifier.to_string(), "verifier_ca_file": null, "plaintext_fixture": true})).await;
+        let mut input = daemon_input(verifier, proxy, 0, "https://example.com/", None);
+        input["timeout_ms"] = 1500.into();
+        let started = Instant::now();
+        daemon.send(json!({"type": "hop", "id": "h1", "input": input})).await;
+        until_waiting(&s, 1).await;
+        let (reply, presenting) = daemon.result("h1").await;
+        assert!((Duration::from_millis(1400)..Duration::from_secs(4)).contains(&started.elapsed()), "{:?}", started.elapsed());
+        assert_eq!((reply["type"].as_str(), reply["presented"].as_bool(), presenting), (Some("error"), Some(false), false), "{reply}");
+        assert!(reply["error"].as_str().unwrap().contains("no token before the hop deadline"), "{reply}");
+        // Nothing was sent, no target reached, and the verifier no longer holds its connection.
+        until_waiting(&s, 0).await;
+        assert_eq!((tunnels.load(Ordering::SeqCst), tokens(&s)), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn every_hop_ends_in_a_reply_even_one_that_panics_or_stalls() {
+        use crate::serve::tests::Daemon;
+        let origin = web_origin(routes(&[("example.com/", PAGE, End::Wait)]), false).await;
+        let s = shared(origin.roots.clone(), None);
+        let verifier = serve_verifier(&s).await;
+        let proxy = tunnel(origin.addr).await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let mut daemon = Daemon::start().await;
+        daemon.send(json!({"type": "pool", "size": 0, "verifier": verifier.to_string(), "verifier_ca_file": null, "plaintext_fixture": true})).await;
+        // A hop task that panics is answered, not left silent.
+        daemon.send(json!({"type": "hop", "id": "panics1", "input": daemon_input(verifier, proxy, 0, "https://example.com/", Some(&token))})).await;
+        let (reply, presenting) = daemon.result("panics1").await;
+        assert_eq!((reply["type"].as_str(), reply["class"].as_str(), reply["presented"].as_bool(), presenting), (Some("error"), Some("fetch_failed"), Some(false), false), "{reply}");
+        // A hop stuck where no step of its own bounds it is answered a second after its deadline.
+        let mut input = daemon_input(verifier, proxy, 0, "https://example.com/", Some(&token));
+        input["timeout_ms"] = 1000.into();
+        let started = Instant::now();
+        daemon.send(json!({"type": "hop", "id": "stalls1", "input": input})).await;
+        let (reply, _) = daemon.result("stalls1").await;
+        assert!((Duration::from_secs(2)..Duration::from_secs(4)).contains(&started.elapsed()), "{:?}", started.elapsed());
+        assert!(reply["type"] == "error" && reply["error"].as_str().unwrap().contains("overran its deadline"), "{reply}");
+        // Neither spent the token, and the daemon goes on serving.
+        daemon.send(json!({"type": "hop", "id": "h1", "input": daemon_input(verifier, proxy, 0, "https://example.com/", Some(&token))})).await;
+        let (reply, presenting) = daemon.result("h1").await;
+        assert!(presenting && reply["type"] == "summary", "{reply}");
+    }
+
+    // Hang mode B: the verifier rejects a page that is too large while the
+    // target is still sending it; the daemon must answer with that rejection
+    // at once, not after the page, and nothing of the hop may linger.
+    #[tokio::test]
+    async fn a_hop_the_verifier_rejects_mid_stream_answers_at_once() {
+        use crate::serve::tests::Daemon;
+        let huge: Respond = Arc::new(|_: &[u8]| {
+            let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 104857600\r\n\r\n".to_vec();
+            response.resize(response.len() + (16 << 20), b'x');
+            (response, End::Wait)
+        });
+        let origin = web_origin(huge, false).await;
+        let s = shared(origin.roots.clone(), None);
+        let verifier = serve_verifier(&s).await;
+        let proxy = tunnel(origin.addr).await;
+        let token = register(&s, payload("https://example.com/", 5)).await;
+        let mut daemon = Daemon::start().await;
+        daemon.send(json!({"type": "pool", "size": 1, "verifier": verifier.to_string(), "verifier_ca_file": null, "plaintext_fixture": true})).await;
+        until_waiting(&s, 1).await;
+        daemon.send(json!({"type": "hop", "id": "h1", "input": daemon_input(verifier, proxy, 0, "https://example.com/", None)})).await;
+        daemon.send(json!({"type": "token", "id": "h1", "token": token})).await;
+        let started = Instant::now();
+        let (reply, presenting) = daemon.result("h1").await;
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(presenting, "{reply}");
+        assert_eq!((reply["type"].as_str(), reply["class"].as_str(), reply["presented"].as_bool()), (Some("error"), Some("page_too_large"), Some(true)), "{reply}");
+        assert_eq!(view(&s).await["rejections"], json!(["page_too_large"]));
+        // The hop is gone: the pool is refilled to its one connection and the
+        // next hop's request is answered.
+        until_waiting(&s, 1).await;
+        daemon.send(json!({"type": "token", "id": "h1", "token": token})).await;
+        daemon.send(json!({"type": "hop", "id": "h2", "input": daemon_input(verifier, proxy, 0, "https://example.com/", Some(&token))})).await;
+        let (reply, _) = daemon.result("h2").await;
+        assert_eq!(reply["type"], "error", "{reply}");
+    }
+
     async fn capacity_view(s: &Shared) -> Value {
         let (_, Json(view)) = capacity(State(s.clone()), headers()).await;
         view

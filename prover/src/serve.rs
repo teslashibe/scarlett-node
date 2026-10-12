@@ -36,6 +36,7 @@
 
 use std::{
     collections::HashMap,
+    panic::AssertUnwindSafe,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -44,6 +45,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
@@ -89,6 +91,66 @@ pub fn detail(line: std::fmt::Arguments) {
         note(line);
     }
 }
+
+/// What a hop is doing now, for the stuck-hop watch and the verbose log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    WaitingForToken,
+    Connecting,
+    Dialing,
+    Presenting,
+    InSession,
+}
+
+impl Step {
+    fn name(self) -> &'static str {
+        match self {
+            Step::WaitingForToken => "waiting for its token",
+            Step::Connecting => "connecting to its target",
+            Step::Dialing => "dialing the verifier",
+            Step::Presenting => "presenting its token",
+            Step::InSession => "in its session",
+        }
+    }
+
+    /// How long a hop may stay in this step before the log says so: a
+    /// session may stream a large page for minutes; the rest takes seconds.
+    fn noteworthy_after(self) -> Duration {
+        match self {
+            Step::InSession => Duration::from_secs(120),
+            _ => Duration::from_secs(15),
+        }
+    }
+}
+
+/// Each running hop's step and since when. The upkeep notes, once per step,
+/// a hop that stays in one for long: a hop that hangs shows where.
+#[derive(Default)]
+pub struct Steps(Mutex<HashMap<String, (Step, Instant, bool)>>);
+
+impl Steps {
+    pub fn set(&self, id: &str, step: Step) {
+        detail(format_args!("hop {id}: {}", step.name()));
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_owned(), (step, Instant::now(), false));
+    }
+
+    fn end(&self, id: &str) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+    }
+
+    fn watch(&self) {
+        for (id, (step, since, noted)) in self.0.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
+            if !*noted && since.elapsed() >= step.noteworthy_after() {
+                *noted = true;
+                note(format_args!("hop {id} has been {} for {} s", step.name(), since.elapsed().as_secs()));
+            }
+        }
+    }
+}
+
+/// How long past its deadline a hop may take to reply. Every step keeps to
+/// the deadline on its own; this bounds whatever does not.
+const REPLY_GRACE: Duration = Duration::from_secs(1);
 
 /// Reads one message; `None` at end of input between messages.
 pub async fn read_message<R: AsyncRead + Unpin>(input: &mut R) -> Result<Option<Vec<u8>>> {
@@ -187,8 +249,12 @@ struct Idle {
 }
 
 impl Idle {
+    /// A connection the verifier gives only the short wait (a pre-dial
+    /// that was cancelled before its PING) is pinged at the next upkeep,
+    /// which gives it the long one.
     fn new(link: Link) -> Self {
-        Self { link, pinged: Instant::now() }
+        let pinged = if link.long_wait() { Instant::now() } else { Instant::now().checked_sub(PING_EVERY).unwrap_or_else(Instant::now) };
+        Self { link, pinged }
     }
 }
 
@@ -196,6 +262,7 @@ struct Shared {
     pool: Mutex<Pool>,
     upkeep: Notify,
     hops: Mutex<HashMap<String, oneshot::Sender<Start>>>,
+    steps: Arc<Steps>,
     replies: Replies,
 }
 
@@ -270,7 +337,7 @@ where
             }
         }
     });
-    let shared = Arc::new(Shared { pool: Mutex::new(Pool::default()), upkeep: Notify::new(), hops: Mutex::new(HashMap::new()), replies: Replies(sender) });
+    let shared = Arc::new(Shared { pool: Mutex::new(Pool::default()), upkeep: Notify::new(), hops: Mutex::new(HashMap::new()), steps: Arc::default(), replies: Replies(sender) });
     shared.replies.send(Reply::Ready { version: VERSION });
     let upkeep = tokio::spawn(upkeep(shared.clone()));
     let result = async {
@@ -350,8 +417,18 @@ fn start_hop(shared: &Arc<Shared>, request: HopRequest) {
     tokio::spawn(async move {
         let trace = Trace::new();
         let begun = Instant::now();
-        let reply = hop(&shared, &id, job, input, started, &trace).await;
+        let presented = AtomicBool::new(false);
+        // Whatever happens inside, the hop ends in a reply: a panic is
+        // answered as a failure, never with silence.
+        let reply = match AssertUnwindSafe(hop(&shared, &id, job, input, started, &trace, &presented)).catch_unwind().await {
+            Ok(reply) => reply,
+            Err(_) => {
+                note(format_args!("hop {id} failed unexpectedly"));
+                Reply::Error { id: id.clone(), class: "fetch_failed", error: "the hop failed unexpectedly".into(), presented: presented.load(Ordering::SeqCst), diagnostics: trace.snapshot().ended(Outcome::Error) }
+            }
+        };
         shared.hops.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+        shared.steps.end(&id);
         match &reply {
             Reply::Error { class, presented, .. } => detail(format_args!("hop {id}: ends {class} (presented {presented}) after {} ms", begun.elapsed().as_millis())),
             reply => detail(format_args!("hop {id}: ends {} after {} ms", reply.kind(), begun.elapsed().as_millis())),
@@ -360,20 +437,47 @@ fn start_hop(shared: &Arc<Shared>, request: HopRequest) {
     });
 }
 
-/// One hop, start to reply.
-async fn hop(shared: &Arc<Shared>, id: &str, job: Option<String>, input: Value, started: oneshot::Receiver<Start>, trace: &Trace) -> Reply {
-    let failed = |error: node::WebError, presented: bool| Reply::Error { id: id.to_owned(), class: error.class, error: node::loggable_cause(&error.error), presented, diagnostics: trace.snapshot().ended(Outcome::Error) };
+/// The reply for a hop that failed with `error`.
+fn failure(id: &str, error: node::WebError, presented: bool, trace: &Trace) -> Reply {
+    Reply::Error { id: id.to_owned(), class: error.class, error: node::loggable_cause(&error.error), presented, diagnostics: trace.snapshot().ended(Outcome::Error) }
+}
+
+/// One hop, start to reply, by its deadline. `presented` is set once the
+/// hop announces its token: from then on its session may have been spent.
+async fn hop(shared: &Arc<Shared>, id: &str, job: Option<String>, input: Value, started: oneshot::Receiver<Start>, trace: &Trace, presented: &AtomicBool) -> Reply {
     let request: WebRequest = match serde_json::from_value(input) {
         Ok(request) => request,
-        Err(e) => return failed(node::WebError::fetch(anyhow::Error::new(e).context("invalid hop input")), false),
+        Err(e) => return failure(id, node::WebError::fetch(anyhow::Error::new(e).context("invalid hop input")), false, trace),
     };
     if request.predial {
-        return failed(node::WebError::fetch(anyhow::anyhow!("a hop waits for its token without predial")), false);
+        return failure(id, node::WebError::fetch(anyhow::anyhow!("a hop waits for its token without predial")), false, trace);
     }
     let hop = match Hop::prepare(request) {
-        Ok(hop) => hop.labelled(id),
-        Err(error) => return failed(error, false),
+        Ok(hop) => hop.logged(id, shared.steps.clone()),
+        Err(error) => return failure(id, error, false, trace),
     };
+    match tokio::time::timeout_at(hop.deadline() + REPLY_GRACE, run_hop(shared, id, job, &hop, started, trace, presented)).await {
+        Ok(reply) => reply,
+        Err(_) => {
+            note(format_args!("hop {id} overran its deadline"));
+            failure(id, node::WebError::fetch(anyhow::anyhow!("the hop overran its deadline")), presented.load(Ordering::SeqCst), trace)
+        }
+    }
+}
+
+/// A prepared hop: its connection, its token, its session.
+async fn run_hop(shared: &Arc<Shared>, id: &str, job: Option<String>, hop: &Hop, started: oneshot::Receiver<Start>, trace: &Trace, presented: &AtomicBool) -> Reply {
+    // Tests reach the guards above with hops that fail in ways no input can cause.
+    #[cfg(test)]
+    {
+        if id.starts_with("panics") {
+            panic!("a test hop panics");
+        }
+        if id.starts_with("stalls") {
+            std::future::pending::<()>().await;
+        }
+    }
+    let failed = |error: node::WebError, presented: bool| failure(id, error, presented, trace);
     let verifier = hop.verifier();
     // The job's hops share their token; a hop that has it can take the
     // connection the job's last hop left.
@@ -412,7 +516,8 @@ async fn hop(shared: &Arc<Shared>, id: &str, job: Option<String>, input: Value, 
                     _ => None,
                 }
             };
-            let waited = node::wait_for_token(&hop, source, next, trace).await;
+            shared.steps.set(id, Step::WaitingForToken);
+            let waited = node::wait_for_token(hop, source, next, trace).await;
             detail(format_args!(
                 "hop {id}: wait for the token ended: {}",
                 match &waited {
@@ -440,8 +545,11 @@ async fn hop(shared: &Arc<Shared>, id: &str, job: Option<String>, input: Value, 
         }
     };
     let affinity = job.or_else(|| Some(token_key(&token)));
-    let presenting = shared.replies.written(Reply::Presenting { id: id.to_owned() });
-    match node::finish(&hop, &token, source, trace, presenting).await {
+    let presenting = async {
+        presented.store(true, Ordering::SeqCst);
+        shared.replies.written(Reply::Presenting { id: id.to_owned() }).await
+    };
+    match node::finish(hop, &token, source, trace, presenting).await {
         Ok((mut summary, kept)) => {
             // The job's next hop takes the connection its redirect left.
             give_back(shared, affinity.as_deref(), kept, !summary.is_final);
@@ -499,6 +607,7 @@ async fn upkeep(shared: Arc<Shared>) {
             _ = shared.upkeep.notified() => {}
             _ = tokio::time::sleep(TICK) => {}
         }
+        shared.steps.watch();
         let (to_ping, dials, verifier) = {
             let mut pool = shared.pool.lock().unwrap_or_else(|e| e.into_inner());
             let now = Instant::now();
