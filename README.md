@@ -228,6 +228,7 @@ A `web` job fetches one public `https` page from the node's own connection, so t
 - TLS 1.3 with AES-128-GCM and HTTP/1.1 only. Sites that offer only TLS 1.2 fail. No JavaScript runs.
 - Before every hop the node resolves the host itself and refuses the hop if any address is loopback, private, link-local, CGNAT, multicast, reserved, documentation, ULA, 6to4, Teredo, an IPv4-mapped or NAT64 address that carries one of those, or an address on one of the node's own interfaces. The helper then dials exactly the checked address, so a second DNS answer cannot redirect it. `x.com`, `twitter.com` and reserved names such as `.local` are refused before any lookup.
 - `SCARLETT_WEB_CONCURRENCY` (1–32, default 4) bounds simultaneous pages. `SCARLETT_WEB_EGRESS_PROXY=http://[user:pass@]host:port` sends every web connection through a local HTTP `CONNECT` proxy, such as a residential proxy for a cloud server. The proxy must tunnel without intercepting (TLS runs end to end with the verifier). Its address and credentials never leave the node; the heartbeat says only `egress: proxy`.
+- `SCARLETT_WEB_CONCURRENCY=auto` lets the node find its own limit between 2 and 16 pages, starting at 4. It takes one more page after 20 healthy pages in a row: each proven with no timeout or `verifier_busy`, with at least half the limit running, while the relay helper's p90 time stays within 1.25× its five-minute median, CPU is under 70% and memory is not tight. It halves, never below 2, after 3 pages time out or are turned away as `verifier_busy` within 60 s, when the p90 passes twice the median, or under critical memory pressure. A lower limit only stops new pages; running pages always finish. The heartbeat advertises the limit as web capacity, and `scarlett-node status` shows it as `web_limit` (`limit_mode`, `limit`, `limit_reason`, `limit_changed_at`).
 - A caught verifier misuse latches the same node-wide relay halt as for X. Web has no MPC fallback, so it stops until `scarlett-node relay-resume`.
 
 Known residual: a site that resolves to the node's own public IP behind NAT (hairpin) is not detected.
@@ -290,10 +291,10 @@ Settings come from the environment, typically via `~/.config/scarlett-node/node.
 | `SCARLETT_CODEX_CONCURRENCY` | Total simultaneous Codex jobs across accounts |
 | `SCARLETT_X_CONCURRENCY` | Total simultaneous X jobs across accounts |
 | `SCARLETT_X_ACCOUNT_CONCURRENCY` | Optional ceiling per authenticated X account, 1–32; CLI default 32 retains the registry limit, desktop sets 1 |
-| `SCARLETT_WEB_CONCURRENCY` | Simultaneous web pages, 1–32 (default 4) |
+| `SCARLETT_WEB_CONCURRENCY` | Simultaneous web pages, 1–32, or `auto` to adapt between 2 and 16 from 4 (default 4) |
 | `SCARLETT_WEB_EGRESS_PROXY` | Optional local HTTP `CONNECT` proxy for web targets, `http://[user:pass@]host:port`, such as a residential proxy for a cloud server; never logged or reported |
 | `SCARLETT_WEB_BROWSER` | `on` or `off`: the hidden browser tier for web jobs in browser mode. Default `on` with web on macOS and Linux, `off` on Windows |
-| `SCARLETT_WEB_BROWSER_CONCURRENCY` | Pages the browser renders at once, 1–4 and at most `SCARLETT_WEB_CONCURRENCY`; default 1 below 16 GiB of memory, else 2 |
+| `SCARLETT_WEB_BROWSER_CONCURRENCY` | Pages the browser renders at once, 1–4 and at most `SCARLETT_WEB_CONCURRENCY` (with `auto`, at most its current limit); default 1 below 16 GiB of memory, else 2 |
 | `SCARLETT_WEB_BROWSER_IDLE_SECONDS` | How long an idle browser stays up, 30–3600 (default 120) |
 | `SCARLETT_WEB_SOLVERS` | Optional operator-paid captcha solvers for the browser tier: a comma list of `capmonster`, `capsolver` and `2captcha` (needs the browser tier) |
 | `SCARLETT_WEB_SOLVER_CAPMONSTER_KEY_FILE`, `SCARLETT_WEB_SOLVER_CAPSOLVER_KEY_FILE`, `SCARLETT_WEB_SOLVER_2CAPTCHA_KEY_FILE` | Absolute path of each listed provider's key file: a private (0600) regular file holding the key alone; never logged or reported |
