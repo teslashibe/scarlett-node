@@ -17,6 +17,8 @@ Optional: captcha solvers for the browser tier, paid by you. Put each provider's
 
 For the default Linux installation, copy `scarlett-node.service` to `~/.config/systemd/user/`, run `systemctl --user daemon-reload`, then `systemctl --user enable --now scarlett-node`. Pair first using the same configuration and state directory. The installer does not start services or change login persistence. Custom installation paths need corresponding edits to the unit. On macOS, run the node in the foreground or use your own process supervisor.
 
+Stopping the service (SIGTERM), a drain and a suspend tell the coordinator goodbye first, within a second, so jobs the node has not accepted go to other nodes at once; accepted jobs still finish within the unit's stop timeout. Linux needs no sleep hook: after a suspend the node notices the wall clock jump ahead of its monotonic clock and reconnects at once. `scarlett-node status` shows when the last heartbeat was answered (`last_heartbeat_ok_at`), why the last one failed (`heartbeat_error_class`) and whether the coordinator is holding back work for missed offers (`dispatch_health`). Run the node as Scarlett Node 0.1.17 or later: the coordinator answers older versions 426 `update_required` and gives them no work.
+
 Every setting, readiness state and failure code is described in the operator guide at <https://network.scarlett.ai/docs/>, including running a web node on a cloud server through `SCARLETT_WEB_EGRESS_PROXY`.
 
 ## Updates
@@ -24,7 +26,7 @@ Every setting, readiness state and failure code is described in the operator gui
 `scarlett-node update check` reports the installed and latest release, whether the coordinator still offers this version new jobs, and the release's highlights with a link to the changelog at <https://network.scarlett.ai/changelog/>. `scarlett-node update apply` installs the latest release:
 
 1. It downloads the signed bundle for this platform from `https://network.scarlett.ai/downloads/` (or your `SCARLETT_COORDINATOR` origin; HTTPS only) and checks its length, SHA-256 and minisign signature against the keys built into the node. Nothing runs before all three pass.
-2. If the node is serving, it pauses new work (`drain`) and waits until the node reports `draining` with no accepted job in flight. It never stops accepted work; after 30 minutes it resumes and gives up.
+2. If the node is serving, it pauses new work (`drain`; the node says goodbye, so the coordinator moves offers it has not accepted) and waits until the node reports `draining` with no accepted job in flight. It never stops accepted work; after 30 minutes it resumes and gives up.
 3. It runs the new bundle's own `install.sh`, which checks every file again and switches `current` atomically.
 4. It starts the new binary, then restarts `scarlett-node.service` when that user service is active and waits up to three minutes for the node to report running on the new release. If either check fails, it reinstalls the previous version with that version's `install.sh`, restarts it and records the failed version.
 5. It resumes new work if it was the one that paused it.
