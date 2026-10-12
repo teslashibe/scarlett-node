@@ -382,7 +382,7 @@ lowercase hex digit, so the first byte tells a token from a frame.
   for 45 s, well inside the 60 s.
 - **Places.** Every connection that has not presented a token, new or kept,
   holds a waiting place: at most `SCARLETT_VERIFIER_PRE_TOKEN_LIMIT` (2,048)
-  in all and `SCARLETT_VERIFIER_PRE_TOKEN_PER_ADDRESS` (8) per source
+  in all and `SCARLETT_VERIFIER_PRE_TOKEN_PER_ADDRESS` (64) per source
   address (an IPv4 address, or an IPv6 /64). A connection that finds no
   place is closed right after the TCP accept. A kept connection needs a
   place again at `DONE`; without one `DONE` says `"keep":false`.
@@ -396,11 +396,14 @@ lowercase hex digit, so the first byte tells a token from a frame.
 | Variable | Default | Range |
 |---|---|---|
 | `SCARLETT_VERIFIER_PRE_TOKEN_LIMIT` | 2048 | 16 to 65,536 |
-| `SCARLETT_VERIFIER_PRE_TOKEN_PER_ADDRESS` | 8 | 1 to the limit |
+| `SCARLETT_VERIFIER_PRE_TOKEN_PER_ADDRESS` | 64 | 1 to the limit |
 
-A local harness that runs several nodes on one address (127.0.0.1) needs a
-larger per-address limit: each node may hold two kept connections plus one
-per accept in flight.
+One node holds at most one waiting connection per web slot (its pre-dials
+and the hops about to present a token; `SCARLETT_WEB_CONCURRENCY` is at most
+32) plus its warm pool (at most 2, and 2 more while it replaces them), so a
+single node at full concurrency never meets the default per-address cap. A
+local harness that runs several nodes on one address (127.0.0.1), or
+operators behind one NAT address, may need a larger one.
 
 ### 12.4 Capacity
 `GET /v1/capacity` (`capacity.json`): `active_connections` now counts the

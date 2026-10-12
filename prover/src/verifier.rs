@@ -89,9 +89,12 @@ const MAX_DURABLE_X_EXCHANGES: usize = 10;
 const X_CODEX_SLOTS: usize = 16;
 
 /// Connections that may wait for a token at once, all told and from one
-/// source address (SCARLETT_VERIFIER_PRE_TOKEN_LIMIT and _PER_ADDRESS).
+/// source address (SCARLETT_VERIFIER_PRE_TOKEN_LIMIT and _PER_ADDRESS). One
+/// node holds at most one per web slot (32 at most) for its hops and pre-
+/// dials, plus its warm pool (2, and 2 replacing them): one node at full
+/// concurrency never meets the per-address cap.
 const PRE_TOKEN_LIMIT: usize = 2048;
-const PRE_TOKEN_PER_ADDRESS: usize = 8;
+const PRE_TOKEN_PER_ADDRESS: usize = 64;
 
 struct Config {
     key: String,
