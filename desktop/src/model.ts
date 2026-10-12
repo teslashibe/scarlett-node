@@ -258,8 +258,8 @@ export function ago(ms: number): string {
   const hours = Math.floor(minutes / 60);
   return hours < 48 ? `${hours} h ago` : `${Math.floor(hours / 24)} days ago`;
 }
-// Scarlett answers an idle heartbeat within about 25 s, so a minute with no
-// answer means the node is not reaching it.
+// Scarlett holds an idle heartbeat for 20 s before it answers, so a minute
+// with no answer means the node is not reaching it.
 export const HEARTBEAT_LATE_MS = 60_000;
 // When Scarlett last answered this node's heartbeat.
 export function lastHeartbeat(s: Snapshot, now = Date.now()): Metric {
