@@ -350,6 +350,9 @@ pub struct Node {
     /// Web pages at once for the next child: 0 is Auto, the node's adaptive
     /// limit.
     web_concurrency: std::sync::atomic::AtomicU8,
+    /// Browser pages at once for the next child: 0 is Auto, the node's own
+    /// choice from its memory.
+    web_browser_concurrency: std::sync::atomic::AtomicU8,
     /// An explicit SCARLETT_WEB_BROWSER ("on" or "off") from the same trusted
     /// environment, passed on only with web. Unset, the node's platform
     /// default applies (on for macOS, off for Windows in this release).
@@ -369,6 +372,19 @@ fn web_concurrency_env(setting: u8) -> String {
         "auto".into()
     } else {
         setting.to_string()
+    }
+}
+
+/// SCARLETT_WEB_BROWSER_CONCURRENCY for a Browser pages at once setting and
+/// the Web pages at once setting beside it. Auto (0) passes nothing, so the
+/// node picks 1 or 2 from its memory. A number is passed on, at most a fixed
+/// web limit: the node refuses to start with more browser pages than web
+/// pages (internal/config). Auto web's ceiling, 16, is above every choice.
+fn web_browser_concurrency_env(browser: u8, web: u8) -> Option<String> {
+    match (browser, web) {
+        (0, _) => None,
+        (pages, 0) => Some(pages.to_string()),
+        (pages, web) => Some(pages.min(web).to_string()),
     }
 }
 
@@ -510,7 +526,7 @@ pub(crate) fn private_dir_with_helper(path: &Path, helper: &Path) -> Result<()> 
     }
 }
 /// The largest reply `private_helper` reads. The longest is the device
-/// preferences (136 bytes with every field at its widest).
+/// preferences (185 bytes with every field at its widest, newline included).
 pub(crate) const PRIVATE_HELPER_REPLY_LIMIT: usize = 256;
 pub(crate) fn private_helper(binary: &Path, action: &str, path: &Path) -> Result<Value> {
     if !path.is_absolute() || !regular(binary) {
@@ -811,6 +827,7 @@ impl Node {
             web: AtomicBool::new(crate::preferences::default_serve_web()),
             web_running: AtomicBool::new(false),
             web_concurrency: std::sync::atomic::AtomicU8::new(0),
+            web_browser_concurrency: std::sync::atomic::AtomicU8::new(0),
             web_browser: None,
             log_dir: None,
             log_bound: std::sync::Mutex::new(None),
@@ -870,6 +887,16 @@ impl Node {
             return Err(Error::InvalidInput);
         }
         self.web_concurrency.store(concurrency, Ordering::SeqCst);
+        Ok(())
+    }
+    /// Browser pages at once for the next child process: 0 is Auto. Like Web
+    /// pages at once, a running node keeps the value it was started with.
+    pub fn set_web_browser_concurrency(&self, concurrency: u8) -> Result<()> {
+        if concurrency > crate::preferences::MAX_WEB_BROWSER_CONCURRENCY {
+            return Err(Error::InvalidInput);
+        }
+        self.web_browser_concurrency
+            .store(concurrency, Ordering::SeqCst);
         Ok(())
     }
     pub fn network_url(&self, destination: &str) -> Result<String> {
@@ -951,12 +978,19 @@ impl Node {
         #[cfg(windows)]
         cmd.creation_flags(0x08000000);
         if web {
-            cmd.env(
-                "SCARLETT_WEB_CONCURRENCY",
-                web_concurrency_env(self.web_concurrency.load(Ordering::SeqCst)),
-            );
+            let concurrency = self.web_concurrency.load(Ordering::SeqCst);
+            cmd.env("SCARLETT_WEB_CONCURRENCY", web_concurrency_env(concurrency));
             if let Some(browser) = self.web_browser {
                 cmd.env("SCARLETT_WEB_BROWSER", browser);
+            }
+            // Only a node whose browser runs is told how many pages it renders.
+            if web_browser_on(self.web_browser)
+                && let Some(pages) = web_browser_concurrency_env(
+                    self.web_browser_concurrency.load(Ordering::SeqCst),
+                    concurrency,
+                )
+            {
+                cmd.env("SCARLETT_WEB_BROWSER_CONCURRENCY", pages);
             }
         }
         if let Some(root) = managed_codex_root(&self.state) {
@@ -3050,6 +3084,72 @@ esac
                 r#"func WebBrowserDefault(goos string) bool { return goos != "windows" }"#
             )
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn launcher_passes_browser_pages_at_once_within_the_web_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("node");
+        std::fs::write(&binary, "synthetic node").unwrap();
+        let mut node = Node::new(
+            temp.path().join("state"),
+            binary,
+            temp.path().join("helper"),
+        );
+        let pages = |node: &Node| -> Option<String> {
+            node.command(&["desktop", "run"])
+                .unwrap()
+                .as_std()
+                .get_envs()
+                .find(|(k, _)| *k == "SCARLETT_WEB_BROWSER_CONCURRENCY")
+                .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        };
+        node.web_browser = web_browser_setting(Some("on"));
+        // Auto passes nothing, so the node picks from its memory.
+        assert_eq!(pages(&node), None);
+        // A number passes through with Auto web, whose ceiling is above it.
+        for n in 1..=crate::preferences::MAX_WEB_BROWSER_CONCURRENCY {
+            node.set_web_browser_concurrency(n).unwrap();
+            assert_eq!(pages(&node), Some(n.to_string()));
+        }
+        // Above the node's own ceiling is refused, keeping the saved value.
+        for invalid in [crate::preferences::MAX_WEB_BROWSER_CONCURRENCY + 1, u8::MAX] {
+            assert_eq!(
+                node.set_web_browser_concurrency(invalid),
+                Err(Error::InvalidInput)
+            );
+        }
+        assert_eq!(pages(&node).as_deref(), Some("4"));
+        // A fixed Web pages at once below it caps what the node is told, so
+        // the node still starts; the saved choice applies again above it.
+        for (web, want) in [(1, "1"), (2, "2"), (4, "4"), (16, "4"), (0, "4")] {
+            node.set_web_concurrency(web).unwrap();
+            assert_eq!(pages(&node).as_deref(), Some(want), "web {web}");
+        }
+        node.set_web_browser_concurrency(1).unwrap();
+        node.set_web_concurrency(2).unwrap();
+        assert_eq!(pages(&node).as_deref(), Some("1"));
+        // Only with web, and only when the browser runs.
+        node.set_web(false);
+        assert_eq!(pages(&node), None);
+        node.set_web(true);
+        node.web_browser = web_browser_setting(Some("off"));
+        assert_eq!(pages(&node), None);
+        node.web_browser = None;
+        assert_eq!(pages(&node).is_some(), !cfg!(windows));
+        node.set_web_browser_concurrency(0).unwrap();
+        assert_eq!(pages(&node), None);
+        // The node's rules this mirrors: 1-4, never above web, and Auto web's
+        // ceiling of 16.
+        let config = include_str!("../../../internal/config/config.go");
+        for rule in [
+            r#"return errors.New("invalid SCARLETT_WEB_BROWSER_CONCURRENCY; use 1-4")"#,
+            "c.WebBrowser && c.WebBrowserConcurrency > c.WebConcurrency",
+            "c.WebConcurrencyAuto, c.WebConcurrency = true, WebAutoMax",
+            "WebAutoMax   = 16",
+        ] {
+            assert!(config.contains(rule), "{rule}");
+        }
     }
     #[cfg(unix)]
     #[tokio::test]

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "version": "0.1.18",
+  "date": "2026-10-12",
+  "title": "Choose how many browser pages load at once",
+  "highlights": [
+    "New Browser pages at once setting: Auto picks 1 or 2 to suit your memory, or choose up to 4 for pages behind bot checks",
+    "The Hidden browser tile shows how many pages it renders at once"
+  ]
+}

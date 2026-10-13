@@ -32,10 +32,19 @@ pub struct Data {
     /// preferences.json; it applies to the next child process.
     #[serde(default)]
     pub web_concurrency: u8,
+    /// "Browser pages at once": 0 is Auto (the node picks 1 below 16 GiB of
+    /// memory, else 2), 1-4 a fixed number, passed on within Web pages at
+    /// once. The helper keeps it in its own file beside preferences.json; it
+    /// applies to the next child process.
+    #[serde(default)]
+    pub web_browser_concurrency: u8,
 }
 /// The desktop's ceiling for Web pages at once, below the node's own 32
 /// until the coordinator shares the verifier's web sessions between nodes.
 pub const MAX_WEB_CONCURRENCY: u8 = 16;
+/// The node's own ceiling for browser pages at once
+/// (SCARLETT_WEB_BROWSER_CONCURRENCY, 1-4).
+pub const MAX_WEB_BROWSER_CONCURRENCY: u8 = 4;
 pub const fn default_x_concurrency() -> u8 {
     2
 }
@@ -52,6 +61,7 @@ impl Data {
             || !(1..=8).contains(&self.x_concurrency)
             || !matches!(self.updates.as_str(), "notify" | "automatic")
             || self.web_concurrency > MAX_WEB_CONCURRENCY
+            || self.web_browser_concurrency > MAX_WEB_BROWSER_CONCURRENCY
         {
             return Err(Error::InvalidInput);
         }
@@ -111,10 +121,21 @@ mod tests {
         assert!(!legacy.resume_serving);
         assert!(legacy.serve_web);
         assert_eq!(legacy.web_concurrency, 0);
+        assert_eq!(legacy.web_browser_concurrency, 0);
         assert!(legacy.validate().is_ok());
         for limit in [MAX_WEB_CONCURRENCY + 1, u8::MAX] {
             let mut invalid = legacy.clone();
             invalid.web_concurrency = limit;
+            assert_eq!(invalid.validate(), Err(Error::InvalidInput));
+        }
+        for limit in 0..=MAX_WEB_BROWSER_CONCURRENCY {
+            let mut valid = legacy.clone();
+            valid.web_browser_concurrency = limit;
+            assert!(valid.validate().is_ok());
+        }
+        for limit in [MAX_WEB_BROWSER_CONCURRENCY + 1, u8::MAX] {
+            let mut invalid = legacy.clone();
+            invalid.web_browser_concurrency = limit;
             assert_eq!(invalid.validate(), Err(Error::InvalidInput));
         }
         let mut silent = legacy.clone();
@@ -151,6 +172,7 @@ mod tests {
                 resume_serving: false,
                 serve_web: true,
                 web_concurrency: 0,
+                web_browser_concurrency: 0,
             }),
             background: AtomicBool::new(false),
         };
@@ -165,11 +187,13 @@ mod tests {
                 resume_serving: true,
                 serve_web: false,
                 web_concurrency: 8,
+                web_browser_concurrency: 3,
             })
             .unwrap();
         assert!(prefs.background());
         assert_eq!(prefs.snapshot().unwrap().local_api_port, 18088);
         assert!(!prefs.snapshot().unwrap().serve_web);
+        assert_eq!(prefs.snapshot().unwrap().web_browser_concurrency, 3);
     }
     #[test]
     fn web_serving_defaults_on_and_round_trips_off() {
@@ -204,6 +228,7 @@ mod tests {
             resume_serving: false,
             serve_web: false,
             web_concurrency: MAX_WEB_CONCURRENCY,
+            web_browser_concurrency: MAX_WEB_BROWSER_CONCURRENCY,
         };
         assert!(widest.validate().is_ok());
         let reply = serde_json::to_vec(&widest).unwrap().len() + 1;

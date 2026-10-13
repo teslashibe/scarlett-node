@@ -120,6 +120,8 @@ input.locked { color: var(--faint); border-color: var(--border); }
 .summary-state { margin-left: auto; font-size: 11px; color: var(--faint); }
 .disclosure > summary:has(.summary-state)::after { margin-left: 0; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; max-width: 620px; }
+/* Device limits sit in one row; a label that wraps keeps its input in line. */
+.form-grid.limits { grid-template-columns: repeat(3, minmax(0, 1fr)); max-width: 720px; align-items: end; }
 .subsection { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--border); }
 .measurement-help { margin: 16px 0; }
 .measurement-help > summary { color: var(--muted); font-size: 12px; text-decoration: underline; text-underline-offset: 3px; }
@@ -187,7 +189,7 @@ dialog .actions { justify-content: flex-end; }
   .account-row { flex-wrap: wrap; }
   .account-row .account-copy { flex: 1 1 200px; }
   .account-row .actions { margin-left: 44px; }
-  .form-grid { grid-template-columns: 1fr; gap: 0; }
+  .form-grid, .form-grid.limits { grid-template-columns: 1fr; gap: 0; }
   .relay-banner, footer { align-items: flex-start; flex-direction: column; }
   .disclosure > summary { padding: 16px; }
   .disclosure-body { padding: 0 16px 16px; }

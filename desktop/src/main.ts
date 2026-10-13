@@ -10,6 +10,7 @@ import {
   accountHealth,
   accountTitle,
   validWebConcurrency,
+  validWebBrowserConcurrency,
   canConnectCodex,
   canStart,
   claudeStatusText,
@@ -128,6 +129,8 @@ function render(s: Snapshot) {
   $("x-consent").toggleAttribute("disabled", busy || !browserProfilesAvailable);
   $("x-import").toggleAttribute("disabled", busy || !s.accounts_available || !browserProfilesAvailable || !$<HTMLSelectElement>("x-profile").value || !$<HTMLInputElement>("x-consent").checked);
   for (const id of ["background", "saved-api-port", "x-concurrency", "web-concurrency"]) $(id).toggleAttribute("disabled", busy || !preferencesAvailable);
+  // A device whose browser is off (Windows in this release) has no browser pages to set.
+  $("web-browser-concurrency").toggleAttribute("disabled", busy || !preferencesAvailable || s.web_browser === false);
   $("preferences-form").querySelector("button")!.toggleAttribute("disabled", busy || !preferencesAvailable);
   $("autostart").toggleAttribute("disabled", busy || !autostartAvailable);
   $("serve-web").toggleAttribute("disabled", busy || !preferencesAvailable);
@@ -628,6 +631,7 @@ async function loadPreferences() {
   $<HTMLInputElement>("background").checked = settings.background;
   $<HTMLInputElement>("x-concurrency").value = String(settings.x_concurrency);
   $<HTMLSelectElement>("web-concurrency").value = String(settings.web_concurrency);
+  $<HTMLSelectElement>("web-browser-concurrency").value = String(settings.web_browser_concurrency);
   $<HTMLInputElement>("serve-web").checked = settings.serve_web;
   preferencesAvailable = true;
   try {
@@ -642,14 +646,16 @@ $("preferences-form").addEventListener("submit", event => {
   const background = $<HTMLInputElement>("background").checked;
   const xConcurrency = Number($<HTMLInputElement>("x-concurrency").value);
   const webConcurrency = Number($<HTMLSelectElement>("web-concurrency").value);
+  const webBrowserConcurrency = Number($<HTMLSelectElement>("web-browser-concurrency").value);
   if (!Number.isInteger(port) || port < 1024 || port > 65535) { notice("Choose a local port between 1024 and 65535", true); return; }
   if (!Number.isInteger(xConcurrency) || xConcurrency < 1 || xConcurrency > 8) { notice("Choose an X job limit between 1 and 8", true); return; }
   if (!validWebConcurrency(webConcurrency)) { notice("Choose how many web pages to load at once", true); return; }
+  if (!validWebBrowserConcurrency(webBrowserConcurrency)) { notice("Choose how many browser pages to load at once", true); return; }
   void act(async () => {
     const current = await api.preferences().catch(() => savedPreferences);
     await api.savePreferences({schema: 1, local_api_port: port, background, x_concurrency: xConcurrency,
       updates: current?.updates ?? "notify", resume_serving: current?.resume_serving ?? false,
-      serve_web: current?.serve_web ?? true, web_concurrency: webConcurrency});
+      serve_web: current?.serve_web ?? true, web_concurrency: webConcurrency, web_browser_concurrency: webBrowserConcurrency});
     if (!snapshot?.local_api?.running) $<HTMLInputElement>("api-port").value = String(port);
   }, background
     ? "Preferences saved. Closing the window keeps Scarlett running"

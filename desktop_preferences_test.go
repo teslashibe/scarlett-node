@@ -22,13 +22,13 @@ func TestDesktopPreferencesPersistPrivatelyWithoutChangingDefaultsOnReads(t *tes
 	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil {
 		t.Fatal(err)
 	}
-	if out.String() != "{\"schema\":1,\"local_api_port\":8088,\"background\":false,\"x_concurrency\":2,\"updates\":\"notify\",\"resume_serving\":false,\"serve_web\":true,\"web_concurrency\":0}\n" {
+	if out.String() != "{\"schema\":1,\"local_api_port\":8088,\"background\":false,\"x_concurrency\":2,\"updates\":\"notify\",\"resume_serving\":false,\"serve_web\":true,\"web_concurrency\":0,\"web_browser_concurrency\":0}\n" {
 		t.Fatal("unexpected defaults")
 	}
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
 		t.Fatal("read wrote preferences")
 	}
-	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":3,"updates":"automatic","resume_serving":true,"serve_web":false,"web_concurrency":0}`
+	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":3,"updates":"automatic","resume_serving":true,"serve_web":false,"web_concurrency":0,"web_browser_concurrency":0}`
 	out.Reset()
 	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(value), &out); err != nil {
 		t.Fatal(err)
@@ -95,7 +95,7 @@ func TestDesktopPreferencesMigrateExistingSettingsAndBoundXConcurrency(t *testin
 	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(out.String()) != `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":2,"updates":"notify","resume_serving":false,"serve_web":true,"web_concurrency":0}` {
+	if strings.TrimSpace(out.String()) != `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":2,"updates":"notify","resume_serving":false,"serve_web":true,"web_concurrency":0,"web_browser_concurrency":0}` {
 		t.Fatal("old preferences did not retain values with default concurrency")
 	}
 	stored, err := os.ReadFile(path)
@@ -120,7 +120,7 @@ func TestSavedThroughputPreferencesRetainDesktop013RollbackRepresentation(t *tes
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "preferences.json")
-	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":4,"updates":"notify","resume_serving":false,"serve_web":true,"web_concurrency":0}`
+	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":4,"updates":"notify","resume_serving":false,"serve_web":true,"web_concurrency":0,"web_browser_concurrency":0}`
 	var out bytes.Buffer
 	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(value), &out); err != nil {
 		t.Fatal(err)
@@ -155,7 +155,7 @@ func TestLifecyclePreferencesDefaultToNotifyAndRoundTrip(t *testing.T) {
 	}
 	path := filepath.Join(dir, "preferences.json")
 	var out bytes.Buffer
-	value := `{"schema":1,"local_api_port":8088,"background":false,"x_concurrency":2,"updates":"automatic","resume_serving":true,"serve_web":true,"web_concurrency":0}`
+	value := `{"schema":1,"local_api_port":8088,"background":false,"x_concurrency":2,"updates":"automatic","resume_serving":true,"serve_web":true,"web_concurrency":0,"web_browser_concurrency":0}`
 	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(value), &out); err != nil {
 		t.Fatal(err)
 	}
@@ -208,13 +208,13 @@ func TestWebPreferenceDefaultsOnPersistsOffAndKeepsDesktop013FilesReadable(t *te
 	}
 	var out bytes.Buffer
 	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil ||
-		strings.TrimSpace(out.String()) != `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":3,"updates":"automatic","resume_serving":true,"serve_web":true,"web_concurrency":0}` {
+		strings.TrimSpace(out.String()) != `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":3,"updates":"automatic","resume_serving":true,"serve_web":true,"web_concurrency":0,"web_browser_concurrency":0}` {
 		t.Fatalf("0.1.13 settings did not read with web on: %v %q", err, out.String())
 	}
 	if _, err := os.Lstat(webPath); !os.IsNotExist(err) {
 		t.Fatal("read wrote the web extension")
 	}
-	off := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":3,"updates":"automatic","resume_serving":true,"serve_web":false,"web_concurrency":0}`
+	off := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":3,"updates":"automatic","resume_serving":true,"serve_web":false,"web_concurrency":0,"web_browser_concurrency":0}`
 	out.Reset()
 	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(off), &out); err != nil {
 		t.Fatal(err)
@@ -298,13 +298,13 @@ func TestDesktopPreferencesKeepWebPagesAtOnceInItsOwnExtension(t *testing.T) {
 	webPath := filepath.Join(dir, "web-preferences-v1.json")
 	var out bytes.Buffer
 	// A device that never chose reads Auto, and reading writes nothing.
-	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil || !strings.Contains(out.String(), `"web_concurrency":0}`) {
+	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil || !strings.Contains(out.String(), `"web_concurrency":0,`) {
 		t.Fatalf("Web pages at once did not default to Auto: %v %q", err, out.String())
 	}
 	if _, err := os.Lstat(capacityPath); !os.IsNotExist(err) {
 		t.Fatal("read wrote the web capacity extension")
 	}
-	value := `{"schema":1,"local_api_port":8088,"background":false,"x_concurrency":2,"updates":"notify","resume_serving":false,"serve_web":true,"web_concurrency":12}`
+	value := `{"schema":1,"local_api_port":8088,"background":false,"x_concurrency":2,"updates":"notify","resume_serving":false,"serve_web":true,"web_concurrency":12,"web_browser_concurrency":0}`
 	out.Reset()
 	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(value), &out); err != nil {
 		t.Fatal(err)
@@ -357,6 +357,104 @@ func TestDesktopPreferencesKeepWebPagesAtOnceInItsOwnExtension(t *testing.T) {
 		}
 		if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err == nil {
 			t.Fatalf("corrupt web capacity extension accepted: %s", corrupt)
+		}
+	}
+}
+
+// Browser pages at once lives in its own extension: a device that never chose
+// reads Auto, and every file 0.1.17 decodes strictly keeps its representation,
+// so a rollback still starts.
+func TestDesktopPreferencesKeepBrowserPagesAtOnceInItsOwnExtension(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "private")
+	if err := localfs.EnsureDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "preferences.json")
+	browserPath := filepath.Join(dir, "browser-capacity-preferences-v1.json")
+	webCapacityPath := filepath.Join(dir, "web-capacity-preferences-v1.json")
+	// A device updating from 0.1.17 has every earlier file but this one.
+	for name, raw := range map[string]string{
+		"preferences.json":                 `{"schema":1,"local_api_port":18088,"background":true}`,
+		"throughput-preferences-v1.json":   `{"schema":1,"x_concurrency":6}`,
+		"lifecycle-preferences-v1.json":    `{"schema":1,"updates":"automatic","resume_serving":true}`,
+		"web-preferences-v1.json":          `{"schema":1,"serve_web":true}`,
+		"web-capacity-preferences-v1.json": `{"schema":1,"web_concurrency":16}`,
+	} {
+		if err := localfs.WriteAtomic(filepath.Join(dir, name), []byte(raw), true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var out bytes.Buffer
+	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil ||
+		strings.TrimSpace(out.String()) != `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":6,"updates":"automatic","resume_serving":true,"serve_web":true,"web_concurrency":16,"web_browser_concurrency":0}` {
+		t.Fatalf("0.1.17 settings did not read with Browser pages at once on Auto: %v %q", err, out.String())
+	}
+	if _, err := os.Lstat(browserPath); !os.IsNotExist(err) {
+		t.Fatal("read wrote the browser capacity extension")
+	}
+	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":6,"updates":"automatic","resume_serving":true,"serve_web":true,"web_concurrency":16,"web_browser_concurrency":4}`
+	out.Reset()
+	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(value), &out); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil || strings.TrimSpace(out.String()) != value {
+		t.Fatalf("Browser pages at once did not survive reopen: %v %q", err, out.String())
+	}
+	if raw, err := os.ReadFile(browserPath); err != nil || string(raw) != `{"schema":1,"web_browser_concurrency":4}` {
+		t.Fatalf("unexpected browser capacity extension %q", raw)
+	}
+	f, err := localfs.OpenPrivate(browserPath)
+	if err != nil {
+		t.Fatal("browser capacity extension not private", err)
+	}
+	f.Close()
+	// What 0.1.17 reads is unchanged: preferences.json and the web capacity
+	// extension keep their representations, and its reader still takes them.
+	if raw, err := os.ReadFile(path); err != nil || string(raw) != `{"schema":1,"local_api_port":18088,"background":true}` {
+		t.Fatalf("preferences.json changed representation: %q", raw)
+	}
+	if raw, err := os.ReadFile(webCapacityPath); err != nil || string(raw) != `{"schema":1,"web_concurrency":16}` {
+		t.Fatalf("web capacity extension changed representation: %q", raw)
+	}
+	if n, err := readDesktopWebConcurrency(webCapacityPath); err != nil || n != 16 {
+		t.Fatal("0.1.17 cannot read the web capacity extension")
+	}
+	// The helper keeps the operator's choice even above a fixed web limit;
+	// the app passes at most Web pages at once to the node it starts.
+	above := strings.Replace(value, `"web_concurrency":16`, `"web_concurrency":2`, 1)
+	out.Reset()
+	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(above), &out); err != nil || strings.TrimSpace(out.String()) != above {
+		t.Fatalf("Browser pages at once above a fixed web limit not kept: %v %q", err, out.String())
+	}
+	for _, invalid := range []string{
+		strings.Replace(value, `"web_browser_concurrency":4`, `"web_browser_concurrency":-1`, 1),
+		strings.Replace(value, `"web_browser_concurrency":4`, `"web_browser_concurrency":5`, 1),
+		strings.Replace(value, `"web_browser_concurrency":4`, `"web_browser_concurrency":1.5`, 1),
+		strings.Replace(value, `"web_browser_concurrency":4`, `"web_browser_concurrency":"2"`, 1),
+	} {
+		if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(invalid), &out); err == nil {
+			t.Fatalf("invalid Browser pages at once accepted: %s", invalid)
+		}
+	}
+	out.Reset()
+	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil || strings.TrimSpace(out.String()) != above {
+		t.Fatal("an invalid write changed Browser pages at once")
+	}
+	// Auto is saved explicitly, and a corrupt extension is reported, not reset.
+	auto := strings.Replace(value, `"web_browser_concurrency":4`, `"web_browser_concurrency":0`, 1)
+	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(auto), &out); err != nil {
+		t.Fatal(err)
+	}
+	if raw, err := os.ReadFile(browserPath); err != nil || string(raw) != `{"schema":1,"web_browser_concurrency":0}` {
+		t.Fatalf("Auto not saved: %q", raw)
+	}
+	for _, corrupt := range []string{`{"schema":1,"web_browser_concurrency":5}`, `{"schema":1,"web_browser_concurrency":-1}`, `{"schema":1}`, `{"schema":2,"web_browser_concurrency":2}`, `{"schema":1,"web_browser_concurrency":2,"extra":1}`, `{"schema":1,"web_browser_concurrency":2}{}`, "corrupted"} {
+		if err := localfs.WriteAtomic(browserPath, []byte(corrupt), true); err != nil {
+			t.Fatal(err)
+		}
+		if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err == nil {
+			t.Fatalf("corrupt browser capacity extension accepted: %s", corrupt)
 		}
 	}
 }

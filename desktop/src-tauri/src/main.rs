@@ -195,6 +195,7 @@ async fn save_desktop_preferences(
     node.save_preferences(&data).await?;
     node.set_x_concurrency(data.x_concurrency)?;
     node.set_web_concurrency(data.web_concurrency)?;
+    node.set_web_browser_concurrency(data.web_browser_concurrency)?;
     node.set_web(data.serve_web);
     preferences.updated(data)
 }
@@ -732,6 +733,9 @@ fn main() {
             app.state::<Arc<Node>>()
                 .set_web_concurrency(saved.web_concurrency)
                 .map_err(|_| "invalid desktop web concurrency")?;
+            app.state::<Arc<Node>>()
+                .set_web_browser_concurrency(saved.web_browser_concurrency)
+                .map_err(|_| "invalid desktop browser concurrency")?;
             app.state::<Arc<Node>>().set_web(saved.serve_web);
             // Device sleep and wake reach the supervised node on its owner
             // pipe; without them the node's own clock check still notices.

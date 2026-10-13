@@ -30,6 +30,12 @@ type desktopPreferences struct {
 	// limit (SCARLETT_WEB_CONCURRENCY=auto); 1-16 is a fixed number of pages.
 	// It applies when the node next starts.
 	WebConcurrency int `json:"web_concurrency"`
+	// WebBrowserConcurrency is "Browser pages at once", the share of web
+	// pages the hidden browser renders together: 0 is Auto (the node picks 1
+	// below 16 GiB of memory, else 2); 1-4 is SCARLETT_WEB_BROWSER_CONCURRENCY,
+	// which the app keeps within Web pages at once. It applies when the node
+	// next starts.
+	WebBrowserConcurrency int `json:"web_browser_concurrency"`
 }
 
 // desktopWebConcurrencyMax bounds the desktop setting below the node's own
@@ -37,12 +43,20 @@ type desktopPreferences struct {
 // between nodes.
 const desktopWebConcurrencyMax = 16
 
+// desktopWebBrowserConcurrencyMax is the node's own ceiling for browser
+// pages at once (internal/config, SCARLETT_WEB_BROWSER_CONCURRENCY 1-4).
+const desktopWebBrowserConcurrencyMax = 4
+
 func validDesktopWebConcurrency(n int) bool {
 	return n >= 0 && n <= desktopWebConcurrencyMax
 }
 
+func validDesktopWebBrowserConcurrency(n int) bool {
+	return n >= 0 && n <= desktopWebBrowserConcurrencyMax
+}
+
 func (p desktopPreferences) valid() bool {
-	return p.Schema == 1 && p.LocalAPIPort >= 1024 && p.LocalAPIPort <= 65535 && p.XConcurrency >= 1 && p.XConcurrency <= 8 && (p.Updates == "notify" || p.Updates == "automatic") && validDesktopWebConcurrency(p.WebConcurrency)
+	return p.Schema == 1 && p.LocalAPIPort >= 1024 && p.LocalAPIPort <= 65535 && p.XConcurrency >= 1 && p.XConcurrency <= 8 && (p.Updates == "notify" || p.Updates == "automatic") && validDesktopWebConcurrency(p.WebConcurrency) && validDesktopWebBrowserConcurrency(p.WebBrowserConcurrency)
 }
 
 func desktopPreferencesCommand(action, path string, input io.Reader, out io.Writer) error {
@@ -76,9 +90,14 @@ func desktopPreferencesCommand(action, path string, input io.Reader, out io.Writ
 	if err != nil {
 		return fail
 	}
+	browserCapacityPath := filepath.Join(filepath.Dir(path), "browser-capacity-preferences-v1.json")
+	browserConcurrency, err := readDesktopWebBrowserConcurrency(browserCapacityPath)
+	if err != nil {
+		return fail
+	}
 	p.XConcurrency = throughput.XConcurrency
 	p.Updates, p.ResumeServing = lifecycle.Updates, lifecycle.ResumeServing
-	p.ServeWeb, p.WebConcurrency = serveWeb, webConcurrency
+	p.ServeWeb, p.WebConcurrency, p.WebBrowserConcurrency = serveWeb, webConcurrency, browserConcurrency
 	switch action {
 	case "preferences-get":
 		f, err := localfs.OpenPrivate(path)
@@ -89,7 +108,7 @@ func desktopPreferencesCommand(action, path string, input io.Reader, out io.Writ
 			}
 			p.XConcurrency = throughput.XConcurrency
 			p.Updates, p.ResumeServing = lifecycle.Updates, lifecycle.ResumeServing
-			p.ServeWeb, p.WebConcurrency = serveWeb, webConcurrency
+			p.ServeWeb, p.WebConcurrency, p.WebBrowserConcurrency = serveWeb, webConcurrency, browserConcurrency
 		} else if !os.IsNotExist(err) {
 			return fail
 		}
@@ -108,9 +127,11 @@ func desktopPreferencesCommand(action, path string, input io.Reader, out io.Writ
 		lifecycleRaw, lifecycleErr := json.Marshal(desktopLifecyclePreferences{Schema: 1, Updates: p.Updates, ResumeServing: p.ResumeServing})
 		webRaw, webErr := json.Marshal(desktopWebPreferences{Schema: 1, ServeWeb: &p.ServeWeb})
 		webCapacityRaw, webCapacityErr := json.Marshal(desktopWebCapacityPreferences{Schema: 1, WebConcurrency: &p.WebConcurrency})
-		if err != nil || extensionErr != nil || lifecycleErr != nil || webErr != nil || webCapacityErr != nil || localfs.WriteAtomic(throughputPath, extension, true) != nil ||
+		browserCapacityRaw, browserCapacityErr := json.Marshal(desktopBrowserCapacityPreferences{Schema: 1, WebBrowserConcurrency: &p.WebBrowserConcurrency})
+		if err != nil || extensionErr != nil || lifecycleErr != nil || webErr != nil || webCapacityErr != nil || browserCapacityErr != nil || localfs.WriteAtomic(throughputPath, extension, true) != nil ||
 			localfs.WriteAtomic(lifecyclePath, lifecycleRaw, true) != nil || localfs.WriteAtomic(webPath, webRaw, true) != nil ||
-			localfs.WriteAtomic(webCapacityPath, webCapacityRaw, true) != nil || localfs.WriteAtomic(path, raw, true) != nil {
+			localfs.WriteAtomic(webCapacityPath, webCapacityRaw, true) != nil || localfs.WriteAtomic(browserCapacityPath, browserCapacityRaw, true) != nil ||
+			localfs.WriteAtomic(path, raw, true) != nil {
 			return fail
 		}
 	default:
@@ -126,7 +147,7 @@ func decodeDesktopPreferences(input io.Reader, p *desktopPreferences) bool {
 	}
 	// Existing schema-1 files have no X concurrency, lifecycle or web settings.
 	// Normalize the defaults on reads without writing or changing any account.
-	// Web pages at once defaults to Auto (zero).
+	// Web pages at once and Browser pages at once default to Auto (zero).
 	*p = desktopPreferences{XConcurrency: 2, Updates: "notify", ServeWeb: true}
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.DisallowUnknownFields()
@@ -253,4 +274,34 @@ func readDesktopWebConcurrency(path string) (int, error) {
 		return 0, errors.New("invalid web capacity preferences")
 	}
 	return *p.WebConcurrency, nil
+}
+
+// "Browser pages at once", in its own extension file for the same reason:
+// 0.1.17 and earlier decode their files strictly and never open this one, so
+// a rollback still starts. Absent, it is Auto (zero).
+type desktopBrowserCapacityPreferences struct {
+	Schema                int  `json:"schema"`
+	WebBrowserConcurrency *int `json:"web_browser_concurrency"`
+}
+
+func readDesktopWebBrowserConcurrency(path string) (int, error) {
+	f, err := localfs.OpenPrivate(path)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, 1025))
+	if err != nil || len(raw) > 1024 {
+		return 0, errors.New("invalid browser capacity preferences")
+	}
+	var p desktopBrowserCapacityPreferences
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.DisallowUnknownFields()
+	if d.Decode(&p) != nil || d.Decode(&struct{}{}) != io.EOF || p.Schema != 1 || p.WebBrowserConcurrency == nil || !validDesktopWebBrowserConcurrency(*p.WebBrowserConcurrency) {
+		return 0, errors.New("invalid browser capacity preferences")
+	}
+	return *p.WebBrowserConcurrency, nil
 }
