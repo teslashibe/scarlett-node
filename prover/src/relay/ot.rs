@@ -51,7 +51,7 @@ impl NodeOt {
             bail!("unexpected base-OT choice");
         };
         // The output only says the transfer was sent; the seeds are ours.
-        let _ = base.queue_send_ot(&seeds[..]).map_err(|e| anyhow::anyhow!("base OT: {e}"))?;
+        drop(base.queue_send_ot(&seeds[..]).map_err(|e| anyhow::anyhow!("base OT: {e}"))?);
         let payload = base.send(decode(payload)?).map_err(|e| anyhow::anyhow!("base OT: {e}"))?;
         let mut frames = vec![(wire::CO_PAYLOAD, encode(&payload)?)];
         let mut receiver = kos::Receiver::new(kos::ReceiverConfig::default()).setup(*seeds);
@@ -87,6 +87,8 @@ impl NodeOt {
     }
 }
 
+// One state at a time per session; boxing the large ones buys nothing.
+#[allow(clippy::large_enum_variant)]
 enum VerifierState {
     Start(chou_orlandi::Receiver),
     BaseOt { base: chou_orlandi::Receiver<co_receiver::Setup>, seeds: <chou_orlandi::Receiver<co_receiver::Setup> as OTReceiver<bool, Block>>::Future },

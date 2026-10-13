@@ -334,8 +334,15 @@ func TestAccountEligibilityFinalCheckPreservesSelectedFence(t *testing.T) {
 			if lease.config.AccountReady("search") {
 				t.Fatal("final selected-account check accepted changed quota/session")
 			}
-			var requests atomic.Int32
+			var requests, rejects atomic.Int32
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// The node rejects the offer its account can no longer take.
+				var body coordinator.Rejection
+				if r.URL.Path == "/api/node/v1/jobs/"+offer.JobID+"/reject" && json.NewDecoder(r.Body).Decode(&body) == nil && body.Reason == coordinator.RejectNoAccount {
+					rejects.Add(1)
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
 				requests.Add(1)
 				w.WriteHeader(http.StatusInternalServerError)
 			}))
@@ -346,8 +353,8 @@ func TestAccountEligibilityFinalCheckPreservesSelectedFence(t *testing.T) {
 			selected.Executor = config.ExecutorServices
 			journal := testJournal(t, filepath.Join(privateTestDir(t), "attempts"))
 			code, err := submitLease(context.Background(), client, selected, offer, nil, journal)
-			if code != "service_unavailable" || err == nil || requests.Load() != 0 {
-				t.Fatal("changed readiness reached funded acceptance or provider execution", code, err, requests.Load())
+			if code != "service_unavailable" || err == nil || requests.Load() != 0 || rejects.Load() != 1 {
+				t.Fatal("changed readiness reached funded acceptance or provider execution, or was not rejected", code, err, requests.Load(), rejects.Load())
 			}
 			h := healthKind(t, p, "x_read")
 			want := coordinator.ActiveLease{JobID: offer.JobID, Attempt: offer.Attempt, Fence: offer.Fence}
@@ -406,7 +413,7 @@ func TestAccountEligibilityInheritedJournalBlocksUntilReconciled(t *testing.T) {
 	p.finishAccount(second, "")
 }
 
-func TestAccountEligibilityDeadlineEndsHeldHeartbeatBeforePeriodicTick(t *testing.T) {
+func TestAccountEligibilityDeadlinePostsAvailabilityBeforePeriodicTick(t *testing.T) {
 	p := multiPool(t)
 	f := xOnlyRegistry(t, p)
 	f.Accounts = f.Accounts[:1]
@@ -436,10 +443,14 @@ func TestAccountEligibilityDeadlineEndsHeldHeartbeatBeforePeriodicTick(t *testin
 	ctx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(nil)
 	sent := availability{services: serviceStates(health)}
-	watched := make(chan struct{})
+	current := func() availability { return availability{services: serviceStates(p.health())} }
+	posted := make(chan time.Time, 4)
+	watched := make(chan watchResult, 1)
 	go func() {
-		defer close(watched)
-		watchHeartbeat(ctx, cancel, sent, func() availability { return availability{services: serviceStates(p.health())} }, nil)
+		watched <- watchHeartbeat(ctx, cancel, testWatch(sent, current, func(context.Context) (availability, error) {
+			posted <- time.Now()
+			return current(), nil
+		}))
 	}()
 	polled := make(chan error, 1)
 	started := time.Now()
@@ -453,18 +464,24 @@ func TestAccountEligibilityDeadlineEndsHeldHeartbeatBeforePeriodicTick(t *testin
 		t.Fatal("coordinator did not hold the heartbeat")
 	}
 	select {
-	case err := <-polled:
-		if err == nil || context.Cause(ctx) != errHeartbeatStale {
-			t.Fatal("readiness timer did not cancel the held heartbeat as stale", err)
+	case at := <-posted:
+		if at.Before(readyAt) || at.Sub(started) >= heartbeatWatchInterval {
+			t.Fatalf("availability posted %v after the start, eligibility at %v", at.Sub(started), readyAt.Sub(started))
 		}
 	case <-time.After(800 * time.Millisecond):
-		cancel(nil)
 		t.Fatal("readiness refresh waited for the periodic tick or full hold")
 	}
-	<-watched
-	if time.Now().Before(readyAt) || time.Since(started) >= heartbeatWatchInterval {
-		t.Fatal("heartbeat refreshed before eligibility or after the first periodic tick")
+	// The hold goes on: the coordinator learns the readiness from the post.
+	select {
+	case err := <-polled:
+		t.Fatal("readiness ended the held heartbeat", err)
+	case <-time.After(200 * time.Millisecond):
 	}
+	cancel(nil)
+	if result := <-watched; result.cause != nil || result.goodbye {
+		t.Fatalf("watch ended %+v", result)
+	}
+	<-polled
 	after := healthKind(t, p, "x_read")
 	if eligibilityOperation(t, after, "search").RunnableCapacity != 1 || after.Capacity != 0 || eligibilityCount(t, after.ReadyAccounts) != 1 {
 		t.Fatalf("eligible operation wake granted generic readiness or missed search supply: %+v", after)

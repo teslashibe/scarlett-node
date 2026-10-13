@@ -27,7 +27,15 @@ pub struct Data {
     /// node helper keeps it in its own file beside preferences.json.
     #[serde(default = "default_serve_web")]
     pub serve_web: bool,
+    /// "Web pages at once": 0 is Auto (the node's adaptive limit), 1-16 a
+    /// fixed number. The helper keeps it in its own file beside
+    /// preferences.json; it applies to the next child process.
+    #[serde(default)]
+    pub web_concurrency: u8,
 }
+/// The desktop's ceiling for Web pages at once, below the node's own 32
+/// until the coordinator shares the verifier's web sessions between nodes.
+pub const MAX_WEB_CONCURRENCY: u8 = 16;
 pub const fn default_x_concurrency() -> u8 {
     2
 }
@@ -43,6 +51,7 @@ impl Data {
             || self.local_api_port < 1024
             || !(1..=8).contains(&self.x_concurrency)
             || !matches!(self.updates.as_str(), "notify" | "automatic")
+            || self.web_concurrency > MAX_WEB_CONCURRENCY
         {
             return Err(Error::InvalidInput);
         }
@@ -101,7 +110,13 @@ mod tests {
         assert_eq!(legacy.updates, "notify");
         assert!(!legacy.resume_serving);
         assert!(legacy.serve_web);
+        assert_eq!(legacy.web_concurrency, 0);
         assert!(legacy.validate().is_ok());
+        for limit in [MAX_WEB_CONCURRENCY + 1, u8::MAX] {
+            let mut invalid = legacy.clone();
+            invalid.web_concurrency = limit;
+            assert_eq!(invalid.validate(), Err(Error::InvalidInput));
+        }
         let mut silent = legacy.clone();
         silent.updates = "silent".into();
         assert_eq!(silent.validate(), Err(Error::InvalidInput));
@@ -135,6 +150,7 @@ mod tests {
                 updates: "notify".into(),
                 resume_serving: false,
                 serve_web: true,
+                web_concurrency: 0,
             }),
             background: AtomicBool::new(false),
         };
@@ -148,6 +164,7 @@ mod tests {
                 updates: "automatic".into(),
                 resume_serving: true,
                 serve_web: false,
+                web_concurrency: 8,
             })
             .unwrap();
         assert!(prefs.background());
@@ -170,7 +187,12 @@ mod tests {
         let back: Data = serde_json::from_str(&raw).unwrap();
         assert_eq!(back, off);
         assert!(back.validate().is_ok());
-        assert!(serde_json::from_str::<Data>(&raw.replace("false}", "\"off\"}")).is_err());
+        assert!(
+            serde_json::from_str::<Data>(
+                &raw.replace(r#""serve_web":false"#, r#""serve_web":"off""#)
+            )
+            .is_err()
+        );
         // The helper's reply, every field at its widest, fits what the app
         // reads back from it (with the encoder's newline).
         let widest = Data {
@@ -181,6 +203,7 @@ mod tests {
             updates: "automatic".into(),
             resume_serving: false,
             serve_web: false,
+            web_concurrency: MAX_WEB_CONCURRENCY,
         };
         assert!(widest.validate().is_ok());
         let reply = serde_json::to_vec(&widest).unwrap().len() + 1;

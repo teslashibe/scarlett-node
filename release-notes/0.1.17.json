@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "version": "0.1.17",
+  "date": "2026-10-12",
+  "title": "Faster, steadier job delivery",
+  "highlights": [
+    "Your node picks up jobs faster, and when it stops or your computer sleeps, its waiting jobs move to other nodes at once",
+    "New Web pages at once setting: Auto adjusts to your connection, or choose a fixed number up to 16",
+    "This update is required: earlier versions no longer receive jobs"
+  ]
+}

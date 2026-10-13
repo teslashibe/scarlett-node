@@ -35,6 +35,8 @@ type Web struct {
 	Browser BrowserTier
 	// busyWait overrides webBusyBackoff; tests shorten it.
 	busyWait func(try int) time.Duration
+	// hopTime overrides webHopLimit; tests shorten it.
+	hopTime time.Duration
 	// Upload stores a browser result before report: the DOM's gzip parts
 	// from gzipPath (with manifest.DOM "ok") and then the manifest. nil never
 	// stores one.
@@ -288,15 +290,51 @@ func (w Web) Run(ctx context.Context, l coordinator.Lease) string {
 func (w Web) Report(ctx context.Context, l coordinator.Lease) WebReport {
 	plan, deadline, code := validateWebLease(w.Config, l)
 	if code != "" {
+		w.observePage(code, false)
 		return WebReport{Code: code}
 	}
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
+	var report WebReport
 	if l.WebRequest.Mode == "browser" {
-		return w.runBrowser(ctx, l, plan, deadline)
+		report = w.runBrowser(ctx, l, plan, deadline)
+	} else {
+		code, _ = w.relay(ctx, plan, l.VerifierToken, nil)
+		report = wireReport(code)
 	}
-	code, _ = w.relay(ctx, plan, l.VerifierToken, nil)
-	return wireReport(code)
+	// A page that ran into its deadline timed out, whatever it reports.
+	w.observePage(report.Code, errors.Is(ctx.Err(), context.DeadlineExceeded))
+	return report
+}
+
+// observePage and observeHop pass the page's relay outcomes to the adaptive
+// web limit, when the service pool gave the lease an observer.
+func (w Web) observePage(code string, timedOut bool) {
+	if o := w.Config.WebObserver; o != nil {
+		o.Done(code, timedOut)
+	}
+}
+
+// observeHop passes one relay helper run that started at started. A failed
+// run timed out when the page's deadline ended it, or when it lasted its
+// whole budget or webTimeoutWall; a cancelled one never did.
+func (w Web) observeHop(ctx context.Context, code string, started time.Time) {
+	o := w.Config.WebObserver
+	if o == nil {
+		return
+	}
+	wall := time.Since(started)
+	timedOut := false
+	switch code {
+	case "", "verifier_busy", "relay_misuse", "prover_error", "page_too_large":
+	default:
+		budget := webTimeoutWall
+		if deadline, ok := ctx.Deadline(); ok {
+			budget = min(budget, deadline.Sub(started))
+		}
+		timedOut = !errors.Is(ctx.Err(), context.Canceled) && (errors.Is(ctx.Err(), context.DeadlineExceeded) || wall >= budget)
+	}
+	o.Hop(code, wall, timedOut)
 }
 
 // wireReport is a relay outcome as a report: page_too_large there is the
@@ -307,6 +345,13 @@ func wireReport(code string) WebReport {
 		return WebReport{Code: code, Stage: "wire", ObservedBytes: maxWebResponseBytes + 1}
 	}
 	return WebReport{Code: code}
+}
+
+func (w Web) hopLimit() time.Duration {
+	if w.hopTime > 0 {
+		return w.hopTime
+	}
+	return webHopLimit
 }
 
 func (w Web) egress() *WebEgress {
@@ -398,7 +443,9 @@ func (w Web) hop(ctx context.Context, plan webPlan, token string, hop int, targe
 		return webHopOutcome{code: "web_egress_denied"}
 	}
 	for try := 0; ; try++ {
+		started := time.Now()
 		outcome := w.prove(ctx, plan, token, hop, canonical, addr, headers)
+		w.observeHop(ctx, outcome.code, started)
 		if outcome.code != "verifier_busy" {
 			return outcome
 		}
@@ -421,6 +468,12 @@ func (w Web) hop(ctx context.Context, plan webPlan, token string, hop int, targe
 			return webHopOutcome{code: "expired"}
 		case <-timer.C:
 			end("verifier_busy")
+		}
+		// A wait that overran by a few milliseconds leaves less than the
+		// second prove needs; the hop failed on a busy verifier, it did not
+		// run out of time.
+		if time.Until(deadline) < time.Second {
+			return webHopOutcome{code: "web_fetch_failed"}
 		}
 	}
 }

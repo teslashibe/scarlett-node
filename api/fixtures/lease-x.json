@@ -1,5 +1,5 @@
 {
-  "version": "node-v1",
+  "version": "node-v2",
   "service_type": "x_read",
   "job_id": "synthetic-x",
   "signed_job_id": "synthetic-commitment",

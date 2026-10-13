@@ -371,6 +371,75 @@ func TestWebServiceConfiguration(t *testing.T) {
 	}
 }
 
+// SCARLETT_WEB_CONCURRENCY is 1-32 or auto. Unset it stays the fixed 4;
+// auto is the adaptive limit, whose ceiling becomes the web slot count.
+func TestWebConcurrencyAuto(t *testing.T) {
+	t.Setenv("SCARLETT_COORDINATOR", "https://example.org")
+	t.Setenv("SCARLETT_PROFILE", "synthetic")
+	t.Setenv("SCARLETT_EXECUTOR", ExecutorServices)
+	t.Setenv("SCARLETT_VERIFIER", "127.0.0.1:7047")
+	t.Setenv("SCARLETT_PROVER", "scarlett-prover")
+	t.Setenv("SCARLETT_SERVICES", "web")
+	t.Setenv("SCARLETT_WEB_CONCURRENCY", "")
+	os.Unsetenv("SCARLETT_WEB_CONCURRENCY")
+	if c, err := Load(); err != nil || c.WebConcurrency != 4 || c.WebConcurrencyAuto {
+		t.Fatal("unset", err, c.WebConcurrency, c.WebConcurrencyAuto)
+	}
+	if WebAutoMin != 2 || WebAutoStart != 4 || WebAutoMax != 16 {
+		t.Fatal("adaptive bounds", WebAutoMin, WebAutoStart, WebAutoMax)
+	}
+	for _, value := range []string{"auto", "AUTO", "Auto", " auto "} {
+		t.Setenv("SCARLETT_WEB_CONCURRENCY", value)
+		c, err := Load()
+		if err != nil || !c.WebConcurrencyAuto || c.WebConcurrency != WebAutoMax {
+			t.Errorf("SCARLETT_WEB_CONCURRENCY=%q: %v %v %d", value, err, c.WebConcurrencyAuto, c.WebConcurrency)
+		}
+	}
+	for value, want := range map[string]int{"1": 1, "4": 4, "16": 16, "32": 32} {
+		t.Setenv("SCARLETT_WEB_CONCURRENCY", value)
+		if c, err := Load(); err != nil || c.WebConcurrencyAuto || c.WebConcurrency != want {
+			t.Errorf("SCARLETT_WEB_CONCURRENCY=%q: %v %v %d", value, err, c.WebConcurrencyAuto, c.WebConcurrency)
+		}
+	}
+	for _, value := range []string{"0", "33", "-1", "four", "auto4", "autos", "4 ", "adaptive"} {
+		t.Setenv("SCARLETT_WEB_CONCURRENCY", value)
+		if _, err := Load(); err == nil {
+			t.Errorf("SCARLETT_WEB_CONCURRENCY=%q accepted", value)
+		}
+	}
+	// The browser stays within web capacity: at most the ceiling at load,
+	// and the live limit at runtime (the service pool caps it).
+	t.Setenv("SCARLETT_WEB_CONCURRENCY", "auto")
+	t.Setenv("SCARLETT_WEB_BROWSER", "on")
+	t.Setenv("SCARLETT_WEB_BROWSER_CONCURRENCY", "4")
+	if c, err := Load(); err != nil || !c.WebBrowser || c.WebBrowserConcurrency != 4 || !c.WebConcurrencyAuto {
+		t.Fatal("browser with auto web", err)
+	}
+	os.Unsetenv("SCARLETT_WEB_BROWSER")
+	os.Unsetenv("SCARLETT_WEB_BROWSER_CONCURRENCY")
+	// auto with any other ceiling is not a configuration Load makes.
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.WebConcurrency = 8
+	if c.Validate() == nil {
+		t.Fatal("auto below its ceiling validated")
+	}
+	c.WebConcurrency, c.WebConcurrencyAuto = 8, false
+	if c.Validate() != nil {
+		t.Fatal("fixed 8 refused")
+	}
+	// Like every service setting, auto belongs to the services executor:
+	// elsewhere the variable is not read.
+	t.Setenv("SCARLETT_EXECUTOR", ExecutorGateway)
+	t.Setenv("SCARLETT_SERVICES", "")
+	t.Setenv("SCARLETT_GATEWAY", "http://127.0.0.1:8088")
+	if c, err := Load(); err != nil || c.WebConcurrencyAuto || c.WebConcurrency != 0 {
+		t.Fatal("gateway node", err, c.WebConcurrencyAuto, c.WebConcurrency)
+	}
+}
+
 func TestWebBrowserConfiguration(t *testing.T) {
 	if !WebBrowserDefault("darwin") || !WebBrowserDefault("linux") || WebBrowserDefault("windows") {
 		t.Fatal("browser tier defaults: on for macOS and Linux, off for Windows")

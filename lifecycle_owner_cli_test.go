@@ -58,6 +58,9 @@ func testActualCLIDrain(t *testing.T, owned bool) {
 			w.WriteHeader(401)
 			return
 		}
+		if controlRoute(w, r) {
+			return
+		}
 		switch r.URL.Path {
 		case "/api/node/v1/heartbeat":
 			var h coordinator.Heartbeat
@@ -79,9 +82,9 @@ func testActualCLIDrain(t *testing.T, owned bool) {
 				}
 			}
 			if h.State == "available" && offered.CompareAndSwap(false, true) {
-				json.NewEncoder(w).Encode(coordinator.HeartbeatReply{Lease: &lease})
+				json.NewEncoder(w).Encode(coordinator.HeartbeatReply{Leases: []coordinator.Lease{lease}})
 			} else {
-				io.WriteString(w, `{"lease":null}`)
+				io.WriteString(w, `{"leases":[]}`)
 			}
 		case "/api/node/v1/jobs/synthetic/result":
 			var result coordinator.Result

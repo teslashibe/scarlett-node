@@ -48,12 +48,15 @@ func TestActualAccountShutdownSnapshotsDrainingAndFinishedWork(t *testing.T) {
 	var offered atomic.Bool
 	var reports atomic.Int32
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if controlRoute(w, r) {
+			return
+		}
 		switch {
 		case r.URL.Path == "/api/node/v1/heartbeat":
 			if offered.CompareAndSwap(false, true) {
-				json.NewEncoder(w).Encode(map[string]any{"lease": l})
+				json.NewEncoder(w).Encode(map[string]any{"leases": []coordinator.Lease{l}})
 			} else {
-				io.WriteString(w, `{"lease":null}`)
+				io.WriteString(w, `{"leases":[]}`)
 			}
 		case strings.HasSuffix(r.URL.Path, "/accept"):
 			records, e := os.ReadDir(filepath.Join(state, "attempts"))

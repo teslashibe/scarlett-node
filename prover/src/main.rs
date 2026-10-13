@@ -7,10 +7,17 @@
 //! `scarlett-prover relay-web` reads one web hop (see relay/node.rs), sends
 //! it over a relay session to the address the node checked, and prints the
 //! hop's summary; on failure it prints `SCARLETT_WEB_ERROR=<class>` on stderr.
+//! With `"predial": true` it dials the verifier first and reads the token
+//! from its next stdin line (design E1).
+//! `scarlett-prover serve` runs web hops for one node process over warm,
+//! reused verifier connections (see serve.rs).
 //! A `web-browser-v1` hop's input also carries `node_headers` (the browser's
 //! User-Agent and clearance cookies), whose values are never printed.
 //! `scarlett-prover verifier` runs the validator service (see verifier.rs).
 //! `scarlett-prover fake-openai <addr> <ca-out>` is for impersonation tests.
+
+// Test tables keep single-range lists, closure tables and long helpers as they read best.
+#![cfg_attr(test, allow(clippy::single_range_in_vec_init, clippy::type_complexity, clippy::too_many_arguments))]
 
 #[cfg(unix)]
 mod body;
@@ -22,8 +29,11 @@ mod fake;
 mod policy;
 mod prove;
 mod relay;
+mod serve;
 #[cfg(unix)]
 mod verifier;
+#[cfg(unix)]
+mod verifier_events;
 #[cfg(unix)]
 mod verifier_store;
 mod webpolicy;
@@ -59,28 +69,31 @@ async fn main() -> Result<()> {
             Ok(())
         }
         ["relay-web"] => {
-            let mut input = Vec::new();
-            tokio::io::stdin().take(1 << 20).read_to_end(&mut input).await?;
-            match relay::node::run_web(&input).await {
-                Ok(summary) => {
+            match relay::node::relay_web(&mut tokio::io::BufReader::new(tokio::io::stdin())).await {
+                Ok(relay::node::RelayWeb::Hop(summary)) => {
                     println!("{}", serde_json::to_string(&summary)?);
+                    Ok(())
+                }
+                // The accept failed: no token was sent and no target reached.
+                Ok(relay::node::RelayWeb::Aborted(aborted)) => {
+                    println!("{}", serde_json::to_string(&aborted)?);
                     Ok(())
                 }
                 Err(failure) => {
                     // One classification line, then the cause on one line. The
                     // cause keeps the relay misuse text the node looks for.
-                    let cause: String = format!("{:#}", failure.error).chars().map(|c| if c.is_control() { ' ' } else { c }).take(2048).collect();
-                    eprintln!("SCARLETT_WEB_ERROR={}\nError: {cause}", failure.class);
+                    eprintln!("SCARLETT_WEB_ERROR={}\nError: {}", failure.class, relay::node::loggable_cause(&failure.error));
                     std::process::exit(1);
                 }
             }
         }
+        ["serve"] => serve::run(tokio::io::stdin(), tokio::io::stdout()).await,
         #[cfg(unix)]
         ["verifier"] => verifier::run().await,
         #[cfg(unix)]
         ["fake-openai", listen, ca_out] => fake::run(listen, ca_out).await,
         #[cfg(not(unix))]
         ["verifier"] | ["fake-openai", ..] => bail!("this platform supports the proof client only"),
-        _ => bail!("usage: scarlett-prover prove | prove-x | relay-x | relay-web | verifier | fake-openai <addr> <ca-out>"),
+        _ => bail!("usage: scarlett-prover prove | prove-x | relay-x | relay-web | serve | verifier | fake-openai <addr> <ca-out>"),
     }
 }

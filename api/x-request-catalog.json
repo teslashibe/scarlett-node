@@ -89,5 +89,5 @@
   "policy_reference": "x-public-v1",
   "source_module": "github.com/teslashibe/x-go",
   "source_version": "v1.13.0",
-  "version": "node-v1"
+  "version": "node-v2"
 }

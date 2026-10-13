@@ -37,7 +37,7 @@ Scarlett Node is the supplier client for the Scarlett network. You run it on a m
 
 Web pages need no account. They are fetched from the node's own address, so a site sees a home connection (or the residential proxy a cloud node is configured with). Pages behind bot protection can be rendered in a hidden, sandboxed browser that the node downloads and verifies itself; the node then re-fetches the page through the verified relay with the browser's anti-bot clearance cookies, so the buyer gets a TLS-verified copy whenever the site allows it.
 
-The node is outbound-only. It polls the coordinator over HTTPS, opens no inbound port and holds no wallet key. The heartbeat is a long poll: each one asks the coordinator to hold it for up to 20 seconds and is answered the moment a job for this node is funded, so new work reaches an idle node in about one round trip; the node heartbeats again immediately after any answer and pauses only after a failed heartbeat (from one second, doubling to fifteen, with jitter) or when the coordinator asks with `Retry-After`. Provider credentials stay in private files on your machine and reach the Rust proof helper over stdin, never as command arguments or coordinator fields. Only the values of your login token or session cookies are hidden inside the proof; the request and the whole response are revealed to the verifier.
+The node is outbound-only. It polls the coordinator over HTTPS, opens no inbound port and holds no wallet key. The heartbeat is a long poll: each one asks the coordinator to hold it for up to 20 seconds and is answered the moment jobs for this node are funded, up to eight in one answer, so new work reaches an idle node in about one round trip; the node heartbeats again immediately after any answer and pauses only after a failed heartbeat (from one second, doubling to fifteen, with jitter) or when the coordinator asks with `Retry-After`. Each heartbeat acknowledges the offers the node received, so the coordinator sends a lost answer's offers again, and the node rejects at once any offer it will not take instead of letting it expire. While a heartbeat is held, a change in what the node can take, such as a job finishing, is posted to the coordinator without ending the hold. Stopping or pausing the node, an update and a computer going to sleep say goodbye first, so the coordinator moves jobs the node has not accepted to other nodes at once. The coordinator connection uses HTTP/2 health pings, and after a sleep the node reconnects at once. Provider credentials stay in private files on your machine and reach the Rust proof helper over stdin, never as command arguments or coordinator fields. Only the values of your login token or session cookies are hidden inside the proof; the request and the whole response are revealed to the verifier.
 
 Suppliers earn points only. The production coordinator at `https://network.scarlett.ai` implements [`api/node-v1.openapi.yaml`](api/node-v1.openapi.yaml); which services it dispatches and scores is set there and published in the [network rules](https://network.scarlett.ai/rules/). Provider subscription terms, and permission to relay paid inference, are separate from this code and must be checked before serving real jobs. Everything below is a summary; the dense, authoritative version is [`docs/REFERENCE.md`](docs/REFERENCE.md), and the operator guide (install, pairing, every setting, readiness and failure codes, web scraping, verification) is at [network.scarlett.ai/docs](https://network.scarlett.ai/docs/).
 
@@ -61,7 +61,7 @@ flowchart LR
     V -- "verified response, model, usage, page" --> C
 ```
 
-1. The node heartbeats to the coordinator and may receive a lease. A lease pins the exact request (a Codex `response.create` payload, an X GraphQL read with its operation, query ID, variables and features, or one canonical `https` URL) and carries a single-use verifier token.
+1. The node heartbeats to the coordinator and may receive leases, up to eight at once. A lease pins the exact request (a Codex `response.create` payload, an X GraphQL read with its operation, query ID, variables and features, or one canonical `https` URL) and carries a single-use verifier token.
 2. The node opens the TCP connection to the provider or website from its own address and runs the request through the `scarlett-prover` helper with the verifier on the other side of a TLSNotary or keyed-relay session. For a web page the node first resolves the host and refuses private, local and reserved addresses.
 3. The verifier checks the proven request against the job, records the full response, and the node posts `/proven`. The node never submits the answer itself.
 4. The coordinator reads model, output and usage (Codex) or the verified response (X, web) from the verifier and settles separately. A stored proof is not a paid receipt.
@@ -227,7 +227,8 @@ A `web` job fetches one public `https` page from the node's own connection, so t
 - One `GET` per job, with fixed browser-like headers. Redirects are followed up to five times, each hop a new relay session that the verifier authorizes only for the `https` `Location` of the previous verified redirect.
 - TLS 1.3 with AES-128-GCM and HTTP/1.1 only. Sites that offer only TLS 1.2 fail. No JavaScript runs.
 - Before every hop the node resolves the host itself and refuses the hop if any address is loopback, private, link-local, CGNAT, multicast, reserved, documentation, ULA, 6to4, Teredo, an IPv4-mapped or NAT64 address that carries one of those, or an address on one of the node's own interfaces. The helper then dials exactly the checked address, so a second DNS answer cannot redirect it. `x.com`, `twitter.com` and reserved names such as `.local` are refused before any lookup.
-- `SCARLETT_WEB_CONCURRENCY` (1–32, default 4) bounds simultaneous pages. `SCARLETT_WEB_EGRESS_PROXY=http://[user:pass@]host:port` sends every web connection through a local HTTP `CONNECT` proxy, such as a residential proxy for a cloud server. The proxy must tunnel without intercepting (TLS runs end to end with the verifier). Its address and credentials never leave the node; the heartbeat says only `egress: proxy`.
+- `SCARLETT_WEB_CONCURRENCY` (1–32, default 4) bounds simultaneous pages. In the desktop app, this is **Device settings → Web pages at once** (Auto passes `auto`, or a fixed 2–16). `SCARLETT_WEB_EGRESS_PROXY=http://[user:pass@]host:port` sends every web connection through a local HTTP `CONNECT` proxy, such as a residential proxy for a cloud server. The proxy must tunnel without intercepting (TLS runs end to end with the verifier). Its address and credentials never leave the node; the heartbeat says only `egress: proxy`.
+- `SCARLETT_WEB_CONCURRENCY=auto` lets the node find its own limit between 2 and 16 pages, starting at 4. It takes one more page after 20 healthy pages in a row: each proven with no timeout or `verifier_busy`, with at least half the limit running, while the relay helper's p90 time stays within 1.25× its five-minute median, CPU is under 70% and memory is not tight. It halves, never below 2, after 3 pages time out or are turned away as `verifier_busy` within 60 s, when the p90 passes twice the median, or under critical memory pressure. A lower limit only stops new pages; running pages always finish. The heartbeat advertises the limit as web capacity, and `scarlett-node status` shows it as `web_limit` (`limit_mode`, `limit`, `limit_reason`, `limit_changed_at`).
 - A caught verifier misuse latches the same node-wide relay halt as for X. Web has no MPC fallback, so it stops until `scarlett-node relay-resume`.
 
 Known residual: a site that resolves to the node's own public IP behind NAT (hairpin) is not detected.
@@ -290,11 +291,12 @@ Settings come from the environment, typically via `~/.config/scarlett-node/node.
 | `SCARLETT_CODEX_CONCURRENCY` | Total simultaneous Codex jobs across accounts |
 | `SCARLETT_X_CONCURRENCY` | Total simultaneous X jobs across accounts |
 | `SCARLETT_X_ACCOUNT_CONCURRENCY` | Optional ceiling per authenticated X account, 1–32; CLI default 32 retains the registry limit, desktop sets 1 |
-| `SCARLETT_WEB_CONCURRENCY` | Simultaneous web pages, 1–32 (default 4) |
+| `SCARLETT_WEB_CONCURRENCY` | Simultaneous web pages, 1–32, or `auto` to adapt between 2 and 16 from 4 (default 4) |
 | `SCARLETT_WEB_EGRESS_PROXY` | Optional local HTTP `CONNECT` proxy for web targets, `http://[user:pass@]host:port`, such as a residential proxy for a cloud server; never logged or reported |
 | `SCARLETT_WEB_BROWSER` | `on` or `off`: the hidden browser tier for web jobs in browser mode. Default `on` with web on macOS and Linux, `off` on Windows |
-| `SCARLETT_WEB_BROWSER_CONCURRENCY` | Pages the browser renders at once, 1–4 and at most `SCARLETT_WEB_CONCURRENCY`; default 1 below 16 GiB of memory, else 2 |
+| `SCARLETT_WEB_BROWSER_CONCURRENCY` | Pages the browser renders at once, 1–4 and at most `SCARLETT_WEB_CONCURRENCY` (with `auto`, at most its current limit); default 1 below 16 GiB of memory, else 2 |
 | `SCARLETT_WEB_BROWSER_IDLE_SECONDS` | How long an idle browser stays up, 30–3600 (default 120) |
+| `SCARLETT_WEB_DAEMON_LOG` | `1` logs every web hop's steps on the node and in its relay helper daemon (`web daemon:` lines in the node log); without it the daemon logs only stuck hops and verifier trouble. Never logs tokens, URLs or target addresses |
 | `SCARLETT_WEB_SOLVERS` | Optional operator-paid captcha solvers for the browser tier: a comma list of `capmonster`, `capsolver` and `2captcha` (needs the browser tier) |
 | `SCARLETT_WEB_SOLVER_CAPMONSTER_KEY_FILE`, `SCARLETT_WEB_SOLVER_CAPSOLVER_KEY_FILE`, `SCARLETT_WEB_SOLVER_2CAPTCHA_KEY_FILE` | Absolute path of each listed provider's key file: a private (0600) regular file holding the key alone; never logged or reported |
 | `SCARLETT_WEB_SOLVER_MAX_SOLVES_PER_FETCH` | Paid solves per page, 1–4 (default 2) |
@@ -354,7 +356,7 @@ It needs the environment variables listed in `internal/worker/xlive_test.go`. Ot
 
 ## Contributing and security reporting
 
-There is no separate contributing guide or security policy yet. Open an [issue](https://github.com/teslashibe/scarlett-node/issues) for bugs, questions and security reports. Pull requests must keep `go build ./...` and `go test ./...` passing, keep the `node-v1` wire schema and fixtures aligned with the Go structs, and never log secrets or weaken deadline and fence protections.
+There is no separate contributing guide or security policy yet. Open an [issue](https://github.com/teslashibe/scarlett-node/issues) for bugs, questions and security reports. Pull requests must keep `go build ./...` and `go test ./...` passing, keep the `node-v2` wire schema and fixtures aligned with the Go structs, and never log secrets or weaken deadline and fence protections.
 
 ---
 
@@ -364,7 +366,7 @@ There is no separate contributing guide or security policy yet. Open an [issue](
     <a href="https://network.scarlett.ai/docs/">Operator docs</a> ·
     <a href="packaging/INSTALL.md">Install</a> ·
     <a href="desktop/README.md">Desktop</a> ·
-    <a href="api/node-v1.openapi.yaml">node-v1 wire API</a> ·
+    <a href="api/node-v1.openapi.yaml">node-v2 wire API</a> ·
     <a href="api/x-request-catalog.json">X request catalog</a> ·
     <a href="https://github.com/teslashibe/scarlett-node/issues/1">Roadmap gaps (issue #1)</a>
   </sub>
@@ -386,7 +388,7 @@ Offline fixtures cover the operation lifecycle and account replacement. They do 
 
 Each verified X identity has one execution lane and a shared local quota domain. Adding another session for the same X identity does not add capacity. Reusing an identity on another node does not create independent provider quota; these checks currently cover one node.
 
-Heartbeats report the physical configured ceiling separately from current runnable capacity. Managed accounts expose bounded aggregate account counts and readiness for search, profile, post and thread. Operation capacities overlap and must never be added together. A known eligibility deadline wakes the held heartbeat at that deadline; dispatch still checks the selected identity and session before accepting the immutable request. Inherited unresolved X journals hold X admission until reconciliation because those records cannot prove their original account identity.
+Heartbeats report the physical configured ceiling separately from current runnable capacity. Managed accounts expose bounded aggregate account counts and readiness for search, profile, post and thread. Operation capacities overlap and must never be added together. A known eligibility deadline posts the node's availability at that deadline while the heartbeat stays held; dispatch still checks the selected identity and session before accepting the immutable request. Inherited unresolved X journals hold X admission until reconciliation because those records cannot prove their original account identity.
 
 `SCARLETT_X_PACING_MODE` defaults to `conservative`, which spreads requests through the observed provider window. The opt-in `quota_budget` mode uses the configured minimum gap while complete, unexpired headers for that operation show remaining quota above a twenty-percent reserve, with a minimum reserve of two requests. Every authenticated dispatch, including validation and pagination, debits the shared budget under the pacing mutex. Stale or concurrent headers cannot replenish an active window. A later page can wait when the preceding page reaches the reserve; the buyer page count does not reserve provider quota in advance.
 

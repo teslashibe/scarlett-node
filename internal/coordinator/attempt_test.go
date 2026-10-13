@@ -9,12 +9,15 @@ import (
 	"testing"
 )
 
-func TestAttemptStatusRequiresCommittedReportReceipt(t *testing.T) {
+// A committed report's receipt must be a well-formed hash; an accepted or
+// failed attempt without one was decided from the verifier's own record
+// before the node's report arrived (C2), and is valid.
+func TestAttemptStatusChecksTheReportReceipt(t *testing.T) {
 	for _, tc := range []struct {
 		state, hash string
 		valid       bool
 	}{
-		{"accepted", "", false}, {"failed", "", false}, {"accepted", "abcd", false}, {"failed", strings.Repeat("A", 64), false}, {"accepted", strings.Repeat("a", 64), true}, {"failed", strings.Repeat("b", 64), true}, {"proof_pending", strings.Repeat("c", 64), true}, {"live", "", true},
+		{"accepted", "", true}, {"failed", "", true}, {"accepted", "abcd", false}, {"failed", strings.Repeat("A", 64), false}, {"accepted", strings.Repeat("a", 64), true}, {"failed", strings.Repeat("b", 64), true}, {"proof_pending", strings.Repeat("c", 64), true}, {"live", "", true},
 	} {
 		t.Run(tc.state+tc.hash, func(t *testing.T) {
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

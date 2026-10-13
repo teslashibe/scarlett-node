@@ -316,9 +316,18 @@ func TestLegacyCodexTLSNHeartbeatHonorsLocalAdmission(t *testing.T) {
 			reader, writer := io.Pipe()
 			defer reader.Close()
 			defer writer.Close()
-			var heartbeats, other atomic.Int32
+			var heartbeats, other, rejects atomic.Int32
 			received := make(chan coordinator.Heartbeat, 8)
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if controlRoute(w, r) {
+					return
+				}
+				var body coordinator.Rejection
+				if r.URL.Path == "/api/node/v1/jobs/"+offer.JobID+"/reject" && json.NewDecoder(r.Body).Decode(&body) == nil && body.Reason == coordinator.RejectNoAccount {
+					rejects.Add(1)
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
 				if r.URL.Path != "/api/node/v1/heartbeat" {
 					other.Add(1)
 					w.WriteHeader(http.StatusInternalServerError)
@@ -333,12 +342,13 @@ func TestLegacyCodexTLSNHeartbeatHonorsLocalAdmission(t *testing.T) {
 				default:
 				}
 				if heartbeats.Add(1) == 1 && tc.offer {
-					// An unsolicited offer to a blocked node is still never funded.
-					json.NewEncoder(w).Encode(map[string]any{"lease": offer})
+					// An unsolicited offer to a blocked node is still never
+					// funded; the node rejects it instead of letting it expire.
+					json.NewEncoder(w).Encode(map[string]any{"leases": []coordinator.Lease{offer}})
 					return
 				}
 				writer.Close()
-				io.WriteString(w, `{"lease":null}`)
+				io.WriteString(w, `{"leases":[]}`)
 			}))
 			defer server.Close()
 			c.Coordinator = server.URL
@@ -365,8 +375,8 @@ func TestLegacyCodexTLSNHeartbeatHonorsLocalAdmission(t *testing.T) {
 					t.Fatalf("legacy heartbeat %s with capacity %d; want %s with positive legacy capacity", h.State, h.Capacity, tc.state)
 				}
 			}
-			if count == 0 || (tc.offer && count < 2) || other.Load() != 0 {
-				t.Fatal("missing heartbeat, or a blocked offer called acceptance or report HTTP")
+			if count == 0 || (tc.offer && count < 2) || other.Load() != 0 || rejects.Load() != map[bool]int32{false: 0, true: 1}[tc.offer] {
+				t.Fatal("missing heartbeat, a blocked offer called acceptance or report HTTP, or was not rejected")
 			}
 		})
 	}

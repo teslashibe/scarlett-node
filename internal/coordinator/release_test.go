@@ -79,7 +79,7 @@ func TestEveryRequestSendsTheReleaseAndReadsTheNotice(t *testing.T) {
 		w.Header().Set(NodeUpdateRequiredHeader, "true")
 		switch r.URL.Path {
 		case "/api/node/v1/heartbeat":
-			w.Write([]byte(`{"lease":null}`))
+			w.Write([]byte(`{"leases":[]}`))
 		case "/api/node/v1/jobs/job/attempt":
 			// An unsupported reply still carries the policy.
 			w.WriteHeader(http.StatusNotFound)

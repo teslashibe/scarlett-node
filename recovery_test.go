@@ -138,7 +138,7 @@ func TestRecoveryLiveUsesExactBodyAndUncertainCallsNeverRerun(t *testing.T) {
 	}
 }
 func TestRecoveryRejectsWrongIdentityOldContractAndDifferentReceipt(t *testing.T) {
-	for _, failure := range []string{"identity", "old-contract", "wrong-receipt", "missing-receipt", "malformed-receipt", "pending", "fenced", "unsupported"} {
+	for _, failure := range []string{"identity", "old-contract", "wrong-receipt", "malformed-receipt", "pending", "fenced", "unsupported"} {
 		t.Run(failure, func(t *testing.T) {
 			j := testJournal(t, filepath.Join(t.TempDir(), "attempts"))
 			l := testLease()
@@ -158,8 +158,6 @@ func TestRecoveryRejectsWrongIdentityOldContractAndDifferentReceipt(t *testing.T
 				status.ReplaySafe = false
 			case "wrong-receipt":
 				status.SubmissionSHA256 = attempts.Hash([]byte("other"))
-			case "missing-receipt":
-				status.SubmissionSHA256 = ""
 			case "malformed-receipt":
 				status.SubmissionSHA256 = "invalid"
 			case "pending":
@@ -244,5 +242,49 @@ func TestProofIngestionCanStayPendingWithoutRerun(t *testing.T) {
 	pending, e := j.Pending()
 	if e != nil || len(pending) != 1 || posts.Load() != 1 {
 		t.Fatal("pending proof was discarded or repeated", e)
+	}
+}
+
+// The coordinator completed a relay web job from the verifier's event feed
+// (design C2) and the node's report never reached it: the attempt reads
+// accepted, or failed for a rejection, with no receipt. Recovery ends the
+// record without reposting, rather than retrying it until the journal purges it.
+func TestRecoveryEndsAnAttemptTheVerifierDecidedWithoutTheReport(t *testing.T) {
+	for _, tc := range []struct{ state, kind string }{{"accepted", "proven"}, {"failed", "fail"}, {"accepted", "fail"}} {
+		t.Run(tc.state+"-"+tc.kind, func(t *testing.T) {
+			j := testJournal(t, filepath.Join(t.TempDir(), "attempts"))
+			l := testLease()
+			r, _ := attemptRecord(l)
+			if e := j.Begin(r); e != nil {
+				t.Fatal(e)
+			}
+			r, e := j.Ready(r, tc.kind, []byte(`{"version":"node-v2","attempt":"1","fence":"f1"}`))
+			if e != nil {
+				t.Fatal(e)
+			}
+			var gets, posts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if req.Method != http.MethodGet {
+					posts.Add(1)
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				gets.Add(1)
+				json.NewEncoder(w).Encode(coordinator.AttemptStatus{Version: coordinator.Version, JobID: l.JobID, Attempt: l.Attempt, Fence: l.Fence, State: tc.state, ReplaySafe: true})
+			}))
+			defer server.Close()
+			client := coordinator.New(server.URL, "synthetic")
+			if e = recoverAttempt(context.Background(), client, j, r); e != nil {
+				t.Fatal(e)
+			}
+			pending, e := j.Pending()
+			if e != nil || len(pending) != 0 || gets.Load() != 1 || posts.Load() != 0 {
+				t.Fatalf("pending %d, gets %d, posts %d, %v", len(pending), gets.Load(), posts.Load(), e)
+			}
+			// Idle reconciliation finds nothing left to retry.
+			if e = reconcileIdle(context.Background(), client, j, map[string]bool{}); e != nil || gets.Load() != 1 {
+				t.Fatal("record retried", e, gets.Load())
+			}
+		})
 	}
 }

@@ -149,10 +149,8 @@ pub fn json_messages(data: &[u8]) -> Result<Vec<Value>> {
         i += len;
         if opcode == 0x1 || opcode == 0x0 {
             partial.extend(payload.iter().enumerate().map(|(j, b)| mask.map_or(*b, |m| b ^ m[j % 4])));
-            if fin {
-                if let Ok(value) = serde_json::from_slice(&std::mem::take(&mut partial)) {
-                    messages.push(value);
-                }
+            if fin && let Ok(value) = serde_json::from_slice(&std::mem::take(&mut partial)) {
+                messages.push(value);
             }
         }
     }

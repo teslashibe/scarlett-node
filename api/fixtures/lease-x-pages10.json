@@ -1,5 +1,5 @@
 {
-  "version": "node-v1",
+  "version": "node-v2",
   "service_type": "x_read",
   "job_id": "44444444-4444-4444-8444-444444444444",
   "signed_job_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

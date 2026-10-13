@@ -35,7 +35,10 @@ func recoverAttempt(ctx context.Context, client *coordinator.Client, journal *at
 	}
 	switch status.State {
 	case "accepted", "failed":
-		if r.SubmissionSHA256 != "" && status.SubmissionSHA256 != r.SubmissionSHA256 {
+		// Without a receipt the coordinator decided the attempt from the
+		// verifier's own record before this node's report reached it: the
+		// outcome is final, and the report has nothing left to change.
+		if r.SubmissionSHA256 != "" && status.SubmissionSHA256 != "" && status.SubmissionSHA256 != r.SubmissionSHA256 {
 			return errors.New("coordinator accepted a different attempt report")
 		}
 		return journal.Terminal(r)
@@ -119,6 +122,22 @@ func rejectLease(ctx context.Context, client *coordinator.Client, journal *attem
 		return err
 	}
 	return submitRecord(ctx, client, journal, r)
+}
+
+// declineOffer rejects a funded offer this node will not accept after all, so
+// that the coordinator moves the job at once instead of waiting for a timer
+// or the deadline. It is only for offers no acceptance was sent for, and is
+// best effort: a failure is logged and the coordinator's timers cover it.
+func declineOffer(ctx context.Context, client *coordinator.Client, l coordinator.Lease, reason string) {
+	if client == nil || !l.AcceptanceRequired {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rejectTimeout)
+	defer cancel()
+	fmt.Fprintln(os.Stderr, "offer: rejected ("+reason+")")
+	if err := client.Reject(ctx, l.OfferAttempt(), reason); err != nil {
+		fmt.Fprintln(os.Stderr, "offer: rejection not delivered:", err)
+	}
 }
 
 // activeAttempts counts attempt keys whose worker goroutine has not returned.

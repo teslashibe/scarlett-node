@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -24,11 +23,12 @@ import (
 // input the worker built, logs it for the test and answers as the verifier
 // would through OUTCOME: final, or a redirect to the next hop URL.
 func fakeWebProver(mode string) {
+	if len(os.Args) == 2 && os.Args[1] == "serve" {
+		fakeWebDaemon(mode)
+	}
 	var in webHopInput
-	data, _ := io.ReadAll(os.Stdin)
-	d := json.NewDecoder(bytes.NewReader(data))
-	d.DisallowUnknownFields()
-	if d.Decode(&in) != nil || len(os.Args) != 2 || os.Args[1] != "relay-web" || in.Verifier != "verifier:7047" || len(in.Token) != 64 || in.Port != 443 || len(in.Payload) == 0 || in.TimeoutMS < 1000 || in.TimeoutMS > 280000 {
+	data := fakeRelayWebInput(&in)
+	if len(os.Args) != 2 || os.Args[1] != "relay-web" || in.Verifier != "verifier:7047" || len(in.Token) != 64 || in.Port != 443 || len(in.Payload) == 0 || in.TimeoutMS < 1000 || in.TimeoutMS > 280000 {
 		fmt.Fprintln(os.Stderr, "bad relay-web input")
 		os.Exit(2)
 	}
