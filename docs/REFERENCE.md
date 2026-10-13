@@ -462,7 +462,9 @@ may not exceed `SCARLETT_WEB_CONCURRENCY`; unset, the runtime uses 1 below
 All three need the services executor (so do the solver settings below). A desktop node with Serve web
 pages on (the default) inherits the defaults; the desktop app passes an
 explicit `SCARLETT_WEB_BROWSER` of `on` or `off` from its own environment to
-the node, and only together with web.
+the node, and only together with web. Its **Browser pages at once** setting
+passes `SCARLETT_WEB_BROWSER_CONCURRENCY` (Auto passes nothing) when that node
+runs the browser, at most a fixed Web pages at once.
 
 **What ships and what is fetched.** The node bundle and the desktop app carry
 `web-runtime-<platform>.tar.gz` and `web-runtime.json` beside

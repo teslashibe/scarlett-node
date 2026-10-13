@@ -1,7 +1,10 @@
-export type Preferences = { schema: 1; local_api_port: number; background: boolean; x_concurrency: number; updates: "notify" | "automatic"; resume_serving: boolean; serve_web: boolean; web_concurrency: number };
+export type Preferences = { schema: 1; local_api_port: number; background: boolean; x_concurrency: number; updates: "notify" | "automatic"; resume_serving: boolean; serve_web: boolean; web_concurrency: number; web_browser_concurrency: number };
 /** Web pages at once: 0 is Auto (SCARLETT_WEB_CONCURRENCY=auto, the node's adaptive limit). */
 export const WEB_CONCURRENCY_CHOICES = [0, 2, 4, 8, 12, 16] as const;
 export function validWebConcurrency(n: number): boolean { return (WEB_CONCURRENCY_CHOICES as readonly number[]).includes(n); }
+/** Browser pages at once: 0 is Auto (the node picks 1 or 2 from its memory); 1-4 is SCARLETT_WEB_BROWSER_CONCURRENCY, never above Web pages at once. */
+export const WEB_BROWSER_CONCURRENCY_CHOICES = [0, 1, 2, 3, 4] as const;
+export function validWebBrowserConcurrency(n: number): boolean { return (WEB_BROWSER_CONCURRENCY_CHOICES as readonly number[]).includes(n); }
 export type Account = {
   id: string;
   service: "codex" | "x_read";
@@ -238,7 +241,13 @@ export function hiddenBrowser(s: Snapshot): Metric {
   if (!nodeLive(s))
     return s.web_browser === false ? BROWSER_UNAVAILABLE.disabled : { value: "Off", note: "Checked when the node runs" };
   const browser = webEntry(s)?.browser;
-  if (browser?.state === "ready") return { value: "Ready", note: "For pages behind bot checks" };
+  if (browser?.state === "ready") {
+    // How many pages it renders at once: Browser pages at once, within web's.
+    const pages = browser.capacity;
+    return pages !== undefined && Number.isInteger(pages) && pages >= 1 && pages <= 4
+      ? { value: "Ready", note: `${pages} ${pages === 1 ? "page" : "pages"} at once` }
+      : { value: "Ready", note: "For pages behind bot checks" };
+  }
   if (browser?.state === "unavailable")
     return BROWSER_UNAVAILABLE[browser.reason ?? ""] ?? { value: "Unavailable", note: "Browser not ready" };
   return { value: "Unknown", note: "Waiting for node status" };

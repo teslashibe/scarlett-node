@@ -4,6 +4,8 @@ import { layout } from "../src/layout.ts";
 import {
   validWebConcurrency,
   WEB_CONCURRENCY_CHOICES,
+  validWebBrowserConcurrency,
+  WEB_BROWSER_CONCURRENCY_CHOICES,
   canConnectCodex,
   canStart,
   claudeStatusText,
@@ -326,7 +328,7 @@ const readyWeb: ServiceHealth = {
 test("The web tiles show what the running node serves, not only the saved setting", () => {
   assert.deepEqual(webServing(webNode(readyWeb)), { value: "On", note: "Serving on this device" });
   assert.equal(availableWebSlots(webNode(readyWeb)), 3);
-  assert.deepEqual(hiddenBrowser(webNode(readyWeb)), { value: "Ready", note: "For pages behind bot checks" });
+  assert.deepEqual(hiddenBrowser(webNode(readyWeb)), { value: "Ready", note: "2 pages at once" });
   // A configured service has not served a page yet but takes work.
   assert.equal(availableWebSlots(webNode({ ...readyWeb, state: "configured" })), 3);
   assert.equal(webServing(webNode({ ...readyWeb, state: "configured" })).value, "On");
@@ -398,7 +400,7 @@ test("A full receipt journal pauses web without turning a node with web off on",
   const on = webNode({ ...readyWeb, state: "exhausted" }, full);
   assert.deepEqual(webServing(on), { value: "Paused", note: "Receipt journal full" });
   assert.equal(availableWebSlots(on), 0);
-  assert.deepEqual(hiddenBrowser(on), { value: "Ready", note: "For pages behind bot checks" });
+  assert.deepEqual(hiddenBrowser(on), { value: "Ready", note: "2 pages at once" });
   const off = { ...webNode({ kind: "web", state: "exhausted", capacity: 0, in_flight: 0 }, full), web_enabled: false };
   assert.deepEqual(webServing(off), { value: "Off", note: "Turn on in Device settings" });
   assert.equal(availableWebSlots(off), 0);
@@ -448,6 +450,27 @@ test("Web pages at once offers Auto and the listed page counts only", () => {
   // fixed number, and the settings copy says so.
   assert.match(layout, /Auto adjusts to your connection/);
   assert.doesNotMatch(layout, /Auto uses \d/);
+});
+
+test("Browser pages at once offers Auto and 1 to 4, beside Web pages at once", () => {
+  assert.deepEqual([...WEB_BROWSER_CONCURRENCY_CHOICES], [0, 1, 2, 3, 4]);
+  for (const n of WEB_BROWSER_CONCURRENCY_CHOICES) assert.ok(validWebBrowserConcurrency(n), String(n));
+  for (const n of [-1, 5, 8, 1.5, Number.NaN]) assert.equal(validWebBrowserConcurrency(n), false, String(n));
+  // The settings menu offers exactly these choices, Auto first, right after
+  // Web pages at once in the same row.
+  const select = /<select id="web-browser-concurrency">(.*?)<\/select>/.exec(layout)?.[1] ?? "";
+  assert.deepEqual([...select.matchAll(/<option value="(\d+)">/g)].map(m => Number(m[1])), [...WEB_BROWSER_CONCURRENCY_CHOICES]);
+  assert.match(select, /<option value="0">Auto \(recommended\)<\/option>/);
+  assert.match(layout, /<select id="web-concurrency">.*?<\/select><\/label><label>Browser pages at once<select id="web-browser-concurrency">/);
+  // The copy says it is a share of the web pages, and that Auto follows memory.
+  assert.match(layout, /Browser pages at once is how many of those can use the hidden browser, for pages behind bot checks; Auto picks 1 or 2 to suit this device's memory/);
+});
+test("The hidden browser tile says how many pages it renders at once", () => {
+  const ready = (capacity?: number) => hiddenBrowser(webNode({ ...readyWeb, browser: { state: "ready", capacity, in_flight: 0, version: "155.0.8059.39" } }));
+  assert.deepEqual(ready(1), { value: "Ready", note: "1 page at once" });
+  assert.deepEqual(ready(4), { value: "Ready", note: "4 pages at once" });
+  // A missing or out-of-range count is never shown.
+  for (const capacity of [undefined, 0, 5, 1.5]) assert.deepEqual(ready(capacity), { value: "Ready", note: "For pages behind bot checks" }, String(capacity));
 });
 
 // A node this app runs, reporting the given status fields.
