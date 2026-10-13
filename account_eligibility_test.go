@@ -456,7 +456,12 @@ func TestAccountEligibilityDeadlinePostsAvailabilityBeforePeriodicTick(t *testin
 		t.Fatalf("setup left %v before the deadline", time.Until(readyAt))
 	}
 	time.Sleep(lead)
+	// The node times the advertised deadline by the wall clock, which on
+	// macOS drifts from the monotonic one over the setup, so the deadline is
+	// re-read from its wall time here: the node's wake and the operation's
+	// eligibility are then the same instant.
 	started := time.Now()
+	readyAt = started.Add(readyAt.Round(0).Sub(started.Round(0)))
 	go func() {
 		watched <- watchHeartbeat(ctx, cancel, testWatch(sent, current, func(context.Context) (availability, error) {
 			posted <- time.Now()
