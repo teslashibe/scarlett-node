@@ -526,7 +526,7 @@ pub(crate) fn private_dir_with_helper(path: &Path, helper: &Path) -> Result<()> 
     }
 }
 /// The largest reply `private_helper` reads. The longest is the device
-/// preferences (136 bytes with every field at its widest).
+/// preferences (185 bytes with every field at its widest, newline included).
 pub(crate) const PRIVATE_HELPER_REPLY_LIMIT: usize = 256;
 pub(crate) fn private_helper(binary: &Path, action: &str, path: &Path) -> Result<Value> {
     if !path.is_absolute() || !regular(binary) {
