@@ -1,6 +1,6 @@
 module github.com/teslashibe/scarlett-node
 
-go 1.25.13
+go 1.26.10
 
 require (
 	filippo.io/edwards25519 v1.1.0
@@ -9,9 +9,9 @@ require (
 	github.com/teslashibe/open-agent-api v0.1.32
 	github.com/teslashibe/x-go v1.13.0
 	go.yaml.in/yaml/v2 v2.4.2
-	golang.org/x/crypto v0.52.0
-	golang.org/x/sys v0.45.0
-	golang.org/x/term v0.43.0
+	golang.org/x/crypto v0.56.0
+	golang.org/x/sys v0.47.0
+	golang.org/x/term v0.45.0
 )
 
 require (
