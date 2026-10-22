@@ -1,4 +1,4 @@
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26.10-alpine AS builder
 WORKDIR /src
 COPY go.mod go.sum ./
 COPY third_party/x-go ./third_party/x-go
@@ -13,7 +13,7 @@ COPY prover/ ./
 RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates gosu && \
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends ca-certificates gosu && \
     rm -rf /var/lib/apt/lists/* && useradd -m -u 10001 node && mkdir -m 755 /run/scarlett-browser
 COPY --from=builder /scarlett-node /usr/local/bin/scarlett-node
 COPY --from=prover-builder /src/prover/target/release/scarlett-prover /usr/local/bin/scarlett-prover
