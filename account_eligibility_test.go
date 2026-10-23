@@ -418,7 +418,9 @@ func TestAccountEligibilityDeadlinePostsAvailabilityBeforePeriodicTick(t *testin
 	f := xOnlyRegistry(t, p)
 	f.Accounts = f.Accounts[:1]
 	saveAccountFixture(t, p, f)
-	readyAt := time.Now().Add(250 * time.Millisecond)
+	// Two seconds out, so a slow runner still reads the deadline as ahead
+	// while it builds the advertisement; the hold starts just before it.
+	readyAt := time.Now().Add(2 * time.Second)
 	later := readyAt.Add(2 * time.Second)
 	p.xEligibility = func(id, operation string, now time.Time) time.Time {
 		if operation == "search" {
@@ -446,6 +448,20 @@ func TestAccountEligibilityDeadlinePostsAvailabilityBeforePeriodicTick(t *testin
 	current := func() availability { return availability{services: serviceStates(p.health())} }
 	posted := make(chan time.Time, 4)
 	watched := make(chan watchResult, 1)
+	// The hold starts a quarter second before the deadline, however long the
+	// setup took, so the deadline falls well before the first periodic tick.
+	// The start is taken before the watch, whose ticks all come later.
+	lead := time.Until(readyAt) - 250*time.Millisecond
+	if lead <= 0 {
+		t.Fatalf("setup left %v before the deadline", time.Until(readyAt))
+	}
+	time.Sleep(lead)
+	// The node times the advertised deadline by the wall clock, which on
+	// macOS drifts from the monotonic one over the setup, so the deadline is
+	// re-read from its wall time here: the node's wake and the operation's
+	// eligibility are then the same instant.
+	started := time.Now()
+	readyAt = started.Add(readyAt.Round(0).Sub(started.Round(0)))
 	go func() {
 		watched <- watchHeartbeat(ctx, cancel, testWatch(sent, current, func(context.Context) (availability, error) {
 			posted <- time.Now()
@@ -453,7 +469,6 @@ func TestAccountEligibilityDeadlinePostsAvailabilityBeforePeriodicTick(t *testin
 		}))
 	}()
 	polled := make(chan error, 1)
-	started := time.Now()
 	go func() {
 		_, err := client.Poll(ctx, coordinator.Heartbeat{Version: coordinator.Version, NodeID: "synthetic-node", Profile: "standard", State: "exhausted", Capacity: 0, Services: health, WaitSeconds: coordinator.HeartbeatWaitSeconds})
 		polled <- err
