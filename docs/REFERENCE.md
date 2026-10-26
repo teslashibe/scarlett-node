@@ -524,7 +524,9 @@ left; under 5 s the job is `expired`. Then:
    **re-fetch** is the relay hop loop above with the same token, each hop
    carrying `node_headers`: the pinned User-Agent and a Cookie built from the
    browser's cookies (below). The re-fetch is skipped when the browser could not
-   clear a bot challenge.
+   clear a bot challenge, or when the site answered the browser's main document
+   429: the site is limiting this node's address, and a second request from it
+   seconds later only extends the limit.
 5. The node reports once both are done, or at the report deadline: `/proven`
    when the manifest was stored or the verifier holds at least one re-fetch hop,
    otherwise `/fail` with `page_too_large` (`stage` `dom`) for a DOM over the

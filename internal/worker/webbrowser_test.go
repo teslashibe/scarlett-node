@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -581,6 +582,11 @@ func TestRunBrowserOutcomes(t *testing.T) {
 		{name: "later re-fetch hop fails", mode: "web-later-fails", upload: failUpload, code: "", uploads: 1, hops: 2},
 		{name: "unsolved challenge: no re-fetch", mode: "web-final", browser: func(f *fakeBrowser) { f.result.Challenge = "unsolved" }, code: "", uploads: 1, hops: 0},
 		{name: "unsolved challenge, upload failed", mode: "web-final", browser: func(f *fakeBrowser) { f.result.Challenge = "unsolved" }, upload: failUpload, code: "web_browser_failed", uploads: 1, hops: 0},
+		// A site that answers the browser 429 is limiting this address: the
+		// copy is still uploaded, and no re-fetch asks the same site again.
+		{name: "site rate limit: no re-fetch", mode: "web-final", browser: func(f *fakeBrowser) { f.result.StatusCode = http.StatusTooManyRequests }, code: "", uploads: 1, hops: 0},
+		{name: "site rate limit, upload failed", mode: "web-final", browser: func(f *fakeBrowser) { f.result.StatusCode = http.StatusTooManyRequests }, upload: failUpload, code: "web_browser_failed", uploads: 1, hops: 0},
+		{name: "site error 503: re-fetch", mode: "web-final", browser: func(f *fakeBrowser) { f.result.StatusCode = http.StatusServiceUnavailable }, upload: failUpload, code: "", uploads: 1, hops: 1},
 		{name: "x host final URL: no upload", mode: "web-final", browser: func(f *fakeBrowser) { f.result.FinalURL = "https://x.com/home" }, code: "", uploads: 0, hops: 1},
 		{name: "x host final URL, re-fetch fails", mode: "web-fetch", browser: func(f *fakeBrowser) { f.result.FinalURL = "https://mobile.twitter.com/a" }, code: "web_browser_failed", uploads: 0, hops: 1},
 		{name: "relative final URL", mode: "web-fetch", browser: func(f *fakeBrowser) { f.result.FinalURL = "/home" }, code: "web_browser_failed", uploads: 0, hops: 1},
