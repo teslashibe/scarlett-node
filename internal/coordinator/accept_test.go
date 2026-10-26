@@ -304,9 +304,29 @@ func TestAcceptWithoutRetrySendsOnce(t *testing.T) {
 	}
 }
 
-// Refusals, rate limits and other unavailability are final: one request each.
+// A 429 rate_limited with a Retry-After of at most two seconds is asked again
+// after it: the coordinator's limiter refused before it read the request.
+func TestAcceptRetriesAShortRateLimit(t *testing.T) {
+	offer := retryOffer(time.Minute)
+	client, calls, _ := acceptRetryServer(t, offer, []acceptReply{{429, "1", "rate_limited"}, {429, "2", "rate_limited"}})
+	var waits []time.Duration
+	client.retryWait = func(after time.Duration) time.Duration {
+		waits = append(waits, after)
+		return time.Millisecond
+	}
+	got, err := client.Accept(context.Background(), offer)
+	if err != nil || got.VerifierToken != strings.Repeat("c", 64) {
+		t.Fatal("rate-limited acceptance failed", err)
+	}
+	if calls.Load() != 3 || !reflect.DeepEqual(waits, []time.Duration{time.Second, 2 * time.Second}) {
+		t.Fatalf("calls %d, Retry-After waits %v", calls.Load(), waits)
+	}
+}
+
+// Refusals, longer or unstated rate limits and other unavailability are
+// final: one request each.
 func TestAcceptNeverRetriesRefusals(t *testing.T) {
-	for _, reply := range []acceptReply{{401, "1", "node_unauthorized"}, {404, "1", "attempt_unavailable"}, {409, "1", "attempt_conflict"}, {429, "1", "rate_limited"}, {400, "", "invalid_request"}, {503, "1", "dispatch_unavailable"}, {503, "1", ""}, {500, "1", "network_unavailable"}} {
+	for _, reply := range []acceptReply{{401, "1", "node_unauthorized"}, {404, "1", "attempt_unavailable"}, {409, "1", "attempt_conflict"}, {429, "3", "rate_limited"}, {429, "", "rate_limited"}, {429, "1", ""}, {400, "", "invalid_request"}, {503, "1", "dispatch_unavailable"}, {503, "1", ""}, {500, "1", "network_unavailable"}} {
 		offer := retryOffer(time.Minute)
 		client, calls, _ := acceptRetryServer(t, offer, []acceptReply{reply, reply})
 		client.retryWait = func(time.Duration) time.Duration { t.Error("refusal retried", reply); return time.Millisecond }
@@ -316,6 +336,48 @@ func TestAcceptNeverRetriesRefusals(t *testing.T) {
 		if calls.Load() != 1 {
 			t.Fatalf("%+v: %d requests", reply, calls.Load())
 		}
+	}
+}
+
+// AcceptRefused holds only for answers that prove no lease exists for this
+// node: 400, 401, 404, 409 and 429, unless an earlier try was answered 503
+// network_unavailable, which may follow a committed acceptance. A 5xx, a
+// transport failure and an accepted but unreadable reply stay in doubt.
+func TestAcceptRefusedOnlyWhenNoLeaseCanExist(t *testing.T) {
+	for _, tc := range []struct {
+		replies []acceptReply
+		refused bool
+	}{
+		{[]acceptReply{{400, "", "invalid_request"}}, true},
+		{[]acceptReply{{401, "", "node_unauthorized"}}, true},
+		{[]acceptReply{{404, "", "attempt_unavailable"}}, true},
+		{[]acceptReply{{409, "", "attempt_conflict"}}, true},
+		{[]acceptReply{{429, "", "rate_limited"}}, true},
+		{[]acceptReply{{429, "1", "rate_limited"}, {429, "1", "rate_limited"}, {429, "1", "rate_limited"}, {429, "1", "rate_limited"}}, true},
+		{[]acceptReply{{503, "1", "dispatch_busy"}, {429, "", "rate_limited"}}, true},
+		{[]acceptReply{{503, "1", "dispatch_busy"}, {409, "", "attempt_conflict"}}, true},
+		{[]acceptReply{{503, "1", "network_unavailable"}, {429, "", "rate_limited"}}, false},
+		{[]acceptReply{{503, "1", "network_unavailable"}, {409, "", "attempt_conflict"}}, false},
+		{[]acceptReply{{503, "1", "network_unavailable"}, {503, "1", "network_unavailable"}, {503, "1", "network_unavailable"}, {503, "1", "network_unavailable"}}, false},
+		{[]acceptReply{{503, "", "dispatch_unavailable"}}, false},
+		{[]acceptReply{{500, "", ""}}, false},
+		{[]acceptReply{{502, "", ""}}, false},
+		{[]acceptReply{{200, "", ""}}, false},
+	} {
+		offer := retryOffer(time.Minute)
+		client, _, _ := acceptRetryServer(t, offer, tc.replies)
+		client.retryWait = func(time.Duration) time.Duration { return time.Millisecond }
+		_, err := client.Accept(context.Background(), offer)
+		if err == nil || AcceptRefused(err) != tc.refused {
+			t.Fatalf("%+v: refused %v, error %v", tc.replies, AcceptRefused(err), err)
+		}
+	}
+	// No answer at all.
+	offer := retryOffer(time.Minute)
+	client, _, _ := acceptRetryServer(t, offer, nil)
+	client.Origin = "https://127.0.0.1:1"
+	if _, err := client.Accept(context.Background(), offer); err == nil || AcceptRefused(err) || !errors.Is(err, ErrUnavailable) {
+		t.Fatal("transport failure read as a refusal", err)
 	}
 }
 

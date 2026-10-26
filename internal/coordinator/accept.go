@@ -42,14 +42,22 @@ func OfferLifetime(service string) time.Duration {
 }
 
 // acceptRetries is how many more times Accept sends the same acceptance after
-// a 503 dispatch_busy or network_unavailable. Both are transient, acceptance
-// of the exact attempt and fence is idempotent at the coordinator, and no
-// provider work starts before an accepted reply.
+// a 503 dispatch_busy or network_unavailable, or a 429 rate_limited with a
+// short Retry-After. All are transient, acceptance of the exact attempt and
+// fence is idempotent at the coordinator, and no provider work starts before
+// an accepted reply.
 const acceptRetries = 3
 
 // acceptRetryMargin is how long before the lease deadline Accept stops
 // retrying, leaving the rest of the lease to the provider work.
 const acceptRetryMargin = 30 * time.Second
+
+// acceptRateLimitWait is the longest Retry-After on a 429 rate_limited that
+// Accept waits out. The coordinator moves an unaccepted realtime offer to
+// another node a fraction of a second after offering it, and fails it about
+// three seconds after the job was created, so a longer wait only holds a slot
+// for an offer that is gone.
+const acceptRateLimitWait = 2 * time.Second
 
 type noAcceptRetry struct{}
 
@@ -62,14 +70,52 @@ func WithoutAcceptRetry(ctx context.Context) context.Context {
 }
 
 // acceptRetryAfter reports whether a failed acceptance may be repeated, and
-// the Retry-After to honour first: one second when the coordinator sent none.
-// A 401, 404, 409, 429, any other 503 and a transport failure are final.
+// the Retry-After to honour first. A 503 dispatch_busy or network_unavailable
+// is repeated after its Retry-After, one second when the coordinator sent
+// none. A 429 rate_limited is repeated only when its Retry-After is at most
+// acceptRateLimitWait: the coordinator's limiter refuses before it reads the
+// request, so nothing was registered. A 401, 404, 409, a 429 without such a
+// Retry-After, any other 503 and a transport failure are final.
 func acceptRetryAfter(err error) (time.Duration, bool) {
 	var status *StatusError
-	if !errors.As(err, &status) || status.Status != http.StatusServiceUnavailable || status.Code != "dispatch_busy" && status.Code != "network_unavailable" {
+	switch {
+	case !errors.As(err, &status):
 		return 0, false
+	case status.Status == http.StatusServiceUnavailable && (status.Code == "dispatch_busy" || status.Code == "network_unavailable"):
+		return max(status.RetryAfter, MinRetryAfter), true
+	case status.Status == http.StatusTooManyRequests && status.Code == "rate_limited" && status.RetryAfter > 0 && status.RetryAfter <= acceptRateLimitWait:
+		return status.RetryAfter, true
 	}
-	return max(status.RetryAfter, MinRetryAfter), true
+	return 0, false
+}
+
+// acceptInDoubt wraps the final error of an Accept whose earlier try was
+// answered 503 network_unavailable. That answer may follow an acceptance the
+// coordinator committed, so a later refusal that registered nothing, such as
+// a 429, does not prove that this node holds no lease.
+type acceptInDoubt struct{ err error }
+
+func (e *acceptInDoubt) Error() string { return e.err.Error() }
+func (e *acceptInDoubt) Unwrap() error { return e.err }
+
+// AcceptRefused reports whether an Accept error proves that the coordinator
+// holds no lease for the offered attempt on this node, so that its journal
+// record can end at once instead of waiting for reconciliation: a 400, 401
+// or 429 refuses before anything is registered, and a 404 or 409 is the
+// coordinator's verdict that the attempt is not this node's to accept. A 5xx,
+// a transport failure, an unreadable or changed reply, and a refusal after a
+// try that may have committed leave the acceptance in doubt.
+func AcceptRefused(err error) bool {
+	var doubt *acceptInDoubt
+	var status *StatusError
+	if errors.As(err, &doubt) || !errors.As(err, &status) {
+		return false
+	}
+	switch status.Status {
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusNotFound, http.StatusConflict, http.StatusTooManyRequests:
+		return true
+	}
+	return false
 }
 
 // OfferClockSkew is how far this node's clock may run behind the
@@ -104,10 +150,12 @@ func ValidOffer(offer Lease, now time.Time) error {
 // Accept asks only the locally configured authenticated HTTPS coordinator to
 // confirm production receipt authority for the exact immutable offered terms.
 // It does not read a node-selected RPC or treat prototype funds as authority.
-// A busy or temporarily unavailable coordinator is asked again within this
-// call, at most acceptRetries times and never later than acceptRetryMargin
-// before the lease deadline, unless ctx came from WithoutAcceptRetry. No retry
-// authorizes repeating provider work.
+// A busy, briefly rate-limited or temporarily unavailable coordinator is asked
+// again within this call, at most acceptRetries times and never later than
+// acceptRetryMargin before the lease deadline, unless ctx came from
+// WithoutAcceptRetry. No retry authorizes repeating provider work.
+// AcceptRefused tells a failure that proves no lease exists from one that
+// leaves the acceptance in doubt.
 func (c *Client) Accept(ctx context.Context, offer Lease) (Lease, error) {
 	u, err := url.Parse(c.Origin)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || c.Credential == "" {
@@ -135,9 +183,15 @@ func (c *Client) Accept(ctx context.Context, offer Lease) (Lease, error) {
 	if ctx.Value(noAcceptRetry{}) != nil {
 		retries = 0
 	}
+	inDoubt := false
+tries:
 	for retry := 0; ; retry++ {
 		reply = LeaseAcceptance{}
 		status, err = c.Post(ctx, path, body, &reply)
+		var refused *StatusError
+		if errors.As(err, &refused) && refused.Status == http.StatusServiceUnavailable && refused.Code == "network_unavailable" {
+			inDoubt = true
+		}
 		after, retryable := acceptRetryAfter(err)
 		if !retryable || retry == retries {
 			break
@@ -153,11 +207,14 @@ func (c *Client) Accept(ctx context.Context, offer Lease) (Lease, error) {
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return Lease{}, err
+			break tries
 		case <-timer.C:
 		}
 	}
 	if err != nil {
+		if inDoubt {
+			err = &acceptInDoubt{err}
+		}
 		return Lease{}, err
 	}
 	if status != http.StatusOK || reply.Version != Version || reply.State != "leased" || reply.FundingAuthority != "production_receipt" || !digest(reply.Lease.VerifierToken) || !reply.Lease.LeaseDeadline.After(time.Now()) {
