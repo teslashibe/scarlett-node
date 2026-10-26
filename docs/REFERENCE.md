@@ -643,12 +643,13 @@ pairs and 65536 bytes in total), never `set-cookie` or `cookie`;
 `set_cookie_names` carries names only. `started_at_ms` and `duration_ms` come
 from the node's clock around the browser phase. Every request uses the node's
 coordinator transport and version headers but its own client without the 10 s
-timeout, runs under the report deadline, and is tried at most three times (1,
-2 and 4 s apart, or the coordinator's longer `Retry-After`), retried only after
-a transport error, 429 or 5xx; a part try starts only while `max(10 s, part
-size / 250 kB/s + 5 s)` remains, a manifest try while 3 s does. A too_large or
-memory manifest still runs the proven re-fetch, so the coordinator can serve
-it. An upload that is not stored is logged once it gives up, with the route,
+timeout, and runs under the report deadline. A try that fails with a
+transport error, 429 or 5xx is retried after 1, 2, 4 and then every 8 s (or
+the coordinator's longer `Retry-After`) for as long as the next try can still
+start: a part try starts only while `max(10 s, part size / 250 kB/s + 5 s)`
+remains, a manifest try while 3 s does. Any other answer is final. A
+too_large or memory manifest still runs the proven re-fetch, so the
+coordinator can serve it. An upload that is not stored is logged once it gives up, with the route,
 the status and the coordinator's error code, the DOM state and the part
 counts, and nothing else: `web browser: result upload not stored (dom ok, 2
 parts sent, 0 skipped, 1 retries): PUT part: coordinator HTTP 409 fenced`.

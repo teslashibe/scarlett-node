@@ -113,8 +113,6 @@ const (
 	// browserUploadRate is the slowest uplink a part try is planned for, in
 	// bytes per second.
 	browserUploadRate = 250_000
-	// browserUploadTries bounds the tries of one part or of the manifest.
-	browserUploadTries = 3
 	// browserPartMinimum is the least time before the report deadline in
 	// which a part try may start; browserManifestReserve is kept after a
 	// part for the manifest.
@@ -125,8 +123,11 @@ const (
 	browserManifestMinimum = 3 * time.Second
 )
 
-// browserUploadBackoff is the wait before each retry of a part or manifest.
-var browserUploadBackoff = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
+// browserUploadBackoff is the wait before each retry of a part or manifest,
+// the last repeating: a browser job usually has minutes left when its upload
+// starts, and a coordinator that limits this node's requests for a whole
+// minute refuses every try packed into the first few seconds.
+var browserUploadBackoff = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
 
 // ErrBrowserUploadTooLate means a part or the manifest could not start with
 // enough time left before the report deadline.
@@ -291,12 +292,13 @@ type UploadStats struct {
 // 10-second timeout: every request runs under the report deadline. It reads
 // the stored part set first and skips parts already stored under the same
 // upload sha256 (the coordinator replaces a set with a different one). Each
-// part is held in memory alone, and each part or manifest is tried at most
-// three times, after 1, 2 and 4 seconds or the coordinator's Retry-After;
-// only a transport failure, 429 or 5xx is retried. A part try starts only
-// while max(10 s, size / 250 kB/s + 5 s) is left before report, a manifest
-// try while 3 s is. A manifest answered 409 parts_incomplete sends the
-// missing parts once more and posts again.
+// part is held in memory alone. A part or manifest whose try fails with a
+// transport failure, 429 or 5xx is tried again after 1, 2, 4 and then every
+// 8 seconds, or the coordinator's longer Retry-After, until ctx ends or the
+// next try could not start in time: a part try starts only while max(10 s,
+// size / 250 kB/s + 5 s) is left before report, a manifest try while 3 s is.
+// Any other answer is final. A manifest answered 409 parts_incomplete sends
+// the missing parts once more and posts again.
 func (c *Client) UploadBrowserResult(ctx context.Context, jobID string, r BrowserResult, gzipPath string, report time.Time) (UploadStats, error) {
 	var stats UploadStats
 	base, err := JobPath(jobID, "browser-result")
@@ -437,7 +439,8 @@ func (u *browserUploader) request(ctx context.Context, method, path string, body
 }
 
 // send makes one request with the upload's retry rule and returns its last
-// status. need is the least time before the report deadline for a try.
+// status. need is the least time before the report deadline for a try; the
+// report deadline and ctx are the only bounds on the number of tries.
 func (u *browserUploader) send(ctx context.Context, method, path string, body []byte, contentType string, headers map[string]string, need time.Duration) (int, error) {
 	backoff := browserUploadBackoff
 	if u.c.uploadBackoff != nil {
@@ -445,7 +448,7 @@ func (u *browserUploader) send(ctx context.Context, method, path string, body []
 	}
 	var last error = ErrBrowserUploadTooLate
 	status := 0
-	for try := 0; try < browserUploadTries; try++ {
+	for try := 0; ; try++ {
 		if try > 0 {
 			wait := backoff[min(try-1, len(backoff)-1)]
 			var se *StatusError
@@ -473,7 +476,6 @@ func (u *browserUploader) send(ctx context.Context, method, path string, body []
 			return status, last
 		}
 	}
-	return status, last
 }
 
 func (u *browserUploader) once(ctx context.Context, method, path string, body []byte, contentType string, headers map[string]string) (int, bool, error) {

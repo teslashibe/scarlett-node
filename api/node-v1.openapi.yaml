@@ -335,10 +335,11 @@ paths:
         replaces it (a node that rebuilt its gzip stream starts over); the same part sent again
         with the same bytes gets 200. After the manifest is committed any PUT gets 409
         result_conflict. The coordinator allows at least 90 seconds to read one part. The node
-        holds one part in memory, sends parts in order, and repeats a part after a transport
-        failure, 429 or 5xx at most three times (1, 2 and 4 seconds apart, or the Retry-After when
-        longer), each try starting only while max(10 s, part size / 250 kB/s + 5 s) is left before
-        the report deadline.
+        holds one part in memory, sends parts in order, and repeats a part or the manifest after
+        a transport failure, 429 or 5xx (1, 2, 4 and then every 8 seconds, or the Retry-After
+        when longer) for as long as the next try can start: a part try only while max(10 s,
+        part size / 250 kB/s + 5 s) is left before the report deadline, a manifest try while
+        3 s is.
       requestBody:
         required: true
         content:
