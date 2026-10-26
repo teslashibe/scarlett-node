@@ -652,13 +652,14 @@ func TestLostAcceptanceStartedRecordReconcilesWithoutRestart(t *testing.T) {
 			}
 			key := pending[0].Key()
 			// While its worker may still run, the runtime pass leaves it alone.
-			if err := reconcileIdle(context.Background(), client, j, map[string]bool{key: true}); err != nil {
+			var idle idleReconciler
+			if err := idle.reconcileIdle(context.Background(), client, j, map[string]bool{key: true}); err != nil {
 				t.Fatal(err)
 			}
 			if statusCalls.Load() != 0 {
 				t.Fatal("active attempt reconciled")
 			}
-			if err := reconcileIdle(context.Background(), client, j, map[string]bool{}); err != nil {
+			if err := idle.reconcileIdle(context.Background(), client, j, map[string]bool{}); err != nil {
 				t.Fatal(err)
 			}
 			if pending, perr = j.Pending(); perr != nil || len(pending) != 0 || statusCalls.Load() != 1 || failures.Load() != 1 {

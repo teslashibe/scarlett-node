@@ -479,8 +479,10 @@ paths:
         that result/proven/fail persist one immutable submission body per attempt
         and fence, with identical retries returning the original outcome and changed
         bodies rejected. submission_sha256 hashes the exact HTTP report body bytes.
-        Report retries require this explicit contract. Persistence idempotency never
-        authorizes repeated provider execution. live means no committed report;
+        Report retries require this explicit contract; the node relies on it to send its
+        first report again in place, with the same body, after a 429, a 503
+        network_unavailable or a lost answer, for at most 10 seconds. Persistence idempotency
+        never authorizes repeated provider execution. live means no committed report;
         proof_pending means the verifier owns ingestion; accepted/failed are committed
         outcomes, with submission_sha256 unless the coordinator decided a relay web
         attempt from the verifier's own record before the node's report arrived (the

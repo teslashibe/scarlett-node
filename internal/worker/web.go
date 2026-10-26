@@ -78,6 +78,18 @@ const (
 	webLookupLimit = 5 * time.Second
 )
 
+// ReportMargin is the part of a lease of service that its worker leaves for
+// the report, which the node's report retries stay out of so that the
+// coordinator's verifier read still fits: xReportMargin for x_read and
+// webReportMargin for web. A Codex worker keeps no margin of its own, and its
+// retries keep the web one.
+func ReportMargin(service string) time.Duration {
+	if service == "x_read" {
+		return xReportMargin
+	}
+	return webReportMargin
+}
+
 // webBusyBackoff is the wait before each repeat of a hop the verifier turned
 // away as busy (at its web session limit): 1, 2, 4, then every 5 seconds,
 // while at least a second of the hop budget would remain.
