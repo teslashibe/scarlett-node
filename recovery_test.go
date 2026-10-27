@@ -565,8 +565,11 @@ func TestReconcileIdleKeepsToItsBudget(t *testing.T) {
 	pendingRecords(t, j, reconcilePassRecords)
 	var gets atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		gets.Add(1)
-		time.Sleep(800 * time.Millisecond)
+		// Two records are answered; the third read never is.
+		if gets.Add(1) == 3 {
+			<-req.Context().Done()
+			return
+		}
 		w.WriteHeader(http.StatusConflict)
 	}))
 	defer server.Close()
@@ -575,7 +578,7 @@ func TestReconcileIdleKeepsToItsBudget(t *testing.T) {
 	if err := idle.reconcileIdle(context.Background(), coordinator.New(server.URL, "synthetic"), j, map[string]bool{}); err != nil {
 		t.Fatal(err)
 	}
-	if took := time.Since(started); took > reconcilePassBudget+500*time.Millisecond || gets.Load() != 3 {
+	if took := time.Since(started); took < reconcilePassBudget || took > reconcilePassBudget+time.Second || gets.Load() != 3 {
 		t.Fatalf("pass took %v for %d reads", took, gets.Load())
 	}
 	pending, _ := j.Pending()
