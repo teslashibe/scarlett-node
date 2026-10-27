@@ -55,6 +55,7 @@ main { max-width: 1120px; margin: auto; padding: 30px 28px 24px; display: flex; 
 .status-dot[data-tone="paused"] { background: var(--warn); box-shadow: 0 0 0 5px rgb(245 197 66 / 12%); }
 #runtime-note { max-width: 530px; margin-top: 12px; color: var(--muted); font-size: 13px; }
 .proof-chip { display: inline-flex; max-width: 100%; margin-top: 12px; padding: 5px 9px; border: 1px solid var(--border-strong); border-radius: 999px; color: var(--body); font-size: 11px; overflow-wrap: anywhere; }
+.proof-chip:not([hidden]) + .proof-chip { margin-left: 6px; }
 .node-controls { flex: 0 0 auto; text-align: right; }
 .node-controls .actions { justify-content: flex-end; }
 #work { max-width: 280px; margin-top: 10px; }
@@ -123,6 +124,7 @@ input.locked { color: var(--faint); border-color: var(--border); }
 /* Device limits sit in one row; a label that wraps keeps its input in line. */
 .form-grid.limits { grid-template-columns: repeat(3, minmax(0, 1fr)); max-width: 720px; align-items: end; }
 .subsection { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--border); }
+.subsection .form-grid { margin: 14px 0 10px; }
 .measurement-help { margin: 16px 0; }
 .measurement-help > summary { color: var(--muted); font-size: 12px; text-decoration: underline; text-underline-offset: 3px; }
 .pairing > p { margin: 14px 0; }

@@ -214,7 +214,7 @@ mod tests {
 
     /// A node started and stopped on the app's async runtime, as its commands
     /// are, with events from a plain thread, as the OS sends them. It records
-    /// each owner line and then the pipe's EOF.
+    /// each owner line, after the start line, and then the pipe's EOF.
     #[cfg(unix)]
     #[test]
     fn sleep_is_held_for_the_goodbye_and_the_pipe_stays_open() {
@@ -246,16 +246,16 @@ mod tests {
         let began = Instant::now();
         forward(&node, OwnerCommand::Sleep, hold);
         assert!(began.elapsed() >= hold);
-        wait_for("sleep\n");
+        wait_for("{}\nsleep\n");
         let began = Instant::now();
         forward(&node, OwnerCommand::Wake, Duration::from_secs(10));
         assert!(began.elapsed() < Duration::from_secs(2));
-        wait_for("sleep\nwake\n");
+        wait_for("{}\nsleep\nwake\n");
         // Neither line closed the pipe: the node still runs until Stop
         // closes it, and only then sees EOF.
         assert!(tauri::async_runtime::block_on(node.snapshot()).supervised);
         tauri::async_runtime::block_on(node.stop()).unwrap();
-        assert_eq!(lines(), "sleep\nwake\nEOF\n");
+        assert_eq!(lines(), "{}\nsleep\nwake\nEOF\n");
         assert!(!tauri::async_runtime::block_on(
             node.owner_command(OwnerCommand::Wake)
         ));
