@@ -603,7 +603,9 @@ left; under 5 s the job is `expired`. Then:
    if it could not run at all, `web_browser_failed` if it failed. A proxied
    page whose main document the operator's proxy would not tunnel fails with
    that proxy class's code and rest instead, as a relay hop 0 would
-   (`web_proxy_failed`, `web_proxy_refused` or `web_connect_failed`). After the
+   (`web_proxy_failed`, `web_proxy_refused` or `web_connect_failed`). Only a
+   tunnel to the page's own host counts: a refused redirect target or
+   subresource on another host leaves the page `web_browser_failed`. After the
    page loads, the anti-bot pass (below) runs within the browser budget.
 3. The final document must be an absolute `http` or `https` URL of at most
    2048 bytes and not an X host; otherwise the browser copy is dropped.

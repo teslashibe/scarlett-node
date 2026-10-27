@@ -1069,6 +1069,14 @@ func TestManagerProxiedPageGetsItsOwnEgressProxy(t *testing.T) {
 	if res, _, _ := page(up.upstream("Basic am9iLWM=")); res.Outcome != "failed" || res.Error != "navigation_failed" || res.ProxyClass != proxyRefused {
 		t.Fatalf("refused page: %s %s %q", res.Outcome, res.Error, res.ProxyClass)
 	}
+	// A refusal of another host than the page's (here the page is
+	// www.example.com, the fake's tunnels go to example.com) is not the
+	// page's class.
+	other, err := s.m.Fetch(context.Background(), FetchRequest{URL: "https://www.example.com/", Wait: "load", TimeoutMS: 5000, Upstream: up.upstream("Basic am9iLWQ=")})
+	pages++
+	if err != nil || other.Outcome != "failed" || other.Error != "navigation_failed" || other.ProxyClass != "" {
+		t.Fatalf("another host refused: %v %s %q", err, other.Outcome, other.ProxyClass)
+	}
 	if s.helperPID(t) != pid {
 		t.Fatal("a proxied page restarted the helper")
 	}

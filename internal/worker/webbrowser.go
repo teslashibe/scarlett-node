@@ -96,9 +96,10 @@ type BrowserFetchResult struct {
 	// Solver is "used", "needed" or "" (see coordinator.BrowserResult).
 	Solver string `json:"solver"`
 	// ProxyClass is, for a proxied page whose navigation failed, the proxy
-	// class of the first tunnel the job's proxy would not open (its main
-	// document's, as that is the page's first connection), else "". The
-	// tier sets it; the helper never sees the proxy.
+	// class of the first tunnel to the page's own host the job's proxy
+	// would not open (its main document's, as that is the page's first
+	// connection), else "". The tier sets it; the helper never sees the
+	// proxy.
 	ProxyClass string `json:"-"`
 }
 

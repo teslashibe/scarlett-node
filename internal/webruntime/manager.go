@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -179,10 +180,11 @@ type FetchResult struct {
 	// was in flight. Set by Fetch, never by the helper.
 	TreePeakBytes uint64 `json:"-"`
 	// ProxyClass is, for a proxied page whose navigation failed, the proxy
-	// class of the first upstream tunnel that would not open (proxy_auth,
-	// proxy_refused and the like), else "". The main document is the page's
-	// first connection, so a refused one is the first to fail. Set by
-	// Fetch, never by the helper.
+	// class of the first upstream tunnel to the page's own host that would
+	// not open (proxy_auth, proxy_refused and the like), else "". The main
+	// document is the page's first connection to it, so a refused one is
+	// the first to fail; a refused redirect target or subresource elsewhere
+	// leaves it "". Set by Fetch, never by the helper.
 	ProxyClass string `json:"-"`
 }
 
@@ -505,8 +507,11 @@ func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 	}()
 	var job *egressProxy
 	if req.Upstream != nil {
-		var err error
-		if job, err = newEgressProxy(m.cfg.Guard, m.cfg.Resolver, req.Upstream, jobTunnels, &m.stats); err != nil {
+		page, err := url.Parse(req.URL)
+		if err != nil {
+			return FetchResult{}, errors.New("web browser fetch request invalid")
+		}
+		if job, err = newEgressProxy(m.cfg.Guard, m.cfg.Resolver, req.Upstream, page.Hostname(), jobTunnels, &m.stats); err != nil {
 			return FetchResult{}, fmt.Errorf("%w: job egress proxy unavailable", ErrUnavailable)
 		}
 		// Closed before the page slot is released: nothing of this page
@@ -1162,7 +1167,7 @@ func (m *Manager) startHelper(ctx context.Context) (*helper, error) {
 			m.cleanup(h)
 		}
 	}()
-	if h.proxy, err = newEgressProxy(m.cfg.Guard, m.cfg.Resolver, nil, 32*capacity+16, &m.stats); err != nil {
+	if h.proxy, err = newEgressProxy(m.cfg.Guard, m.cfg.Resolver, nil, "", 32*capacity+16, &m.stats); err != nil {
 		return nil, errors.New("egress proxy unavailable")
 	}
 	if h.deny, err = newDenyListener(&m.stats); err != nil {

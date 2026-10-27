@@ -172,10 +172,15 @@ type egressProxy struct {
 	cancel    context.CancelFunc
 	mu        sync.Mutex
 	conns     map[net.Conn]struct{}
-	// failure is the proxy class of the first upstream tunnel that would
-	// not open, under mu.
+	// failure is the proxy class of the first upstream tunnel to page that
+	// would not open, under mu.
 	failure string
 	wg      sync.WaitGroup
+
+	// page is a proxied page's own host: only a tunnel to it records a
+	// failure, so a refused redirect target or third-party subresource is
+	// never reported as the page's.
+	page string
 }
 
 func defaultResolver(ctx context.Context, host string) ([]netip.Addr, error) {
@@ -183,8 +188,9 @@ func defaultResolver(ctx context.Context, host string) ([]netip.Addr, error) {
 }
 
 // newEgressProxy listens on a fresh loopback port. upstream is nil for the
-// helper's shared proxy, else the one proxied page's way out.
-func newEgressProxy(guard EgressGuard, resolve func(context.Context, string) ([]netip.Addr, error), upstream *Upstream, tunnels int, stats *ProxyStats) (*egressProxy, error) {
+// helper's shared proxy, else the one proxied page's way out, and page that
+// page's host.
+func newEgressProxy(guard EgressGuard, resolve func(context.Context, string) ([]netip.Addr, error), upstream *Upstream, page string, tunnels int, stats *ProxyStats) (*egressProxy, error) {
 	if guard == nil {
 		return nil, errors.New("egress guard required")
 	}
@@ -200,7 +206,7 @@ func newEgressProxy(guard EgressGuard, resolve func(context.Context, string) ([]
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	dialer := &net.Dialer{Timeout: proxyDialLimit}
-	p := &egressProxy{ln: ln, guard: guard, resolve: resolve, dial: dialer.DialContext, dialLimit: proxyDialLimit, upstream: upstream,
+	p := &egressProxy{ln: ln, guard: guard, resolve: resolve, dial: dialer.DialContext, dialLimit: proxyDialLimit, upstream: upstream, page: tunnelHost(page),
 		slots: make(chan struct{}, tunnels), refusals: make(chan struct{}, proxyRefusals), stats: stats, ctx: ctx, cancel: cancel, conns: map[net.Conn]struct{}{}}
 	p.wg.Add(1)
 	go p.serve()
@@ -209,12 +215,18 @@ func newEgressProxy(guard EgressGuard, resolve func(context.Context, string) ([]
 
 func (p *egressProxy) URL() string { return "http://" + p.ln.Addr().String() }
 
-// Failure is the proxy class of the first upstream tunnel that would not
-// open, or "".
+// Failure is the proxy class of the first upstream tunnel to the page's own
+// host that would not open, or "".
 func (p *egressProxy) Failure() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.failure
+}
+
+// tunnelHost is a host as the page's own is compared: lowercase, without a
+// trailing dot or IPv6 brackets.
+func tunnelHost(host string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")), ".")
 }
 
 func (p *egressProxy) upstreamFailed(class string) {
@@ -363,10 +375,11 @@ func (p *egressProxy) handle(conn net.Conn) {
 	}
 	portNum, _ := strconv.Atoi(port)
 	target := netip.AddrPortFrom(addr, uint16(portNum))
+	own := p.page != "" && tunnelHost(hostport) == p.page
 	p.stats.Allowed.Add(1)
 	_ = conn.SetReadDeadline(time.Time{})
 	if req.Method == http.MethodConnect {
-		upstream, err := p.dialChecked(p.ctx, target)
+		upstream, err := p.dialChecked(p.ctx, target, own)
 		if err != nil {
 			reply(conn, http.StatusBadGateway)
 			return
@@ -385,7 +398,7 @@ func (p *egressProxy) handle(conn net.Conn) {
 		splice(conn, upstream)
 		return
 	}
-	p.forward(conn, req, target)
+	p.forward(conn, req, target, own)
 }
 
 // check resolves a page-chosen host under the rules: names first (no lookup
@@ -436,10 +449,11 @@ func (p *egressProxy) check(host string) (netip.Addr, int) {
 
 // dialChecked connects to exactly the checked address: directly, or as the
 // CONNECT target of the job's upstream at its checked address, as the core
-// relay does. A tunnel the upstream would not open keeps its proxy class
-// (Failure, the first one only); the page gets 502 either way. Closing the
-// proxy ends a CONNECT the upstream has not answered.
-func (p *egressProxy) dialChecked(ctx context.Context, target netip.AddrPort) (net.Conn, error) {
+// relay does. A tunnel to the page's own host (own) that the upstream would
+// not open keeps its proxy class (Failure, the first one only); the page
+// gets 502 either way. Closing the proxy ends a CONNECT the upstream has not
+// answered.
+func (p *egressProxy) dialChecked(ctx context.Context, target netip.AddrPort, own bool) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.dialLimit)
 	defer cancel()
 	if p.upstream == nil {
@@ -462,7 +476,7 @@ func (p *egressProxy) dialChecked(ctx context.Context, target netip.AddrPort) (n
 	}
 	if class != "" {
 		// A proxy that is closing records nothing: the page is done.
-		if !errors.Is(ctx.Err(), context.Canceled) {
+		if own && !errors.Is(ctx.Err(), context.Canceled) {
 			p.upstreamFailed(class)
 		}
 		return nil, errors.New("upstream proxy refused the tunnel")
@@ -518,7 +532,7 @@ func stripHop(h http.Header) {
 
 // forward sends an absolute-form plain-HTTP request in origin form to the
 // checked address (never re-resolving the name) and streams the response.
-func (p *egressProxy) forward(conn net.Conn, req *http.Request, target netip.AddrPort) {
+func (p *egressProxy) forward(conn net.Conn, req *http.Request, target netip.AddrPort, own bool) {
 	ctx, cancel := context.WithCancel(p.ctx)
 	defer cancel()
 	out := req.Clone(ctx)
@@ -526,7 +540,7 @@ func (p *egressProxy) forward(conn net.Conn, req *http.Request, target netip.Add
 	stripHop(out.Header)
 	transport := &http.Transport{Proxy: nil, DisableKeepAlives: true, DisableCompression: true, MaxResponseHeaderBytes: 1 << 20,
 		ResponseHeaderTimeout: proxyTunnelIdle,
-		DialContext:           func(ctx context.Context, _, _ string) (net.Conn, error) { return p.dialChecked(ctx, target) }}
+		DialContext:           func(ctx context.Context, _, _ string) (net.Conn, error) { return p.dialChecked(ctx, target, own) }}
 	defer transport.CloseIdleConnections()
 	resp, err := transport.RoundTrip(out)
 	if err != nil {

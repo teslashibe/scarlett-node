@@ -109,7 +109,7 @@ func echoServer(t *testing.T) string {
 func newTestProxy(t *testing.T, f *fakeNet, upstream *Upstream, tunnels int) (*egressProxy, *ProxyStats) {
 	t.Helper()
 	stats := &ProxyStats{}
-	p, err := newEgressProxy(testGuard{}, f.resolve, upstream, tunnels, stats)
+	p, err := newEgressProxy(testGuard{}, f.resolve, upstream, "example.com", tunnels, stats)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,6 +484,43 @@ func TestProxyKeepsTheUpstreamRefusalClass(t *testing.T) {
 	}
 }
 
+// Only a tunnel to the page's own host records a class: a refused redirect
+// target or third-party subresource is not the page's refusal.
+func TestProxyKeepsOnlyThePageHostsClass(t *testing.T) {
+	up := newFakeUpstream(t, statusReply(http.StatusForbidden))
+	p, _ := newTestProxy(t, &fakeNet{}, up.upstream("Basic c3ludGhldGlj"), jobTunnels)
+	p.dial = (&net.Dialer{}).DialContext
+	for _, target := range []string{"cdn.example.net:443", "www.example.com:443", publicV4.String() + ":443"} {
+		if got, c := connect(t, p.URL(), target); got != http.StatusBadGateway {
+			c.Close()
+			t.Fatalf("CONNECT %s: %d", target, got)
+		}
+	}
+	if got, _ := absolute(t, p.URL(), "http://b.example.org/"); got != http.StatusBadGateway {
+		t.Fatalf("GET: %d", got)
+	}
+	if p.Failure() != "" || len(up.seen()) != 4 {
+		t.Fatalf("another host's refusal recorded %q", p.Failure())
+	}
+	// The page's host, as Chrome may spell it.
+	if got, c := connect(t, p.URL(), "EXAMPLE.com.:443"); got != http.StatusBadGateway {
+		c.Close()
+		t.Fatalf("CONNECT: %d", got)
+	}
+	if p.Failure() != proxyRefused {
+		t.Fatalf("class %q", p.Failure())
+	}
+	// The shared proxy has no page and no upstream.
+	shared, err := newEgressProxy(testGuard{}, (&fakeNet{}).resolve, nil, "", jobTunnels, &ProxyStats{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shared.Close()
+	if shared.page != "" {
+		t.Fatal("the shared proxy has a page")
+	}
+}
+
 func TestProxyUpstreamThatIsNoProxy(t *testing.T) {
 	// No TCP to the proxy at all.
 	closed, _ := net.Listen("tcp4", "127.0.0.1:0")
@@ -539,7 +576,7 @@ func TestProxyUpstreamThatNeverAnswers(t *testing.T) {
 // and records nothing: the page is over.
 func TestProxyCloseEndsAnUnansweredTunnel(t *testing.T) {
 	up := newFakeUpstream(t, func(int) string { return "" })
-	p, err := newEgressProxy(testGuard{}, (&fakeNet{}).resolve, up.upstream("Basic c3ludGhldGlj"), jobTunnels, &ProxyStats{})
+	p, err := newEgressProxy(testGuard{}, (&fakeNet{}).resolve, up.upstream("Basic c3ludGhldGlj"), "example.com", jobTunnels, &ProxyStats{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -603,7 +640,7 @@ func TestUpstreamRulesAndRedaction(t *testing.T) {
 		if u.valid() != ok {
 			t.Errorf("%s: %v", addr, !ok)
 		}
-		if _, err := newEgressProxy(testGuard{}, nil, &u, jobTunnels, &ProxyStats{}); (err == nil) != ok {
+		if _, err := newEgressProxy(testGuard{}, nil, &u, "example.com", jobTunnels, &ProxyStats{}); (err == nil) != ok {
 			t.Errorf("%s: proxy %v", addr, err)
 		}
 	}
