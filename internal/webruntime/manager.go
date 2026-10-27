@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/netip"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,13 +55,9 @@ type Config struct {
 	XLoginNode string
 	Guard      EgressGuard
 	// Resolver resolves page-chosen names; default net.DefaultResolver.
+	// A proxied page's names resolve here too: only its connections go
+	// through its upstream (FetchRequest.Upstream).
 	Resolver func(ctx context.Context, host string) ([]netip.Addr, error)
-	// UpstreamProxy is SCARLETT_WEB_EGRESS_PROXY; the egress proxy then
-	// reaches every checked address through it with CONNECT <ip>:<port>.
-	UpstreamProxy *url.URL
-	// UpstreamAuthorization is its Proxy-Authorization value, as config.WebProxy
-	// holds it; userinfo in UpstreamProxy is used when this is empty.
-	UpstreamAuthorization string
 	// Capacity is browser pages at once, 1–4; 0 picks 1 below 16 GiB of
 	// physical memory and 2 otherwise.
 	Capacity int
@@ -113,6 +108,11 @@ type FetchRequest struct {
 	TimeoutMS      int    `json:"timeout_ms"`
 	BlockResources bool   `json:"block_resources"`
 	SolveChallenge bool   `json:"solve_challenge"`
+	// Upstream is a proxied page's proxy and session, nil for a direct one.
+	// Fetch gives such a page its own egress proxy, which reaches every
+	// checked address through it; the helper sees only that proxy's
+	// loopback URL, never the upstream.
+	Upstream *Upstream `json:"-"`
 }
 
 func (r FetchRequest) String() string   { return "web browser fetch [redacted]" }
@@ -131,14 +131,20 @@ func (r FetchRequest) validate() error {
 			return invalid
 		}
 	}
+	if r.Upstream != nil && !r.Upstream.valid() {
+		return invalid
+	}
 	return nil
 }
 
 // helperFetch is POST /v1/fetch: the request plus whether this fetch may use
-// the operator's solver, which the Manager decides from today's spend.
+// the operator's solver, which the Manager decides from today's spend, and
+// for a proxied page the loopback URL of its own egress proxy (no
+// credentials), which the helper uses in place of WEB_EGRESS_PROXY.
 type helperFetch struct {
 	FetchRequest
-	Solver bool `json:"solver"`
+	Solver      bool   `json:"solver"`
+	EgressProxy string `json:"egress_proxy,omitempty"`
 }
 
 // FetchResult is the helper's answer. It holds page content and cookie
@@ -172,6 +178,12 @@ type FetchResult struct {
 	// TreePeakBytes is the largest helper tree size sampled while this page
 	// was in flight. Set by Fetch, never by the helper.
 	TreePeakBytes uint64 `json:"-"`
+	// ProxyClass is, for a proxied page whose navigation failed, the proxy
+	// class of the first upstream tunnel that would not open (proxy_auth,
+	// proxy_refused and the like), else "". The main document is the page's
+	// first connection, so a refused one is the first to fail. Set by
+	// Fetch, never by the helper.
+	ProxyClass string `json:"-"`
 }
 
 func (FetchResult) String() string   { return "web browser result [redacted]" }
@@ -464,7 +476,10 @@ func (m *Manager) healthLocked() Health {
 // Fetch renders one page. Errors wrapping ErrUnavailable mean the tier could
 // not take the job (web_browser_unavailable); ErrHelper means the render or
 // the helper failed (web_browser_failed). A result whose Outcome is not "ok"
-// is returned without an error.
+// is returned without an error. A proxied page (req.Upstream) gets its own
+// loopback egress proxy, at most 48 tunnels, which carries that job's
+// Proxy-Authorization and closes when Fetch returns; every other page uses
+// the helper's shared one, which has no upstream.
 func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (FetchResult, error) {
 	if err := req.validate(); err != nil {
 		return FetchResult{}, err
@@ -488,6 +503,16 @@ func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 		m.notify()
 		m.mu.Unlock()
 	}()
+	var job *egressProxy
+	if req.Upstream != nil {
+		var err error
+		if job, err = newEgressProxy(m.cfg.Guard, m.cfg.Resolver, req.Upstream, jobTunnels, &m.stats); err != nil {
+			return FetchResult{}, fmt.Errorf("%w: job egress proxy unavailable", ErrUnavailable)
+		}
+		// Closed before the page slot is released: nothing of this page
+		// leaves through the job's session afterwards.
+		defer job.Close()
+	}
 	h, err := m.acquire(ctx, false)
 	if err != nil {
 		return FetchResult{}, err
@@ -500,7 +525,14 @@ func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 	}
 	h.watches[watch] = struct{}{}
 	m.mu.Unlock()
-	res, err := m.call(ctx, h, helperFetch{FetchRequest: req, Solver: solver})
+	fetch := helperFetch{FetchRequest: req, Solver: solver}
+	if job != nil {
+		fetch.EgressProxy = job.URL()
+	}
+	res, err := m.call(ctx, h, fetch)
+	if err == nil && job != nil && res.Outcome == "failed" && res.Error == "navigation_failed" {
+		res.ProxyClass = job.Failure()
+	}
 	if err == nil {
 		m.recordSpend(res.SolverCostMicroUSD)
 		if res.HTMLPath, err = m.adoptDOM(res); err != nil {
@@ -1130,7 +1162,7 @@ func (m *Manager) startHelper(ctx context.Context) (*helper, error) {
 			m.cleanup(h)
 		}
 	}()
-	if h.proxy, err = newEgressProxy(m.cfg.Guard, m.cfg.Resolver, m.cfg.UpstreamProxy, m.cfg.UpstreamAuthorization, 32*capacity+16, &m.stats); err != nil {
+	if h.proxy, err = newEgressProxy(m.cfg.Guard, m.cfg.Resolver, nil, 32*capacity+16, &m.stats); err != nil {
 		return nil, errors.New("egress proxy unavailable")
 	}
 	if h.deny, err = newDenyListener(&m.stats); err != nil {

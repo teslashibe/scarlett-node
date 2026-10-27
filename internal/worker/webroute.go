@@ -69,6 +69,21 @@ func proxyClass(class string) string {
 // ValidProxyClass reports whether class is one a proxied job can fail with.
 func ValidProxyClass(class string) bool { return proxyClass(class) != "" }
 
+// proxyCode is a proxy class's job code: web_proxy_failed when the proxy
+// itself failed, web_proxy_refused when it refused the target and
+// web_connect_failed when its exit failed; "" for any other class.
+func proxyCode(class string) string {
+	switch class {
+	case proxyUnreachable, proxyAuth, proxyQuota, proxyBusy:
+		return "web_proxy_failed"
+	case proxyRefused:
+		return "web_proxy_refused"
+	case proxyExit:
+		return "web_connect_failed"
+	}
+	return ""
+}
+
 // webRoute is one web job's egress: direct (proxy nil), or the operator's
 // proxy on the job's session. For a sticky (Webshare) session it holds the
 // exit probe, which a rotation restarts. Every method is nil-safe and safe
@@ -224,7 +239,8 @@ func (r *webRoute) rotate() bool {
 	return true
 }
 
-// failed records the proxy class hop 0 failed with.
+// failed records the proxy class the job failed with: hop 0's, or the
+// browser's main document's.
 func (r *webRoute) failed(class string) {
 	if r.proxied() && proxyClass(class) != "" {
 		r.mu.Lock()

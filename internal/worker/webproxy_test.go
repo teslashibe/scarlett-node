@@ -626,3 +626,42 @@ func TestWebProxiedBrowserJob(t *testing.T) {
 		t.Fatal("IPv6-only page through the proxy", run.code)
 	}
 }
+
+// A main document the job's proxy would not tunnel fails with the proxy's
+// class as a relay hop 0 would, and that class decides web's rest whatever
+// the re-fetch ran into. A re-fetch that proves the page still serves it.
+func TestWebProxiedBrowserPageTheProxyRefused(t *testing.T) {
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	origin, roots := exitEcho(t, "93.184.216.34\n", 0)
+	proxy := newFakeConnectProxy(t, http.StatusOK, "", origin)
+	c := browserConfig()
+	c.WebEgressProxy = syntheticWebshare(t, "all")
+	var outcomes []config.WebEgressOutcome
+	c.WebEgressObserver = func(o config.WebEgressOutcome) { outcomes = append(outcomes, o) }
+	refused := func(class string) *fakeBrowser {
+		return &fakeBrowser{status: readyStatus(), result: BrowserFetchResult{Outcome: "failed", Error: "navigation_failed", Challenge: "none", ProxyClass: class}, dir: t.TempDir()}
+	}
+	for _, tc := range []struct{ class, relay, code, rest string }{
+		{proxyRefused, "web-class-proxy_refused", "web_proxy_refused", ""},
+		{proxyAuth, "web-class-proxy_busy", "web_proxy_failed", proxyAuth},
+		{proxyQuota, "web-fetch", "web_proxy_failed", proxyQuota},
+		{proxyUnreachable, "web-fetch", "web_proxy_failed", proxyUnreachable},
+		{proxyExit, "web-fetch", "web_connect_failed", ""},
+		{proxyRefused, "web-final", "", ""},
+		{"no_such_class", "web-fetch", "web_browser_failed", ""},
+	} {
+		outcomes = nil
+		w := probeWorker(c, proxyAnswers(nil), proxy, roots)
+		w.Browser = refused(tc.class)
+		run := runWebOn(t, tc.relay, webBrowserFixtureLease(t), w)
+		if run.code != tc.code || run.report.Egress.Via != "proxy" || len(outcomes) != 1 || outcomes[0].ProxyClass != tc.rest {
+			t.Fatalf("%s then %s: %q %+v", tc.class, tc.relay, run.code, outcomes)
+		}
+	}
+	// A direct page never takes a proxy class from the tier.
+	w := Web{Config: browserConfig(), Resolver: (&fakeResolver{answers: proxyAnswers(nil)}).resolve, Egress: staticEgress(), Browser: refused(proxyRefused)}
+	if run := runWebOn(t, "web-fetch", webBrowserFixtureLease(t), w); run.code != "web_browser_failed" || run.report.Egress.Via != "direct" {
+		t.Fatal("direct page", run.code)
+	}
+}

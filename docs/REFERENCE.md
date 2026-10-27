@@ -521,10 +521,12 @@ line, or sent to the coordinator. `scarlett-node status` adds a local
 `web_egress` object: `via` (`direct`, `both` or `proxy`), `provider`,
 `country`, `last_exit` and `last_exit_at` from the last probe, and
 `rest_reason`, the class of a rest in progress. It is never in a heartbeat.
-The browser tier's filtering proxy does not yet carry a job's session, so a
-proxied browser job ends `web_browser_unavailable` instead of rendering from
-the node's own network. The browser download itself uses ordinary system
-networking, never the egress proxy.
+A proxied browser job's page and its re-fetch use the job's one session: the
+browser tier opens a loopback filtering proxy for that page alone, which
+reaches every checked address through the operator's proxy with the job's
+`Proxy-Authorization`, and closes it when the page is done (see Browser tier,
+Network). The browser download itself uses ordinary system networking, never
+the egress proxy.
 
 ## Browser tier
 
@@ -597,7 +599,10 @@ left; under 5 s the job is `expired`. Then:
 1. The page's host is resolved and checked with the egress guard before any
    browser work: `web_dns_failed` or `web_egress_denied`.
 2. The browser renders the page in a fresh context: `web_browser_unavailable`
-   if it could not run at all, `web_browser_failed` if it failed. After the
+   if it could not run at all, `web_browser_failed` if it failed. A proxied
+   page whose main document the operator's proxy would not tunnel fails with
+   that proxy class's code and rest instead, as a relay hop 0 would
+   (`web_proxy_failed`, `web_proxy_refused` or `web_connect_failed`). After the
    page loads, the anti-bot pass (below) runs within the browser budget.
 3. The final document must be an absolute `http` or `https` URL of at most
    2048 bytes and not an X host; otherwise the browser copy is dropped.
@@ -847,6 +852,20 @@ everything and never dials or resolves. QUIC is disabled, WebRTC may not send
 UDP outside the proxy, and multicast DNS candidates are off. Tunnels are capped
 at `32 × capacity + 16` per helper, 60 s idle and 128 MiB each. Hosts are never
 logged; only counters are kept.
+
+A page the job sends through the operator's proxy gets a filtering proxy of
+its own instead, on a new loopback port, capped at 48 tunnels. It applies the
+same rules, picks IPv4 only (proxy exits are IPv4; a host without an IPv4
+answer gets 502), and reaches each checked address with
+`CONNECT <checked-ip>:<port>` through the proxy's checked address with the
+job's `Proxy-Authorization`, so every connection of the page leaves from the
+job's exit. The helper gets only that listener's loopback URL in its request
+(`egress_proxy`), which it uses for both of the page's passes; it, Chrome and
+Scrapling never see the proxy's address or credentials. The listener closes
+when the page returns, ending any tunnel still open. The first tunnel the
+proxy would not open keeps its class (the table under Proxy egress), and
+a page whose navigation failed reports it. The shared listener has no
+upstream, so a direct page never touches the proxy.
 
 **Lifecycle.** At start, with web and the tier on, the node prepares in the
 background: memory check, cleanup of crash dumps and partial downloads, runtime

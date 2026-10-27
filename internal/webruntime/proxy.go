@@ -3,13 +3,11 @@ package webruntime
 import (
 	"bufio"
 	"context"
-	"encoding/base64"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/netip"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,7 +46,68 @@ const (
 	// unanswered. Each lasts at most proxyRefuseLimit per direction.
 	proxyRefusals    = 16
 	proxyRefuseLimit = time.Second
+	// jobTunnels caps one proxied page's own egress proxy.
+	jobTunnels = 48
+	// maxUpstreamAuthorization bounds a job's Proxy-Authorization, as the
+	// prover does.
+	maxUpstreamAuthorization = 4096
 )
+
+// Upstream is one proxied page's way out: the operator's proxy at the address
+// the node checked, which nothing resolves again, and the job's
+// Proxy-Authorization (empty for a proxy without credentials). String and
+// GoString redact it.
+type Upstream struct {
+	Addr          netip.AddrPort
+	Authorization string
+}
+
+func (Upstream) String() string   { return "web proxy upstream [redacted]" }
+func (Upstream) GoString() string { return "webruntime.Upstream{}" }
+
+// valid is the prover's proxy rule (prover/src/dial.rs): an IP literal that
+// is not link-local, unspecified, multicast or broadcast, a port, and a
+// Proxy-Authorization of printable ASCII up to 4096 bytes.
+func (u Upstream) valid() bool {
+	a := u.Addr.Addr().Unmap()
+	if !a.IsValid() || a.Zone() != "" || u.Addr.Port() == 0 || a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() || a.IsUnspecified() ||
+		a.IsMulticast() || a == netip.AddrFrom4([4]byte{255, 255, 255, 255}) || len(u.Authorization) > maxUpstreamAuthorization {
+		return false
+	}
+	for i := 0; i < len(u.Authorization); i++ {
+		if u.Authorization[i] < 0x20 || u.Authorization[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+// The proxy classes of an upstream tunnel that would not open, as the prover
+// names them (prover/src/relay/node.rs proxy_class); the worker maps them to
+// the job's code.
+const (
+	proxyUnreachable = "proxy_unreachable" // no TCP to the proxy, or no CONNECT reply as HTTP
+	proxyAuth        = "proxy_auth"        // 407
+	proxyQuota       = "proxy_quota"       // 402
+	proxyBusy        = "proxy_busy"        // 429
+	proxyRefused     = "proxy_refused"     // 403
+	proxyExit        = "proxy_exit"        // 502 or any other status, or no reply in time
+)
+
+// upstreamClass is the proxy class of a CONNECT reply status other than 200.
+func upstreamClass(status int) string {
+	switch status {
+	case http.StatusProxyAuthRequired:
+		return proxyAuth
+	case http.StatusPaymentRequired:
+		return proxyQuota
+	case http.StatusTooManyRequests:
+		return proxyBusy
+	case http.StatusForbidden:
+		return proxyRefused
+	}
+	return proxyExit
+}
 
 // ProxyStats are the proxy's only output besides traffic: counters. Hosts
 // are never recorded.
@@ -94,31 +153,43 @@ func proxyHost(raw string) (string, netip.Addr, bool) {
 	return host, netip.Addr{}, true
 }
 
-// egressProxy is the loopback HTTP proxy every per-job browser context uses.
+// egressProxy is the loopback HTTP proxy a per-job browser context uses: the
+// helper's shared one for direct pages, which has no upstream, or a proxied
+// page's own, which reaches every checked address through that job's
+// upstream.
 type egressProxy struct {
-	ln           net.Listener
-	guard        EgressGuard
-	resolve      func(ctx context.Context, host string) ([]netip.Addr, error)
-	dial         func(ctx context.Context, network, address string) (net.Conn, error)
-	upstream     *url.URL
-	upstreamAuth string
-	slots        chan struct{}
-	refusals     chan struct{}
-	stats        *ProxyStats
-	ctx          context.Context
-	cancel       context.CancelFunc
-	mu           sync.Mutex
-	conns        map[net.Conn]struct{}
-	wg           sync.WaitGroup
+	ln      net.Listener
+	guard   EgressGuard
+	resolve func(ctx context.Context, host string) ([]netip.Addr, error)
+	dial    func(ctx context.Context, network, address string) (net.Conn, error)
+	// dialLimit bounds a dial, and through an upstream its CONNECT reply.
+	dialLimit time.Duration
+	upstream  *Upstream
+	slots     chan struct{}
+	refusals  chan struct{}
+	stats     *ProxyStats
+	ctx       context.Context
+	cancel    context.CancelFunc
+	mu        sync.Mutex
+	conns     map[net.Conn]struct{}
+	// failure is the proxy class of the first upstream tunnel that would
+	// not open, under mu.
+	failure string
+	wg      sync.WaitGroup
 }
 
 func defaultResolver(ctx context.Context, host string) ([]netip.Addr, error) {
 	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 }
 
-func newEgressProxy(guard EgressGuard, resolve func(context.Context, string) ([]netip.Addr, error), upstream *url.URL, upstreamAuth string, tunnels int, stats *ProxyStats) (*egressProxy, error) {
+// newEgressProxy listens on a fresh loopback port. upstream is nil for the
+// helper's shared proxy, else the one proxied page's way out.
+func newEgressProxy(guard EgressGuard, resolve func(context.Context, string) ([]netip.Addr, error), upstream *Upstream, tunnels int, stats *ProxyStats) (*egressProxy, error) {
 	if guard == nil {
 		return nil, errors.New("egress guard required")
+	}
+	if upstream != nil && !upstream.valid() {
+		return nil, errors.New("egress proxy upstream invalid")
 	}
 	if resolve == nil {
 		resolve = defaultResolver
@@ -129,18 +200,30 @@ func newEgressProxy(guard EgressGuard, resolve func(context.Context, string) ([]
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	dialer := &net.Dialer{Timeout: proxyDialLimit}
-	p := &egressProxy{ln: ln, guard: guard, resolve: resolve, dial: dialer.DialContext, upstream: upstream, upstreamAuth: upstreamAuth,
+	p := &egressProxy{ln: ln, guard: guard, resolve: resolve, dial: dialer.DialContext, dialLimit: proxyDialLimit, upstream: upstream,
 		slots: make(chan struct{}, tunnels), refusals: make(chan struct{}, proxyRefusals), stats: stats, ctx: ctx, cancel: cancel, conns: map[net.Conn]struct{}{}}
-	if upstream != nil && upstream.User != nil && upstreamAuth == "" {
-		password, _ := upstream.User.Password()
-		p.upstreamAuth = "Basic " + base64.StdEncoding.EncodeToString([]byte(upstream.User.Username()+":"+password))
-	}
 	p.wg.Add(1)
 	go p.serve()
 	return p, nil
 }
 
 func (p *egressProxy) URL() string { return "http://" + p.ln.Addr().String() }
+
+// Failure is the proxy class of the first upstream tunnel that would not
+// open, or "".
+func (p *egressProxy) Failure() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.failure
+}
+
+func (p *egressProxy) upstreamFailed(class string) {
+	p.mu.Lock()
+	if p.failure == "" {
+		p.failure = class
+	}
+	p.mu.Unlock()
+}
 
 func (p *egressProxy) serve() {
 	defer p.wg.Done()
@@ -307,7 +390,9 @@ func (p *egressProxy) handle(conn net.Conn) {
 
 // check resolves a page-chosen host under the rules: names first (no lookup
 // for a refused name), then every address through the guard. It returns the
-// address to dial: the first IPv4, else the first IPv6.
+// address to dial: the first IPv4, else the first IPv6. Through an upstream
+// it is IPv4 only, as proxy exits are (the relay's proxied hops pick the
+// same way): a host without an IPv4 answer gets 502.
 func (p *egressProxy) check(host string) (netip.Addr, int) {
 	name, literal, ok := proxyHost(host)
 	if !ok {
@@ -340,6 +425,9 @@ func (p *egressProxy) check(host string) (netip.Addr, int) {
 	if v4.IsValid() {
 		return v4, 0
 	}
+	if v6.IsValid() && p.upstream != nil {
+		return netip.Addr{}, http.StatusBadGateway
+	}
 	if v6.IsValid() {
 		return v6, 0
 	}
@@ -347,34 +435,67 @@ func (p *egressProxy) check(host string) (netip.Addr, int) {
 }
 
 // dialChecked connects to exactly the checked address: directly, or as the
-// CONNECT target of the configured upstream proxy, as the core relay does.
+// CONNECT target of the job's upstream at its checked address, as the core
+// relay does. A tunnel the upstream would not open keeps its proxy class
+// (Failure, the first one only); the page gets 502 either way. Closing the
+// proxy ends a CONNECT the upstream has not answered.
 func (p *egressProxy) dialChecked(ctx context.Context, target netip.AddrPort) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(ctx, proxyDialLimit)
+	ctx, cancel := context.WithTimeout(ctx, p.dialLimit)
 	defer cancel()
 	if p.upstream == nil {
 		return p.dial(ctx, "tcp", target.String())
 	}
-	conn, err := p.dial(ctx, "tcp", p.upstream.Host)
+	class := ""
+	conn, err := p.dial(ctx, "tcp", p.upstream.Addr.String())
 	if err != nil {
-		return nil, err
+		class = proxyUnreachable
+	} else {
+		stop := context.AfterFunc(ctx, func() { conn.Close() })
+		class = p.connect(ctx, conn, target)
+		if !stop() && class == "" {
+			// The dial limit passed, or the proxy closed, as the reply came.
+			class = proxyExit
+		}
+		if class != "" {
+			conn.Close()
+		}
 	}
-	_ = conn.SetDeadline(time.Now().Add(proxyDialLimit))
-	head := "CONNECT " + target.String() + " HTTP/1.1\r\nHost: " + target.String() + "\r\n"
-	if p.upstreamAuth != "" {
-		head += "Proxy-Authorization: " + p.upstreamAuth + "\r\n"
-	}
-	if _, err = io.WriteString(conn, head+"\r\n"); err != nil {
-		conn.Close()
-		return nil, err
-	}
-	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
-	if err != nil || resp.StatusCode != http.StatusOK || br.Buffered() > 0 {
-		conn.Close()
+	if class != "" {
+		// A proxy that is closing records nothing: the page is done.
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			p.upstreamFailed(class)
+		}
 		return nil, errors.New("upstream proxy refused the tunnel")
 	}
-	_ = conn.SetDeadline(time.Time{})
 	return conn, nil
+}
+
+// connect asks the upstream on conn for a tunnel to target and returns ""
+// once it is open, else the proxy class (as the prover's dial.rs tells them
+// apart).
+func (p *egressProxy) connect(ctx context.Context, conn net.Conn, target netip.AddrPort) string {
+	head := "CONNECT " + target.String() + " HTTP/1.1\r\nHost: " + target.String() + "\r\n"
+	if p.upstream.Authorization != "" {
+		head += "Proxy-Authorization: " + p.upstream.Authorization + "\r\n"
+	}
+	if _, err := io.WriteString(conn, head+"\r\n"); err != nil {
+		return proxyUnreachable
+	}
+	br := bufio.NewReader(io.LimitReader(conn, proxyHeadLimit))
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	switch {
+	case err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded):
+		// The proxy took the connection but never answered: its exit.
+		return proxyExit
+	case err != nil:
+		return proxyUnreachable
+	case resp.StatusCode != http.StatusOK:
+		return upstreamClass(resp.StatusCode)
+	case br.Buffered() > 0:
+		// The target speaks only after the browser's ClientHello.
+		return proxyUnreachable
+	}
+	return ""
 }
 
 var hopHeaders = []string{"Connection", "Proxy-Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer", "Transfer-Encoding", "Upgrade"}

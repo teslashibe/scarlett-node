@@ -1,6 +1,7 @@
 package webruntime
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -117,12 +119,29 @@ func fakeHelper(mode, dump string) int {
 	}))
 	mux.HandleFunc("/v1/fetch", auth(func(w http.ResponseWriter, r *http.Request) {
 		var req helperFetch
-		if json.NewDecoder(r.Body).Decode(&req) != nil || r.Header.Get("Content-Type") != "application/json" {
+		body, _ := io.ReadAll(r.Body)
+		if json.Unmarshal(body, &req) != nil || r.Header.Get("Content-Type") != "application/json" {
 			http.Error(w, "{}", 400)
 			return
 		}
 		n := fetches.Add(1)
 		os.WriteFile(filepath.Join(dump, "solver-"+strconv.FormatInt(n, 10)), []byte(strconv.FormatBool(req.Solver)), 0o600)
+		if mode == "tunnel" {
+			// The page and one subresource, each a tunnel through the
+			// egress proxy the request names (or none for a direct page).
+			// A page whose tunnel was refused fails as Chrome's does.
+			os.WriteFile(filepath.Join(dump, "fetch-"+strconv.FormatInt(n, 10)+".json"), body, 0o600)
+			ok := true
+			for i := 0; i < 2 && req.EgressProxy != ""; i++ {
+				ok = ok && fakeTunnel(req.EgressProxy)
+			}
+			if !ok {
+				fmt.Fprint(w, `{"data":{"outcome":"failed","error":"navigation_failed","final_url":"","status_code":0,"headers":[],"set_cookie_names":[],"content_type":"",
+					"html_path":"","html_bytes":0,"html_sha256":"","cookies":[],"challenge":"none","redirects":[],"started_at_ms":1,
+					"timings":{"context_ms":1,"navigate_ms":0,"settle_ms":0,"challenge_ms":0,"total_ms":1},"solver":"","solver_cost_micro_usd":0}}`)
+				return
+			}
+		}
 		// The DOM goes to a private file in TMPDIR, as the real helper writes
 		// it; the answer names the file, its size and its sha256.
 		dom := fakeDOM(mode, dump)
@@ -171,6 +190,27 @@ func fakeHelper(mode, dump string) int {
 }
 
 func exists(p string) bool { _, err := os.Stat(p); return err == nil }
+
+// fakeTunnel is one page connection as Chrome makes it through an egress
+// proxy URL: CONNECT example.com:443, then bytes that must come back.
+func fakeTunnel(proxy string) bool {
+	c, err := net.DialTimeout("tcp4", strings.TrimPrefix(proxy, "http://"), 5*time.Second)
+	if err != nil {
+		return false
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	fmt.Fprint(c, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+	br := bufio.NewReader(c)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return false
+	}
+	fmt.Fprint(c, "hello")
+	buf := make([]byte, 5)
+	_, err = io.ReadFull(br, buf)
+	return err == nil && string(buf) == "hello"
+}
 
 // fakeDOMPage is what the fake helper renders.
 const fakeDOMPage = "<p>ok é</p>"
@@ -957,6 +997,106 @@ func TestFetchRequestValidationAndBusy(t *testing.T) {
 	}
 	cancel()
 	wg.Wait()
+}
+
+// A proxied page gets its own egress proxy: the helper is told its loopback
+// URL and nothing else, every connection of the page reaches the upstream
+// with that job's Proxy-Authorization, and the proxy is gone once Fetch
+// returns. A direct page uses the helper's shared proxy, which has no
+// upstream. A page whose tunnel the upstream refused reports its class.
+func TestManagerProxiedPageGetsItsOwnEgressProxy(t *testing.T) {
+	s := newTestManager(t, "tunnel")
+	s.m.cfg.Resolver = (&fakeNet{}).resolve
+	s.prepare(t)
+	refuse := atomic.Bool{}
+	up := newFakeUpstream(t, func(int) string {
+		if refuse.Load() {
+			return statusReply(http.StatusForbidden)(0)
+		}
+		return statusReply(http.StatusOK)(0)
+	})
+	pages := 0
+	page := func(u *Upstream) (FetchResult, helperFetch, string) {
+		t.Helper()
+		res, err := s.m.Fetch(context.Background(), FetchRequest{URL: "https://example.com/", Wait: "load", TimeoutMS: 5000, Upstream: u})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pages++
+		raw, _ := os.ReadFile(filepath.Join(s.dump, "fetch-"+strconv.Itoa(pages)+".json"))
+		var sent helperFetch
+		if err := json.Unmarshal(raw, &sent); err != nil {
+			t.Fatal(err)
+		}
+		removeAdopted(res)
+		return res, sent, string(raw)
+	}
+	pid := 0
+	for i, auth := range []string{"Basic am9iLWE=", "Basic am9iLWI="} {
+		res, sent, raw := page(up.upstream(auth))
+		if pid == 0 {
+			pid = s.helperPID(t)
+		}
+		if res.Outcome != "ok" || res.ProxyClass != "" {
+			t.Fatalf("page %d: %s %s", i, res.Outcome, res.ProxyClass)
+		}
+		if !strings.HasPrefix(sent.EgressProxy, "http://127.0.0.1:") || strings.Contains(sent.EgressProxy, "@") ||
+			strings.Contains(raw, "Basic") || strings.Contains(raw, up.ln.Addr().String()) {
+			t.Fatalf("the helper request carries more than a loopback URL: %s", raw)
+		}
+		if sent.EgressProxy == s.sharedProxy(t) {
+			t.Fatal("a proxied page went through the shared proxy")
+		}
+		heads := up.seen()
+		if len(heads) != 2*(i+1) || heads[2*i] != "CONNECT "+publicV4.String()+":443 "+auth || heads[2*i+1] != heads[2*i] {
+			t.Fatalf("page %d: upstream saw %v", i, heads)
+		}
+		if _, err := net.DialTimeout("tcp4", strings.TrimPrefix(sent.EgressProxy, "http://"), time.Second); err == nil {
+			t.Fatalf("page %d: its egress proxy outlived the fetch", i)
+		}
+	}
+	res, sent, _ := page(nil)
+	if res.Outcome != "ok" || sent.EgressProxy != "" || len(up.seen()) != 4 {
+		t.Fatalf("direct page: %s %q", res.Outcome, sent.EgressProxy)
+	}
+	s.m.mu.Lock()
+	shared := s.m.helper.proxy.upstream
+	s.m.mu.Unlock()
+	if shared != nil {
+		t.Fatal("the shared egress proxy has an upstream")
+	}
+	refuse.Store(true)
+	if res, _, _ := page(up.upstream("Basic am9iLWM=")); res.Outcome != "failed" || res.Error != "navigation_failed" || res.ProxyClass != proxyRefused {
+		t.Fatalf("refused page: %s %s %q", res.Outcome, res.Error, res.ProxyClass)
+	}
+	if s.helperPID(t) != pid {
+		t.Fatal("a proxied page restarted the helper")
+	}
+	if _, err := s.m.Fetch(context.Background(), FetchRequest{URL: "https://example.com/", Wait: "load", TimeoutMS: 5000,
+		Upstream: &Upstream{Addr: netip.MustParseAddrPort("169.254.169.254:80")}}); err == nil || errors.Is(err, ErrUnavailable) {
+		t.Fatal("a link-local upstream was accepted", err)
+	}
+}
+
+// sharedProxy is the helper's WEB_EGRESS_PROXY.
+func (s *testManagerSetup) sharedProxy(t *testing.T) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(s.dump, "env-"+strconv.Itoa(s.helperPID(t))+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env struct {
+		Proxy string `json:"proxy"`
+	}
+	json.Unmarshal(raw, &env)
+	return env.Proxy
+}
+
+// removeAdopted deletes an ok result's adopted DOM file.
+func removeAdopted(res FetchResult) {
+	if res.HTMLPath != "" {
+		os.Remove(res.HTMLPath)
+	}
 }
 
 func TestDescendantsWalkParentsAcrossProcessGroups(t *testing.T) {

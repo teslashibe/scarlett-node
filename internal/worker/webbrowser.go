@@ -95,6 +95,11 @@ type BrowserFetchResult struct {
 	StartedAtMS   int64                         `json:"started_at_ms"`
 	// Solver is "used", "needed" or "" (see coordinator.BrowserResult).
 	Solver string `json:"solver"`
+	// ProxyClass is, for a proxied page whose navigation failed, the proxy
+	// class of the first tunnel the job's proxy would not open (its main
+	// document's, as that is the page's first connection), else "". The
+	// tier sets it; the helper never sees the proxy.
+	ProxyClass string `json:"-"`
 }
 
 // The browser failures that still produce a browser-result manifest.
@@ -185,9 +190,15 @@ func (w Web) runBrowser(ctx context.Context, l coordinator.Lease, plan webPlan, 
 		end("web_browser_unavailable")
 		return WebReport{Code: "web_browser_unavailable"}
 	}
-	browserCode := ""
+	browserCode, browserClass := "", ""
 	if err != nil || res.Outcome != "ok" {
 		browserCode = "web_browser_failed"
+		// A main document the job's proxy would not tunnel fails as a
+		// relay hop 0 would: the proxy itself, its refusal of the target,
+		// or its exit.
+		if class := proxyClass(res.ProxyClass); class != "" && route.proxied() {
+			browserCode, browserClass = proxyCode(class), class
+		}
 	}
 	end(webDiagnosticOutcome(ctx, browserCode))
 	// What the manifest says about the DOM: uploaded, over the ceiling, or
@@ -276,6 +287,9 @@ func (w Web) runBrowser(ctx context.Context, l coordinator.Lease, plan webPlan, 
 	case refetch && refetchCode == "page_too_large":
 		return wireReport(refetchCode)
 	case browserCode != "":
+		// The proxy class behind the reported code is the browser's, which
+		// decides how long web rests, whatever the re-fetch ran into.
+		route.failed(browserClass)
 		return WebReport{Code: browserCode}
 	case refetch && refetchCode != "":
 		return wireReport(refetchCode)

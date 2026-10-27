@@ -42,8 +42,8 @@ func startRuntimeBrowser(ctx context.Context, c config.Config) (worker.BrowserTi
 		Logf: func(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...) },
 	}
 	// No shared upstream: each proxied page brings its own session
-	// (worker.BrowserFetchRequest.Upstream), and every other page leaves from
-	// this node's own network.
+	// (worker.BrowserFetchRequest.Upstream) and gets its own egress proxy,
+	// and every other page leaves from this node's own network.
 	cfg.Solvers = runtimeSolvers(c.WebSolvers)
 	m := webruntime.New(cfg)
 	runCtx, cancel := context.WithCancel(ctx)
@@ -74,14 +74,14 @@ func (r runtimeBrowser) Prewarm() { r.m.Prewarm() }
 // Fetch maps the runtime's errors to the worker's: ErrUnavailable (not ready,
 // busy, or the helper could not start) is web_browser_unavailable, and any
 // other error a failed render. An ok result's DOM file passes to the worker,
-// which deletes it. The runtime has no per-page upstream yet, so a proxied
-// page is refused as unavailable rather than rendered from this node's own
-// network; its relay re-fetch is not run either.
+// which deletes it. A proxied page's upstream goes to the runtime, which
+// sends the whole page through it and never hands it to the helper.
 func (r runtimeBrowser) Fetch(ctx context.Context, req worker.BrowserFetchRequest) (worker.BrowserFetchResult, error) {
-	if req.Upstream != nil {
-		return worker.BrowserFetchResult{}, worker.ErrBrowserUnavailable
+	in := webruntime.FetchRequest{URL: req.URL, Wait: req.Wait, WaitMS: req.WaitMS, WaitSelector: req.WaitSelector, TimeoutMS: req.TimeoutMS, BlockResources: req.BlockResources, SolveChallenge: req.SolveChallenge}
+	if u := req.Upstream; u != nil {
+		in.Upstream = &webruntime.Upstream{Addr: u.Addr, Authorization: u.Authorization}
 	}
-	res, err := r.m.Fetch(ctx, webruntime.FetchRequest{URL: req.URL, Wait: req.Wait, WaitMS: req.WaitMS, WaitSelector: req.WaitSelector, TimeoutMS: req.TimeoutMS, BlockResources: req.BlockResources, SolveChallenge: req.SolveChallenge})
+	res, err := r.m.Fetch(ctx, in)
 	if errors.Is(err, webruntime.ErrUnavailable) {
 		return worker.BrowserFetchResult{}, worker.ErrBrowserUnavailable
 	}
@@ -89,7 +89,8 @@ func (r runtimeBrowser) Fetch(ctx context.Context, req worker.BrowserFetchReques
 		return worker.BrowserFetchResult{}, err
 	}
 	out := worker.BrowserFetchResult{Outcome: res.Outcome, Error: res.Error, FinalURL: res.FinalURL, StatusCode: res.StatusCode, Headers: res.Headers, SetCookieNames: res.SetCookieNames, ContentType: res.ContentType,
-		HTMLPath: res.HTMLPath, HTMLBytes: res.HTMLBytes, HTMLSHA256: res.HTMLSHA256, TreePeakBytes: int64(min(res.TreePeakBytes, 1<<62)), Challenge: res.Challenge, StartedAtMS: res.StartedAtMS, Solver: res.Solver}
+		HTMLPath: res.HTMLPath, HTMLBytes: res.HTMLBytes, HTMLSHA256: res.HTMLSHA256, TreePeakBytes: int64(min(res.TreePeakBytes, 1<<62)), Challenge: res.Challenge, StartedAtMS: res.StartedAtMS, Solver: res.Solver,
+		ProxyClass: res.ProxyClass}
 	for _, c := range res.Cookies {
 		out.Cookies = append(out.Cookies, worker.BrowserCookie(c))
 	}

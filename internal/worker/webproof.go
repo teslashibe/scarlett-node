@@ -250,13 +250,12 @@ func webFailureCode(ctx context.Context, cause, class string) string {
 	if ctx.Err() != nil {
 		return "expired"
 	}
+	if code := proxyCode(class); code != "" {
+		return code
+	}
 	switch class {
-	case "connect_failed", proxyExit:
+	case "connect_failed":
 		return "web_connect_failed"
-	case proxyUnreachable, proxyAuth, proxyQuota, proxyBusy:
-		return "web_proxy_failed"
-	case proxyRefused:
-		return "web_proxy_refused"
 	case "verifier_busy":
 		// Repeated by hop within its budget; never a job code.
 		return "verifier_busy"

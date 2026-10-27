@@ -15,6 +15,7 @@ import (
 
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
+	"github.com/teslashibe/scarlett-node/internal/webruntime"
 	"github.com/teslashibe/scarlett-node/internal/worker"
 )
 
@@ -105,11 +106,18 @@ func TestRuntimeBrowserWithoutArchive(t *testing.T) {
 }
 
 func TestBrowserRuntimeInputs(t *testing.T) {
-	// The runtime has no per-page upstream yet: a proxied page is refused
-	// before the runtime, so it never renders from this node's own network.
-	upstream := &worker.ProxyUpstream{Addr: netip.MustParseAddrPort("104.16.0.10:1080"), Authorization: "Basic c3ludGhldGlj"}
-	if _, err := (runtimeBrowser{}).Fetch(context.Background(), worker.BrowserFetchRequest{URL: "https://example.com/", Wait: "load", TimeoutMS: 5000, Upstream: upstream}); !errors.Is(err, worker.ErrBrowserUnavailable) {
-		t.Fatal("proxied page", err)
+	// A proxied page's upstream reaches the runtime, which checks it as the
+	// prover checks a proxy: a link-local one is a refused request, a good
+	// one waits for a ready tier like any page.
+	tier := runtimeBrowser{webruntime.New(webruntime.Config{StateDir: t.TempDir(), Guard: worker.DefaultWebEgress()})}
+	page := worker.BrowserFetchRequest{URL: "https://example.com/", Wait: "load", TimeoutMS: 5000}
+	page.Upstream = &worker.ProxyUpstream{Addr: netip.MustParseAddrPort("169.254.169.254:1080"), Authorization: "Basic c3ludGhldGlj"}
+	if _, err := tier.Fetch(context.Background(), page); err == nil || errors.Is(err, worker.ErrBrowserUnavailable) {
+		t.Fatal("link-local upstream", err)
+	}
+	page.Upstream = &worker.ProxyUpstream{Addr: netip.MustParseAddrPort("104.16.0.10:1080"), Authorization: "Basic c3ludGhldGlj"}
+	if _, err := tier.Fetch(context.Background(), page); !errors.Is(err, worker.ErrBrowserUnavailable) {
+		t.Fatal("proxied page before the tier is ready", err)
 	}
 	if !strings.HasSuffix(xLoginNode("/r"), filepath.Join("x-login-runtime", "node")) && !strings.HasSuffix(xLoginNode("/r"), "node.exe") {
 		t.Fatal("x-login node path", xLoginNode("/r"))
