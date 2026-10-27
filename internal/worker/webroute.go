@@ -101,6 +101,8 @@ type webRoute struct {
 	rotation int
 	session  config.ProxySession
 	probe    *exitProbe
+	// pinned keeps the session from rotating once a browser page used it.
+	pinned bool
 	// class is the proxy class hop 0 failed with, if any.
 	class string
 }
@@ -223,13 +225,14 @@ func (r *webRoute) hopProxy() *webProxyInput {
 // rotate moves a sticky session to its one fresh session after an exit
 // failure on hop 0, before any hop was verified (Webshare's advice after a
 // failure), and restarts the exit probe on it. It reports whether it did.
+// A pinned route never rotates.
 func (r *webRoute) rotate() bool {
 	if !r.proxied() {
 		return false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.session.Sticky || r.rotation > 0 {
+	if !r.session.Sticky || r.rotation > 0 || r.pinned {
 		return false
 	}
 	r.rotation = 1
@@ -237,6 +240,17 @@ func (r *webRoute) rotate() bool {
 	r.probe.stop()
 	r.probe = r.w.startExitProbe(r.probeCtx, r.upstreamLocked())
 	return true
+}
+
+// pin keeps the route on its current session: a browser job's re-fetch
+// reaches the site from the exit the page used (its cookies are bound to
+// that address), and the report names that exit.
+func (r *webRoute) pin() {
+	if r.proxied() {
+		r.mu.Lock()
+		r.pinned = true
+		r.mu.Unlock()
+	}
 }
 
 // failed records the proxy class the job failed with: hop 0's, or the

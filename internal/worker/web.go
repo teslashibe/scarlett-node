@@ -482,7 +482,8 @@ type webHopOutcome struct {
 // failure after a verified hop means for the job. A proxied hop dials IPv4
 // only, as proxy exits are IPv4: a host with only IPv6 answers fails
 // web_dns_failed. A proxy exit failure on hop 0 rotates a sticky session
-// once and runs the hop again on the fresh one.
+// once and runs the hop again on the fresh one, except on a browser job's
+// re-fetch, which stays on the page's exit.
 func (w Web) hop(ctx context.Context, plan webPlan, token string, hop int, target string, resolve func(context.Context, string) ([]netip.Addr, error), egress *WebEgress, headers *webNodeHeaders, route *webRoute) webHopOutcome {
 	if ctx.Err() != nil {
 		return webHopOutcome{code: "expired"}

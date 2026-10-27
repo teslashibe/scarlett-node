@@ -486,7 +486,8 @@ and never stored. Every connection of one job therefore leaves from one exit,
 the same lease always maps to the same session (so the pre-dial stays
 usable), and Webshare cannot link a session to a job. An exit failure on hop
 0 moves the job once to a fresh session and runs the hop again; later hops
-keep the session. Set the dashboard's sticky timer to 10 minutes, longer than
+keep the session, and so does a browser job's re-fetch, which reaches the
+site from the exit its page used. Set the dashboard's sticky timer to 10 minutes, longer than
 any web job. An `http` proxy keeps one fixed `Proxy-Authorization` and gets
 no probe.
 

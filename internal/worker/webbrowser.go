@@ -143,7 +143,8 @@ const (
 // DOM over the page ceiling, or a browser killed for memory, still runs the
 // re-fetch and posts a manifest saying so (dom too_large or memory), so the
 // coordinator can serve the re-fetch. A proxied job's page and re-fetch both
-// go through route's session.
+// go through route's session, which never rotates: the re-fetch leaves from
+// the page's exit.
 func (w Web) runBrowser(ctx context.Context, l coordinator.Lease, plan webPlan, report time.Time, route *webRoute) WebReport {
 	opts := *l.WebRequest.Browser
 	budget := min(time.Duration(opts.TimeoutMS)*time.Millisecond, time.Until(report.Add(-webRefetchReserve)))
@@ -176,6 +177,8 @@ func (w Web) runBrowser(ctx context.Context, l coordinator.Lease, plan webPlan, 
 		return WebReport{Code: "web_browser_unavailable"}
 	}
 
+	// The page leaves on the route's session, so its re-fetch keeps it.
+	route.pin()
 	started := time.Now()
 	fetchCtx, cancel := context.WithTimeout(ctx, budget+webBrowserOverrun)
 	end := diagnostics.Start(ctx, "browser_fetch", 0)

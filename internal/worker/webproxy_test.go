@@ -627,6 +627,36 @@ func TestWebProxiedBrowserJob(t *testing.T) {
 	}
 }
 
+// A browser job's re-fetch never rotates the session the page used: a
+// hop-0 exit failure there fails the hop, and the report names the page's
+// exit.
+func TestWebProxiedBrowserRefetchKeepsThePageExit(t *testing.T) {
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	origin, roots := exitEcho(t, "93.184.216.34\n", 0)
+	proxy := newFakeConnectProxy(t, http.StatusOK, "", origin)
+	c := browserConfig()
+	c.WebEgressProxy = syntheticWebshare(t, "all")
+	browser := &fakeBrowser{status: readyStatus(), result: renderedPage(), html: renderedHTML, dir: t.TempDir()}
+	w := probeWorker(c, proxyAnswers(nil), proxy, roots)
+	w.Browser = browser
+	run := runWebOn(t, "web-proxy-exit-once", webBrowserFixtureLease(t), w)
+	if run.code != "web_connect_failed" || len(run.inputs) != 1 || len(browser.requests) != 1 {
+		t.Fatal(run.code, len(run.inputs), len(browser.requests))
+	}
+	if run.inputs[0].Proxy.Authorization != browser.requests[0].Upstream.Authorization {
+		t.Fatal("the re-fetch left the page's session")
+	}
+	// One probe, on the page's session, which the report names.
+	if seen := proxy.connects(); len(seen) != 1 || seen[0].authorization != browser.requests[0].Upstream.Authorization || run.report.Egress != (coordinator.WebEgress{Via: "proxy", Exit: "93.184.216.34"}) {
+		t.Fatal("exit", seen, run.report.Egress)
+	}
+	// A relay job on the same route still rotates.
+	if run := runWebOn(t, "web-proxy-exit-once", webFixtureLease(t), probeWorker(c, proxyAnswers(nil), proxy, roots)); run.code != "" || len(run.inputs) != 2 {
+		t.Fatal("relay job", run.code, len(run.inputs))
+	}
+}
+
 // A main document the job's proxy would not tunnel fails with the proxy's
 // class as a relay hop 0 would, and that class decides web's rest whatever
 // the re-fetch ran into. A re-fetch that proves the page still serves it.
