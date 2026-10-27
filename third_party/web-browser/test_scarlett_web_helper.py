@@ -715,6 +715,26 @@ class FetchTests(unittest.TestCase):
         # The redirect guard is on before the page navigates.
         self.assertEqual(page.context.cdp.sent[0][0], "Fetch.enable")
 
+    def test_a_proxied_page_uses_its_own_egress_proxy_in_both_passes(self):
+        session = FakeSession([FakePage(PAGE), FakePage(PAGE)], [TIMED_OUT, CLEAN])
+        data = self.fetch(session, request(egress_proxy="http://127.0.0.1:2345"))
+        self.assertEqual(data["outcome"], "ok")
+        self.assertEqual([call["proxy"] for call in session.fetch_calls], ["http://127.0.0.1:2345"] * 2)
+        # Without one, both passes use the shared egress proxy.
+        session = FakeSession([FakePage(PAGE), FakePage(PAGE)], [TIMED_OUT, CLEAN])
+        self.fetch(session)
+        self.assertEqual([call["proxy"] for call in session.fetch_calls], ["http://127.0.0.1:1111"] * 2)
+
+    def test_egress_proxy_is_a_loopback_url_without_credentials(self):
+        for value in ("http://127.0.0.1:1", "http://127.0.0.1:65535"):
+            self.assertEqual(request(egress_proxy=value).egress_proxy, value)
+        self.assertIsNone(request().egress_proxy)
+        for value in ("http://user:pass@127.0.0.1:2345", "http://127.0.0.1:0", "http://127.0.0.1:65536", "http://127.0.0.1:02345",
+                      "https://127.0.0.1:2345", "http://localhost:2345", "http://10.0.0.2:2345", "http://p.webshare.io:80",
+                      "http://127.0.0.1:2345/", "http://127.0.0.1:2345\n", "http://127.0.0.1", "", 2345, ["http://127.0.0.1:2345"]):
+            with self.assertRaises(ValueError, msg=repr(value)):
+                request(egress_proxy=value)
+
     def test_the_solver_goes_only_to_fetches_the_node_allows(self):
         router = FakeRouter()
         session = FakeSession([FakePage(PAGE), FakePage(PAGE)])
@@ -1012,8 +1032,11 @@ class ScraplingFetchTests(unittest.TestCase):
         self.calls = []
         self.outcome = CLEAN
 
+        self.proxies = []
+
         @contextlib.asynccontextmanager
-        async def page_generator(*args, **kwargs):
+        async def page_generator(timeout, extra_headers, disable_resources, proxy=None, *args, **kwargs):
+            self.proxies.append(proxy)
             yield PageInfo(page=self.pages.pop(0), state="busy", url="")
         self.session._page_generator = page_generator
 
@@ -1047,6 +1070,15 @@ class ScraplingFetchTests(unittest.TestCase):
         self.assertEqual((data["outcome"], data["status_code"], read_dom(data), data["challenge"]), ("ok", 200, page.html, "none"))
         self.assertEqual(page.context.cdp.sent[0][0], "Fetch.enable")
         self.assertEqual(page.navigations, 1)
+
+    def test_a_proxied_page_gets_a_context_on_its_own_egress_proxy(self):
+        # The per-fetch proxy overrides the session's rotator: a fresh context
+        # on the job's loopback proxy, which carries no credentials.
+        self.fetch(FakePage(PAGE), request(egress_proxy="http://127.0.0.1:2345"))
+        self.fetch(FakePage(PAGE))
+        self.assertEqual(self.proxies, ["http://127.0.0.1:2345", "http://127.0.0.1:1111"])
+        self.assertEqual(self.session._build_context_with_proxy(self.proxies[0])["proxy"],
+                         {"server": "http://127.0.0.1:2345", "username": "", "password": ""})
 
     def test_the_pass_runs_after_navigation_with_the_fetch_budget_and_solver(self):
         router = FakeRouter(spent=0.0012, attempts=1)
@@ -1157,6 +1189,19 @@ class ServerTests(unittest.TestCase):
             body = json.dumps({"url": "https://example.com/", "solver": value}).encode()
             status, _ = self.call(self.head("POST", "/v1/fetch", body, extra="Content-Type: application/json\r\n"))
             self.assertEqual(status == 200, ok, value)
+
+    def test_egress_proxy_reaches_the_fetch(self):
+        seen = []
+
+        class Fetcher:
+            async def fetch(self, req):
+                seen.append(req.egress_proxy)
+                return {"data": {"outcome": "ok"}, "no_retry": False}
+        self.server = helper.Server("ab" * 32, Fetcher(), "155.0.8059.39", 2)
+        for value, status in (("http://127.0.0.1:2345", 200), ("http://user:secret@127.0.0.1:2345", 400)):
+            body = json.dumps({"url": "https://example.com/", "egress_proxy": value}).encode()
+            self.assertEqual(self.call(self.head("POST", "/v1/fetch", body, extra="Content-Type: application/json\r\n"))[0], status)
+        self.assertEqual(seen, ["http://127.0.0.1:2345"])
 
     def test_body_caps_and_validation(self):
         big = b"{" + b" " * helper.MAX_REQUEST_BODY + b"}"
