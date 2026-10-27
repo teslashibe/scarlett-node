@@ -484,8 +484,10 @@ type Client struct {
 	heartbeatGrace time.Duration
 	// retryWait overrides RetryAfterWait for acceptance retries; tests shorten it.
 	retryWait func(retryAfter time.Duration) time.Duration
-	// uploadBackoff overrides browserUploadBackoff; tests shorten it.
-	uploadBackoff []time.Duration
+	// uploadBackoff overrides browserUploadBackoff and uploadRetryBudget
+	// browserUploadRetryBudget; tests shorten them.
+	uploadBackoff     []time.Duration
+	uploadRetryBudget time.Duration
 	// release holds the coordinator's last release notice; see Release.
 	release *releaseState
 	// seen holds the offers the next heartbeat acknowledges.

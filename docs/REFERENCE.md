@@ -646,10 +646,15 @@ pairs and 65536 bytes in total), never `set-cookie` or `cookie`;
 from the node's clock around the browser phase. Every request uses the node's
 coordinator transport and version headers but its own client without the 10 s
 timeout, and runs under the report deadline. A try that fails with a
-transport error, 429 or 5xx is retried after 1, 2, 4 and then every 8 s (or
-the coordinator's longer `Retry-After`) for as long as the next try can still
-start: a part try starts only while `max(10 s, part size / 250 kB/s + 5 s)`
-remains, a manifest try while 3 s does. Any other answer is final. A
+transport error, 429 or 5xx is retried after 1, 2, 4 and then every 8 s, each
+with up to a quarter more (or after the coordinator's longer `Retry-After`
+with up to half more), for as long as the next try can still start and the
+upload's waits stay within 60 s in all, parts and manifest together: a part
+try starts only while `max(10 s, part size / 250 kB/s + 5 s)` remains, a
+manifest try while 3 s does. Sixty seconds covers one window of the
+coordinator's per-node limit; an upload refused for longer gives up and
+frees the job's slots and report, which a verified re-fetch may still
+prove. Any other answer is final. A
 too_large or memory manifest still runs the proven re-fetch, so the
 coordinator can serve it. An upload that is not stored is logged once it gives up, with the route,
 the status and the coordinator's error code, the DOM state and the part

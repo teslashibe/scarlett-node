@@ -473,11 +473,40 @@ func TestUploadBrowserResultRetriesUntilTheReportDeadline(t *testing.T) {
 	}
 }
 
-// The schedule is 1, 2, 4 and then every 8 seconds, and a longer Retry-After
-// wins.
+// A coordinator that keeps refusing an upload with minutes left before the
+// report deadline is waited for only as long as the upload's retry budget,
+// counted over parts and manifest together.
+func TestUploadBrowserResultKeepsToItsRetryBudget(t *testing.T) {
+	m, gz := preparedManifest(t, randomBytes(t, 3<<20))
+	f := newFakeBrowserCoordinator(t, m)
+	f.fail = func(method, route string, n int, w http.ResponseWriter) bool {
+		// Part 1 is stored after two refusals; part 2 never is.
+		if route == "part" && (n == 2 || len(f.log) <= 3) {
+			writeError(w, http.StatusServiceUnavailable, "network_unavailable")
+			return true
+		}
+		return false
+	}
+	c := New(f.URL, "synthetic-credential")
+	c.uploadBackoff = []time.Duration{20 * time.Millisecond}
+	c.uploadRetryBudget = 110 * time.Millisecond
+	started := time.Now()
+	stats, err := c.UploadBrowserResult(context.Background(), testJob, m, gz, time.Now().Add(time.Hour))
+	var status *StatusError
+	// Each wait is 20-25 ms: four or five fit the budget, two of them part 1's.
+	if !errors.As(err, &status) || status.Status != http.StatusServiceUnavailable || stats.PartsSent != 1 || stats.Retries < 4 || stats.Retries > 5 {
+		t.Fatalf("err %v stats %+v log %v", err, stats, f.requests())
+	}
+	if took := time.Since(started); took > 5*time.Second {
+		t.Fatal("waited past the retry budget", took)
+	}
+}
+
+// The schedule is 1, 2, 4 and then every 8 seconds with up to a quarter
+// more, within a minute of waits per upload, and a longer Retry-After wins.
 func TestBrowserUploadBackoff(t *testing.T) {
-	if !reflect.DeepEqual(browserUploadBackoff, []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}) {
-		t.Fatal(browserUploadBackoff)
+	if !reflect.DeepEqual(browserUploadBackoff, []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}) || browserUploadRetryBudget != time.Minute {
+		t.Fatal(browserUploadBackoff, browserUploadRetryBudget)
 	}
 	m := browserResultFixture(t, "browser-result-memory.json")
 	f := newFakeBrowserCoordinator(t, m)

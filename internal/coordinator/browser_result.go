@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"strconv"
@@ -124,10 +125,19 @@ const (
 )
 
 // browserUploadBackoff is the wait before each retry of a part or manifest,
-// the last repeating: a browser job usually has minutes left when its upload
-// starts, and a coordinator that limits this node's requests for a whole
-// minute refuses every try packed into the first few seconds.
+// the last repeating, plus up to a quarter of it again: a browser job usually
+// has minutes left when its upload starts, and a coordinator that limits this
+// node's requests for a whole minute refuses every try packed into the first
+// few seconds.
 var browserUploadBackoff = []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
+
+// browserUploadRetryBudget bounds the waits before retries over a whole
+// upload, parts and manifest together: one window of the coordinator's
+// per-node limit, the longest it refuses a node outright. A coordinator that
+// is still refusing after that is not waited for until the report deadline,
+// which would hold the job's web and browser slots and its report for minutes
+// when a verified re-fetch may already prove it.
+const browserUploadRetryBudget = time.Minute
 
 // ErrBrowserUploadTooLate means a part or the manifest could not start with
 // enough time left before the report deadline.
@@ -294,10 +304,11 @@ type UploadStats struct {
 // upload sha256 (the coordinator replaces a set with a different one). Each
 // part is held in memory alone. A part or manifest whose try fails with a
 // transport failure, 429 or 5xx is tried again after 1, 2, 4 and then every
-// 8 seconds, or the coordinator's longer Retry-After, until ctx ends or the
-// next try could not start in time: a part try starts only while max(10 s,
-// size / 250 kB/s + 5 s) is left before report, a manifest try while 3 s is.
-// Any other answer is final. A manifest answered 409 parts_incomplete sends
+// 8 seconds, each with up to a quarter more, or after the coordinator's longer
+// Retry-After with its jitter, until ctx ends, the waits of the whole upload
+// would pass browserUploadRetryBudget, or the next try could not start in
+// time: a part try starts only while max(10 s, size / 250 kB/s + 5 s) is left
+// before report, a manifest try while 3 s is. Any other answer is final. A manifest answered 409 parts_incomplete sends
 // the missing parts once more and posts again.
 func (c *Client) UploadBrowserResult(ctx context.Context, jobID string, r BrowserResult, gzipPath string, report time.Time) (UploadStats, error) {
 	var stats UploadStats
@@ -349,6 +360,8 @@ type browserUploader struct {
 	file   *os.File
 	report time.Time
 	stats  *UploadStats
+	// waited is the time this upload has spent waiting to retry.
+	waited time.Duration
 }
 
 // sendParts sends every part the coordinator does not hold yet.
@@ -439,25 +452,34 @@ func (u *browserUploader) request(ctx context.Context, method, path string, body
 }
 
 // send makes one request with the upload's retry rule and returns its last
-// status. need is the least time before the report deadline for a try; the
-// report deadline and ctx are the only bounds on the number of tries.
+// status. need is the least time before the report deadline for a try; ctx,
+// the report deadline and the upload's retry budget bound the number of
+// tries.
 func (u *browserUploader) send(ctx context.Context, method, path string, body []byte, contentType string, headers map[string]string, need time.Duration) (int, error) {
-	backoff := browserUploadBackoff
+	backoff, budget := browserUploadBackoff, browserUploadRetryBudget
 	if u.c.uploadBackoff != nil {
 		backoff = u.c.uploadBackoff
+	}
+	if u.c.uploadRetryBudget != 0 {
+		budget = u.c.uploadRetryBudget
 	}
 	var last error = ErrBrowserUploadTooLate
 	status := 0
 	for try := 0; ; try++ {
 		if try > 0 {
-			wait := backoff[min(try-1, len(backoff)-1)]
+			// Jittered like every other retry of the node's, so that the
+			// nodes a coordinator refused together do not come back together
+			// for as long as their uploads last.
+			step := backoff[min(try-1, len(backoff)-1)]
+			wait := step + rand.N(step/4+1)
 			var se *StatusError
-			if errors.As(last, &se) && se.RetryAfter > wait {
-				wait = se.RetryAfter
+			if errors.As(last, &se) && se.RetryAfter > step {
+				wait = RetryAfterWait(se.RetryAfter)
 			}
-			if time.Until(u.report)-wait < need {
+			if time.Until(u.report)-wait < need || u.waited+wait > budget {
 				return status, last
 			}
+			u.waited += wait
 			u.stats.Retries++
 			timer := time.NewTimer(wait)
 			select {

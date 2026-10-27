@@ -337,9 +337,9 @@ paths:
         result_conflict. The coordinator allows at least 90 seconds to read one part. The node
         holds one part in memory, sends parts in order, and repeats a part or the manifest after
         a transport failure, 429 or 5xx (1, 2, 4 and then every 8 seconds, or the Retry-After
-        when longer) for as long as the next try can start: a part try only while max(10 s,
-        part size / 250 kB/s + 5 s) is left before the report deadline, a manifest try while
-        3 s is.
+        when longer, each with jitter) for as long as the next try can start and the upload's
+        waits stay within 60 seconds in all: a part try only while max(10 s, part size /
+        250 kB/s + 5 s) is left before the report deadline, a manifest try while 3 s is.
       requestBody:
         required: true
         content:
