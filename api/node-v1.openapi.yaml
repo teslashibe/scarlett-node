@@ -655,7 +655,7 @@ components:
       required: [kind, state, capacity, in_flight]
       properties:
         kind: {type: string, enum: [codex, x_read, web]}
-        state: {type: string, enum: [not_added, configured, ready, exhausted, auth_required, unreachable], description: "configured means a local credential file is usable (for x_read: the account's warm client is still being built, or a rest just ended and the next 15-second check has not yet confirmed the installed client); ready means local execution reported proof sent, not verifier acceptance, or for x_read that a client build validated the session against X; an x_read build that X refuses, rate-limits or cannot reach reports auth_required, exhausted or unreachable without waiting for a job. web has no accounts: configured means enabled with the proof helper present, ready means the last web job ended proven, and unreachable carries last_error_code relay_misuse (keyed relay halted), prover_error (helper missing) or web_proxy_failed (a 60-second rest after the egress proxy failed). Target-side web failures, and the browser codes web_browser_unavailable and web_browser_failed, never change the web state; browser readiness is reported in browser."}
+        state: {type: string, enum: [not_added, configured, ready, exhausted, auth_required, unreachable], description: "configured means a local credential file is usable (for x_read: the account's warm client is still being built, or a rest just ended and the next 15-second check has not yet confirmed the installed client); ready means local execution reported proof sent, not verifier acceptance, or for x_read that a client build validated the session against X; an x_read build that X refuses, rate-limits or cannot reach reports auth_required, exhausted or unreachable without waiting for a job. web has no accounts: configured means enabled with the proof helper present, ready means the last web job ended proven, and unreachable carries last_error_code relay_misuse (keyed relay halted), prover_error (helper missing) or web_proxy_failed (a rest after the egress proxy failed: 60 seconds when it was unreachable or answered 429, 10 minutes after 407, 30 minutes after 402; a 403 or an exit failure rests nothing). Target-side web failures, and the browser codes web_browser_unavailable and web_browser_failed, never change the web state; browser readiness is reported in browser."}
         capacity: {type: integer, minimum: 0, maximum: 32}
         in_flight: {type: integer, minimum: 0, maximum: 32}
         configured_capacity: {type: integer, minimum: 0, maximum: 32, description: "Optional physical service ceiling including retained in-flight work and distinct usable authenticated account lanes, at least capacity. Never provider quota or global independence across nodes."}
@@ -714,8 +714,8 @@ components:
           items: {type: string, enum: [mpc, relay]}
         egress:
           type: string
-          enum: [direct, proxy]
-          description: "web only; required for an enabled web entry. proxy means the node dials targets through a local HTTP CONNECT proxy (SCARLETT_WEB_EGRESS_PROXY). Node-reported, not verified."
+          enum: [direct, both, proxy]
+          description: "web only; required for an enabled web entry. direct means every page leaves from the node's own network. both means its own network by default and the operator's HTTP CONNECT proxy for leases with web_egress proxy (the desktop app's Sites that limit this network, or a proxy file with use limited_sites). proxy means every page goes through the proxy (use all). Node-reported, not verified."
         browser:
           $ref: '#/components/schemas/BrowserHealth'
     BrowserHealth:
@@ -870,6 +870,16 @@ components:
             has met bot protection before, so the node starts its browser while it runs the relay job
             in case the coordinator escalates. Outside web_request: never hashed into input_sha256
             and not part of the accepted terms.
+        web_egress:
+          type: string
+          enum: [proxy]
+          description: >-
+            Web offers only, relay or browser. The page's domain recently limited a node's own network,
+            so the node sends this job through its proxy with a session of its own. Sent only to nodes
+            whose web egress is both or proxy; a node whose egress is direct rejects the offer
+            invalid_offer. A node never falls back to its own network when the proxy fails. Outside
+            web_request like web_prewarm_browser: never hashed and not part of the accepted terms; the
+            acceptance reply repeats it.
     XRequest:
       type: object
       additionalProperties: false
@@ -1120,6 +1130,21 @@ components:
         version: {type: string, enum: [node-v2]}
         attempt: {type: string}
         fence: {type: string}
+        egress: {$ref: '#/components/schemas/WebEgress'}
+    WebEgress:
+      type: object
+      description: >-
+        Required in every proven and fail report of a web job, and forbidden in reports of other
+        services. via is how the job left the node: direct (its own network) or proxy. exit is the
+        proxy's public IPv4 address as the node's probe through the job's session saw it
+        (https://ipv4.webshare.io/), present only for a proxied job whose probe answered in time;
+        a direct report never carries an address. The coordinator keys web cooldowns by it.
+        Node-reported, not verified.
+      required: [via]
+      additionalProperties: false
+      properties:
+        via: {type: string, enum: [direct, proxy]}
+        exit: {type: string, format: ipv4}
     AttemptStatus:
       type: object
       additionalProperties: false
@@ -1139,6 +1164,7 @@ components:
         version: {type: string, enum: [node-v2]}
         attempt: {type: string}
         fence: {type: string}
-        code: {type: string, enum: [invalid_lease, expired, gateway_error, capacity_unavailable, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds, prover_error, execution_uncertain, auth_required, service_unavailable, x_rate_limited, x_incomplete, x_request_failed, relay_misuse, web_egress_denied, web_dns_failed, web_connect_failed, web_proxy_failed, web_fetch_failed, web_browser_unavailable, web_browser_failed, page_too_large], description: relay_misuse means the node caught its verifier sealing something other than the node's own request in a keyed-relay session, or closing the session without opening the record; the node then stops serving relay until its operator clears the halt. execution_uncertain means a provider call might have occurred before interruption and must not automatically requeue paid work. Transport failure alone does not prove a call never ran; capacity_unavailable must not authorize an ambiguous provider retry. Web codes describe the first hop only (a later hop failing after a verified first hop is reported proven); web_egress_denied means the page host resolved to a private, reserved or local address, or its URL failed node validation; web_dns_failed means the host did not resolve within 5 seconds; web_connect_failed means the node could not open TCP to the checked address, before any verifier session; web_proxy_failed means the local CONNECT proxy was unreachable, refused authentication or did not answer 200; web_fetch_failed means the verified session failed after the token was presented (TLS, framing, a verifier refusal, or a verifier that stayed busy for the whole hop budget). page_too_large means the page is over the 64 MiB ceiling: stage wire when the first hop's verifier refused the entity as too large (relay-web class page_too_large), stage dom when a browser job's DOM was larger than 67108864 bytes and neither its manifest was stored nor a re-fetch hop verified; stage and observed_bytes are present exactly with it, and observed_bytes is a lower bound (the coordinator prefers the verifier's own byte counts). For browser web jobs, web_browser_unavailable means the browser tier was not ready or its helper could not start, and web_browser_failed means the browser failed (navigation, TLS, crash, timeout or a memory kill) with no browser copy stored and no verified re-fetch hop; neither changes the web state.}
+        code: {type: string, enum: [invalid_lease, expired, gateway_error, capacity_unavailable, invalid_gateway_response, usage_unavailable, usage_untrusted, usage_out_of_bounds, prover_error, execution_uncertain, auth_required, service_unavailable, x_rate_limited, x_incomplete, x_request_failed, relay_misuse, web_egress_denied, web_dns_failed, web_connect_failed, web_proxy_failed, web_proxy_refused, web_fetch_failed, web_browser_unavailable, web_browser_failed, page_too_large], description: relay_misuse means the node caught its verifier sealing something other than the node's own request in a keyed-relay session, or closing the session without opening the record; the node then stops serving relay until its operator clears the halt. execution_uncertain means a provider call might have occurred before interruption and must not automatically requeue paid work. Transport failure alone does not prove a call never ran; capacity_unavailable must not authorize an ambiguous provider retry. Web codes describe the first hop only (a later hop failing after a verified first hop is reported proven); web_egress_denied means the page host resolved to a private, reserved or local address, or its URL failed node validation; web_dns_failed means the host did not resolve within 5 seconds; web_connect_failed means the node could not open TCP to the checked address, before any verifier session, or for a proxied job that the proxy's exit could not (CONNECT answered 502 or another status not named here; the node first retries hop 0 once on a fresh session); web_proxy_failed means the egress proxy was unreachable or did not speak CONNECT, refused the sign-in (407), was out of bandwidth (402) or busy (429); web_proxy_refused means the proxy answered the CONNECT 403, refusing that target; web_fetch_failed means the verified session failed after the token was presented (TLS, framing, a verifier refusal, or a verifier that stayed busy for the whole hop budget). page_too_large means the page is over the 64 MiB ceiling: stage wire when the first hop's verifier refused the entity as too large (relay-web class page_too_large), stage dom when a browser job's DOM was larger than 67108864 bytes and neither its manifest was stored nor a re-fetch hop verified; stage and observed_bytes are present exactly with it, and observed_bytes is a lower bound (the coordinator prefers the verifier's own byte counts). For browser web jobs, web_browser_unavailable means the browser tier was not ready or its helper could not start, and web_browser_failed means the browser failed (navigation, TLS, crash, timeout or a memory kill) with no browser copy stored and no verified re-fetch hop; neither changes the web state.}
         stage: {type: string, enum: [wire, dom], description: page_too_large only}
         observed_bytes: {type: integer, minimum: 67108865, description: "page_too_large only: at least this many bytes (wire: 67108865 when the node has no count; dom: the DOM's UTF-8 size)"}
+        egress: {$ref: '#/components/schemas/WebEgress'}

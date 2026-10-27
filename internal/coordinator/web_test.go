@@ -114,7 +114,7 @@ func TestOpenAPIDescribesWeb(t *testing.T) {
 	if get(schemas, "Heartbeat", "properties", "capacity", "maximum") != 96 || get(schemas, "Heartbeat", "properties", "services", "maxItems") != 3 {
 		t.Fatal("heartbeat limits")
 	}
-	if !slices.Equal(strs(get(schemas, "ServiceHealth", "properties", "kind", "enum")), []string{"codex", "x_read", "web"}) || !slices.Equal(strs(get(schemas, "ServiceHealth", "properties", "egress", "enum")), []string{"direct", "proxy"}) {
+	if !slices.Equal(strs(get(schemas, "ServiceHealth", "properties", "kind", "enum")), []string{"codex", "x_read", "web"}) || !slices.Equal(strs(get(schemas, "ServiceHealth", "properties", "egress", "enum")), []string{"direct", "both", "proxy"}) {
 		t.Fatal("service kinds or egress")
 	}
 	if !slices.Contains(strs(get(schemas, "Lease", "properties", "service_type", "enum")), "web") || get(schemas, "Lease", "properties", "web_request", "$ref") != "#/components/schemas/WebRequest" || get(schemas, "Lease", "properties", "web_payload", "$ref") != "#/components/schemas/WebPayload" {
@@ -216,13 +216,15 @@ func readFailureCode(t *testing.T, name string) string {
 // Large pages (node 0.1.13) changed both leases' max_response_bytes to the
 // 64 MiB page ceiling and so their request_sha256. Protocol node-v2 (node
 // 0.1.17) changed every body's version to node-v2 and gave the heartbeat its
-// required offers_seen; the digests inside the leases did not change.
+// required offers_seen; the digests inside the leases did not change. Proxy
+// egress (node 0.1.20) made egress required in every web report, so the
+// failure gained {"via":"direct"}.
 func TestCoreWebFixturesUnchanged(t *testing.T) {
 	for name, want := range map[string]string{
 		"lease-web-offer.json": "0d5c6043557d466af73d8ceb665f02a7990bf989439bb3a93223f81df2bd2feb",
 		"lease-web.json":       "615630450fc2660e1b5dbbfb17b5a07ced75ead5be6af7e31d2d1101b9f36519",
 		"heartbeat-web.json":   "6088d8aae3f0e2602d695183aed93a8d3a7286b1798db51b8b589381fdb027d1",
-		"failure-web.json":     "04b01092dad25c3d88396f5decdc3443ad6d8bb7853fe69559ef78ee727dcb85",
+		"failure-web.json":     "284211ba621cc419bd2aee50a257e2000de46930d1013aeca716c20582888dfb",
 	} {
 		raw, err := os.ReadFile("../../api/fixtures/" + name)
 		if err != nil {
@@ -403,4 +405,168 @@ func TestOpenAPIDescribesTheBrowserTier(t *testing.T) {
 	within(lease["web_request"].(map[string]any)["browser"].(map[string]any), "WebBrowser")
 	within(lease["web_payload"].(map[string]any), "WebPayload")
 	within(fields("lease-web-prewarm-offer.json"), "Lease")
+}
+
+// The proxy hint sits outside web_request, as the pre-warm hint does: the
+// hinted lease has the plain lease's terms and digests, offers carry it only
+// for web, and acceptance compares the terms without it and keeps the
+// offer's value.
+func TestWebEgressHint(t *testing.T) {
+	plain, hinted := readLeaseFixture(t, "lease-web.json"), readLeaseFixture(t, "lease-web-proxy.json")
+	if hinted.WebEgress != "proxy" || hinted.InputSHA256 != plain.InputSHA256 || hinted.RequestSHA256 != plain.RequestSHA256 || !bytes.Equal(hinted.WebPayload, plain.WebPayload) {
+		t.Fatal("proxy hint changed the job")
+	}
+	hinted.WebEgress = ""
+	a, _ := json.Marshal(plain)
+	b, _ := json.Marshal(hinted)
+	if !bytes.Equal(a, b) {
+		t.Fatal("proxy lease differs beyond the hint")
+	}
+	raw, _ := os.ReadFile("../../api/fixtures/lease-web-proxy.json")
+	hinted.WebEgress = "proxy"
+	if again, _ := json.Marshal(hinted); string(again) != strings.TrimSpace(string(raw)) {
+		t.Fatal("proxy lease does not round-trip", string(again))
+	}
+
+	now := time.Now()
+	offer := readLeaseFixture(t, "lease-web-offer.json")
+	offer.LeaseDeadline = now.Add(118 * time.Second).UTC().Truncate(time.Second)
+	offer.SettlementDeadline = offer.LeaseDeadline
+	offer.WebEgress = "proxy"
+	if err := ValidOffer(offer, now); err != nil {
+		t.Fatal(err)
+	}
+	browser := readLeaseFixture(t, "lease-web-browser-offer.json")
+	browser.LeaseDeadline, browser.SettlementDeadline = offer.LeaseDeadline, offer.LeaseDeadline
+	browser.WebEgress = "proxy"
+	if err := ValidOffer(browser, now); err != nil {
+		t.Fatal("proxy hint on a browser offer", err)
+	}
+	for _, value := range []string{"direct", "both", "PROXY"} {
+		bad := offer
+		bad.WebEgress = value
+		if ValidOffer(bad, now) == nil {
+			t.Fatal("web_egress accepted:", value)
+		}
+	}
+	codex := retryOffer(time.Minute)
+	codex.WebEgress = "proxy"
+	if ValidOffer(codex, now) == nil {
+		t.Fatal("proxy hint accepted on a non-web offer")
+	}
+	for _, echo := range []string{"", "proxy"} {
+		reply := offer
+		reply.WebEgress = echo
+		client, _, _ := acceptRetryServer(t, reply, nil)
+		got, err := client.Accept(context.Background(), offer)
+		if err != nil || got.WebEgress != "proxy" || got.VerifierToken == "" {
+			t.Fatal("hinted acceptance", echo, err)
+		}
+	}
+	// A hint the coordinator adds only at accept is not the offer's.
+	plainOffer := offer
+	plainOffer.WebEgress = ""
+	client, _, _ := acceptRetryServer(t, offer, nil)
+	if got, err := client.Accept(context.Background(), plainOffer); err != nil || got.WebEgress != "" {
+		t.Fatal("hint added at accept", err, got.WebEgress)
+	}
+}
+
+// Web reports carry egress, and reports for other services do not: the
+// structs encode the fixtures byte for byte.
+func TestWebReportFixtures(t *testing.T) {
+	const attempt, fence = "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"
+	for name, body := range map[string]any{
+		"proven-web-direct.json":         Proven{Version: Version, Attempt: attempt, Fence: fence, Egress: &WebEgress{Via: "direct"}},
+		"proven-web-proxy.json":          Proven{Version: Version, Attempt: attempt, Fence: fence, Egress: &WebEgress{Via: "proxy", Exit: "93.184.215.14"}},
+		"failure-web-proxy-refused.json": Failure{Version: Version, Attempt: attempt, Fence: fence, Code: "web_proxy_refused", Egress: &WebEgress{Via: "proxy"}},
+		"failure-web.json":               Failure{Version: Version, Attempt: attempt, Fence: fence, Code: "web_dns_failed", Egress: &WebEgress{Via: "direct"}},
+		"failure-web-browser.json":       Failure{Version: Version, Attempt: attempt, Fence: fence, Code: "web_browser_failed", Egress: &WebEgress{Via: "direct"}},
+		"failure-web-too-large.json":     Failure{Version: Version, Attempt: attempt, Fence: fence, Code: "page_too_large", Stage: "dom", ObservedBytes: 70254592, Egress: &WebEgress{Via: "direct"}},
+		"proven.json":                    Proven{Version: Version, Attempt: "1", Fence: "fence-1"},
+		"failure.json":                   Failure{Version: Version, Attempt: "1", Fence: "fence-1", Code: "usage_untrusted"},
+	} {
+		raw, err := os.ReadFile("../../api/fixtures/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _ := json.Marshal(body)
+		if string(got) != strings.TrimSpace(string(raw)) {
+			t.Errorf("%s: %s", name, got)
+		}
+	}
+	var heartbeat Heartbeat
+	raw, _ := os.ReadFile("../../api/fixtures/heartbeat-web-both.json")
+	if err := json.Unmarshal(raw, &heartbeat); err != nil || heartbeat.Services[2].Kind != "web" || heartbeat.Services[2].Egress != "both" {
+		t.Fatal("both heartbeat fixture", err)
+	}
+}
+
+// The spec's proxy egress additions are checked structurally, as the core
+// ones are, and the egress fixtures name only fields it describes.
+func TestOpenAPIDescribesWebEgress(t *testing.T) {
+	raw, err := os.ReadFile("../../api/node-v1.openapi.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spec map[any]any
+	if err := yaml.Unmarshal(raw, &spec); err != nil {
+		t.Fatal(err)
+	}
+	get := func(v any, path ...string) any {
+		for _, key := range path {
+			m, ok := v.(map[any]any)
+			if !ok {
+				t.Fatalf("not a map at %v", path)
+			}
+			v = m[key]
+		}
+		return v
+	}
+	strs := func(v any) []string {
+		out := []string{}
+		items, _ := v.([]any)
+		for _, item := range items {
+			out = append(out, item.(string))
+		}
+		return out
+	}
+	schemas := get(spec, "components", "schemas")
+	if !slices.Equal(strs(get(schemas, "Lease", "properties", "web_egress", "enum")), []string{"proxy"}) ||
+		get(schemas, "Proven", "properties", "egress", "$ref") != "#/components/schemas/WebEgress" || get(schemas, "Failure", "properties", "egress", "$ref") != "#/components/schemas/WebEgress" ||
+		!slices.Equal(strs(get(schemas, "WebEgress", "properties", "via", "enum")), []string{"direct", "proxy"}) || !slices.Equal(strs(get(schemas, "WebEgress", "required")), []string{"via"}) || get(schemas, "WebEgress", "additionalProperties") != false {
+		t.Fatal("web egress schema")
+	}
+	if !slices.Contains(strs(get(schemas, "Failure", "properties", "code", "enum")), "web_proxy_refused") {
+		t.Fatal("web_proxy_refused missing")
+	}
+	within := func(name, schema string) map[string]any {
+		raw, _ := os.ReadFile("../../api/fixtures/" + name)
+		var v map[string]any
+		if err := json.Unmarshal(raw, &v); err != nil {
+			t.Fatal(name, err)
+		}
+		properties := get(schemas, schema, "properties").(map[any]any)
+		for field := range v {
+			if properties[field] == nil {
+				t.Fatalf("%s: %s field outside the spec: %s", name, schema, field)
+			}
+		}
+		return v
+	}
+	for name, schema := range map[string]string{"proven-web-direct.json": "Proven", "proven-web-proxy.json": "Proven", "failure-web-proxy-refused.json": "Failure", "failure-web.json": "Failure", "lease-web-proxy.json": "Lease"} {
+		v := within(name, schema)
+		if egress, ok := v["egress"].(map[string]any); ok {
+			properties := get(schemas, "WebEgress", "properties").(map[any]any)
+			for field := range egress {
+				if properties[field] == nil {
+					t.Fatalf("%s: egress field outside the spec: %s", name, field)
+				}
+			}
+		}
+	}
+	web := within("heartbeat-web-both.json", "Heartbeat")["services"].([]any)[2].(map[string]any)
+	if web["egress"] != "both" {
+		t.Fatal("both heartbeat")
+	}
 }
