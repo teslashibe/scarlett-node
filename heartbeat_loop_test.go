@@ -932,13 +932,18 @@ func TestRunLoopHonoursRetryAfterAndBacksOffRejectedHeartbeat(t *testing.T) {
 	if got[0].services == "null" || got[1].services != got[0].services {
 		t.Fatalf("heartbeat after a rejection changed shape:\n%s\n%s", got[0].services, got[1].services)
 	}
+	// A gap is never shorter than its pause, so the lower bounds are exact.
+	// A slow runner adds its own time on top: the status saves and the next
+	// heartbeat's build and send fall outside the pause, so the upper bounds
+	// carry slop for that.
+	const slop = 250 * time.Millisecond
 	for i, want := range []struct{ min, max time.Duration }{
 		{time.Second, 1500 * time.Millisecond},     // 413: the fixture's fixed second
 		{time.Second, 2 * time.Second},             // 200 with Retry-After 1: one to one and a half seconds
 		{2 * time.Second, 3500 * time.Millisecond}, // 503 with Retry-After 2: two to three seconds, after the 50 ms answer
 	} {
-		if gap := got[i+1].at.Sub(got[i].at); gap < want.min || gap > want.max {
-			t.Fatalf("heartbeat %d followed after %v, want [%v, %v]", i+1, gap, want.min, want.max)
+		if gap := got[i+1].at.Sub(got[i].at); gap < want.min || gap > want.max+slop {
+			t.Fatalf("heartbeat %d followed after %v, want [%v, %v]", i+1, gap, want.min, want.max+slop)
 		}
 	}
 }
