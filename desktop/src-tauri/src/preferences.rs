@@ -94,6 +94,15 @@ impl Data {
             .ok()
             .filter(|_| self.web_proxy)
     }
+    /// These preferences with the web proxy settings as saved: Save device
+    /// preferences never changes them, since only Save proxy's passing test
+    /// turns the proxy on.
+    pub fn keeping_web_proxy(mut self, saved: &Data) -> Self {
+        self.web_proxy = saved.web_proxy;
+        self.web_proxy_use = saved.web_proxy_use.clone();
+        self.web_proxy_port = saved.web_proxy_port;
+        self
+    }
 }
 pub struct Preferences {
     data: Mutex<Data>,
@@ -272,6 +281,46 @@ mod tests {
                 r#"{"schema":1,"local_api_port":8088,"background":false,"web_proxy":"on"}"#
             )
             .is_err()
+        );
+    }
+    /// Save device preferences takes every field from the page except the
+    /// web proxy's, which stay as saved: the page cannot turn the proxy on
+    /// without a passing test.
+    #[test]
+    fn device_preferences_keep_the_saved_web_proxy() {
+        let saved: Data = serde_json::from_str(
+            r#"{"schema":1,"local_api_port":8088,"background":false,"web_proxy":false,"web_proxy_use":"limited_sites","web_proxy_port":80}"#,
+        )
+        .unwrap();
+        let page: Data = serde_json::from_str(
+            r#"{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":4,"web_concurrency":8,"web_proxy":true,"web_proxy_use":"all","web_proxy_port":1080}"#,
+        )
+        .unwrap();
+        let kept = page.clone().keeping_web_proxy(&saved);
+        assert!(!kept.web_proxy);
+        assert_eq!(
+            (kept.web_proxy_use.as_str(), kept.web_proxy_port),
+            ("limited_sites", 80)
+        );
+        assert_eq!(kept.web_proxy_route(), None);
+        assert_eq!(
+            (
+                kept.local_api_port,
+                kept.background,
+                kept.x_concurrency,
+                kept.web_concurrency
+            ),
+            (18088, true, 4, 8)
+        );
+        // A proxy that is on stays on, with its saved route.
+        let mut on = saved.clone();
+        on.web_proxy = true;
+        on.web_proxy_port = 3128;
+        let mut off_page = page.clone();
+        off_page.web_proxy = false;
+        assert_eq!(
+            off_page.keeping_web_proxy(&on).web_proxy_route(),
+            Some(crate::web_proxy::Route::new("limited_sites", 3128).unwrap())
         );
     }
     #[test]

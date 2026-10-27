@@ -194,11 +194,7 @@ async fn save_desktop_preferences(
     data.validate()?;
     let _guard = runtime.0.lock().await;
     // The web proxy has its own commands: only a passing test turns it on.
-    let mut data = data;
-    let current = preferences.snapshot()?;
-    data.web_proxy = current.web_proxy;
-    data.web_proxy_use = current.web_proxy_use;
-    data.web_proxy_port = current.web_proxy_port;
+    let data = data.keeping_web_proxy(&preferences.snapshot()?);
     node.save_preferences(&data).await?;
     node.set_x_concurrency(data.x_concurrency)?;
     node.set_web_concurrency(data.web_concurrency)?;

@@ -132,42 +132,64 @@ fn proxy<'a>(credentials: &'a Credentials, route: Route) -> Proxy<'a> {
     }
 }
 
-/// A buffer that holds any line this module writes without growing, so no
-/// copy of the credentials is left behind in a freed allocation; callers
-/// overwrite it when done.
-fn secret_buffer() -> Vec<u8> {
-    Vec::with_capacity(START_LINE_LIMIT + 1)
+/// Bytes holding the credentials: the start line, the test input and the
+/// keychain item. Like Credentials they are overwritten when dropped, on
+/// every path, and Debug never shows them.
+pub struct Secret(Vec<u8>);
+impl Secret {
+    /// Room for any line this module writes, so writing never regrows the
+    /// buffer and leaves a copy behind in a freed allocation.
+    fn new() -> Self {
+        Self(Vec::with_capacity(START_LINE_LIMIT + 1))
+    }
+}
+impl std::ops::Deref for Secret {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret([redacted])")
+    }
+}
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.fill(0);
+        std::hint::black_box(&self.0);
+    }
 }
 
 /// `desktop proxy-test`'s stdin: the proxy object and a newline.
-pub fn test_input(credentials: &Credentials, route: Route) -> Result<Vec<u8>> {
-    let mut raw = secret_buffer();
-    serde_json::to_writer(&mut raw, &proxy(credentials, route)).map_err(|_| Error::InvalidInput)?;
-    raw.push(b'\n');
+pub fn test_input(credentials: &Credentials, route: Route) -> Result<Secret> {
+    let mut raw = Secret::new();
+    serde_json::to_writer(&mut raw.0, &proxy(credentials, route))
+        .map_err(|_| Error::InvalidInput)?;
+    raw.0.push(b'\n');
     Ok(raw)
 }
 
 /// The one line the app writes to `desktop run` before any owner command:
 /// the proxy for this node, or `{}` without one. The app always sends it.
-pub fn start_line(web_proxy: Option<(&Credentials, Route)>) -> Result<Vec<u8>> {
+pub fn start_line(web_proxy: Option<(&Credentials, Route)>) -> Result<Secret> {
     #[derive(Serialize)]
     struct Line<'a> {
         web_egress_proxy: Proxy<'a>,
     }
-    let mut raw = secret_buffer();
+    let mut raw = Secret::new();
     match web_proxy {
         Some((credentials, route)) => serde_json::to_writer(
-            &mut raw,
+            &mut raw.0,
             &Line {
                 web_egress_proxy: proxy(credentials, route),
             },
         )
         .map_err(|_| Error::InvalidInput)?,
-        None => raw.extend_from_slice(b"{}"),
+        None => raw.0.extend_from_slice(b"{}"),
     }
-    raw.push(b'\n');
+    raw.0.push(b'\n');
     if raw.len() > START_LINE_LIMIT {
-        raw.fill(0);
         return Err(Error::InvalidInput);
     }
     Ok(raw)
@@ -285,25 +307,25 @@ impl Keychain {
         }
     }
     pub fn save(&self, credentials: &Credentials) -> Result<()> {
-        let mut raw = secret_buffer();
-        serde_json::to_writer(&mut raw, credentials).map_err(|_| Error::InvalidInput)?;
-        let saved = self.entry().and_then(|entry| entry.set_secret(&raw));
-        raw.fill(0);
-        saved.map_err(|_| Error::KeychainUnavailable)
+        let mut raw = Secret::new();
+        serde_json::to_writer(&mut raw.0, credentials).map_err(|_| Error::InvalidInput)?;
+        self.entry()
+            .and_then(|entry| entry.set_secret(&raw))
+            .map_err(|_| Error::KeychainUnavailable)
     }
     /// The saved credentials, or none. An item that is not what this app
     /// saves fails closed; Remove deletes it.
     pub fn load(&self) -> Result<Option<Credentials>> {
-        let mut raw = match self.entry().and_then(|entry| entry.get_secret()) {
-            Ok(raw) => raw,
+        let raw = match self.entry().and_then(|entry| entry.get_secret()) {
+            Ok(raw) => Secret(raw),
             Err(keyring_core::Error::NoEntry) => return Ok(None),
             Err(_) => return Err(Error::KeychainUnavailable),
         };
-        let credentials = serde_json::from_slice::<Credentials>(&raw)
+        serde_json::from_slice::<Credentials>(&raw)
             .ok()
-            .filter(Credentials::valid);
-        raw.fill(0);
-        credentials.map(Some).ok_or(Error::KeychainUnavailable)
+            .filter(Credentials::valid)
+            .map(Some)
+            .ok_or(Error::KeychainUnavailable)
     }
     /// Removes the item; removing an absent one succeeds.
     pub fn delete(&self) -> Result<()> {
@@ -350,8 +372,7 @@ impl Form {
             (true, true) => Ok(None),
             (false, false) => Credentials::new(username, password).map(Some),
             _ => {
-                let mut password = password.into_bytes();
-                password.fill(0);
+                drop(Secret(password.into_bytes()));
                 Err(Error::InvalidInput)
             }
         }
@@ -471,7 +492,7 @@ mod tests {
             r##"#!/bin/sh
 case "$1 $2" in
 'desktop preferences-get') printf '%s' '{"schema":1,"local_api_port":8088,"background":false,"x_concurrency":2,"updates":"notify","resume_serving":false,"serve_web":true,"web_concurrency":0,"web_browser_concurrency":0,"web_proxy":false,"web_proxy_use":"limited_sites","web_proxy_port":80}';;
-'desktop preferences-set') cat;;
+'desktop preferences-set') [ -e "$SCARLETT_STATE_DIR/fail-save" ] && exit 1; cat;;
 'desktop proxy-test')
   printf '%s\n' "$*" >> "$SCARLETT_STATE_DIR/calls"
   cat >> "$SCARLETT_STATE_DIR/proxy-input"
@@ -556,7 +577,8 @@ esac
         assert!(read("proxy-input").lines().nth(1).unwrap().contains(
             r#""password":"synthetic-pass","country":"us","port":3128,"use":"limited_sites""#
         ));
-        // A test that cannot run is a failed test: the switch is saved off.
+        // A test that cannot run is a failed test: the switch is saved off,
+        // and the page is told the test could not run.
         reply("proxy said no to synthuser");
         assert_eq!(
             save(
@@ -566,10 +588,32 @@ esac
                 form(true, "limited_sites", 3128, "", "")
             )
             .await,
-            Err(Error::CommandFailed)
+            Err(Error::ProxyTestUnavailable)
         );
         assert!(!preferences.snapshot().unwrap().web_proxy);
         assert_eq!(node.snapshot().await.web_proxy, None);
+        assert_eq!(
+            test(&node, form(false, "all", 80, "", "")).await,
+            Err(Error::ProxyTestUnavailable)
+        );
+        // Private storage that fails is its own error, whether or not a
+        // test ran first, and the proxy stays as it was.
+        reply(r#"{"ok":true,"exit":"45.86.200.17"}"#);
+        std::fs::write(node.state.join("fail-save"), "").unwrap();
+        for enabled in [true, false] {
+            assert_eq!(
+                save(
+                    &node,
+                    &preferences,
+                    &runtime,
+                    form(enabled, "all", 80, "", "")
+                )
+                .await,
+                Err(Error::CommandFailed)
+            );
+        }
+        assert!(!preferences.snapshot().unwrap().web_proxy);
+        std::fs::remove_file(node.state.join("fail-save")).unwrap();
         // Switching off runs no test.
         let calls = read("calls");
         let saved = save(
@@ -757,15 +801,15 @@ esac
     #[test]
     fn start_line_and_test_input_match_the_node_contract() {
         let credentials = synthetic();
-        assert_eq!(start_line(None).unwrap(), b"{}\n");
+        assert_eq!(&*start_line(None).unwrap(), b"{}\n");
         let route = Route::new("limited_sites", 80).unwrap();
         assert_eq!(
-            String::from_utf8(start_line(Some((&credentials, route))).unwrap()).unwrap(),
+            std::str::from_utf8(&start_line(Some((&credentials, route))).unwrap()).unwrap(),
             "{\"web_egress_proxy\":{\"provider\":\"webshare\",\"username\":\"synthuser\",\"password\":\"synthetic-pass\",\"country\":\"us\",\"port\":80,\"use\":\"limited_sites\"}}\n"
         );
         let route = Route::new("all", 3128).unwrap();
         assert_eq!(
-            String::from_utf8(test_input(&credentials, route).unwrap()).unwrap(),
+            std::str::from_utf8(&test_input(&credentials, route).unwrap()).unwrap(),
             "{\"provider\":\"webshare\",\"username\":\"synthuser\",\"password\":\"synthetic-pass\",\"country\":\"us\",\"port\":3128,\"use\":\"all\"}\n"
         );
         // The widest line fits what the node reads.

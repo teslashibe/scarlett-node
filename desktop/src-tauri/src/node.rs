@@ -137,6 +137,9 @@ pub enum Error {
     KeychainUnavailable,
     /// The web proxy is on but no proxy username and password are saved.
     WebProxyNotSaved,
+    /// `desktop proxy-test` did not finish or gave no reply the app reads, so
+    /// the proxy is untested.
+    ProxyTestUnavailable,
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -375,8 +378,13 @@ pub struct Node {
     /// applies to the next child process; its username and password stay in
     /// the keychain until that child's start line.
     web_proxy: std::sync::Mutex<Option<crate::web_proxy::Route>>,
-    /// The web proxy the supervised child was started with (None without web).
-    web_proxy_running: std::sync::Mutex<Option<crate::web_proxy::Route>>,
+    /// The web proxy the supervised child was started with (None without web)
+    /// and the credentials generation it read.
+    web_proxy_running: std::sync::Mutex<Option<(crate::web_proxy::Route, u64)>>,
+    /// Counts saves and deletes of the proxy credentials, so a node started
+    /// with older ones shows a restart pending; the credentials themselves
+    /// are never kept to compare.
+    web_proxy_generation: std::sync::atomic::AtomicU64,
     /// Where the web proxy's username and password are saved.
     keychain: std::sync::Arc<crate::web_proxy::Keychain>,
     /// An explicit SCARLETT_WEB_BROWSER ("on" or "off") from the same trusted
@@ -920,6 +928,7 @@ impl Node {
             web_browser_concurrency: std::sync::atomic::AtomicU8::new(0),
             web_proxy: std::sync::Mutex::new(None),
             web_proxy_running: std::sync::Mutex::new(None),
+            web_proxy_generation: std::sync::atomic::AtomicU64::new(0),
             keychain: std::sync::Arc::new(crate::web_proxy::Keychain::native()),
             web_browser: None,
             log_dir: None,
@@ -1017,36 +1026,42 @@ impl Node {
             .await
             .map_err(|_| Error::KeychainUnavailable)?
     }
-    /// Saves the web proxy credentials, replacing any saved ones.
+    /// Saves the web proxy credentials, replacing any saved ones. A node
+    /// running with the proxy keeps the old ones until it next starts.
     pub async fn save_web_proxy_credentials(
         &self,
         credentials: &crate::web_proxy::Credentials,
     ) -> Result<()> {
         let keychain = self.keychain();
         let credentials = credentials.clone();
-        tokio::task::spawn_blocking(move || keychain.save(&credentials))
-            .await
-            .map_err(|_| Error::KeychainUnavailable)?
+        let saved = tokio::task::spawn_blocking(move || keychain.save(&credentials)).await;
+        // Counted after the write, failed or not: a start that read the
+        // store before this count then shows a restart pending.
+        self.web_proxy_generation.fetch_add(1, Ordering::SeqCst);
+        saved.map_err(|_| Error::KeychainUnavailable)?
     }
     /// Deletes the saved web proxy credentials; deleting none succeeds.
     pub async fn delete_web_proxy_credentials(&self) -> Result<()> {
         let keychain = self.keychain();
-        tokio::task::spawn_blocking(move || keychain.delete())
-            .await
-            .map_err(|_| Error::KeychainUnavailable)?
+        let deleted = tokio::task::spawn_blocking(move || keychain.delete()).await;
+        self.web_proxy_generation.fetch_add(1, Ordering::SeqCst);
+        deleted.map_err(|_| Error::KeychainUnavailable)?
     }
     /// One `desktop proxy-test`: the bundled node runs one exit probe through
     /// a fresh session with these credentials and port. The credentials go
-    /// only on its stdin, and only its fixed reply comes back.
+    /// only on its stdin, and only its fixed reply comes back. A probe that
+    /// does not finish or replies with anything else is ProxyTestUnavailable,
+    /// apart from the app's own failures.
     pub async fn test_web_proxy(
         &self,
         credentials: &crate::web_proxy::Credentials,
         route: crate::web_proxy::Route,
     ) -> Result<crate::web_proxy::TestResult> {
-        let mut input = crate::web_proxy::test_input(credentials, route)?;
-        let result = self.proxy_test(&input).await;
-        input.fill(0);
-        result
+        let input = crate::web_proxy::test_input(credentials, route)?;
+        match self.proxy_test(&input).await {
+            Err(Error::CommandFailed | Error::CommandTimeout) => Err(Error::ProxyTestUnavailable),
+            result => result,
+        }
     }
     async fn proxy_test(&self, input: &[u8]) -> Result<crate::web_proxy::TestResult> {
         let mut child = self
@@ -1623,10 +1638,14 @@ impl Node {
         if self.accounts().await?.is_empty() && !web {
             return Err(Error::AccountsUnavailable);
         }
+        let mut cmd = self.command_with_web(&["desktop", "run"], web)?;
         // The start line carries the web proxy, read from the keychain now.
         // With the proxy on and nothing saved the node does not start: it
-        // never falls back to this network.
+        // never falls back to this network. The generation is read first, so
+        // credentials saved while this start reads them show a restart
+        // pending.
         let route = if web { self.web_proxy_route() } else { None };
+        let generation = self.web_proxy_generation.load(Ordering::SeqCst);
         let credentials = match route {
             Some(_) => Some(
                 self.web_proxy_credentials()
@@ -1635,9 +1654,8 @@ impl Node {
             ),
             None => None,
         };
-        let mut line = crate::web_proxy::start_line(credentials.as_ref().zip(route))?;
+        let line = crate::web_proxy::start_line(credentials.as_ref().zip(route))?;
         drop(credentials);
-        let mut cmd = self.command_with_web(&["desktop", "run"], web)?;
         // The node's stderr goes to its private local log; a log that cannot
         // be opened never stops the node from starting.
         let log = self
@@ -1652,15 +1670,30 @@ impl Node {
         {
             cmd.process_group(0);
         }
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(_) => {
-                line.fill(0);
-                return Err(Error::RuntimeUnavailable);
-            }
-        };
-        // `desktop run` reads exactly this line before its config; owner
-        // commands follow on the same pipe.
+        let child = cmd.spawn().map_err(|_| Error::RuntimeUnavailable)?;
+        let proxy = route.map(|route| (route, generation));
+        self.supervise(&mut running, child, line, web, proxy)
+            .await?;
+        let bound = self
+            .log_dir
+            .clone()
+            .filter(|_| logging)
+            .map(|dir| tokio::spawn(crate::node_log::keep_bounded(dir)));
+        self.stop_log_bound(bound);
+        Ok(())
+    }
+    /// Sends `desktop run` its start line, which it reads exactly before its
+    /// config, then supervises it: owner commands follow on the same pipe. A
+    /// child that does not take the line is killed, and no owner pipe is kept
+    /// for it.
+    async fn supervise(
+        &self,
+        running: &mut Option<Child>,
+        mut child: Child,
+        line: crate::web_proxy::Secret,
+        web: bool,
+        proxy: Option<(crate::web_proxy::Route, u64)>,
+    ) -> Result<()> {
         let mut owner = child.stdin.take();
         let sent = tokio::time::timeout(START_LINE_TIMEOUT, async {
             let pipe = owner.as_mut()?;
@@ -1671,7 +1704,7 @@ impl Node {
         .ok()
         .flatten()
         .is_some();
-        line.fill(0);
+        drop(line);
         if !sent {
             let _ = child.kill().await;
             return Err(Error::CommandFailed);
@@ -1682,13 +1715,7 @@ impl Node {
         *self
             .web_proxy_running
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = route;
-        let bound = self
-            .log_dir
-            .clone()
-            .filter(|_| logging)
-            .map(|dir| tokio::spawn(crate::node_log::keep_bounded(dir)));
-        self.stop_log_bound(bound);
+            .unwrap_or_else(|e| e.into_inner()) = proxy;
         Ok(())
     }
     /// Ends the previous node's log rotation, starting `next` in its place.
@@ -1976,8 +2003,11 @@ impl Node {
             s.supervised && self.web_running.load(Ordering::SeqCst) != s.web_enabled;
         s.web_proxy = self.web_proxy_route();
         // Only a node serving web uses a proxy, so compare what each node
-        // with web would use.
-        let next = s.web_proxy.filter(|_| s.web_enabled);
+        // with web would use: the route and the credentials it reads.
+        let next = s
+            .web_proxy
+            .filter(|_| s.web_enabled)
+            .map(|route| (route, self.web_proxy_generation.load(Ordering::SeqCst)));
         let started = *self
             .web_proxy_running
             .lock()
@@ -3554,29 +3584,106 @@ esac
         assert!(!snapshot.web_proxy_restart_pending);
         let shown = serde_json::to_string(&snapshot).unwrap();
         assert!(!shown.contains("synthuser") && !shown.contains("synthetic-pass"));
-        // A change while it runs waits for the next start.
+        // A change while it runs waits for the next start: the route, or new
+        // credentials on the same route (a rotated proxy password).
         node.set_web_proxy(None);
         assert!(node.snapshot().await.web_proxy_restart_pending);
         node.set_web_proxy(Some(route));
         assert!(!node.snapshot().await.web_proxy_restart_pending);
+        let rotated =
+            crate::web_proxy::Credentials::new("synthuser".into(), "rotated-pass".into()).unwrap();
+        node.save_web_proxy_credentials(&rotated).await.unwrap();
+        assert!(node.snapshot().await.web_proxy_restart_pending);
         node.stop().await.unwrap();
-        // Without web the node gets `{}`, and never reads the keychain.
+        node.start().await.unwrap();
+        run(3).await;
+        assert!(
+            lines()
+                .lines()
+                .nth(2)
+                .unwrap()
+                .contains(r#""password":"rotated-pass""#)
+        );
+        assert!(!node.snapshot().await.web_proxy_restart_pending);
+        // Deleting them is a change too.
+        node.delete_web_proxy_credentials().await.unwrap();
+        assert!(node.snapshot().await.web_proxy_restart_pending);
+        node.stop().await.unwrap();
+        // Without web the node gets `{}` and never reads the keychain: the
+        // store's error still waits for the next call. A save while it runs,
+        // even one that fails, does not concern it.
         node.set_web(false);
         node.keychain().fail_next();
         node.start().await.unwrap();
-        run(3).await;
+        run(4).await;
+        assert_eq!(
+            node.save_web_proxy_credentials(&credentials).await,
+            Err(Error::KeychainUnavailable)
+        );
         assert!(!node.snapshot().await.web_proxy_restart_pending);
         node.stop().await.unwrap();
-        assert_eq!(lines().lines().nth(2).unwrap(), "{}");
+        assert_eq!(lines().lines().nth(3).unwrap(), "{}");
         // A keychain that refuses access stops the start too.
         node.set_web(true);
         node.keychain().fail_next();
         assert_eq!(node.start().await, Err(Error::KeychainUnavailable));
         assert!(!node.snapshot().await.supervised);
-        assert_eq!(lines().lines().count(), 3);
+        assert_eq!(lines().lines().count(), 4);
     }
-    /// A node that never reads its start line (or exits first) does not run:
-    /// the app does not store an owner pipe for it.
+    /// A child that cannot take its start line is killed and not supervised:
+    /// no owner pipe, no running child, and the start fails. The child closes
+    /// its stdin and says so before the line is sent, so the write fails
+    /// every time.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_that_refuses_its_start_line_is_killed_and_not_supervised() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = start_line_fixture(&temp);
+        let marker = temp.path().join("stdin-closed");
+        let child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                r#"exec 0<&-; echo $$ > "$1.tmp"; mv "$1.tmp" "$1"; exec sleep 30"#,
+                "sh",
+            ])
+            .arg(&marker)
+            .stdin(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let began = Instant::now();
+        while !marker.exists() {
+            assert!(began.elapsed() < Duration::from_secs(5));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let pid: libc::pid_t = std::fs::read_to_string(&marker)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let credentials =
+            crate::web_proxy::Credentials::new("synthuser".into(), "synthetic-pass".into())
+                .unwrap();
+        let route = crate::web_proxy::Route::new("all", 80).unwrap();
+        let line = crate::web_proxy::start_line(Some((&credentials, route))).unwrap();
+        let mut running = node.running.lock().await;
+        assert_eq!(
+            node.supervise(&mut running, child, line, true, Some((route, 0)))
+                .await,
+            Err(Error::CommandFailed)
+        );
+        assert!(running.is_none());
+        drop(running);
+        assert!(node.owner.lock().await.is_none());
+        // The child was killed and reaped, not left behind.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        let snapshot = node.snapshot().await;
+        assert!(!snapshot.supervised && !snapshot.web_proxy_restart_pending);
+        assert!(node.web_proxy_running.lock().unwrap().is_none());
+    }
+    /// A node that exits before reading its start line does not run: the app
+    /// does not keep an owner pipe for it, whether the write failed or the
+    /// pipe took the line first.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_node_that_exits_before_its_start_line_is_not_supervised() {
