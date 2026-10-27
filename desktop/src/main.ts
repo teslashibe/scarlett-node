@@ -34,7 +34,19 @@ import {
   hiddenBrowser,
   lastHeartbeat,
   missedJobs,
+  webEgress,
+  webProxyNote,
+  webProxyPlaceholders,
+  webProxySaved,
+  webProxyTestText,
+  validWebProxyPassword,
+  validWebProxyPort,
+  validWebProxyUse,
+  validWebProxyUsername,
   type Metric,
+  type WebProxySaved,
+  type WebProxyTest,
+  type WebProxyUse,
   type XLoginStatus,
   type Account,
   type Preferences,
@@ -70,6 +82,11 @@ let preferencesAvailable = false;
 // The saved settings the form does not edit (update mode, resume on launch,
 // web pages).
 let savedPreferences: Preferences | undefined;
+// The saved web proxy as the app shows it: never the password. Unreadable
+// means the keychain refused or holds an item this app cannot use; Remove
+// stays available to clear it.
+let webProxy: WebProxySaved | undefined;
+let webProxyUnreadable = false;
 let updateStatus: UpdateStatus | undefined;
 let updatePolling = false;
 let acknowledged = false;
@@ -137,6 +154,12 @@ function render(s: Snapshot) {
   const webNote = webServingNote(s);
   setText($("web-note"), webNote);
   $("web-note").hidden = !webNote;
+  for (const id of ["web-proxy", "web-proxy-use", "web-proxy-port", "web-proxy-username", "web-proxy-password", "web-proxy-save", "web-proxy-test"])
+    $(id).toggleAttribute("disabled", busy || !preferencesAvailable || !webProxy);
+  $("web-proxy-remove").toggleAttribute("disabled", busy || !(webProxy?.saved || webProxyUnreadable));
+  const proxyNote = webProxyNote(s);
+  setText($("web-proxy-note"), proxyNote);
+  $("web-proxy-note").hidden = !proxyNote;
   const local = s.local_api;
   setText($("api-summary"), !local?.available ? "Unavailable" : local.running ? (local.ready ? "Ready" : "Not ready") : "Stopped");
   $("api-status").textContent = local?.running ? `${local.ready ? "Ready" : "Not ready"} · ${local.base_url ?? ""} · ${local.claude_enabled ? "Codex and Claude" : "Codex"}` : local?.available ? "Stopped · listens only on this device" : "Local API controls are unavailable in this build";
@@ -170,6 +193,9 @@ function render(s: Snapshot) {
   const proofs = xProofModes(s);
   $("x-proofs").hidden = !proofs;
   $("x-proofs").textContent = proofs ? `X proofs · ${proofs}` : "";
+  const egress = webEgress(s);
+  $("web-egress").hidden = !egress;
+  setText($("web-egress"), egress);
   $("status").textContent = statusText(s);
   $("status-dot").dataset.tone = s.observation?.drain_requested || s.observation?.state === "draining"
     ? "paused" : s.observation?.state === "running" ? "running" : "stopped";
@@ -346,7 +372,10 @@ async function refreshDiagnostics() {
   setText($("diagnostics-note"), diagnosticsNote(diagnostics));
   renderDiagnostics($("diagnostics-history"), diagnostics);
 }
-async function act(fn: () => Promise<void>, success: string) {
+// The notice after an action: fixed text, or text the action's result
+// decides (a failed proxy test is shown as an error).
+type Outcome = string | (() => { text: string; error?: boolean });
+async function act(fn: () => Promise<void>, success: Outcome) {
   if (busy) return;
   busy = true;
   mutationEpoch++;
@@ -354,7 +383,8 @@ async function act(fn: () => Promise<void>, success: string) {
   notice("Working…");
   try {
     await fn();
-    notice(success);
+    const done = typeof success === "string" ? { text: success } : success();
+    notice(done.text, done.error);
   } catch (e) {
     notice(errorMessage(e), true);
   } finally {
@@ -620,7 +650,7 @@ $("api-hide-key").addEventListener("click", hideLocalKey);
 window.addEventListener("blur", hideLocalKey);
 window.addEventListener("pagehide", () => {
   hideLocalKey();
-  for (const id of ["pair-code", "x-token", "x-ct0", "claude-key"])
+  for (const id of ["pair-code", "x-token", "x-ct0", "claude-key", "web-proxy-username", "web-proxy-password"])
     $<HTMLInputElement>(id).value = "";
 });
 async function loadPreferences() {
@@ -633,7 +663,9 @@ async function loadPreferences() {
   $<HTMLSelectElement>("web-concurrency").value = String(settings.web_concurrency);
   $<HTMLSelectElement>("web-browser-concurrency").value = String(settings.web_browser_concurrency);
   $<HTMLInputElement>("serve-web").checked = settings.serve_web;
+  showWebProxySettings(settings);
   preferencesAvailable = true;
+  void loadWebProxy();
   try {
     $<HTMLInputElement>("autostart").checked = await api.autostart();
     autostartAvailable = true;
@@ -653,9 +685,11 @@ $("preferences-form").addEventListener("submit", event => {
   if (!validWebBrowserConcurrency(webBrowserConcurrency)) { notice("Choose how many browser pages to load at once", true); return; }
   void act(async () => {
     const current = await api.preferences().catch(() => savedPreferences);
+    // The proxy settings pass through unchanged; only Save proxy changes them.
     await api.savePreferences({schema: 1, local_api_port: port, background, x_concurrency: xConcurrency,
       updates: current?.updates ?? "notify", resume_serving: current?.resume_serving ?? false,
-      serve_web: current?.serve_web ?? true, web_concurrency: webConcurrency, web_browser_concurrency: webBrowserConcurrency});
+      serve_web: current?.serve_web ?? true, web_concurrency: webConcurrency, web_browser_concurrency: webBrowserConcurrency,
+      web_proxy: current?.web_proxy ?? false, web_proxy_use: current?.web_proxy_use ?? "limited_sites", web_proxy_port: current?.web_proxy_port ?? 80});
     if (!snapshot?.local_api?.running) $<HTMLInputElement>("api-port").value = String(port);
   }, background
     ? "Preferences saved. Closing the window keeps Scarlett running"
@@ -673,6 +707,103 @@ $("serve-web").addEventListener("change", () => {
       if (saved) { savedPreferences = saved; input.checked = saved.serve_web; }
     }
   }, webServingSaved(enabled, !!snapshot?.supervised));
+});
+// The web proxy's saved settings. The username and password fields are never
+// filled back: their placeholders say what is saved.
+function showWebProxySettings(settings: Preferences) {
+  $<HTMLInputElement>("web-proxy").checked = settings.web_proxy;
+  $<HTMLSelectElement>("web-proxy-use").value = settings.web_proxy_use;
+  $<HTMLSelectElement>("web-proxy-port").value = String(settings.web_proxy_port);
+}
+function showWebProxy(saved: WebProxySaved) {
+  webProxy = saved;
+  const placeholders = webProxyPlaceholders(saved);
+  $<HTMLInputElement>("web-proxy-username").placeholder = placeholders.username;
+  $<HTMLInputElement>("web-proxy-password").placeholder = placeholders.password;
+  if (snapshot) render(snapshot);
+}
+async function loadWebProxy() {
+  try {
+    showWebProxy(await api.webProxy());
+    webProxyUnreadable = false;
+  } catch (e) {
+    // New credentials can still be saved over it, or it can be removed.
+    webProxyUnreadable = true;
+    showWebProxy({ saved: false, username: null, store: "" });
+    notice(errorMessage(e), true);
+  }
+}
+// A test the bundled node could not run says so, instead of the generic
+// command failure.
+async function proxyTest<T>(run: () => Promise<T>): Promise<T> {
+  try { return await run(); }
+  catch (e) { throw e === "command_failed" || e === "command_timeout" ? "proxy_test_unavailable" : e; }
+}
+// The proxy form as typed: both credentials, or neither to keep the saved ones.
+function webProxyForm(): { pages: WebProxyUse; port: number; username: string; password: string } | undefined {
+  const pages = $<HTMLSelectElement>("web-proxy-use").value;
+  const port = Number($<HTMLSelectElement>("web-proxy-port").value);
+  const username = $<HTMLInputElement>("web-proxy-username").value.trim();
+  const password = $<HTMLInputElement>("web-proxy-password").value;
+  if (!validWebProxyUse(pages) || !validWebProxyPort(port)) { notice("Choose what the proxy is for and its port", true); return; }
+  if (!username && !password) {
+    if (!webProxy?.saved) { notice(errorMessage("web_proxy_not_saved"), true); return; }
+  } else if (!validWebProxyUsername(username) || !validWebProxyPassword(password)) {
+    notice("Enter the proxy username (letters and digits) and its password from your Webshare dashboard", true);
+    return;
+  }
+  return { pages, port, username, password };
+}
+const showProxyResult = (text: string) => {
+  setText($("web-proxy-result"), text);
+  $("web-proxy-result").hidden = !text;
+};
+$("web-proxy-test").addEventListener("click", () => {
+  const form = webProxyForm();
+  if (!form) return;
+  let result: WebProxyTest | undefined;
+  showProxyResult("");
+  void act(async () => {
+    result = await proxyTest(() => api.testWebProxy(form.pages, form.port, form.username, form.password));
+    showProxyResult(webProxyTestText(result));
+  }, () => ({ text: webProxyTestText(result!), error: !result!.ok }));
+});
+// Save keeps the credentials and, with the switch on, tests first: only a
+// passing test turns the proxy on. The page shows what was saved either way.
+$("web-proxy-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const form = webProxyForm();
+  if (!form) return;
+  const enabled = $<HTMLInputElement>("web-proxy").checked;
+  for (const id of ["web-proxy-username", "web-proxy-password"]) $<HTMLInputElement>(id).value = "";
+  let outcome = { text: "", error: false };
+  showProxyResult("");
+  void act(async () => {
+    try {
+      const result = await proxyTest(() => api.saveWebProxy(enabled, form.pages, form.port, form.username, form.password));
+      outcome = webProxySaved(result, !!snapshot?.supervised);
+      showProxyResult(result.test ? webProxyTestText(result.test) : "");
+      webProxyUnreadable = false;
+      showWebProxy(result);
+    } finally {
+      // Show what is saved, whether or not the change was.
+      const saved = await api.preferences().catch(() => undefined);
+      if (saved) { savedPreferences = saved; showWebProxySettings(saved); }
+    }
+  }, () => outcome);
+});
+$("web-proxy-remove").addEventListener("click", () => {
+  if (!confirm("Remove the saved proxy?\n\nThe proxy username and password are deleted from this device and the proxy is turned off. A running node keeps its proxy until it next starts."))
+    return;
+  showProxyResult("");
+  void act(async () => {
+    try { await api.removeWebProxy(); }
+    finally {
+      const saved = await api.preferences().catch(() => undefined);
+      if (saved) { savedPreferences = saved; showWebProxySettings(saved); }
+      await loadWebProxy();
+    }
+  }, snapshot?.supervised ? "Proxy removed. Stop and start the node to apply it" : "Proxy removed");
 });
 $("autostart").addEventListener("change", () => {
   const input = $<HTMLInputElement>("autostart");

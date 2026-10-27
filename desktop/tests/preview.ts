@@ -1,7 +1,7 @@
 /// <reference types="vite/client" />
 import { mockIPC } from "@tauri-apps/api/mocks";
 import type { InvokeArgs } from "@tauri-apps/api/core";
-import type { Account, ClaudeStatus, Preferences, Snapshot, XLoginStatus } from "../src/model.ts";
+import type { Account, ClaudeStatus, Preferences, Snapshot, WebProxySaved, WebProxyUse, XLoginStatus } from "../src/model.ts";
 import { historyBytes, MAX_HISTORY_BYTES, type Diagnostics, type DiagnosticsRecord, type DiagnosticsSpan } from "../src/diagnostics.ts";
 import type { UpdateStatus } from "../src/update.ts";
 
@@ -14,12 +14,16 @@ if (!import.meta.env.DEV || !["127.0.0.1", "localhost", "[::1]"].includes(locati
 const scenarios = ["ready", "unpaired", "relay-halted", "auth-required", "pending-login", "running-local-api",
   "available", "required", "downloading", "draining", "updated", "rolled-back",
   "web-only", "web-off", "browser-downloading", "browser-off", "history-full",
-  "missed-jobs", "heartbeat-late", "older-node"] as const;
+  "missed-jobs", "heartbeat-late", "older-node", "web-proxy", "proxy-resting"] as const;
 type Scenario = typeof scenarios[number];
 const requested = new URLSearchParams(location.search).get("scenario");
 const scenario: Scenario = scenarios.includes(requested as Scenario) ? requested as Scenario : "ready";
 const at = (secondsAgo = 0) => new Date(Date.now() - secondsAgo * 1000).toISOString();
-let preferences: Preferences = { schema: 1, local_api_port: 8088, background: true, x_concurrency: 2, updates: "notify", resume_serving: true, serve_web: true, web_concurrency: 0, web_browser_concurrency: 0 };
+let preferences: Preferences = { schema: 1, local_api_port: 8088, background: true, x_concurrency: 2, updates: "notify", resume_serving: true, serve_web: true, web_concurrency: 0, web_browser_concurrency: 0, web_proxy: false, web_proxy_use: "limited_sites", web_proxy_port: 80 };
+// The synthetic proxy: only whether one is saved and a masked username, as
+// the native side reports it. No password exists anywhere in the preview.
+let proxySaved: WebProxySaved = { saved: false, username: null, store: "Keychain" };
+let proxyRunning: { use: WebProxyUse; port: number } | null = null;
 let webRunning = true;
 let autostart = false;
 let claude: ClaudeStatus = { available: true, connected: false, pending: false };
@@ -103,6 +107,21 @@ if (scenario === "older-node") {
   observation.dispatch_health = undefined;
 }
 
+// The proxy is on for sites that limit this network, and the last proxied
+// page reported its exit.
+if (scenario === "web-proxy" || scenario === "proxy-resting") {
+  Object.assign(preferences, { web_proxy: true, web_proxy_use: "limited_sites", web_proxy_port: 80 });
+  proxySaved = { saved: true, username: "pre••••", store: "Keychain" };
+  proxyRunning = { use: "limited_sites", port: 80 };
+  webService.egress = "both";
+  observation.web_egress = { via: "both", provider: "webshare", country: "us", last_exit: "45.86.200.17", last_exit_at: at(40), rest_reason: null };
+}
+// The proxy refused its sign-in, so the node rests web for 10 minutes and
+// never sends the pages direct.
+if (scenario === "proxy-resting") {
+  Object.assign(webService, { state: "unreachable", last_error_code: "web_proxy_failed", in_flight: 0 });
+  observation.web_egress!.rest_reason = "proxy_auth";
+}
 if (scenario === "web-only") {
   snapshot.accounts = [];
   observation.accounts = [];
@@ -261,6 +280,8 @@ mockIPC((command, payload) => {
       if (snapshot.supervised && observation.last_heartbeat_ok_at && scenario !== "heartbeat-late") observation.last_heartbeat_ok_at = at(4);
       snapshot.web_enabled = preferences.serve_web;
       snapshot.web_restart_pending = snapshot.supervised && webRunning !== preferences.serve_web;
+      snapshot.web_proxy = preferences.web_proxy ? { use: preferences.web_proxy_use, port: preferences.web_proxy_port } : null;
+      snapshot.web_proxy_restart_pending = snapshot.supervised && JSON.stringify(proxyRunning) !== JSON.stringify(preferences.serve_web ? snapshot.web_proxy : null);
       return structuredClone(snapshot);
     case "desktop_diagnostics": return structuredClone(diagnostics);
     case "claude_status": return structuredClone(claude);
@@ -273,6 +294,22 @@ mockIPC((command, payload) => {
     case "update_ack": return null;
     case "update_dismiss": if (text(data, "notice") === "updated") update.updated = null; else update.failure = null; return null;
     case "set_web_serving": preferences.serve_web = !!data.enabled; return null;
+    case "get_web_proxy": return structuredClone(proxySaved);
+    case "test_web_proxy": case "save_web_proxy": {
+      const pages = text(data, "pages") === "all" ? "all" : "limited_sites";
+      const port = Number(data.port);
+      const typed = !!text(data, "username") || !!text(data, "password");
+      if (typed && !(text(data, "username") && text(data, "password"))) throw "invalid_input";
+      if (!typed && !proxySaved.saved) throw "web_proxy_not_saved";
+      // A password of "wrong" fails sign-in, so the failed-save path can be seen.
+      const test = text(data, "password") === "wrong" ? { ok: false, class: "proxy_auth" } : { ok: true, exit: "45.86.200.17" };
+      if (command === "test_web_proxy") return test;
+      if (typed) proxySaved = { saved: true, username: `${text(data, "username").slice(0, 3)}••••`, store: "Keychain" };
+      const enabled = !!data.enabled && test.ok;
+      Object.assign(preferences, { web_proxy: enabled, web_proxy_use: pages, web_proxy_port: port });
+      return { ...structuredClone(proxySaved), enabled, test: data.enabled ? test : null };
+    }
+    case "remove_web_proxy": preferences.web_proxy = false; proxySaved = { saved: false, username: null, store: "Keychain" }; return null;
     case "set_update_mode": preferences.updates = text(data, "mode") === "automatic" ? "automatic" : "notify"; return null;
     case "pair_node": if (!text(data, "code")) throw "invalid_input"; snapshot.paired = true; return null;
     case "control_node": {
@@ -281,6 +318,7 @@ mockIPC((command, payload) => {
       if (action === "start" && snapshot.local_api?.running) throw "mode_conflict";
       if (action === "start" || action === "stop") snapshot.supervised = action === "start";
       if (action === "start") webRunning = preferences.serve_web;
+      if (action === "start") proxyRunning = preferences.serve_web && preferences.web_proxy ? { use: preferences.web_proxy_use, port: preferences.web_proxy_port } : null;
       observation.state = snapshot.supervised ? "running" : "offline";
       observation.drain_requested = action === "pause";
       if (action === "stop") {
@@ -333,7 +371,7 @@ const calls: PreviewCall[] = [];
 const redact = (value: unknown): unknown => {
   if (Array.isArray(value)) return value.map(redact);
   if (!value || typeof value !== "object") return value;
-  return Object.fromEntries(Object.entries(value).map(([name, entry]) => [name, /^(code|authToken|ct0|password|key|claudeKey)$/i.test(name) ? "[redacted]" : redact(entry)]));
+  return Object.fromEntries(Object.entries(value).map(([name, entry]) => [name, /^(code|authToken|ct0|password|username|key|claudeKey)$/i.test(name) ? "[redacted]" : redact(entry)]));
 };
 const internals = (window as unknown as { __TAURI_INTERNALS__: { invoke: (command: string, payload?: InvokeArgs) => Promise<unknown> } }).__TAURI_INTERNALS__;
 const mockedInvoke = internals.invoke;

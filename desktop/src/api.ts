@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Snapshot, BrowserProfile, Preferences, ClaudeStatus, XLoginStatus } from "./model.ts";
+import type { Snapshot, BrowserProfile, Preferences, ClaudeStatus, XLoginStatus, WebProxySaved, WebProxySaveResult, WebProxyTest, WebProxyUse } from "./model.ts";
 import type { Diagnostics } from "./diagnostics.ts";
 import type { UpdateStatus } from "./update.ts";
 export const api = {
@@ -7,6 +7,17 @@ export const api = {
   savePreferences: (data: Preferences) => invoke<void>("save_desktop_preferences", { data }),
   // Saved at once; used from the next node start.
   setWebServing: (enabled: boolean) => invoke<void>("set_web_serving", { enabled }),
+  // The saved proxy: whether one is saved and a masked username, never the password.
+  webProxy: () => invoke<WebProxySaved>("get_web_proxy"),
+  // Empty username and password keep the saved ones. With the switch on the
+  // app runs Test first and turns the proxy on only when it passes; used from
+  // the next node start.
+  saveWebProxy: (enabled: boolean, pages: WebProxyUse, port: number, username: string, password: string) =>
+    invoke<WebProxySaveResult>("save_web_proxy", { enabled, pages, port, username, password }),
+  testWebProxy: (pages: WebProxyUse, port: number, username: string, password: string) =>
+    invoke<WebProxyTest>("test_web_proxy", { pages, port, username, password }),
+  // Turns the proxy off and deletes its keychain item.
+  removeWebProxy: () => invoke<void>("remove_web_proxy"),
   autostart: () => invoke<boolean>("desktop_autostart"),
   setAutostart: (enabled: boolean) => invoke<void>("set_desktop_autostart", { enabled }),
   quit: () => invoke<void>("quit_desktop"),
