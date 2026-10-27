@@ -171,7 +171,13 @@ func TestRunLoopTakesSeveralOffersAndRejectsWithoutBlocking(t *testing.T) {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			arrivals <- arrival{h, time.Now()}
+			// The test reads only the first two heartbeats. Once the holds
+			// end, the node heartbeats in a loop, so a full channel must not
+			// block here, or the server never closes.
+			select {
+			case arrivals <- arrival{h, time.Now()}:
+			default:
+			}
 			if heartbeats.Add(1) == 1 {
 				var leases []string
 				for _, l := range []coordinator.Lease{running, full, invalid, running, busy} {

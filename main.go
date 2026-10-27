@@ -654,7 +654,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 				mu.Unlock()
 			}
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "submit:", err)
+				fmt.Fprintln(os.Stderr, submitStage(err)+":", err)
 			} else if c.LocalFixture {
 				fmt.Printf("fixture job %s: %s\n", l.JobID, map[bool]string{true: "failed (" + code + ")", false: "submitted"}[code != ""])
 			}
@@ -761,17 +761,26 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 		}
 		return true
 	}
-	lastRecovery := time.Now()
+	lastPurge := time.Now()
+	// The first idle pass follows startup recovery by the usual interval.
+	reconcile := &idleReconciler{next: time.Now().Add(reconcileInterval)}
 	advertisedDrained, firstHeartbeat := false, true
 	for ctx.Err() == nil {
-		if time.Since(lastRecovery) >= 30*time.Second {
+		// The purge waits for a running idle pass, which may hold a record it
+		// would change.
+		if time.Since(lastPurge) >= reconcileInterval && !reconcile.busy() {
 			if err := journal.Purge(time.Now()); err != nil {
 				return err
 			}
-			if err := reconcileIdle(ctx, client, journal, active.snapshot()); err != nil {
+			lastPurge = time.Now()
+		}
+		// The records are chosen here, after the active snapshot; the pass
+		// asks the coordinator on its own goroutine, so this poll is never
+		// held off by it.
+		if reconcile.due(time.Now()) {
+			if err := reconcile.start(ctx, client, journal, active.snapshot(), &running); err != nil {
 				return err
 			}
-			lastRecovery = time.Now()
 		}
 		ad, err := advertise()
 		if err != nil {
@@ -990,7 +999,17 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 		l, err = client.Accept(ctx, l)
 		endAccept(diagnosticOutcome(ctx, "", err))
 		if err != nil {
-			return "", err
+			// A refusal that proves the coordinator holds no lease for this
+			// node ends the record now, as a local refusal does, so it is
+			// never reconciled. No rejection follows: one would draw on the
+			// same per-node budget a 429 says is spent, and the coordinator
+			// already knows the attempt was not accepted.
+			if coordinator.AcceptRefused(err) {
+				if terminalErr := journal.TerminalContext(ctx, record); terminalErr != nil {
+					return "", &stageError{"accept", terminalErr}
+				}
+			}
+			return "", &stageError{"accept", err}
 		}
 		ctx = predial.Accepted(ctx, l)
 	}
@@ -1082,5 +1101,32 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	if err != nil {
 		return code, err
 	}
-	return code, submitRecord(ctx, client, journal, record)
+	deadline := l.LeaseDeadline
+	if l.SettlementDeadline.Before(deadline) {
+		deadline = l.SettlementDeadline
+	}
+	if err = submitReport(ctx, client, journal, record, deadline.Add(-worker.ReportMargin(l.ServiceType))); err != nil {
+		return code, &stageError{"report", err}
+	}
+	return code, nil
+}
+
+// stageError names the coordinator call a submitLease error came from, so
+// that the worker's log line says which one failed.
+type stageError struct {
+	stage string
+	err   error
+}
+
+func (e *stageError) Error() string { return e.err.Error() }
+func (e *stageError) Unwrap() error { return e.err }
+
+// submitStage is the log prefix for a submitLease error: "accept" or "report"
+// for a failed coordinator call, "submit" for anything else.
+func submitStage(err error) string {
+	var stage *stageError
+	if errors.As(err, &stage) {
+		return stage.stage
+	}
+	return "submit"
 }

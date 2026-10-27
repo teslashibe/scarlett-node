@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "version": "0.1.19",
+  "date": "2026-10-26",
+  "title": "Steadier job delivery when the network is busy",
+  "highlights": [
+    "When the network asks your node to slow down, it now waits and tries again, so fewer jobs, reports and rendered pages are lost",
+    "When a website rate-limits your address, your node no longer asks it a second time seconds later"
+  ]
+}

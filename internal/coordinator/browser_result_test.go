@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -399,12 +400,14 @@ func TestUploadBrowserResultSendsPartsThenTheManifest(t *testing.T) {
 }
 
 // Transient failures (503 with Retry-After, 502, a transport error) are
-// retried per part; a later upload resumes from the stored set and skips
-// what is already there under the same upload sha256.
+// retried per part, as often as the time left allows; a later upload resumes
+// from the stored set and skips what is already there under the same upload
+// sha256.
 func TestUploadBrowserResultRetriesAndResumes(t *testing.T) {
 	m, gz := preparedManifest(t, randomBytes(t, 5<<20))
 	f := newFakeBrowserCoordinator(t, m)
 	failed := map[string]bool{}
+	part3 := 0
 	f.fail = func(method, route string, n int, w http.ResponseWriter) bool {
 		key := method + route + strconv.Itoa(n)
 		if route == "part" && n == 2 && !failed[key] {
@@ -414,8 +417,13 @@ func TestUploadBrowserResultRetriesAndResumes(t *testing.T) {
 			return true
 		}
 		if route == "part" && n == 3 {
-			// Part 3 fails every time: the upload stops after three tries.
-			w.WriteHeader(http.StatusBadGateway)
+			// Part 3 fails five times, more than the three tries an upload
+			// once had, and then with a final answer that ends the upload.
+			if part3++; part3 <= 5 {
+				w.WriteHeader(http.StatusBadGateway)
+			} else {
+				writeError(w, http.StatusBadRequest, "invalid_part")
+			}
 			return true
 		}
 		return false
@@ -424,7 +432,7 @@ func TestUploadBrowserResultRetriesAndResumes(t *testing.T) {
 	started := time.Now()
 	stats, err := c.UploadBrowserResult(context.Background(), testJob, m, gz, report())
 	var status *StatusError
-	if !errors.As(err, &status) || status.Status != http.StatusBadGateway || stats.PartsSent != 2 || stats.Retries != 3 {
+	if !errors.As(err, &status) || status.Status != http.StatusBadRequest || stats.PartsSent != 2 || stats.Retries != 6 || part3 != 6 {
 		t.Fatalf("err %v stats %+v log %v", err, stats, f.requests())
 	}
 	if time.Since(started) < time.Second {
@@ -442,20 +450,104 @@ func TestUploadBrowserResultRetriesAndResumes(t *testing.T) {
 	}
 }
 
+// A coordinator that keeps limiting the node is asked again until the next
+// try could not start in time before the report deadline, and the last
+// answer is returned.
+func TestUploadBrowserResultRetriesUntilTheReportDeadline(t *testing.T) {
+	m := browserResultFixture(t, "browser-result-memory.json")
+	f := newFakeBrowserCoordinator(t, m)
+	f.fail = func(method, route string, n int, w http.ResponseWriter) bool {
+		writeError(w, http.StatusTooManyRequests, "rate_limited")
+		return true
+	}
+	c := New(f.URL, "synthetic-credential")
+	c.uploadBackoff = []time.Duration{20 * time.Millisecond}
+	deadline := time.Now().Add(browserManifestMinimum + 400*time.Millisecond)
+	stats, err := c.UploadBrowserResult(context.Background(), testJob, m, "", deadline)
+	var status *StatusError
+	if n := len(f.requests()); !errors.As(err, &status) || status.Status != http.StatusTooManyRequests || stats.Retries < 4 || n < stats.Retries || n > stats.Retries+1 {
+		t.Fatalf("err %v stats %+v, %d requests", err, stats, n)
+	}
+	if left := time.Until(deadline); left > browserManifestMinimum+200*time.Millisecond || left < browserManifestMinimum-time.Second {
+		t.Fatalf("gave up with %v left", left)
+	}
+}
+
+// A coordinator that keeps refusing an upload with minutes left before the
+// report deadline is waited for only as long as the upload's retry budget,
+// counted over parts and manifest together.
+func TestUploadBrowserResultKeepsToItsRetryBudget(t *testing.T) {
+	m, gz := preparedManifest(t, randomBytes(t, 3<<20))
+	f := newFakeBrowserCoordinator(t, m)
+	f.fail = func(method, route string, n int, w http.ResponseWriter) bool {
+		// Part 1 is stored after two refusals; part 2 never is.
+		if route == "part" && (n == 2 || len(f.log) <= 3) {
+			writeError(w, http.StatusServiceUnavailable, "network_unavailable")
+			return true
+		}
+		return false
+	}
+	c := New(f.URL, "synthetic-credential")
+	c.uploadBackoff = []time.Duration{20 * time.Millisecond}
+	c.uploadRetryBudget = 110 * time.Millisecond
+	started := time.Now()
+	stats, err := c.UploadBrowserResult(context.Background(), testJob, m, gz, time.Now().Add(time.Hour))
+	var status *StatusError
+	// Each wait is 20-25 ms: four or five fit the budget, two of them part 1's.
+	if !errors.As(err, &status) || status.Status != http.StatusServiceUnavailable || stats.PartsSent != 1 || stats.Retries < 4 || stats.Retries > 5 {
+		t.Fatalf("err %v stats %+v log %v", err, stats, f.requests())
+	}
+	if took := time.Since(started); took > 5*time.Second {
+		t.Fatal("waited past the retry budget", took)
+	}
+}
+
+// The schedule is 1, 2, 4 and then every 8 seconds with up to a quarter
+// more, within a minute of waits per upload, and a longer Retry-After wins.
+func TestBrowserUploadBackoff(t *testing.T) {
+	if !reflect.DeepEqual(browserUploadBackoff, []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}) || browserUploadRetryBudget != time.Minute {
+		t.Fatal(browserUploadBackoff, browserUploadRetryBudget)
+	}
+	m := browserResultFixture(t, "browser-result-memory.json")
+	f := newFakeBrowserCoordinator(t, m)
+	tries := 0
+	f.fail = func(method, route string, n int, w http.ResponseWriter) bool {
+		if tries++; tries > 1 {
+			return false
+		}
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusTooManyRequests, "rate_limited")
+		return true
+	}
+	c := New(f.URL, "synthetic-credential")
+	c.uploadBackoff = []time.Duration{time.Millisecond}
+	started := time.Now()
+	if stats, err := c.UploadBrowserResult(context.Background(), testJob, m, "", report()); err != nil || stats.Retries != 1 || time.Since(started) < time.Second {
+		t.Fatal("Retry-After not honoured", err, stats, time.Since(started))
+	}
+}
+
 // A node that rebuilt its gzip stream (a different upload sha256) sends
 // every part again and the coordinator replaces the old set.
 func TestUploadBrowserResultReplacesAnOldSet(t *testing.T) {
 	old, oldGz := preparedManifest(t, randomBytes(t, 3<<20))
 	f := newFakeBrowserCoordinator(t, old)
+	// The manifest is refused until the upload is given up on.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manifests := 0
 	f.fail = func(method, route string, n int, w http.ResponseWriter) bool {
 		if route == "manifest" {
+			if manifests++; manifests == 3 {
+				cancel()
+			}
 			writeError(w, http.StatusServiceUnavailable, "network_unavailable")
 			return true
 		}
 		return false
 	}
 	c := uploadClient(f.URL)
-	if _, err := c.UploadBrowserResult(context.Background(), testJob, old, oldGz, report()); err == nil {
+	if _, err := c.UploadBrowserResult(ctx, testJob, old, oldGz, report()); err == nil {
 		t.Fatal("manifest stored despite 503s")
 	}
 	f.mu.Lock()

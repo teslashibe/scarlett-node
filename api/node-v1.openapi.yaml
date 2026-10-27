@@ -208,16 +208,19 @@ paths:
         two more nodes (hedging) and the first acceptance wins; a lost hedge or a superseded
         assignment is answered 409 attempt_conflict, which the node treats as final.
         Acceptance of the exact attempt and fence is idempotent, so on a 503 dispatch_busy or
-        network_unavailable the node repeats the same request inside the same acceptance, at
-        most three times, each after the Retry-After (clamped to 1–60 seconds, one second when
-        absent) plus jitter, and never later than 30 seconds before the lease deadline. It never
-        repeats a 401, 404, 409 or 429. The node refuses, without this request, an offer whose
-        lease deadline is more than its service's offer lifetime (plus 5 seconds of clock skew)
-        ahead of its own clock: 300 seconds for web and x_read, 120 seconds for codex. A web job's
-        deadline is its creation second plus 298 seconds. An x_read search of four to ten pages
-        has the same 298 seconds; one of one to three pages, and every other read, keeps 118
-        seconds. An x_read offer need not carry its payload, so the node allows every x_read
-        offer the 300 seconds.
+        network_unavailable, or a 429 rate_limited whose Retry-After is at most 2 seconds, the node
+        repeats the same request inside the same acceptance, at most three times, each after the
+        Retry-After (clamped to 1–60 seconds, one second when absent) plus jitter, and never later
+        than 30 seconds before the lease deadline. It never repeats a 401, 404 or 409, or a 429
+        without such a Retry-After. A final 400, 401, 404, 409 or 429 means no lease exists for
+        this node, so the node ends the attempt's journal record without reconciling it and sends
+        no rejection, unless an earlier try was answered 503 network_unavailable, which may follow
+        a committed acceptance. The node refuses, without this request, an offer whose lease
+        deadline is more than its service's offer lifetime (plus 5 seconds of clock skew) ahead of
+        its own clock: 300 seconds for web and x_read, 120 seconds for codex. A web job's deadline
+        is its creation second plus 298 seconds. An x_read search of four to ten pages has the same
+        298 seconds; one of one to three pages, and every other read, keeps 118 seconds. An x_read
+        offer need not carry its payload, so the node allows every x_read offer the 300 seconds.
       requestBody:
         required: true
         content:
@@ -332,10 +335,11 @@ paths:
         replaces it (a node that rebuilt its gzip stream starts over); the same part sent again
         with the same bytes gets 200. After the manifest is committed any PUT gets 409
         result_conflict. The coordinator allows at least 90 seconds to read one part. The node
-        holds one part in memory, sends parts in order, and repeats a part after a transport
-        failure, 429 or 5xx at most three times (1, 2 and 4 seconds apart, or the Retry-After when
-        longer), each try starting only while max(10 s, part size / 250 kB/s + 5 s) is left before
-        the report deadline.
+        holds one part in memory, sends parts in order, and repeats a part or the manifest after
+        a transport failure, 429 or 5xx (1, 2, 4 and then every 8 seconds, or the Retry-After
+        when longer, each with jitter) for as long as the next try can start and the upload's
+        waits stay within 60 seconds in all: a part try only while max(10 s, part size /
+        250 kB/s + 5 s) is left before the report deadline, a manifest try while 3 s is.
       requestBody:
         required: true
         content:
@@ -475,8 +479,10 @@ paths:
         that result/proven/fail persist one immutable submission body per attempt
         and fence, with identical retries returning the original outcome and changed
         bodies rejected. submission_sha256 hashes the exact HTTP report body bytes.
-        Report retries require this explicit contract. Persistence idempotency never
-        authorizes repeated provider execution. live means no committed report;
+        Report retries require this explicit contract; the node relies on it to send its
+        first report again in place, with the same body, after a 429, a 503
+        network_unavailable or a lost answer, for at most 10 seconds. Persistence idempotency
+        never authorizes repeated provider execution. live means no committed report;
         proof_pending means the verifier owns ingestion; accepted/failed are committed
         outcomes, with submission_sha256 unless the coordinator decided a relay web
         attempt from the verifier's own record before the node's report arrived (the

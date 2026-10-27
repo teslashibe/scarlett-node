@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"errors"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -207,7 +208,10 @@ func (w Web) runBrowser(ctx context.Context, l coordinator.Lease, plan webPlan, 
 			browserCode = "web_browser_failed"
 		}
 	}
-	refetch := res.Challenge != "unsolved"
+	// No re-fetch follows a challenge the browser could not clear, or a main
+	// document answered 429: the site is limiting this node's address, and a
+	// second request from it seconds later only extends the limit.
+	refetch := res.Challenge != "unsolved" && res.StatusCode != http.StatusTooManyRequests
 
 	var (
 		mu          sync.Mutex

@@ -27,6 +27,11 @@ type AttemptStatus struct {
 	SubmissionSHA256 string `json:"submission_sha256,omitempty"`
 }
 
+// AttemptStatus reads the coordinator's outcome for one attempt. A request
+// that gets no HTTP answer fails with a *TransportError, and any answer other
+// than 200 with a *StatusError, so a caller can tell a rate limit or an
+// unavailable coordinator (429, 503 and its Retry-After) from a refusal of
+// this attempt (401, 404, 409).
 func (c *Client) AttemptStatus(ctx context.Context, job, attempt, fence string) (AttemptStatus, error) {
 	var result AttemptStatus
 	path, err := JobPath(job, "attempt")
@@ -43,12 +48,12 @@ func (c *Client) AttemptStatus(ctx context.Context, job, attempt, fence string) 
 	req.Header.Set(NodeVersionHeader, NodeRelease)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return result, errors.New("attempt reconciliation unavailable")
+		return result, transportError(err)
 	}
 	defer resp.Body.Close()
 	c.observeRelease(resp.Header)
 	if resp.StatusCode != http.StatusOK {
-		return result, errors.New("attempt reconciliation not supported or unauthorized")
+		return result, statusError(resp)
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8193))
 	if err != nil || len(raw) > 8192 || json.Unmarshal(raw, &result) != nil {
