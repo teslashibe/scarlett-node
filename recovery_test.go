@@ -696,6 +696,56 @@ func TestReconcileIdleKeepsToItsBudget(t *testing.T) {
 	}
 }
 
+// start returns as soon as the records are chosen: the heartbeat loop polls
+// while the coordinator is slow to answer, no second pass starts and the
+// purge waits until the running one ends, and a stop waits for it.
+func TestReconcileStartLeavesTheLoopFree(t *testing.T) {
+	j := testJournal(t, filepath.Join(t.TempDir(), "attempts"))
+	pendingRecords(t, j, 2, time.Now().Add(time.Minute))
+	release := make(chan struct{})
+	var gets atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		gets.Add(1)
+		select {
+		case <-release:
+		case <-req.Context().Done():
+			return
+		}
+		w.WriteHeader(http.StatusConflict)
+	}))
+	defer server.Close()
+	client := coordinator.New(server.URL, "synthetic")
+	var idle idleReconciler
+	var running sync.WaitGroup
+	began := time.Now()
+	if err := idle.start(context.Background(), client, j, map[string]bool{}, &running); err != nil {
+		t.Fatal(err)
+	}
+	if took := time.Since(began); took > time.Second {
+		t.Fatalf("start waited %v for the coordinator", took)
+	}
+	if !idle.busy() || idle.due(time.Now().Add(time.Hour)) {
+		t.Fatal("a running pass let another start or the purge run")
+	}
+	close(release)
+	running.Wait()
+	if idle.busy() || gets.Load() != 2 {
+		t.Fatalf("pass still running after it ended, %d reads", gets.Load())
+	}
+	if idle.due(time.Now().Add(reconcileInterval-time.Second)) || !idle.due(time.Now().Add(reconcileInterval)) {
+		t.Fatal("next pass not paced after an asynchronous pass")
+	}
+	// Both records now wait, so a pass due at once chooses nothing and
+	// starts no goroutine.
+	idle.next = time.Time{}
+	if err := idle.start(context.Background(), client, j, map[string]bool{}, &running); err != nil {
+		t.Fatal(err)
+	}
+	if idle.busy() || gets.Load() != 2 {
+		t.Fatalf("a pass with nothing due ran, %d reads", gets.Load())
+	}
+}
+
 // A record a pass handled and left pending (the verifier is still ingesting
 // its proof) is read again only after a wait that doubles, and a worker's own
 // records, ready ones included, are left to it.

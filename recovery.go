@@ -237,9 +237,10 @@ func (a *activeAttempts) snapshot() map[string]bool {
 	return out
 }
 
-// Idle reconciliation runs in the heartbeat loop between two polls, and the
-// coordinator counts every attempt read and report against the same per-node
-// budget as acceptances, so each pass is bounded.
+// Idle reconciliation chooses its records in the heartbeat loop between two
+// polls and asks the coordinator about them on a goroutine of its own, so no
+// poll waits for those answers. The coordinator counts every attempt read and
+// report against a per-node budget, so each pass is bounded.
 const (
 	// reconcileInterval is the time to the next pass after one that read
 	// every due record, or that the coordinator stopped.
@@ -252,13 +253,11 @@ const (
 	// reconcilePassRecords is the most records one pass reads.
 	reconcilePassRecords = 8
 	// reconcilePassBudget is the time after which a pass starts no other
-	// record, so the next poll usually starts well inside the coordinator's
-	// three-second liveness window.
+	// record; the records it leaves are the next pass's.
 	reconcilePassBudget = 2 * time.Second
 	// reconcileRecordTimeout bounds one record's attempt read and report
 	// together. The pass budget never cuts a record it started, so a report
-	// that a slow coordinator takes more than 2 s to store still lands, and a
-	// pass holds the loop for at most about 7 s.
+	// that a slow coordinator takes more than 2 s to store still lands.
 	reconcileRecordTimeout = 5 * time.Second
 	// A record a pass read and left pending (a proven report the verifier is
 	// still ingesting, read proof_pending or answered 202, or any refusal or
@@ -269,10 +268,15 @@ const (
 	reconcileRetryWaitCap = 5 * time.Minute
 )
 
-// idleReconciler paces reconcileIdle. Only the heartbeat loop uses it.
+// idleReconciler paces idle reconciliation. Only the heartbeat loop calls due,
+// busy, start and reconcileIdle; mu guards what a running pass writes back.
 type idleReconciler struct {
+	mu sync.Mutex
 	// next is when the next pass is due.
 	next time.Time
+	// running is set from the moment a pass's records are chosen until the
+	// pass ends.
+	running bool
 	// waits holds the records a pass read and left pending: when each is
 	// read again and the wait before that.
 	waits map[string]reconcileWait
@@ -283,8 +287,39 @@ type reconcileWait struct {
 	wait time.Duration
 }
 
-// due reports whether a pass may start at now.
-func (r *idleReconciler) due(now time.Time) bool { return !now.Before(r.next) }
+// due reports whether a pass may start at now: none is running and the last
+// one asked for no later start.
+func (r *idleReconciler) due(now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return !r.running && !now.Before(r.next)
+}
+
+// busy reports whether a pass is running. The journal purge waits for it, so
+// that no record a pass holds changes state under it.
+func (r *idleReconciler) busy() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.running
+}
+
+// start chooses a pass's records in the calling goroutine, which must have
+// taken active first (see reconcileIdle), and runs the pass on a goroutine of
+// its own, counted in running so that a stop waits for it. The heartbeat loop
+// polls again at once instead of waiting for the coordinator's answers, so a
+// slow coordinator cannot make this node look gone between two polls.
+func (r *idleReconciler) start(ctx context.Context, client *coordinator.Client, journal *attempts.Journal, active map[string]bool, running *sync.WaitGroup) error {
+	due, err := r.choose(journal, active, time.Now())
+	if err != nil || len(due) == 0 {
+		return err
+	}
+	running.Add(1)
+	go func() {
+		defer running.Done()
+		r.pass(ctx, client, journal, due)
+	}()
+	return nil
+}
 
 // reconcileIdle retries ready reports and resolves started records that no
 // running worker owns, such as one left by a lost acceptance acknowledgement
@@ -298,13 +333,28 @@ func (r *idleReconciler) due(now time.Time) bool { return !now.Before(r.next) }
 // reconcileRecordTimeout. It stops at the first 429, 502, 503, 504 or
 // transport failure (a record out of time is one), and the next pass is then
 // due after reconcileInterval or the coordinator's Retry-After, whichever is
-// longer.
+// longer. It runs the whole pass in the calling goroutine; the heartbeat loop
+// uses start instead.
 func (r *idleReconciler) reconcileIdle(ctx context.Context, client *coordinator.Client, journal *attempts.Journal, active map[string]bool) error {
-	now := time.Now()
+	due, err := r.choose(journal, active, time.Now())
+	if err != nil || len(due) == 0 {
+		return err
+	}
+	r.pass(ctx, client, journal, due)
+	return nil
+}
+
+// choose reads the journal and returns a pass's due records in the order the
+// pass reads them. With any, the pass counts as running until pass returns.
+// The next pass is due after reconcileInterval unless the pass says sooner or
+// later.
+func (r *idleReconciler) choose(journal *attempts.Journal, active map[string]bool, now time.Time) ([]attempts.Record, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.next = now.Add(reconcileInterval)
 	records, err := journal.Pending()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	pending := make(map[string]bool, len(records))
 	due := []attempts.Record{}
@@ -326,20 +376,35 @@ func (r *idleReconciler) reconcileIdle(ctx context.Context, client *coordinator.
 		}
 		return due[i].Deadline.Before(due[j].Deadline)
 	})
+	r.running = len(due) > 0
+	return due, nil
+}
+
+// pass reads due, which choose returned, and ends the running pass.
+func (r *idleReconciler) pass(ctx context.Context, client *coordinator.Client, journal *attempts.Journal, due []attempts.Record) {
+	started := time.Now()
+	defer func() {
+		r.mu.Lock()
+		r.running = false
+		r.mu.Unlock()
+	}()
 	for i, record := range due {
-		if i == reconcilePassRecords || time.Since(now) >= reconcilePassBudget {
+		if i == reconcilePassRecords || time.Since(started) >= reconcilePassBudget {
+			r.mu.Lock()
 			r.next = time.Now().Add(reconcileBacklogInterval)
-			break
+			r.mu.Unlock()
+			return
 		}
 		recordCtx, cancel := context.WithTimeout(ctx, reconcileRecordTimeout)
 		err := recoverAttempt(recordCtx, client, journal, record)
 		cancel()
 		if ctx.Err() != nil {
-			return nil
+			return
 		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "reconcile:", err)
 		}
+		r.mu.Lock()
 		// A 429 is the coordinator's limit on this node, not on the record,
 		// which stays first for the next pass. Any other outcome waits: a
 		// record that settled leaves the journal and its wait is dropped next
@@ -348,16 +413,19 @@ func (r *idleReconciler) reconcileIdle(ctx context.Context, client *coordinator.
 		if !errors.As(err, &status) || status.Status != http.StatusTooManyRequests {
 			r.wait(record.Key())
 		}
-		if pause, stop := reconcileStop(err); stop {
+		pause, stop := reconcileStop(err)
+		if stop {
 			r.next = time.Now().Add(max(reconcileInterval, pause))
-			break
+		}
+		r.mu.Unlock()
+		if stop {
+			return
 		}
 	}
-	return nil
 }
 
 // wait puts off the next read of key by reconcileRetryWait, or by twice its
-// last wait up to reconcileRetryWaitCap.
+// last wait up to reconcileRetryWaitCap. The caller holds mu.
 func (r *idleReconciler) wait(key string) {
 	if r.waits == nil {
 		r.waits = map[string]reconcileWait{}

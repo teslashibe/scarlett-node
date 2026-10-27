@@ -766,16 +766,19 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	reconcile := &idleReconciler{next: time.Now().Add(reconcileInterval)}
 	advertisedDrained, firstHeartbeat := false, true
 	for ctx.Err() == nil {
-		if time.Since(lastPurge) >= reconcileInterval {
+		// The purge waits for a running idle pass, which may hold a record it
+		// would change.
+		if time.Since(lastPurge) >= reconcileInterval && !reconcile.busy() {
 			if err := journal.Purge(time.Now()); err != nil {
 				return err
 			}
 			lastPurge = time.Now()
 		}
-		// Bounded, and paced by the coordinator's answers, so the next poll
-		// is never held off for long.
+		// The records are chosen here, after the active snapshot; the pass
+		// asks the coordinator on its own goroutine, so this poll is never
+		// held off by it.
 		if reconcile.due(time.Now()) {
-			if err := reconcile.reconcileIdle(ctx, client, journal, active.snapshot()); err != nil {
+			if err := reconcile.start(ctx, client, journal, active.snapshot(), &running); err != nil {
 				return err
 			}
 		}
