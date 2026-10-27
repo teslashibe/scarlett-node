@@ -457,12 +457,16 @@ func TestReportRetriesInPlace(t *testing.T) {
 	}
 }
 
-// pendingRecords writes n started records for distinct jobs.
-func pendingRecords(t *testing.T, j *attempts.Journal, n int) {
+// pendingRecords writes n started records for distinct jobs, the i-th due
+// (n-i) seconds after deadline, so that their lease deadlines run against
+// the order of their job IDs.
+func pendingRecords(t *testing.T, j *attempts.Journal, n int, deadline time.Time) []attempts.Record {
 	t.Helper()
+	records := []attempts.Record{}
 	for i := range n {
 		l := testLease()
 		l.JobID = fmt.Sprintf("synthetic-%02d", i)
+		l.LeaseDeadline = deadline.Add(time.Duration(n-i) * time.Second)
 		r, err := attemptRecord(l)
 		if err != nil {
 			t.Fatal(err)
@@ -470,19 +474,40 @@ func pendingRecords(t *testing.T, j *attempts.Journal, n int) {
 		if err = j.Begin(r); err != nil {
 			t.Fatal(err)
 		}
+		records = append(records, r)
+	}
+	return records
+}
+
+// attemptJob is the job ID of an attempt read or report.
+func attemptJob(req *http.Request) string { return strings.Split(req.URL.Path, "/")[5] }
+
+// expireWaits makes every record's wait run out.
+func expireWaits(idle *idleReconciler) {
+	for key, w := range idle.waits {
+		w.at = time.Now().Add(-time.Second)
+		idle.waits[key] = w
 	}
 }
 
-// One idle pass reads at most reconcilePassRecords records, and the next
-// starts where it stopped, so every record is read in turn.
-func TestReconcileIdleCapsAndRotates(t *testing.T) {
+// One idle pass reads at most reconcilePassRecords records, earliest lease
+// deadline first and any past it last; the next follows soon while records
+// are left unread, and a record read and left pending waits for later ones.
+func TestReconcileIdleCapsAndOrders(t *testing.T) {
 	j := testJournal(t, filepath.Join(t.TempDir(), "attempts"))
-	pendingRecords(t, j, 12)
+	records := pendingRecords(t, j, 11, time.Now().Add(time.Minute))
+	// One more record is past its deadline: it can only be closed.
+	l := testLease()
+	l.JobID, l.LeaseDeadline = "synthetic-past", time.Now().Add(-time.Minute)
+	past, _ := attemptRecord(l)
+	if err := j.Begin(past); err != nil {
+		t.Fatal(err)
+	}
 	var mu sync.Mutex
 	read := []string{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		mu.Lock()
-		read = append(read, strings.Split(req.URL.Path, "/")[5])
+		read = append(read, attemptJob(req))
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
@@ -490,29 +515,44 @@ func TestReconcileIdleCapsAndRotates(t *testing.T) {
 	}))
 	defer server.Close()
 	client := coordinator.New(server.URL, "synthetic")
+	want := []string{}
+	for i := len(records) - 1; i >= 0; i-- {
+		want = append(want, records[i].JobID)
+	}
+	want = append(want, past.JobID)
 	var idle idleReconciler
-	for range 3 {
+	pass := func(reads []string, next time.Duration) {
+		t.Helper()
+		mu.Lock()
+		read = read[:0]
+		mu.Unlock()
 		if err := idle.reconcileIdle(context.Background(), client, j, map[string]bool{}); err != nil {
 			t.Fatal(err)
 		}
+		mu.Lock()
+		defer mu.Unlock()
+		if strings.Join(read, ",") != strings.Join(reads, ",") {
+			t.Fatalf("read %v, want %v", read, reads)
+		}
+		if now := time.Now(); idle.due(now.Add(next-time.Second)) || !idle.due(now.Add(next)) {
+			t.Fatalf("next pass in %v, want %v", idle.next.Sub(now), next)
+		}
 	}
-	pending, _ := j.Pending()
-	order := []string{}
-	for _, r := range pending {
-		order = append(order, r.JobID)
-	}
-	// Three passes of eight over twelve records read each one twice, in order.
-	want := append(append([]string{}, order...), order...)
-	if len(pending) != 12 || strings.Join(read, ",") != strings.Join(want, ",") {
-		t.Fatalf("read %v, want %v", read, want)
-	}
-	if !idle.due(time.Now().Add(reconcileInterval)) || idle.due(time.Now().Add(reconcileInterval-time.Second)) {
-		t.Fatal("next pass not paced by the interval")
+	pass(want[:reconcilePassRecords], reconcileBacklogInterval)
+	pass(want[reconcilePassRecords:], reconcileInterval)
+	// Every record now waits; once the waits run out the order is the same.
+	pass(nil, reconcileInterval)
+	expireWaits(&idle)
+	pass(want[:reconcilePassRecords], reconcileBacklogInterval)
+	if pending, _ := j.Pending(); len(pending) != len(want) {
+		t.Fatal("records settled on a conflict", len(pending))
 	}
 }
 
-// A pass stops at the first 429, 5xx or transport failure, and the next one
-// waits the longer of the interval and the coordinator's Retry-After.
+// A pass stops at the first 429, 502, 503, 504 or transport failure, and the
+// next one waits the longer of the interval and the coordinator's
+// Retry-After. A 429 limits the node, so the record it answered is first
+// again; any other stop puts the record off like a failure.
 func TestReconcileIdleStopsWhenTheCoordinatorCannotTakeMore(t *testing.T) {
 	for _, tc := range []struct {
 		status     int
@@ -524,10 +564,11 @@ func TestReconcileIdleStopsWhenTheCoordinatorCannotTakeMore(t *testing.T) {
 		{http.StatusTooManyRequests, "5", reconcileInterval},
 		{http.StatusServiceUnavailable, "", reconcileInterval},
 		{http.StatusBadGateway, "", reconcileInterval},
+		{http.StatusGatewayTimeout, "", reconcileInterval},
 		{0, "", reconcileInterval},
 	} {
 		j := testJournal(t, filepath.Join(t.TempDir(), "attempts"))
-		pendingRecords(t, j, 3)
+		records := pendingRecords(t, j, 3, time.Now().Add(time.Minute))
 		var gets atomic.Int32
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			gets.Add(1)
@@ -551,39 +592,107 @@ func TestReconcileIdleStopsWhenTheCoordinatorCannotTakeMore(t *testing.T) {
 		if idle.due(started.Add(tc.wait-time.Second)) || !idle.due(time.Now().Add(tc.wait*3/2)) {
 			t.Fatalf("%d %q: next pass at %v", tc.status, tc.retryAfter, idle.next.Sub(started))
 		}
-		// The record the pass stopped at is the next pass's first.
-		if idle.after != "" {
-			t.Fatal("stopped record counted as read")
+		_, waits := idle.waits[records[2].Key()]
+		if waits != (tc.status != http.StatusTooManyRequests) || len(idle.waits) > 1 {
+			t.Fatalf("%d: waits %v", tc.status, idle.waits)
 		}
 	}
 }
 
-// A pass ends within reconcilePassBudget however slowly the coordinator
-// answers, and the record it was reading is read first next time.
+// A record the coordinator keeps failing on, with a 500, a 503 or no answer
+// in reconcileRecordTimeout, never holds the others back: a 500 concerns the
+// record alone and the pass goes on, and a record that stopped a pass waits
+// before it is read again.
+func TestReconcileIdleOneFailingRecordHoldsNoneBack(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reply func(w http.ResponseWriter, req *http.Request)
+		first int32 // reads in the first pass
+	}{
+		{"500", func(w http.ResponseWriter, req *http.Request) { w.WriteHeader(http.StatusInternalServerError) }, 4},
+		{"503", func(w http.ResponseWriter, req *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) }, 1},
+		{"no answer", func(w http.ResponseWriter, req *http.Request) { <-req.Context().Done() }, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			j := testJournal(t, filepath.Join(t.TempDir(), "attempts"))
+			records := pendingRecords(t, j, 4, time.Now().Add(time.Minute))
+			bad := records[3].JobID // the earliest deadline
+			var mu sync.Mutex
+			read := map[string]int{}
+			var gets atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				gets.Add(1)
+				mu.Lock()
+				read[attemptJob(req)]++
+				mu.Unlock()
+				if attemptJob(req) == bad {
+					tc.reply(w, req)
+					return
+				}
+				w.WriteHeader(http.StatusConflict)
+			}))
+			defer server.Close()
+			client := coordinator.New(server.URL, "synthetic")
+			var idle idleReconciler
+			started := time.Now()
+			if err := idle.reconcileIdle(context.Background(), client, j, map[string]bool{}); err != nil || gets.Load() != tc.first {
+				t.Fatalf("first pass: %d reads, %v", gets.Load(), err)
+			}
+			if tc.name == "no answer" {
+				if took := time.Since(started); took < reconcileRecordTimeout || took > reconcileRecordTimeout+time.Second {
+					t.Fatalf("record cut after %v", took)
+				}
+			}
+			if err := idle.reconcileIdle(context.Background(), client, j, map[string]bool{}); err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			for _, r := range records {
+				if read[r.JobID] != 1 {
+					t.Fatalf("reads %v", read)
+				}
+			}
+		})
+	}
+}
+
+// The pass budget only decides whether another record starts: a record whose
+// read takes longer is answered, not cut, and the records after it are read
+// by the next pass, which follows after reconcileBacklogInterval.
 func TestReconcileIdleKeepsToItsBudget(t *testing.T) {
 	j := testJournal(t, filepath.Join(t.TempDir(), "attempts"))
-	pendingRecords(t, j, reconcilePassRecords)
+	records := pendingRecords(t, j, 3, time.Now().Add(time.Minute))
+	slow := records[2].JobID // the earliest deadline
 	var gets atomic.Int32
+	var cut atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		// Two records are answered; the third read never is.
-		if gets.Add(1) == 3 {
-			<-req.Context().Done()
-			return
+		gets.Add(1)
+		if attemptJob(req) == slow {
+			select {
+			case <-time.After(reconcilePassBudget + 500*time.Millisecond):
+			case <-req.Context().Done():
+				cut.Store(true)
+				return
+			}
 		}
 		w.WriteHeader(http.StatusConflict)
 	}))
 	defer server.Close()
+	client := coordinator.New(server.URL, "synthetic")
 	var idle idleReconciler
 	started := time.Now()
-	if err := idle.reconcileIdle(context.Background(), coordinator.New(server.URL, "synthetic"), j, map[string]bool{}); err != nil {
+	if err := idle.reconcileIdle(context.Background(), client, j, map[string]bool{}); err != nil {
 		t.Fatal(err)
 	}
-	if took := time.Since(started); took < reconcilePassBudget || took > reconcilePassBudget+time.Second || gets.Load() != 3 {
-		t.Fatalf("pass took %v for %d reads", took, gets.Load())
+	if took := time.Since(started); took < reconcilePassBudget || took > reconcilePassBudget+1500*time.Millisecond || gets.Load() != 1 || cut.Load() {
+		t.Fatalf("pass took %v for %d reads, cut %v", took, gets.Load(), cut.Load())
 	}
-	pending, _ := j.Pending()
-	if idle.after != pending[1].Key() {
-		t.Fatal("the cut record was counted as read")
+	if _, ok := idle.waits[records[2].Key()]; !ok || idle.due(time.Now().Add(reconcileBacklogInterval-time.Second)) || !idle.due(time.Now().Add(reconcileBacklogInterval)) {
+		t.Fatal("slow record not counted as read, or the backlog not picked up soon", idle.waits, idle.next.Sub(time.Now()))
+	}
+	if err := idle.reconcileIdle(context.Background(), client, j, map[string]bool{}); err != nil || gets.Load() != 3 {
+		t.Fatal("the rest were not read next", gets.Load(), err)
 	}
 }
 
@@ -625,10 +734,10 @@ func TestReconcileIdleBacksOffAPendingProof(t *testing.T) {
 	}
 	pass()
 	pass()
-	if gets.Load() != 1 || idle.waits[r.Key()].wait != reconcileProofWait {
+	if gets.Load() != 1 || idle.waits[r.Key()].wait != reconcileRetryWait {
 		t.Fatalf("%d reads, wait %v", gets.Load(), idle.waits[r.Key()].wait)
 	}
-	for _, want := range []time.Duration{2 * reconcileProofWait, 4 * reconcileProofWait, 8 * reconcileProofWait, reconcileProofWaitCap, reconcileProofWaitCap} {
+	for _, want := range []time.Duration{2 * reconcileRetryWait, 4 * reconcileRetryWait, 8 * reconcileRetryWait, reconcileRetryWaitCap, reconcileRetryWaitCap} {
 		w := idle.waits[r.Key()]
 		w.at = time.Now().Add(-time.Second)
 		idle.waits[r.Key()] = w

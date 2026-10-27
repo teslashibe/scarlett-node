@@ -241,30 +241,39 @@ func (a *activeAttempts) snapshot() map[string]bool {
 // coordinator counts every attempt read and report against the same per-node
 // budget as acceptances, so each pass is bounded.
 const (
-	// reconcileInterval is the least time from one pass to the next.
+	// reconcileInterval is the time to the next pass after one that read
+	// every due record, or that the coordinator stopped.
 	reconcileInterval = 30 * time.Second
-	// reconcilePassRecords is the most records one pass reads; the rest wait
-	// for later passes, which start where this one stopped.
+	// reconcileBacklogInterval is the time to the next pass after one that
+	// left due records unread at its record cap or its budget: a backlog, such
+	// as the reports a rate-limit storm left behind, clears in seconds rather
+	// than eight records every 30 s, before its leases run out.
+	reconcileBacklogInterval = 5 * time.Second
+	// reconcilePassRecords is the most records one pass reads.
 	reconcilePassRecords = 8
-	// reconcilePassBudget bounds one pass, its requests included, so the next
-	// poll starts well inside the coordinator's three-second liveness window.
+	// reconcilePassBudget is the time after which a pass starts no other
+	// record, so the next poll usually starts well inside the coordinator's
+	// three-second liveness window.
 	reconcilePassBudget = 2 * time.Second
-	// A record that a pass handled and left pending (a proven report the
-	// verifier is still ingesting, read proof_pending or answered 202) is read
-	// again after reconcileProofWait, doubling to reconcileProofWaitCap.
-	reconcileProofWait    = 30 * time.Second
-	reconcileProofWaitCap = 5 * time.Minute
+	// reconcileRecordTimeout bounds one record's attempt read and report
+	// together. The pass budget never cuts a record it started, so a report
+	// that a slow coordinator takes more than 2 s to store still lands, and a
+	// pass holds the loop for at most about 7 s.
+	reconcileRecordTimeout = 5 * time.Second
+	// A record a pass read and left pending (a proven report the verifier is
+	// still ingesting, read proof_pending or answered 202, or any refusal or
+	// failure but a 429) is read again after reconcileRetryWait, doubling to
+	// reconcileRetryWaitCap, so one record that keeps failing never holds the
+	// others back.
+	reconcileRetryWait    = 30 * time.Second
+	reconcileRetryWaitCap = 5 * time.Minute
 )
 
 // idleReconciler paces reconcileIdle. Only the heartbeat loop uses it.
 type idleReconciler struct {
 	// next is when the next pass is due.
 	next time.Time
-	// after is the key of the last record a pass handled; the next pass
-	// starts after it in key order and wraps around, so no record waits
-	// behind others for ever.
-	after string
-	// waits holds the records a pass handled and left pending: when each is
+	// waits holds the records a pass read and left pending: when each is
 	// read again and the wait before that.
 	waits map[string]reconcileWait
 }
@@ -283,10 +292,13 @@ func (r *idleReconciler) due(now time.Time) bool { return !now.Before(r.next) }
 // through the same recovery: no provider call is ever repeated. active must be
 // taken before the journal is read, by the only goroutine that adds keys; a
 // worker that is still running keeps its records, ready ones included, until
-// it returns. One pass reads at most reconcilePassRecords records within
-// reconcilePassBudget, and stops at the first 429, 5xx or transport failure:
-// the next pass is then due after reconcileInterval or the coordinator's
-// Retry-After, whichever is longer.
+// it returns. A pass reads the due records by earliest lease deadline, those
+// past it last since they can only be closed, at most reconcilePassRecords of
+// them and none started after reconcilePassBudget, each within
+// reconcileRecordTimeout. It stops at the first 429, 502, 503, 504 or
+// transport failure (a record out of time is one), and the next pass is then
+// due after reconcileInterval or the coordinator's Retry-After, whichever is
+// longer.
 func (r *idleReconciler) reconcileIdle(ctx context.Context, client *coordinator.Client, journal *attempts.Journal, active map[string]bool) error {
 	now := time.Now()
 	r.next = now.Add(reconcileInterval)
@@ -295,66 +307,79 @@ func (r *idleReconciler) reconcileIdle(ctx context.Context, client *coordinator.
 		return err
 	}
 	pending := make(map[string]bool, len(records))
+	due := []attempts.Record{}
 	for _, record := range records {
-		pending[record.Key()] = true
+		key := record.Key()
+		pending[key] = true
+		if !active[key] && (record.State == "ready" || record.State == "started") && !now.Before(r.waits[key].at) {
+			due = append(due, record)
+		}
 	}
 	for key := range r.waits {
 		if !pending[key] {
 			delete(r.waits, key)
 		}
 	}
-	passCtx, cancel := context.WithTimeout(ctx, reconcilePassBudget)
-	defer cancel()
-	// Pending lists records in key order.
-	first := sort.Search(len(records), func(i int) bool { return records[i].Key() > r.after })
-	read := 0
-	for i := range records {
-		record := records[(first+i)%len(records)]
-		key := record.Key()
-		if active[key] || record.State != "ready" && record.State != "started" || now.Before(r.waits[key].at) {
-			continue
+	sort.SliceStable(due, func(i, j int) bool {
+		if past := !due[i].Deadline.After(now); past != !due[j].Deadline.After(now) {
+			return !past
 		}
-		if read == reconcilePassRecords || passCtx.Err() != nil {
+		return due[i].Deadline.Before(due[j].Deadline)
+	})
+	for i, record := range due {
+		if i == reconcilePassRecords || time.Since(now) >= reconcilePassBudget {
+			r.next = time.Now().Add(reconcileBacklogInterval)
 			break
 		}
-		read++
-		err := recoverAttempt(passCtx, client, journal, record)
-		if err != nil && passCtx.Err() != nil && ctx.Err() == nil {
-			// The pass ran out of time; this record is the next one's first.
-			break
+		recordCtx, cancel := context.WithTimeout(ctx, reconcileRecordTimeout)
+		err := recoverAttempt(recordCtx, client, journal, record)
+		cancel()
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "reconcile:", err)
+		}
+		// A 429 is the coordinator's limit on this node, not on the record,
+		// which stays first for the next pass. Any other outcome waits: a
+		// record that settled leaves the journal and its wait is dropped next
+		// pass.
+		var status *coordinator.StatusError
+		if !errors.As(err, &status) || status.Status != http.StatusTooManyRequests {
+			r.wait(record.Key())
 		}
 		if pause, stop := reconcileStop(err); stop {
-			fmt.Fprintln(os.Stderr, "reconcile:", err)
 			r.next = time.Now().Add(max(reconcileInterval, pause))
 			break
 		}
-		r.after = key
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "reconcile:", err)
-			continue
-		}
-		// Handled without error: a record that settled leaves the journal and
-		// its wait is dropped next pass; one still pending waits longer.
-		if r.waits == nil {
-			r.waits = map[string]reconcileWait{}
-		}
-		wait := reconcileProofWait
-		if last, ok := r.waits[key]; ok {
-			wait = min(2*last.wait, reconcileProofWaitCap)
-		}
-		r.waits[key] = reconcileWait{at: time.Now().Add(wait), wait: wait}
 	}
 	return nil
 }
 
+// wait puts off the next read of key by reconcileRetryWait, or by twice its
+// last wait up to reconcileRetryWaitCap.
+func (r *idleReconciler) wait(key string) {
+	if r.waits == nil {
+		r.waits = map[string]reconcileWait{}
+	}
+	wait := reconcileRetryWait
+	if last, ok := r.waits[key]; ok {
+		wait = min(2*last.wait, reconcileRetryWaitCap)
+	}
+	r.waits[key] = reconcileWait{at: time.Now().Add(wait), wait: wait}
+}
+
 // reconcileStop reports whether a recovery error ends the pass, and the
-// coordinator's Retry-After, if any: a 429 or 5xx answer, or no answer at all,
-// means the coordinator could not take more of this node's requests now.
+// coordinator's Retry-After, if any: a 429, a 503, a gateway's 502 or 504, or
+// no answer at all, means the coordinator could not take more of this node's
+// requests now. Any other refusal or failure, a 500 included, concerns the
+// record alone.
 func reconcileStop(err error) (time.Duration, bool) {
 	var status *coordinator.StatusError
 	switch {
 	case errors.As(err, &status):
-		if status.Status == http.StatusTooManyRequests || status.Status >= 500 {
+		switch status.Status {
+		case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 			return coordinator.RetryAfterWait(status.RetryAfter), true
 		}
 	case errors.Is(err, coordinator.ErrUnavailable):
