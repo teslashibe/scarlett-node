@@ -2917,7 +2917,7 @@ mod web_tests {
         input["proxy"]["port"] = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port().into();
         daemon.send(json!({"type": "hop", "id": "h2", "input": input})).await;
         let (reply, presenting) = daemon.result("h2").await;
-        assert_eq!((reply["type"].as_str(), reply["class"].as_str(), reply["presented"].as_bool(), presenting), (Some("error"), Some("proxy_failed"), Some(false), false));
+        assert_eq!((reply["type"].as_str(), reply["class"].as_str(), reply["presented"].as_bool(), presenting), (Some("error"), Some("proxy_unreachable"), Some(false), false));
         assert_eq!((tokens(&s), view(&s).await["remaining_sessions"].as_u64()), (1, Some(6)));
         // Then the hop runs, on the connection the others gave back.
         daemon.send(json!({"type": "hop", "id": "h3", "input": daemon_input(verifier, proxy, 0, "https://example.com/", Some(&token))})).await;
@@ -2971,7 +2971,8 @@ mod web_tests {
     }
 
     /// A CONNECT proxy that takes connections and never answers: to a hop it
-    /// is a target that never answers its TCP connection.
+    /// is a target that never answers its TCP connection, at an exit that
+    /// never answered the proxy (class proxy_exit).
     async fn silent_proxy() -> u16 {
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = proxy.local_addr().unwrap().port();
@@ -3006,7 +3007,7 @@ mod web_tests {
         let (reply, presenting) = daemon.result("h1").await;
         // Its budget is 20 s; the connect gives up after 3 attempts of 1 s here (5, 10 and 10 s in production).
         assert!(started.elapsed() < Duration::from_secs(6), "{:?}", started.elapsed());
-        assert_eq!((reply["type"].as_str(), reply["class"].as_str(), reply["presented"].as_bool(), presenting), (Some("error"), Some("proxy_failed"), Some(false), false), "{reply}");
+        assert_eq!((reply["type"].as_str(), reply["class"].as_str(), reply["presented"].as_bool(), presenting), (Some("error"), Some("proxy_exit"), Some(false), false), "{reply}");
         assert!(reply["error"].as_str().unwrap().contains("target connection timed out"), "{reply}");
         // Nothing was spent, and the connection it held went back to the pool.
         assert_eq!((tokens(&s), view(&s).await["remaining_sessions"].as_u64()), (1, Some(6)));
@@ -3032,7 +3033,7 @@ mod web_tests {
         daemon.send(json!({"type": "hop", "id": "h1", "input": daemon_input(verifier, silent, 0, "https://example.com/", Some(&token))})).await;
         let (reply, presenting) = daemon.result("h1").await;
         assert!(started.elapsed() < Duration::from_secs(6), "{:?}", started.elapsed());
-        assert_eq!((reply["type"].as_str(), reply["class"].as_str(), reply["presented"].as_bool(), presenting), (Some("error"), Some("proxy_failed"), Some(false), false), "{reply}");
+        assert_eq!((reply["type"].as_str(), reply["class"].as_str(), reply["presented"].as_bool(), presenting), (Some("error"), Some("proxy_exit"), Some(false), false), "{reply}");
         // Its cold dial is closed, not left waiting.
         until_waiting(&s, 0).await;
         assert_eq!(tokens(&s), 1);
