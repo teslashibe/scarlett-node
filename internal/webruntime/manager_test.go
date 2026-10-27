@@ -125,12 +125,12 @@ func fakeHelper(mode, dump string) int {
 			return
 		}
 		n := fetches.Add(1)
+		os.WriteFile(filepath.Join(dump, "fetch-"+strconv.FormatInt(n, 10)+".json"), body, 0o600)
 		os.WriteFile(filepath.Join(dump, "solver-"+strconv.FormatInt(n, 10)), []byte(strconv.FormatBool(req.Solver)), 0o600)
 		if mode == "tunnel" {
 			// The page and one subresource, each a tunnel through the
 			// egress proxy the request names (or none for a direct page).
 			// A page whose tunnel was refused fails as Chrome's does.
-			os.WriteFile(filepath.Join(dump, "fetch-"+strconv.FormatInt(n, 10)+".json"), body, 0o600)
 			ok := true
 			for i := 0; i < 2 && req.EgressProxy != ""; i++ {
 				ok = ok && fakeTunnel(req.EgressProxy)
@@ -1083,6 +1083,58 @@ func TestManagerProxiedPageGetsItsOwnEgressProxy(t *testing.T) {
 	if _, err := s.m.Fetch(context.Background(), FetchRequest{URL: "https://example.com/", Wait: "load", TimeoutMS: 5000,
 		Upstream: &Upstream{Addr: netip.MustParseAddrPort("169.254.169.254:80")}}); err == nil || errors.Is(err, ErrUnavailable) {
 		t.Fatal("a link-local upstream was accepted", err)
+	}
+}
+
+// A proxied page Go stopped waiting for may still be loading in the helper:
+// its egress proxy stops tunnelling at once but keeps its port, closing every
+// connection unanswered, so no later page's proxy can take the port and carry
+// the stale page on another job's session. The port is freed once the helper
+// is gone.
+func TestManagerHoldsAnAbandonedPagesProxyPort(t *testing.T) {
+	s := newTestManager(t, "hang")
+	s.m.cfg.Resolver = (&fakeNet{}).resolve
+	s.prepare(t)
+	up := newFakeUpstream(t, statusReply(http.StatusOK))
+	ctx, cancel := context.WithCancel(context.Background())
+	sent := filepath.Join(s.dump, "fetch-1.json")
+	go func() {
+		for deadline := time.Now().Add(5 * time.Second); !exists(sent) && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		}
+		cancel()
+	}()
+	if _, err := s.m.Fetch(ctx, FetchRequest{URL: "https://example.com/", Wait: "load", TimeoutMS: 5000, Upstream: up.upstream("Basic am9iLWE=")}); err == nil {
+		t.Fatal("an abandoned page succeeded")
+	}
+	raw, _ := os.ReadFile(sent)
+	var req helperFetch
+	if err := json.Unmarshal(raw, &req); err != nil || !strings.HasPrefix(req.EgressProxy, "http://127.0.0.1:") {
+		t.Fatalf("helper request %s", raw)
+	}
+	addr := strings.TrimPrefix(req.EgressProxy, "http://")
+	c, err := net.DialTimeout("tcp4", addr, time.Second)
+	if err != nil {
+		t.Fatal("the abandoned page's port was freed while its helper runs")
+	}
+	fmt.Fprint(c, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if n, err := c.Read(make([]byte, 64)); n != 0 || err == nil {
+		t.Fatal("the retired proxy answered", n, err)
+	}
+	c.Close()
+	if len(up.seen()) != 0 {
+		t.Fatal("the retired proxy reached the upstream", up.seen())
+	}
+	s.m.mu.Lock()
+	held := len(s.m.helper.held)
+	s.m.mu.Unlock()
+	if held != 1 {
+		t.Fatal("held", held)
+	}
+	s.m.Close(context.Background())
+	if c, err := net.DialTimeout("tcp4", addr, time.Second); err == nil {
+		c.Close()
+		t.Fatal("the port outlived the helper")
 	}
 }
 

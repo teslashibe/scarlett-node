@@ -865,10 +865,16 @@ job's `Proxy-Authorization`, so every connection of the page leaves from the
 job's exit. The helper gets only that listener's loopback URL in its request
 (`egress_proxy`), which it uses for both of the page's passes; it, Chrome and
 Scrapling never see the proxy's address or credentials. The listener closes
-when the page returns, ending any tunnel still open. The first tunnel the
-proxy would not open keeps its class (the table under Proxy egress), and
-a page whose navigation failed reports it. The shared listener has no
-upstream, so a direct page never touches the proxy.
+when the page returns, ending any tunnel still open. When the node stopped
+waiting before the helper answered, the page may still be loading: its
+tunnels end at once, but the listener keeps its port, closing every new
+connection unanswered, until the helper (which then drains) has stopped, so
+no later page's listener can take that port and carry the stale page on
+another job's session. The first tunnel to the page's own host that the
+proxy would not open keeps its class (the table under Proxy egress), and a
+page whose navigation failed reports it; a refused tunnel to another host
+records nothing. The shared listener has no upstream, so a direct page never
+touches the proxy.
 
 **Lifecycle.** At start, with web and the tier on, the node prepares in the
 background: memory check, cleanup of crash dumps and partial downloads, runtime

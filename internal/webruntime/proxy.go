@@ -312,14 +312,22 @@ func (p *egressProxy) track(conn net.Conn, add bool) bool {
 }
 
 func (p *egressProxy) Close() {
-	p.cancel()
+	p.retire()
 	p.ln.Close()
+	p.wg.Wait()
+}
+
+// retire ends the proxy's tunnels but keeps its port: every later connection
+// is closed unanswered until Close. A page the helper never answered for may
+// still be loading, and while the port stays bound no later page's proxy can
+// take it and carry the stale page's connections on another job's session.
+func (p *egressProxy) retire() {
+	p.cancel()
 	p.mu.Lock()
 	for conn := range p.conns {
 		conn.Close()
 	}
 	p.mu.Unlock()
-	p.wg.Wait()
 }
 
 func reply(conn net.Conn, status int) {

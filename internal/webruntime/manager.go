@@ -385,6 +385,11 @@ type helper struct {
 	// watches are the fetches in flight on this helper, for their tree peak
 	// and whether a memory kill ended them.
 	watches map[*fetchWatch]struct{}
+	// held are the retired egress proxies of proxied pages this helper
+	// never answered for; cleanup closes them once the helper is gone, and
+	// stopped says it has run. Both under the Manager's mu.
+	held    []*egressProxy
+	stopped bool
 }
 
 type fetchWatch struct {
@@ -481,7 +486,10 @@ func (m *Manager) healthLocked() Health {
 // is returned without an error. A proxied page (req.Upstream) gets its own
 // loopback egress proxy, at most 48 tunnels, which carries that job's
 // Proxy-Authorization and closes when Fetch returns; every other page uses
-// the helper's shared one, which has no upstream.
+// the helper's shared one, which has no upstream. When the helper never
+// answered for a proxied page (Go's deadline, a broken exchange), that
+// proxy stops tunnelling at once but keeps its port until the draining
+// helper is gone.
 func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (FetchResult, error) {
 	if err := req.validate(); err != nil {
 		return FetchResult{}, err
@@ -506,6 +514,7 @@ func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 		m.mu.Unlock()
 	}()
 	var job *egressProxy
+	held := false
 	if req.Upstream != nil {
 		page, err := url.Parse(req.URL)
 		if err != nil {
@@ -515,8 +524,14 @@ func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 			return FetchResult{}, fmt.Errorf("%w: job egress proxy unavailable", ErrUnavailable)
 		}
 		// Closed before the page slot is released: nothing of this page
-		// leaves through the job's session afterwards.
-		defer job.Close()
+		// leaves through the job's session afterwards. A page the helper
+		// never answered for keeps its proxy's port, refusing, until the
+		// helper is gone.
+		defer func() {
+			if !held {
+				job.Close()
+			}
+		}()
 	}
 	h, err := m.acquire(ctx, false)
 	if err != nil {
@@ -535,6 +550,7 @@ func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 		fetch.EgressProxy = job.URL()
 	}
 	res, err := m.call(ctx, h, fetch)
+	abandoned := err != nil
 	if err == nil && job != nil && res.Outcome == "failed" && res.Error == "navigation_failed" {
 		res.ProxyClass = job.Failure()
 	}
@@ -560,8 +576,21 @@ func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 		// holding a page slot; restart once the others finish.
 		h.draining = true
 	}
+	closeNow := false
+	if job != nil && abandoned {
+		// The page may still be loading in the helper: its tunnels end now,
+		// and its port stays bound until cleanup.
+		job.retire()
+		held = true
+		if closeNow = h.stopped; !closeNow {
+			h.held = append(h.held, job)
+		}
+	}
 	m.notify()
 	m.mu.Unlock()
+	if closeNow {
+		job.Close()
+	}
 	m.wake()
 	return res, err
 }
@@ -1360,6 +1389,15 @@ func (m *Manager) cleanup(h *helper) {
 	}
 	if h.client != nil {
 		h.client.CloseIdleConnections()
+	}
+	// The helper and its pages are gone: the ports of the pages it never
+	// answered for can be freed.
+	m.mu.Lock()
+	held := h.held
+	h.held, h.stopped = nil, true
+	m.mu.Unlock()
+	for _, p := range held {
+		p.Close()
 	}
 	if h.proxy != nil {
 		h.proxy.Close()
