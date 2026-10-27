@@ -35,14 +35,14 @@ import {
   lastHeartbeat,
   missedJobs,
   webEgress,
+  webProxyCredentialsError,
   webProxyNote,
   webProxyPlaceholders,
+  webProxyRemovable,
   webProxySaved,
   webProxyTestText,
-  validWebProxyPassword,
   validWebProxyPort,
   validWebProxyUse,
-  validWebProxyUsername,
   type Metric,
   type WebProxySaved,
   type WebProxyTest,
@@ -156,7 +156,7 @@ function render(s: Snapshot) {
   $("web-note").hidden = !webNote;
   for (const id of ["web-proxy", "web-proxy-use", "web-proxy-port", "web-proxy-username", "web-proxy-password", "web-proxy-save", "web-proxy-test"])
     $(id).toggleAttribute("disabled", busy || !preferencesAvailable || !webProxy);
-  $("web-proxy-remove").toggleAttribute("disabled", busy || !(webProxy?.saved || webProxyUnreadable));
+  $("web-proxy-remove").toggleAttribute("disabled", busy || !webProxyRemovable(webProxy, webProxyUnreadable, savedPreferences));
   const proxyNote = webProxyNote(s);
   setText($("web-proxy-note"), proxyNote);
   $("web-proxy-note").hidden = !proxyNote;
@@ -733,25 +733,16 @@ async function loadWebProxy() {
     notice(errorMessage(e), true);
   }
 }
-// A test the bundled node could not run says so, instead of the generic
-// command failure.
-async function proxyTest<T>(run: () => Promise<T>): Promise<T> {
-  try { return await run(); }
-  catch (e) { throw e === "command_failed" || e === "command_timeout" ? "proxy_test_unavailable" : e; }
-}
-// The proxy form as typed: both credentials, or neither to keep the saved ones.
-function webProxyForm(): { pages: WebProxyUse; port: number; username: string; password: string } | undefined {
+// The proxy form as typed: both credentials, or neither to keep the saved
+// ones. Test and switching on need credentials; switching off does not.
+function webProxyForm(needed: boolean): { pages: WebProxyUse; port: number; username: string; password: string } | undefined {
   const pages = $<HTMLSelectElement>("web-proxy-use").value;
   const port = Number($<HTMLSelectElement>("web-proxy-port").value);
   const username = $<HTMLInputElement>("web-proxy-username").value.trim();
   const password = $<HTMLInputElement>("web-proxy-password").value;
   if (!validWebProxyUse(pages) || !validWebProxyPort(port)) { notice("Choose what the proxy is for and its port", true); return; }
-  if (!username && !password) {
-    if (!webProxy?.saved) { notice(errorMessage("web_proxy_not_saved"), true); return; }
-  } else if (!validWebProxyUsername(username) || !validWebProxyPassword(password)) {
-    notice("Enter the proxy username (letters and digits) and its password from your Webshare dashboard", true);
-    return;
-  }
+  const problem = webProxyCredentialsError(username, password, !!webProxy?.saved, needed);
+  if (problem) { notice(problem, true); return; }
   return { pages, port, username, password };
 }
 const showProxyResult = (text: string) => {
@@ -759,12 +750,12 @@ const showProxyResult = (text: string) => {
   $("web-proxy-result").hidden = !text;
 };
 $("web-proxy-test").addEventListener("click", () => {
-  const form = webProxyForm();
+  const form = webProxyForm(true);
   if (!form) return;
   let result: WebProxyTest | undefined;
   showProxyResult("");
   void act(async () => {
-    result = await proxyTest(() => api.testWebProxy(form.pages, form.port, form.username, form.password));
+    result = await api.testWebProxy(form.pages, form.port, form.username, form.password);
     showProxyResult(webProxyTestText(result));
   }, () => ({ text: webProxyTestText(result!), error: !result!.ok }));
 });
@@ -772,19 +763,24 @@ $("web-proxy-test").addEventListener("click", () => {
 // passing test turns the proxy on. The page shows what was saved either way.
 $("web-proxy-form").addEventListener("submit", (event) => {
   event.preventDefault();
-  const form = webProxyForm();
-  if (!form) return;
   const enabled = $<HTMLInputElement>("web-proxy").checked;
+  const form = webProxyForm(enabled);
+  if (!form) return;
   for (const id of ["web-proxy-username", "web-proxy-password"]) $<HTMLInputElement>(id).value = "";
   let outcome = { text: "", error: false };
   showProxyResult("");
   void act(async () => {
     try {
-      const result = await proxyTest(() => api.saveWebProxy(enabled, form.pages, form.port, form.username, form.password));
+      const result = await api.saveWebProxy(enabled, form.pages, form.port, form.username, form.password);
       outcome = webProxySaved(result, !!snapshot?.supervised);
       showProxyResult(result.test ? webProxyTestText(result.test) : "");
       webProxyUnreadable = false;
       showWebProxy(result);
+    } catch (e) {
+      // New credentials are saved before the test runs, so a test that
+      // could not run still changed what is saved: read it again.
+      await loadWebProxy();
+      throw e;
     } finally {
       // Show what is saved, whether or not the change was.
       const saved = await api.preferences().catch(() => undefined);

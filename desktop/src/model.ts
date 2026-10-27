@@ -291,9 +291,11 @@ export function webProxyTestText(result: WebProxyTest): string {
   return PROXY_FAILURE[result.class ?? ""] ?? "The proxy test did not pass";
 }
 // After Save: on, saved but off, or saved but left off because its test
-// failed. A running node keeps its egress until it next starts.
+// failed; off with nothing saved when the keychain item was already gone. A
+// running node keeps its egress until it next starts.
 export function webProxySaved(result: WebProxySaveResult, running: boolean): { text: string; error: boolean } {
   const apply = running ? ". Stop and start the node to apply it" : "";
+  if (!result.saved) return { text: `Proxy off${apply}`, error: false };
   if (result.enabled) return { text: `Proxy saved and on${running ? apply : ". The node uses it when it starts"}`, error: false };
   if (result.test && !result.test.ok) return { text: `Proxy saved but left off. ${webProxyTestText(result.test)}`, error: true };
   return { text: `Proxy saved and off${apply}`, error: false };
@@ -303,6 +305,21 @@ export function webProxySaved(result: WebProxySaveResult, running: boolean): { t
 export function webProxyPlaceholders(saved: WebProxySaved | undefined): { username: string; password: string } {
   if (!saved?.saved) return { username: "", password: "" };
   return { username: saved.username ?? "", password: `Saved in ${saved.store}` };
+}
+// What is wrong with the typed proxy username and password, if anything.
+// Both empty keep the saved ones; Test and switching on need some saved, but
+// switching off never does, so a proxy whose keychain item is gone can still
+// be turned off.
+export function webProxyCredentialsError(username: string, password: string, saved: boolean, needed: boolean): string | undefined {
+  if (!username && !password) return needed && !saved ? errorMessage("web_proxy_not_saved") : undefined;
+  if (!validWebProxyUsername(username) || !validWebProxyPassword(password))
+    return "Enter the proxy username (letters and digits) and its password from your Webshare dashboard";
+  return undefined;
+}
+// Remove clears a saved item, one the keychain will not hand over, or a
+// proxy left on with nothing saved.
+export function webProxyRemovable(saved: WebProxySaved | undefined, unreadable: boolean, preferences: Preferences | undefined): boolean {
+  return !!saved?.saved || unreadable || preferences?.web_proxy === true;
 }
 export function webProxyNote(s: Snapshot): string {
   return s.web_proxy_restart_pending

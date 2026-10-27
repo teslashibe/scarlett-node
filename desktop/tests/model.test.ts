@@ -37,8 +37,10 @@ import {
   missedJobs,
   HEARTBEAT_LATE_MS,
   webEgress,
+  webProxyCredentialsError,
   webProxyNote,
   webProxyPlaceholders,
+  webProxyRemovable,
   webProxySaved,
   webProxyTestText,
   PROXY_REST,
@@ -48,6 +50,7 @@ import {
   validWebProxyUse,
   validWebProxyUsername,
   type DispatchHealth,
+  type Preferences,
   type ServiceHealth,
   type Snapshot,
 } from "../src/model.ts";
@@ -594,6 +597,9 @@ test("Proxy test and save results say what happened in plain words", () => {
   assert.deepEqual(webProxySaved({ saved: true, store: "Keychain", enabled: true, test: { ok: true, exit: "45.86.200.17" } }, false), { text: "Proxy saved and on. The node uses it when it starts", error: false });
   assert.deepEqual(webProxySaved({ saved: true, store: "Keychain", enabled: true, test: { ok: true, exit: "45.86.200.17" } }, true), { text: "Proxy saved and on. Stop and start the node to apply it", error: false });
   assert.deepEqual(webProxySaved({ saved: true, store: "Keychain", enabled: false, test: null }, true), { text: "Proxy saved and off. Stop and start the node to apply it", error: false });
+  // Switched off with the keychain item already gone: off, nothing saved.
+  assert.deepEqual(webProxySaved({ saved: false, username: null, store: "Keychain", enabled: false, test: null }, false), { text: "Proxy off", error: false });
+  assert.deepEqual(webProxySaved({ saved: false, username: null, store: "Keychain", enabled: false, test: null }, true), { text: "Proxy off. Stop and start the node to apply it", error: false });
   assert.equal(webProxyNote({ ...base, supervised: true, web_proxy_restart_pending: true }), "Saved · stop and start the node to apply the proxy change. Accepted jobs finish before it stops");
   assert.equal(webProxyNote({ ...base, supervised: true }), "");
   for (const code of ["keychain_unavailable", "web_proxy_not_saved", "proxy_test_unavailable"])
@@ -607,6 +613,26 @@ test("The proxy password is never shown again, only what is saved", () => {
   // The fields start empty, and the password field is a password field.
   assert.match(layout, /<input id="web-proxy-password" type="password" autocomplete="new-password"[^>]*>/);
   for (const id of ["web-proxy-username", "web-proxy-password"]) assert.doesNotMatch(layout, new RegExp(`<input id="${id}"[^>]* value=`));
+});
+test("A proxy left on with nothing saved can still be turned off or removed", () => {
+  const typo = "Enter the proxy username (letters and digits) and its password from your Webshare dashboard";
+  // Empty fields keep the saved credentials; with none saved, Test and
+  // switching on ask for them, but switching off does not.
+  assert.equal(webProxyCredentialsError("", "", true, true), undefined);
+  assert.equal(webProxyCredentialsError("", "", false, true), errorMessage("web_proxy_not_saved"));
+  assert.equal(webProxyCredentialsError("", "", false, false), undefined);
+  assert.equal(webProxyCredentialsError("synthuser", "synthetic-pass", false, true), undefined);
+  for (const [username, password] of [["synthuser", ""], ["", "synthetic-pass"], ["synth-user", "synthetic-pass"], ["synthuser", "with space"]])
+    for (const needed of [true, false]) assert.equal(webProxyCredentialsError(username, password, true, needed), typo, `${username} ${password} ${needed}`);
+  // Remove is there for a saved item, an unreadable one, or a proxy that is
+  // on with nothing saved (its keychain item deleted outside the app).
+  const prefs = (web_proxy: boolean): Preferences => ({ schema: 1, local_api_port: 8088, background: false, x_concurrency: 2, updates: "notify", resume_serving: false, serve_web: true, web_concurrency: 0, web_browser_concurrency: 0, web_proxy, web_proxy_use: "limited_sites", web_proxy_port: 80 });
+  const none = { saved: false, username: null, store: "Keychain" };
+  assert.equal(webProxyRemovable(none, false, prefs(false)), false);
+  assert.equal(webProxyRemovable(undefined, false, undefined), false);
+  assert.equal(webProxyRemovable(none, false, prefs(true)), true);
+  assert.equal(webProxyRemovable(none, true, prefs(false)), true);
+  assert.equal(webProxyRemovable({ saved: true, username: "syn••••", store: "Keychain" }, false, prefs(false)), true);
 });
 test("The proxy form accepts what the node accepts", () => {
   assert.deepEqual([...WEB_PROXY_PORTS], [80, 1080, 3128]);

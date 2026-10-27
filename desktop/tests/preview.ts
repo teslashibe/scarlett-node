@@ -23,7 +23,10 @@ let preferences: Preferences = { schema: 1, local_api_port: 8088, background: tr
 // The synthetic proxy: only whether one is saved and a masked username, as
 // the native side reports it. No password exists anywhere in the preview.
 let proxySaved: WebProxySaved = { saved: false, username: null, store: "Keychain" };
-let proxyRunning: { use: WebProxyUse; port: number } | null = null;
+// The running node's proxy route and the credentials it read, counted like
+// the native side's saves and deletes.
+let proxyCredentials = 0;
+let proxyRunning: { use: WebProxyUse; port: number; credentials: number } | null = null;
 let webRunning = true;
 let autostart = false;
 let claude: ClaudeStatus = { available: true, connected: false, pending: false };
@@ -112,7 +115,7 @@ if (scenario === "older-node") {
 if (scenario === "web-proxy" || scenario === "proxy-resting") {
   Object.assign(preferences, { web_proxy: true, web_proxy_use: "limited_sites", web_proxy_port: 80 });
   proxySaved = { saved: true, username: "pre••••", store: "Keychain" };
-  proxyRunning = { use: "limited_sites", port: 80 };
+  proxyRunning = { use: "limited_sites", port: 80, credentials: proxyCredentials };
   webService.egress = "both";
   observation.web_egress = { via: "both", provider: "webshare", country: "us", last_exit: "45.86.200.17", last_exit_at: at(40), rest_reason: null };
 }
@@ -281,7 +284,7 @@ mockIPC((command, payload) => {
       snapshot.web_enabled = preferences.serve_web;
       snapshot.web_restart_pending = snapshot.supervised && webRunning !== preferences.serve_web;
       snapshot.web_proxy = preferences.web_proxy ? { use: preferences.web_proxy_use, port: preferences.web_proxy_port } : null;
-      snapshot.web_proxy_restart_pending = snapshot.supervised && JSON.stringify(proxyRunning) !== JSON.stringify(preferences.serve_web ? snapshot.web_proxy : null);
+      snapshot.web_proxy_restart_pending = snapshot.supervised && JSON.stringify(proxyRunning) !== JSON.stringify(preferences.serve_web && snapshot.web_proxy ? { ...snapshot.web_proxy, credentials: proxyCredentials } : null);
       return structuredClone(snapshot);
     case "desktop_diagnostics": return structuredClone(diagnostics);
     case "claude_status": return structuredClone(claude);
@@ -300,16 +303,17 @@ mockIPC((command, payload) => {
       const port = Number(data.port);
       const typed = !!text(data, "username") || !!text(data, "password");
       if (typed && !(text(data, "username") && text(data, "password"))) throw "invalid_input";
-      if (!typed && !proxySaved.saved) throw "web_proxy_not_saved";
+      // Test and switching on need credentials; switching off does not.
+      if (!typed && !proxySaved.saved && (command === "test_web_proxy" || data.enabled)) throw "web_proxy_not_saved";
       // A password of "wrong" fails sign-in, so the failed-save path can be seen.
       const test = text(data, "password") === "wrong" ? { ok: false, class: "proxy_auth" } : { ok: true, exit: "45.86.200.17" };
       if (command === "test_web_proxy") return test;
-      if (typed) proxySaved = { saved: true, username: `${text(data, "username").slice(0, 3)}••••`, store: "Keychain" };
+      if (typed) { proxySaved = { saved: true, username: `${text(data, "username").slice(0, 3)}••••`, store: "Keychain" }; proxyCredentials++; }
       const enabled = !!data.enabled && test.ok;
       Object.assign(preferences, { web_proxy: enabled, web_proxy_use: pages, web_proxy_port: port });
       return { ...structuredClone(proxySaved), enabled, test: data.enabled ? test : null };
     }
-    case "remove_web_proxy": preferences.web_proxy = false; proxySaved = { saved: false, username: null, store: "Keychain" }; return null;
+    case "remove_web_proxy": preferences.web_proxy = false; proxySaved = { saved: false, username: null, store: "Keychain" }; proxyCredentials++; return null;
     case "set_update_mode": preferences.updates = text(data, "mode") === "automatic" ? "automatic" : "notify"; return null;
     case "pair_node": if (!text(data, "code")) throw "invalid_input"; snapshot.paired = true; return null;
     case "control_node": {
@@ -318,7 +322,7 @@ mockIPC((command, payload) => {
       if (action === "start" && snapshot.local_api?.running) throw "mode_conflict";
       if (action === "start" || action === "stop") snapshot.supervised = action === "start";
       if (action === "start") webRunning = preferences.serve_web;
-      if (action === "start") proxyRunning = preferences.serve_web && preferences.web_proxy ? { use: preferences.web_proxy_use, port: preferences.web_proxy_port } : null;
+      if (action === "start") proxyRunning = preferences.serve_web && preferences.web_proxy ? { use: preferences.web_proxy_use, port: preferences.web_proxy_port, credentials: proxyCredentials } : null;
       observation.state = snapshot.supervised ? "running" : "offline";
       observation.drain_requested = action === "pause";
       if (action === "stop") {
