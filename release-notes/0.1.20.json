@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "version": "0.1.20",
+  "date": "2026-10-27",
+  "title": "Send web pages through your own proxy",
+  "highlights": [
+    "New setting: send web pages through your own Webshare proxy, either for every page or only for sites that limit your network",
+    "Each job gets its own proxy session, so a page and its check leave from one address and the next job gets a new one",
+    "Your proxy password stays in your system keychain and is only ever sent to Webshare"
+  ]
+}
