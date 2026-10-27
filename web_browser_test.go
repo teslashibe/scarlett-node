@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -104,21 +105,11 @@ func TestRuntimeBrowserWithoutArchive(t *testing.T) {
 }
 
 func TestBrowserRuntimeInputs(t *testing.T) {
-	if upstreamProxyURL(nil) != nil {
-		t.Fatal("proxy without configuration")
-	}
-	proxy, err := config.ParseWebProxy("http://synthetic-user:synthetic-pass@proxy.synthetic.invalid:3128")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The address only; the credentials travel as the configured
-	// Proxy-Authorization value.
-	if u := upstreamProxyURL(proxy); u.String() != "http://proxy.synthetic.invalid:3128" || u.User != nil || proxy.Authorization == "" {
-		t.Fatal("proxy URL", u.Redacted())
-	}
-	plain, _ := config.ParseWebProxy("http://[2001:db8::1]:8080")
-	if u := upstreamProxyURL(plain); u.Host != "[2001:db8::1]:8080" || u.User != nil {
-		t.Fatal("plain proxy URL", u.String())
+	// The runtime has no per-page upstream yet: a proxied page is refused
+	// before the runtime, so it never renders from this node's own network.
+	upstream := &worker.ProxyUpstream{Addr: netip.MustParseAddrPort("104.16.0.10:1080"), Authorization: "Basic c3ludGhldGlj"}
+	if _, err := (runtimeBrowser{}).Fetch(context.Background(), worker.BrowserFetchRequest{URL: "https://example.com/", Wait: "load", TimeoutMS: 5000, Upstream: upstream}); !errors.Is(err, worker.ErrBrowserUnavailable) {
+		t.Fatal("proxied page", err)
 	}
 	if !strings.HasSuffix(xLoginNode("/r"), filepath.Join("x-login-runtime", "node")) && !strings.HasSuffix(xLoginNode("/r"), "node.exe") {
 		t.Fatal("x-login node path", xLoginNode("/r"))

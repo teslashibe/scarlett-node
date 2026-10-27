@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -21,6 +22,7 @@ import (
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/localfs"
 	"github.com/teslashibe/scarlett-node/internal/process"
+	"github.com/teslashibe/scarlett-node/internal/worker"
 )
 
 // Desktop helpers have no coordinator calls except explicit run. The renderer
@@ -81,11 +83,23 @@ func desktopCommand(args []string, owner io.Reader, out io.Writer) error {
 		if owner == nil {
 			return errors.New("desktop owner pipe required")
 		}
+		// The app's start line comes first, before the owner commands, and
+		// carries the web proxy from the keychain, never the environment.
+		proxy, err := readDesktopStart(owner)
+		if err != nil {
+			return err
+		}
 		c, err := config.Load()
 		if err != nil {
 			return err
 		}
+		if err := c.UseDesktopProxy(proxy); err != nil {
+			return err
+		}
 		return runWithOwner(c, owner)
+	}
+	if len(args) == 1 && args[0] == "proxy-test" {
+		return desktopProxyTest(owner, out)
 	}
 	if len(args) == 2 && args[0] == "api" {
 		if owner == nil {
@@ -121,7 +135,91 @@ func desktopCommand(args []string, owner io.Reader, out io.Writer) error {
 		}
 		return err
 	}
-	return errors.New("usage: scarlett-node desktop private-dir PATH|private-dir-new PATH|bearer PATH|run|api PORT|update-check|update-stage MODE|update-state-get|update-state-set|update-guard")
+	return errors.New("usage: scarlett-node desktop private-dir PATH|private-dir-new PATH|bearer PATH|run|proxy-test|api PORT|update-check|update-stage MODE|update-state-get|update-state-set|update-guard")
+}
+
+// readDesktopStart reads the desktop app's start line from the owner pipe:
+// {} or {"web_egress_proxy":{…}}, at most 4 KiB, then a newline. It reads a
+// byte at a time, so nothing after the line is taken from the owner
+// commands that follow. Errors never repeat the line.
+func readDesktopStart(owner io.Reader) (*config.WebProxy, error) {
+	line, err := readStartLine(owner, true)
+	if err != nil {
+		return nil, err
+	}
+	return config.ParseDesktopStart(line)
+}
+
+// readStartLine reads one line of at most config.MaxDesktopStartLine bytes a
+// byte at a time, without its newline (and a carriage return before it).
+// With needNewline, a line that ends at EOF is refused.
+func readStartLine(r io.Reader, needNewline bool) ([]byte, error) {
+	line := make([]byte, 0, 256)
+	one := make([]byte, 1)
+	for {
+		n, err := r.Read(one)
+		if n == 1 {
+			if one[0] == '\n' {
+				break
+			}
+			if len(line) > config.MaxDesktopStartLine {
+				return nil, errors.New("desktop start line too long")
+			}
+			line = append(line, one[0])
+			continue
+		}
+		if err == io.EOF && !needNewline && len(line) > 0 {
+			break
+		}
+		if err != nil {
+			return nil, errors.New("desktop start line required")
+		}
+	}
+	line = bytes.TrimSuffix(line, []byte("\r"))
+	if len(line) > config.MaxDesktopStartLine {
+		return nil, errors.New("desktop start line too long")
+	}
+	return line, nil
+}
+
+// proxyTestReply is all `desktop proxy-test` prints: the exit on success, or
+// the class of the failure. It never carries the proxy's settings.
+type proxyTestReply struct {
+	OK    bool   `json:"ok"`
+	Exit  string `json:"exit,omitempty"`
+	Class string `json:"class,omitempty"`
+}
+
+// probeDesktopProxy is worker.ProbeWebProxy; tests replace it.
+var probeDesktopProxy = worker.ProbeWebProxy
+
+// desktopProxyTest is `scarlett-node desktop proxy-test`: it reads one web
+// proxy object (the start line's web_egress_proxy) from stdin, runs one exit
+// probe through a fresh session, and prints {"ok":true,"exit":…} or
+// {"ok":false,"class":…}, where class is a proxy class or invalid. The
+// settings never reach a log, an error or the output.
+func desktopProxyTest(in io.Reader, out io.Writer) error {
+	reply := proxyTestReply{Class: "invalid"}
+	var proxy *config.WebProxy
+	if in != nil {
+		if line, err := readStartLine(in, false); err == nil {
+			if p, err := config.ParseWebProxy(line); err == nil && p.Provider == config.ProxyWebshare {
+				proxy = p
+			}
+		}
+	}
+	if proxy != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		exit, class := probeDesktopProxy(ctx, proxy)
+		cancel()
+		reply = proxyTestReply{OK: class == "" && exit.IsValid(), Class: class}
+		if reply.OK {
+			reply.Exit = exit.String()
+		} else if !worker.ValidProxyClass(class) {
+			reply.Class = "proxy_unreachable"
+		}
+	}
+	return json.NewEncoder(out).Encode(reply)
 }
 
 func desktopBearer(path string) (string, error) {

@@ -157,6 +157,50 @@ func TestRecoveryLiveUsesExactBodyAndUncertainCallsNeverRerun(t *testing.T) {
 		})
 	}
 }
+
+// A web attempt recovered after a crash reports execution_uncertain with the
+// egress it recorded when it began; other services' reports carry none.
+func TestRecoveryReportsWebEgress(t *testing.T) {
+	for _, tc := range []struct {
+		service, egress, want string
+	}{{"web", "proxy", `,"egress":{"via":"proxy"}}`}, {"web", "direct", `,"egress":{"via":"direct"}}`}, {"web", "", `,"egress":{"via":"direct"}}`}, {"codex", "", `"execution_uncertain"}`}} {
+		j := testJournal(t, filepath.Join(t.TempDir(), "attempts"))
+		l := testLease()
+		r, e := attemptRecord(l)
+		if e != nil {
+			t.Fatal(e)
+		}
+		r.ProviderAccountID, r.ProviderService, r.WebEgress = tc.service, tc.service, tc.egress
+		if e = j.Begin(r); e != nil {
+			t.Fatal(tc, e)
+		}
+		r.State = "started"
+		var body string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			if req.Method == http.MethodGet {
+				json.NewEncoder(w).Encode(coordinator.AttemptStatus{Version: coordinator.Version, JobID: l.JobID, Attempt: l.Attempt, Fence: l.Fence, State: "live", ReplaySafe: true})
+				return
+			}
+			raw, _ := io.ReadAll(req.Body)
+			body = string(raw)
+			w.WriteHeader(http.StatusOK)
+		}))
+		if e = recoverAttempt(context.Background(), coordinator.New(server.URL, "synthetic"), j, r); e != nil || !strings.HasSuffix(body, tc.want) {
+			t.Fatalf("%+v: %v %s", tc, e, body)
+		}
+		server.Close()
+	}
+	// A recorded egress belongs to a web attempt, and is direct or proxy.
+	j := testJournal(t, filepath.Join(t.TempDir(), "attempts"))
+	for _, bad := range []attempts.Record{{ProviderAccountID: "codex", ProviderService: "codex", WebEgress: "direct"}, {ProviderAccountID: "web", ProviderService: "web", WebEgress: "both"}} {
+		r, _ := attemptRecord(testLease())
+		r.ProviderAccountID, r.ProviderService, r.WebEgress = bad.ProviderAccountID, bad.ProviderService, bad.WebEgress
+		if j.Begin(r) == nil {
+			t.Fatalf("record %+v accepted", bad)
+		}
+	}
+}
+
 func TestRecoveryRejectsWrongIdentityOldContractAndDifferentReceipt(t *testing.T) {
 	for _, failure := range []string{"identity", "old-contract", "wrong-receipt", "malformed-receipt", "pending", "fenced", "unsupported"} {
 		t.Run(failure, func(t *testing.T) {

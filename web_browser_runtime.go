@@ -41,9 +41,9 @@ func startRuntimeBrowser(ctx context.Context, c config.Config) (worker.BrowserTi
 		// State transitions and closed reasons only.
 		Logf: func(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...) },
 	}
-	if p := c.WebEgressProxy; p != nil {
-		cfg.UpstreamProxy, cfg.UpstreamAuthorization = upstreamProxyURL(p), p.Authorization
-	}
+	// No shared upstream: each proxied page brings its own session
+	// (worker.BrowserFetchRequest.Upstream), and every other page leaves from
+	// this node's own network.
 	cfg.Solvers = runtimeSolvers(c.WebSolvers)
 	m := webruntime.New(cfg)
 	runCtx, cancel := context.WithCancel(ctx)
@@ -74,9 +74,14 @@ func (r runtimeBrowser) Prewarm() { r.m.Prewarm() }
 // Fetch maps the runtime's errors to the worker's: ErrUnavailable (not ready,
 // busy, or the helper could not start) is web_browser_unavailable, and any
 // other error a failed render. An ok result's DOM file passes to the worker,
-// which deletes it.
+// which deletes it. The runtime has no per-page upstream yet, so a proxied
+// page is refused as unavailable rather than rendered from this node's own
+// network; its relay re-fetch is not run either.
 func (r runtimeBrowser) Fetch(ctx context.Context, req worker.BrowserFetchRequest) (worker.BrowserFetchResult, error) {
-	res, err := r.m.Fetch(ctx, webruntime.FetchRequest(req))
+	if req.Upstream != nil {
+		return worker.BrowserFetchResult{}, worker.ErrBrowserUnavailable
+	}
+	res, err := r.m.Fetch(ctx, webruntime.FetchRequest{URL: req.URL, Wait: req.Wait, WaitMS: req.WaitMS, WaitSelector: req.WaitSelector, TimeoutMS: req.TimeoutMS, BlockResources: req.BlockResources, SolveChallenge: req.SolveChallenge})
 	if errors.Is(err, webruntime.ErrUnavailable) {
 		return worker.BrowserFetchResult{}, worker.ErrBrowserUnavailable
 	}

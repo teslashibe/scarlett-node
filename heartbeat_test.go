@@ -818,9 +818,9 @@ func TestLocalStatusFromAnotherProtocolAndNewFields(t *testing.T) {
 }
 
 // An offer for a proof mode the node will not serve is rejected before any
-// acceptance: invalid_offer for a mode it never advertised, other while keyed
-// relay is halted, and no_slot for a browser job while the browser tier is
-// not ready.
+// acceptance: invalid_offer for a mode it never advertised or a proxy it does
+// not have, other while keyed relay is halted, and no_slot for a browser job
+// while the browser tier is not ready.
 func TestSubmitLeaseRejectsAProofModeItDoesNotServe(t *testing.T) {
 	worker.ResetRelayHaltForTests()
 	t.Cleanup(worker.ResetRelayHaltForTests)
@@ -853,6 +853,20 @@ func TestSubmitLeaseRejectsAProofModeItDoesNotServe(t *testing.T) {
 	}
 	browser.LeaseDeadline = time.Now().Add(118 * time.Second).UTC().Truncate(time.Second)
 	browser.SettlementDeadline = browser.LeaseDeadline
+	// A node without a proxy refuses a web job that must go through one,
+	// relay or browser, whatever else it could serve.
+	raw, err = os.ReadFile("api/fixtures/lease-web-offer.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var proxied coordinator.Lease
+	if err := json.Unmarshal(raw, &proxied); err != nil {
+		t.Fatal(err)
+	}
+	proxied.LeaseDeadline, proxied.SettlementDeadline = browser.LeaseDeadline, browser.LeaseDeadline
+	proxied.WebEgress = "proxy"
+	proxiedBrowser := browser
+	proxiedBrowser.WebEgress = "proxy"
 	for _, tc := range []struct {
 		name   string
 		offer  coordinator.Lease
@@ -862,6 +876,8 @@ func TestSubmitLeaseRejectsAProofModeItDoesNotServe(t *testing.T) {
 		{"relay never advertised", relay, false, coordinator.RejectInvalidOffer},
 		{"relay halted", relay, true, coordinator.RejectOther},
 		{"browser not ready", browser, false, coordinator.RejectNoSlot},
+		{"proxy on a direct node", proxied, false, coordinator.RejectInvalidOffer},
+		{"proxied browser on a direct node", proxiedBrowser, false, coordinator.RejectInvalidOffer},
 	} {
 		if tc.halted {
 			worker.HaltRelay("synthetic")

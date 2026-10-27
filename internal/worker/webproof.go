@@ -23,8 +23,9 @@ import (
 var netResolver = net.DefaultResolver
 
 // webHopInput is the stdin of `scarlett-prover relay-web` for one hop. The
-// helper dials IP (or asks the proxy to CONNECT to it), never a hostname, and
-// uses URL only for SNI, certificate checks and the request line.
+// helper dials IP (or asks the proxy, at its own checked address, to CONNECT
+// to it), never a hostname, and uses URL only for SNI, certificate checks
+// and the request line.
 type webHopInput struct {
 	Verifier         string `json:"verifier"`
 	VerifierCA       string `json:"verifier_ca_file,omitempty"`
@@ -56,11 +57,17 @@ type webNodeHeaders struct {
 func (webNodeHeaders) String() string   { return "web node headers [redacted]" }
 func (webNodeHeaders) GoString() string { return "worker.webNodeHeaders{}" }
 
+// webProxyInput is a proxied hop's proxy: its checked address as an IP
+// literal, and the job's Proxy-Authorization. It goes to the helper's stdin
+// only; String and GoString redact it.
 type webProxyInput struct {
 	Host          string `json:"host"`
 	Port          int    `json:"port"`
 	Authorization string `json:"authorization,omitempty"`
 }
+
+func (webProxyInput) String() string   { return "web proxy input [redacted]" }
+func (webProxyInput) GoString() string { return "worker.webProxyInput{}" }
 
 // The helper's one stderr classification line on failure. Anything else is a
 // failed fetch.
@@ -82,11 +89,12 @@ const (
 	maxWebStderr = 16 << 10
 )
 
-// prove runs one relay session to addr and reads its summary: on the
-// helper hop 0 started before the accept (E1), else on the web daemon, else
-// as a one-shot relay-web helper. One proof observation covers the hop
-// whichever way it runs, begun before its token can go out.
-func (w Web) prove(ctx context.Context, plan webPlan, token string, hop int, url string, addr netip.Addr, headers *webNodeHeaders) webHopOutcome {
+// prove runs one relay session to addr, through route's proxy when it has
+// one, and reads its summary: on the helper hop 0 started before the accept
+// (E1), else on the web daemon, else as a one-shot relay-web helper. One
+// proof observation covers the hop whichever way it runs, begun before its
+// token can go out.
+func (w Web) prove(ctx context.Context, plan webPlan, token string, hop int, url string, addr netip.Addr, headers *webNodeHeaders, route *webRoute) webHopOutcome {
 	c := w.Config
 	deadline, ok := ctx.Deadline()
 	budget := min(w.hopLimit(), time.Until(deadline))
@@ -95,10 +103,7 @@ func (w Web) prove(ctx context.Context, plan webPlan, token string, hop int, url
 	}
 	exchange := hop + 1
 	endEncode := diagnostics.Start(ctx, "request_encode", exchange)
-	in := webHopInput{Verifier: c.Verifier, VerifierCA: c.VerifierCA, PlaintextFixture: c.VerifierPlaintextFixture, Token: token, Hop: hop, URL: url, IP: addr.String(), Port: 443, Payload: plan.raw, TimeoutMS: budget.Milliseconds(), NodeHeaders: headers}
-	if p := c.WebEgressProxy; p != nil {
-		in.Proxy = &webProxyInput{Host: p.Host, Port: p.Port, Authorization: p.Authorization}
-	}
+	in := webHopInput{Verifier: c.Verifier, VerifierCA: c.VerifierCA, PlaintextFixture: c.VerifierPlaintextFixture, Token: token, Hop: hop, URL: url, IP: addr.String(), Port: 443, Proxy: route.hopProxy(), Payload: plan.raw, TimeoutMS: budget.Milliseconds(), NodeHeaders: headers}
 	input, err := json.Marshal(in)
 	endEncode(diagnosticOutcome(ctx, err))
 	if err != nil {
@@ -173,12 +178,12 @@ func (r webHelperResult) outcome(ctx, hopCtx context.Context, exchange, hop int,
 			if len(r.diagnostics) > 0 {
 				diagnostics.AddHelper(ctx, exchange, r.diagnostics)
 			}
-			return webHopOutcome{code: webFailureCode(ctx, r.cause, r.class)}
+			return webFailure(ctx, r.cause, r.class)
 		}
 	} else {
 		helperStderr(ctx, exchange, r.stderr)
 		if r.err != nil {
-			return webHopOutcome{code: webHelperFailure(ctx, hopCtx, r.err, r.stderr)}
+			return webHelperFailure(ctx, hopCtx, r.err, r.stderr)
 		}
 	}
 	helperDiagnostics(ctx, exchange, r.stdout)
@@ -205,24 +210,38 @@ func runRelayWeb(hopCtx context.Context, prover string, input []byte) webHelperR
 // webHelperFailure classifies a failed helper run. Caught verifier misuse
 // halts relay node-wide first, as for X: the request is already out, and the
 // node must not be used that way again.
-func webHelperFailure(ctx, hopCtx context.Context, err error, stderr string) string {
+func webHelperFailure(ctx, hopCtx context.Context, err error, stderr string) webHopOutcome {
 	if strings.Contains(stderr, relayMisuseMarker) {
 		HaltRelay(relayMisuseMarker)
-		return "relay_misuse"
+		return webHopOutcome{code: "relay_misuse"}
 	}
 	if ctx.Err() != nil {
-		return "expired"
+		return webHopOutcome{code: "expired"}
 	}
 	var exit *exec.ExitError
 	if hopCtx.Err() == nil && !errors.As(err, &exit) {
 		// The helper never ran.
-		return "prover_error"
+		return webHopOutcome{code: "prover_error"}
 	}
-	return webFailureCode(ctx, "", webErrorClass(stderr))
+	return webFailure(ctx, "", webErrorClass(stderr))
+}
+
+// webFailure is a failed hop's outcome: its code and, for a proxy class,
+// that class too.
+func webFailure(ctx context.Context, cause, class string) webHopOutcome {
+	code := webFailureCode(ctx, cause, class)
+	switch code {
+	case "web_proxy_failed", "web_proxy_refused", "web_connect_failed":
+		return webHopOutcome{code: code, proxyClass: proxyClass(class)}
+	}
+	return webHopOutcome{code: code}
 }
 
 // webFailureCode maps a helper's failure class to the hop's code; a cause
-// carrying the relay misuse text halts relay first.
+// carrying the relay misuse text halts relay first. The proxy itself
+// failing is web_proxy_failed, the proxy refusing the target (403)
+// web_proxy_refused, and its exit failing web_connect_failed, as a direct
+// connection that failed.
 func webFailureCode(ctx context.Context, cause, class string) string {
 	if strings.Contains(cause, relayMisuseMarker) {
 		HaltRelay(relayMisuseMarker)
@@ -232,10 +251,12 @@ func webFailureCode(ctx context.Context, cause, class string) string {
 		return "expired"
 	}
 	switch class {
-	case "connect_failed":
+	case "connect_failed", proxyExit:
 		return "web_connect_failed"
-	case "proxy_failed":
+	case proxyUnreachable, proxyAuth, proxyQuota, proxyBusy:
 		return "web_proxy_failed"
+	case proxyRefused:
+		return "web_proxy_refused"
 	case "verifier_busy":
 		// Repeated by hop within its budget; never a job code.
 		return "verifier_busy"
@@ -257,10 +278,13 @@ type WebPredial struct {
 	stop                context.CancelFunc
 	idle                func()
 
-	mu   sync.Mutex
-	in   webHopInput
-	run  predialRun
-	used bool
+	mu  sync.Mutex
+	in  webHopInput
+	run predialRun
+	// proxyAddr is the proxy address the pre-dial checked for a proxied
+	// offer; the job's route takes it, so hop 0 matches the pre-dial.
+	proxyAddr netip.AddrPort
+	used      bool
 }
 
 // predialRun is the helper of a pre-dialed hop: on the daemon, or a
@@ -277,11 +301,11 @@ type webPredialKey struct{}
 
 // StartPredial starts hop 0 of a relay web offer before the node accepts
 // it: nil unless this node serves the offer as a relay page. It resolves
-// and checks the target as hop 0 will, then starts the helper without a
-// token.
+// and checks the target as hop 0 will, and for a proxied offer the proxy
+// too, then starts the helper without a token on the job's session.
 func (w Web) StartPredial(ctx context.Context, l coordinator.Lease) *WebPredial {
 	c := w.Config
-	if c.Executor != config.ExecutorServices || !c.Enabled("web") || l.ServiceType != "web" || !l.AcceptanceRequired || l.VerifierToken != "" || l.WebRequest == nil || l.WebRequest.Mode != "" || RelayHalted() {
+	if c.Executor != config.ExecutorServices || !c.Enabled("web") || l.ServiceType != "web" || !l.AcceptanceRequired || l.VerifierToken != "" || l.WebRequest == nil || l.WebRequest.Mode != "" || RelayHalted() || l.WebEgress != "" && c.WebEgressProxy == nil {
 		return nil
 	}
 	plan, ok := decodeWebPlan(l.WebPayload)
@@ -298,16 +322,29 @@ func (w Web) StartPredial(ctx context.Context, l coordinator.Lease) *WebPredial 
 	}
 	ctx, stop := context.WithDeadline(ctx, deadline.Add(time.Second))
 	p := &WebPredial{job: l.JobID, attempt: l.Attempt, fence: l.Fence, started: make(chan struct{}), stop: stop, idle: webHopBusy(c)}
-	go p.start(ctx, w, plan, deadline)
+	go p.start(ctx, w, plan, deadline, UsesProxy(c, l))
 	return p
 }
 
-func (p *WebPredial) start(ctx context.Context, w Web, plan webPlan, deadline time.Time) {
+func (p *WebPredial) start(ctx context.Context, w Web, plan webPlan, deadline time.Time, proxied bool) {
 	defer close(p.started)
 	c := w.Config
 	canonical, host, err := canonicalWebURL(plan.URL)
 	if err != nil || canonical != plan.URL {
 		return
+	}
+	// The job's route is hop 0's: the checked proxy address and the job's
+	// session at rotation 0, exactly as the job will build them.
+	var route *webRoute
+	if proxied {
+		addr, ok := w.proxyAddress(ctx, c.WebEgressProxy)
+		if !ok {
+			return
+		}
+		p.mu.Lock()
+		p.proxyAddr = addr
+		p.mu.Unlock()
+		route = &webRoute{proxy: c.WebEgressProxy, addr: addr, session: c.WebEgressProxy.Session(p.job, p.attempt, 0)}
 	}
 	lookupCtx, cancel := context.WithTimeout(ctx, webLookupLimit)
 	addrs, err := w.resolver()(lookupCtx, host)
@@ -315,15 +352,12 @@ func (p *WebPredial) start(ctx context.Context, w Web, plan webPlan, deadline ti
 	if err != nil || len(addrs) == 0 {
 		return
 	}
-	addr, ok := w.egress().pickWebAddr(ctx, addrs)
+	addr, code := pickHopAddr(ctx, w.egress(), addrs, proxied)
 	budget := min(w.hopLimit(), time.Until(deadline))
-	if !ok || budget < time.Second {
+	if code != "" || budget < time.Second {
 		return
 	}
-	in := webHopInput{Verifier: c.Verifier, VerifierCA: c.VerifierCA, PlaintextFixture: c.VerifierPlaintextFixture, Hop: 0, URL: plan.URL, IP: addr.String(), Port: 443, Payload: plan.raw, TimeoutMS: budget.Milliseconds()}
-	if proxy := c.WebEgressProxy; proxy != nil {
-		in.Proxy = &webProxyInput{Host: proxy.Host, Port: proxy.Port, Authorization: proxy.Authorization}
-	}
+	in := webHopInput{Verifier: c.Verifier, VerifierCA: c.VerifierCA, PlaintextFixture: c.VerifierPlaintextFixture, Hop: 0, URL: plan.URL, IP: addr.String(), Port: 443, Proxy: route.hopProxy(), Payload: plan.raw, TimeoutMS: budget.Milliseconds()}
 	var run predialRun
 	if d := daemonFor(c); d != nil {
 		if h, err := d.startHop(in); err == nil {

@@ -109,6 +109,10 @@ type Record struct {
 	// NoProvider marks an attempt that never runs provider work, such as a
 	// rejection. Older readers ignore it and treat the record as unbound.
 	NoProvider bool `json:"no_provider,omitempty"`
+	// WebEgress is how a web attempt's page leaves the node, "direct" or
+	// "proxy", fixed when it began: the report of an attempt recovered after
+	// a crash must say it. Set only with ProviderService web.
+	WebEgress string `json:"web_egress,omitempty"`
 }
 
 type Journal struct {
@@ -217,7 +221,7 @@ func (r Record) Key() string { return key(r) }
 
 // sameBinding compares the provider binding fixed when the attempt began.
 func sameBinding(a, b Record) bool {
-	return a.ProviderAccountID == b.ProviderAccountID && a.ProviderService == b.ProviderService && a.NoProvider == b.NoProvider
+	return a.ProviderAccountID == b.ProviderAccountID && a.ProviderService == b.ProviderService && a.NoProvider == b.NoProvider && a.WebEgress == b.WebEgress
 }
 func validField(s string) bool {
 	if len(s) == 0 || len(s) > 128 {
@@ -239,6 +243,9 @@ func valid(r Record) bool {
 		return false
 	}
 	if r.ProviderAccountID != "" && (!validField(r.ProviderAccountID) || (r.ProviderService != "codex" && r.ProviderService != "x_read" && r.ProviderService != "web")) || r.ProviderAccountID == "" && r.ProviderService != "" || r.NoProvider && r.ProviderAccountID != "" {
+		return false
+	}
+	if r.WebEgress != "" && (r.ProviderService != "web" || r.WebEgress != "direct" && r.WebEgress != "proxy") {
 		return false
 	}
 	if !validField(r.JobID) || !validField(r.Attempt) || !validField(r.Fence) || !validHash(r.Fingerprint) || r.Deadline.IsZero() || r.UpdatedAt.IsZero() {

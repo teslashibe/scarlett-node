@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -138,7 +139,7 @@ func TestWebServiceIgnoresAccountPool(t *testing.T) {
 func TestWebHeartbeatLimitsAndProxyPrivacy(t *testing.T) {
 	worker.ResetRelayHaltForTests()
 	p := poolFixture(t, "codex", "x_read", "web")
-	proxy, err := config.ParseWebProxy("http://synthetic-user:synthetic-secret@proxy.synthetic.invalid:3128")
+	proxy, err := config.ParseWebProxy([]byte(`{"provider":"webshare","username":"synthetic0user","password":"synthetic-secret","country":"us","port":3128,"use":"all"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +149,7 @@ func TestWebHeartbeatLimitsAndProxyPrivacy(t *testing.T) {
 		t.Fatal("full node capacity", p.capacity())
 	}
 	raw, _ := json.Marshal(p.health())
-	for _, secret := range []string{"synthetic-user", "synthetic-secret", "proxy.synthetic.invalid", "3128"} {
+	for _, secret := range []string{"synthetic0user", "synthetic-secret", "p.webshare.io", "3128", "webshare"} {
 		if strings.Contains(string(raw), secret) {
 			t.Fatal("heartbeat carries the proxy:", secret)
 		}
@@ -156,7 +157,17 @@ func TestWebHeartbeatLimitsAndProxyPrivacy(t *testing.T) {
 	if h := healthKind(t, p, "web"); h.Egress != "proxy" {
 		t.Fatalf("proxy egress not reported: %+v", h)
 	}
-	status := runtimeStatus{Version: coordinator.Version, State: "running", NodeID: "synthetic-node", InFlight: 96, Services: p.health(), Release: coordinator.NodeRelease}
+	// The exit a page's probe found shows in local status only.
+	lease, ok := p.acquireAccount("web")
+	if !ok {
+		t.Fatal("web slot")
+	}
+	lease.config.WebEgressObserver(config.WebEgressOutcome{Via: "proxy", Exit: netip.MustParseAddr("93.184.216.34")})
+	p.finishAccount(lease, "")
+	status := runtimeStatus{Version: coordinator.Version, State: "running", NodeID: "synthetic-node", InFlight: 96, Services: p.health(), WebEgress: p.webEgressStatus(), Release: coordinator.NodeRelease}
+	if raw, _ := json.Marshal(p.health()); strings.Contains(string(raw), "93.184.216.34") {
+		t.Fatal("heartbeat carries the exit")
+	}
 	if err := saveRuntimeStatus(p.config.StateDir, status); err != nil {
 		t.Fatal(err)
 	}
@@ -165,12 +176,102 @@ func TestWebHeartbeatLimitsAndProxyPrivacy(t *testing.T) {
 	if err := localCommand("status", &out); err != nil {
 		t.Fatal("three-service status refused:", err)
 	}
-	if strings.Contains(out.String(), "synthetic-secret") || !strings.Contains(out.String(), `"egress":"proxy"`) {
+	if strings.Contains(out.String(), "synthetic-secret") || strings.Contains(out.String(), "synthetic0user") || !strings.Contains(out.String(), `"egress":"proxy"`) ||
+		!strings.Contains(out.String(), `"web_egress":{"via":"proxy","provider":"webshare","country":"us","last_exit":"93.184.216.34","last_exit_at":`) {
 		t.Fatal("status output", out.String())
 	}
-	for _, code := range []string{"web_egress_denied", "web_dns_failed", "web_connect_failed", "web_proxy_failed", "web_fetch_failed"} {
+	for _, code := range []string{"web_egress_denied", "web_dns_failed", "web_connect_failed", "web_proxy_failed", "web_proxy_refused", "web_fetch_failed"} {
 		if restsNode(true, code) || restsNode(false, code) {
 			t.Fatal("web outcome rests the node:", code)
 		}
+	}
+}
+
+// A failed proxy rests web for as long as its class says, and never sends a
+// page from this node's own network instead; a proxy that refused one
+// target, or whose exit failed, rests nothing.
+func TestWebProxyRests(t *testing.T) {
+	worker.ResetRelayHaltForTests()
+	t.Cleanup(worker.ResetRelayHaltForTests)
+	p := poolFixture(t, "web")
+	proxy, err := config.ParseWebProxy([]byte(`{"provider":"webshare","username":"synthetic0user","password":"synthetic-secret","country":"us","port":80,"use":"limited_sites"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.config.WebEgressProxy = proxy
+	if h := healthKind(t, p, "web"); h.Egress != "both" {
+		t.Fatalf("both egress: %+v", h)
+	}
+	finish := func(code, class string) {
+		t.Helper()
+		lease, ok := p.acquireAccount("web")
+		if !ok {
+			t.Fatal("web slot refused before", code, class)
+		}
+		lease.config.WebEgressObserver(config.WebEgressOutcome{Via: "proxy", ProxyClass: class})
+		p.finishAccount(lease, code)
+	}
+	recover := func() {
+		p.mu.Lock()
+		p.entries["web"].restUntil = time.Now().Add(-time.Second)
+		p.mu.Unlock()
+		if h := healthKind(t, p, "web"); h.State != "configured" || p.webEgressStatus().RestReason != "" {
+			t.Fatalf("web did not recover: %+v", h)
+		}
+	}
+	for class, rest := range map[string]time.Duration{"proxy_unreachable": time.Minute, "proxy_busy": time.Minute, "proxy_auth": 10 * time.Minute, "proxy_quota": 30 * time.Minute, "": time.Minute} {
+		before := time.Now()
+		finish("web_proxy_failed", class)
+		h := healthKind(t, p, "web")
+		p.mu.Lock()
+		until := p.entries["web"].restUntil
+		p.mu.Unlock()
+		want := class
+		if want == "" {
+			want = "proxy_unreachable"
+		}
+		if h.State != "unreachable" || h.LastErrorCode != "web_proxy_failed" || p.acquire("web") || until.Before(before.Add(rest)) || until.After(time.Now().Add(rest)) || p.webEgressStatus().RestReason != want {
+			t.Fatalf("%q: %+v until %v reason %q", class, h, until.Sub(before), p.webEgressStatus().RestReason)
+		}
+		raw, _ := json.Marshal(p.health())
+		if strings.Contains(string(raw), want) {
+			t.Fatal("heartbeat names the rest reason", string(raw))
+		}
+		recover()
+	}
+	// A longer rest is never cut short by a shorter one.
+	finish("web_proxy_failed", "proxy_quota")
+	p.mu.Lock()
+	p.entries["web"].inFlight++
+	lease := &accountLease{id: "web", kind: "web", account: p.web, webProxyClass: "proxy_busy"}
+	p.mu.Unlock()
+	p.finishAccount(lease, "web_proxy_failed")
+	if p.webEgressStatus().RestReason != "proxy_quota" {
+		t.Fatal("rest shortened", p.webEgressStatus().RestReason)
+	}
+	recover()
+	for _, code := range []string{"web_proxy_refused", "web_connect_failed"} {
+		finish(code, "")
+		if h := healthKind(t, p, "web"); h.State != "configured" && h.State != "ready" || h.LastErrorCode != "" {
+			t.Fatalf("%s rested web: %+v", code, h)
+		}
+	}
+	// Local status reads back, and refuses what this node never writes.
+	status := p.webEgressStatus()
+	if status.Via != "both" || status.Provider != "webshare" || status.Country != "us" || !validWebEgressStatus(status) {
+		t.Fatalf("%+v", status)
+	}
+	at := time.Now()
+	for _, bad := range []webEgressStatus{
+		{Via: "home"}, {Via: "direct", Provider: "webshare"}, {Via: "both"}, {Via: "both", Provider: "webshare"},
+		{Via: "both", Provider: "http", Country: "us"}, {Via: "proxy", Provider: "webshare", Country: "us", LastExit: "2606:2800:220:1::1", LastExitAt: &at},
+		{Via: "proxy", Provider: "webshare", Country: "us", LastExit: "93.184.216.34"}, {Via: "proxy", Provider: "webshare", Country: "us", RestReason: "proxy_exit"},
+	} {
+		if validWebEgressStatus(&bad) {
+			t.Errorf("%+v accepted", bad)
+		}
+	}
+	if !validWebEgressStatus(&webEgressStatus{Via: "direct"}) || !validWebEgressStatus(&webEgressStatus{Via: "proxy", Provider: "http"}) {
+		t.Fatal("valid statuses refused")
 	}
 }

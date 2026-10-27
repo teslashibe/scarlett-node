@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"io"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/localfs"
 )
 
@@ -132,5 +136,95 @@ func TestDesktopHelpersRejectPathsPortsAndUnknownCommands(t *testing.T) {
 	}
 	if err := desktopCommand([]string{"private-dir", file}, strings.NewReader(""), &bytes.Buffer{}); err == nil {
 		t.Fatal("regular file treated as private directory")
+	}
+}
+
+const syntheticStartProxy = `{"provider":"webshare","username":"synthetic0user","password":"synthetic-secret","country":"us","port":80,"use":"limited_sites"}`
+
+// The start line is read a byte at a time, so the owner commands after it
+// stay in the pipe for readOwner.
+func TestDesktopStartLine(t *testing.T) {
+	owner := strings.NewReader("{}\nsleep\nwake\n")
+	if p, err := readDesktopStart(owner); err != nil || p != nil {
+		t.Fatal("empty start line", p, err)
+	}
+	if rest, _ := io.ReadAll(owner); string(rest) != "sleep\nwake\n" {
+		t.Fatalf("start line took %q", rest)
+	}
+	owner = strings.NewReader(`{"web_egress_proxy":` + syntheticStartProxy + "}\r\nwake\n")
+	p, err := readDesktopStart(owner)
+	if err != nil || p == nil || p.Provider != config.ProxyWebshare || p.Use != config.ProxyUseLimitedSites {
+		t.Fatal("proxy start line", err)
+	}
+	if rest, _ := io.ReadAll(owner); string(rest) != "wake\n" {
+		t.Fatalf("start line took %q", rest)
+	}
+	long := `{"web_egress_proxy":` + strings.Replace(syntheticStartProxy, `"use"`, `"pad":"`+strings.Repeat("a", 4096)+`","use"`, 1) + "}\n"
+	for _, line := range []string{"", "{}", "sleep\n", `{"web_egress_proxy":` + strings.Replace(syntheticStartProxy, "webshare", "http", 1) + "}\n", long, "{\"web_egress_proxy\":" + syntheticStartProxy + "}"} {
+		_, err := readDesktopStart(strings.NewReader(line))
+		if err == nil {
+			t.Errorf("%.40q accepted", line)
+		} else if strings.Contains(err.Error(), "synthetic") {
+			t.Errorf("error repeats the line: %v", err)
+		}
+	}
+	// A proxy start line belongs to the services executor; the merge is
+	// checked before anything runs.
+	t.Setenv("SCARLETT_COORDINATOR", "https://example.org")
+	t.Setenv("SCARLETT_PROFILE", "standard")
+	t.Setenv("SCARLETT_EXECUTOR", "gateway")
+	t.Setenv("SCARLETT_GATEWAY", "http://127.0.0.1:8080")
+	t.Setenv("SCARLETT_STATE_DIR", filepath.Join(t.TempDir(), "state"))
+	err = desktopCommand([]string{"run"}, strings.NewReader(`{"web_egress_proxy":`+syntheticStartProxy+"}\n"), &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "services executor") || strings.Contains(err.Error(), "synthetic") {
+		t.Fatal("proxy start line outside services mode", err)
+	}
+	if err := desktopCommand([]string{"run"}, strings.NewReader("sleep\n"), &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "start line") {
+		t.Fatal("run without a start line", err)
+	}
+}
+
+func TestDesktopProxyTest(t *testing.T) {
+	previous := probeDesktopProxy
+	t.Cleanup(func() { probeDesktopProxy = previous })
+	var probed []*config.WebProxy
+	answer := func(exit netip.Addr, class string) {
+		probeDesktopProxy = func(_ context.Context, p *config.WebProxy) (netip.Addr, string) {
+			probed = append(probed, p)
+			return exit, class
+		}
+	}
+	run := func(input string) string {
+		t.Helper()
+		var out bytes.Buffer
+		if err := desktopCommand([]string{"proxy-test"}, strings.NewReader(input), &out); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(out.String(), "synthetic") {
+			t.Fatal("proxy test prints the settings", out.String())
+		}
+		return out.String()
+	}
+	answer(netip.MustParseAddr("93.184.216.34"), "")
+	if out := run(syntheticStartProxy); out != `{"ok":true,"exit":"93.184.216.34"}`+"\n" || len(probed) != 1 || probed[0].Username != "synthetic0user" {
+		t.Fatal(out)
+	}
+	if out := run(syntheticStartProxy + "\n"); out != `{"ok":true,"exit":"93.184.216.34"}`+"\n" {
+		t.Fatal(out)
+	}
+	for _, class := range []string{"proxy_unreachable", "proxy_auth", "proxy_quota", "proxy_busy", "proxy_refused", "proxy_exit"} {
+		answer(netip.Addr{}, class)
+		if out := run(syntheticStartProxy); out != `{"ok":false,"class":"`+class+`"}`+"\n" {
+			t.Fatal(class, out)
+		}
+	}
+	probed = nil
+	for _, input := range []string{"", "{}", `{"web_egress_proxy":` + syntheticStartProxy + `}`, strings.Replace(syntheticStartProxy, `"port":80`, `"port":8080`, 1), `{"provider":"http","host":"127.0.0.1","port":3128,"use":"all"}`} {
+		if out := run(input); out != `{"ok":false,"class":"invalid"}`+"\n" {
+			t.Fatalf("%q: %s", input, out)
+		}
+	}
+	if len(probed) != 0 {
+		t.Fatal("an invalid proxy was probed")
 	}
 }

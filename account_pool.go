@@ -34,6 +34,9 @@ type accountLease struct {
 	quotaUntil time.Time
 	// browser marks a web lease that holds a browser slot too.
 	browser bool
+	// webProxyClass is the proxy class behind a web lease that failed
+	// web_proxy_failed, which decides how long web rests.
+	webProxyClass string
 }
 type accountStatus struct {
 	ID        string    `json:"id"`
@@ -537,7 +540,7 @@ func (p *servicePool) finishAccount(l *accountLease, code string) {
 		if l.browser && p.browserInFlight > 0 {
 			p.browserInFlight--
 		}
-		p.settleWeb(code)
+		p.settleWeb(code, l.webProxyClass)
 		return
 	}
 	if l.xIdentity != "" && p.xInFlight[l.xIdentity] > 0 {

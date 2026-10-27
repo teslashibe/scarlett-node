@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"os/exec"
 	"slices"
@@ -54,6 +55,12 @@ type servicePool struct {
 	// nil when the limit is fixed or web is off. Web's slot count follows it
 	// below the configured ceiling, config.WebConcurrency.
 	webLimit *worker.WebLimiter
+	// webRestReason is the proxy class behind web's current proxy rest, and
+	// webExit and webExitAt the last proxy exit a page's probe found, for
+	// local status only.
+	webRestReason string
+	webExit       netip.Addr
+	webExitAt     time.Time
 }
 
 func newServicePool(c config.Config) *servicePool {
@@ -312,13 +319,89 @@ func (p *servicePool) capacity() int {
 	return total
 }
 
-// webProxyRest is how long the web service reports unreachable after its
-// egress proxy failed, before it is offered work again.
-const webProxyRest = 60 * time.Second
+// webProxyRests are how long the web service reports unreachable after its
+// egress proxy failed, by the failure's proxy class, before it is offered
+// work again: a minute for a proxy that could not be reached or was busy,
+// ten minutes for a sign-in it refused, half an hour for a plan out of
+// bandwidth. A proxy that refused one target (403) or whose exit failed
+// rests nothing. A web_proxy_failed without a class rests a minute.
+var webProxyRests = map[string]time.Duration{
+	"proxy_unreachable": time.Minute,
+	"proxy_busy":        time.Minute,
+	"proxy_auth":        10 * time.Minute,
+	"proxy_quota":       30 * time.Minute,
+}
+
+// webEgressStatus is status.json's web_egress: how web leaves this node
+// (direct, both or proxy, as the heartbeat says), the proxy's provider and
+// country, the last exit a page's probe found and when, and the proxy class
+// of a rest in progress. Local only: never in a heartbeat or ServiceHealth,
+// and never a credential or session. Absent without web.
+type webEgressStatus struct {
+	Via        string     `json:"via"`
+	Provider   string     `json:"provider,omitempty"`
+	Country    string     `json:"country,omitempty"`
+	LastExit   string     `json:"last_exit,omitempty"`
+	LastExitAt *time.Time `json:"last_exit_at,omitempty"`
+	RestReason string     `json:"rest_reason,omitempty"`
+}
+
+func (p *servicePool) webEgressStatus() *webEgressStatus {
+	if !p.config.Enabled("web") {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	status := &webEgressStatus{Via: p.config.WebEgress()}
+	if proxy := p.config.WebEgressProxy; proxy != nil {
+		status.Provider, status.Country = proxy.Provider, proxy.Country
+	}
+	if p.webExit.IsValid() {
+		at := p.webExitAt.UTC()
+		status.LastExit, status.LastExitAt = p.webExit.String(), &at
+	}
+	if time.Now().Before(p.entries["web"].restUntil) {
+		status.RestReason = p.webRestReason
+	}
+	return status
+}
+
+// validWebEgressStatus checks a web_egress read back from status.json.
+func validWebEgressStatus(s *webEgressStatus) bool {
+	if s == nil {
+		return true
+	}
+	exit, err := netip.ParseAddr(s.LastExit)
+	switch {
+	case s.Via != "direct" && s.Via != "both" && s.Via != "proxy":
+		return false
+	case s.Via == "direct" && (s.Provider != "" || s.Country != "" || s.LastExit != "" || s.RestReason != ""):
+		return false
+	case s.Via != "direct" && s.Provider != config.ProxyWebshare && s.Provider != config.ProxyHTTP:
+		return false
+	case s.Country != "" && s.Country != config.WebshareCountry || (s.Provider == config.ProxyWebshare) != (s.Country != ""):
+		return false
+	case s.LastExit != "" && (err != nil || !exit.Is4()) || (s.LastExit == "") != (s.LastExitAt == nil):
+		return false
+	}
+	return s.RestReason == "" || webProxyRests[s.RestReason] > 0
+}
+
+// observeWebEgress records how a web lease's page left: the proxy class of
+// a web_proxy_failed page, for its rest, and the exit its probe found.
+func (p *servicePool) observeWebEgress(l *accountLease, o config.WebEgressOutcome) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	l.webProxyClass = o.ProxyClass
+	if o.Via == "proxy" && o.Exit.IsValid() {
+		p.webExit, p.webExitAt = o.Exit, time.Now()
+	}
+}
 
 // refreshWeb derives the web state. Web has no accounts: it is configured
 // once enabled with the proof helper present, and only the helper, a relay
-// halt or a failed egress proxy make it unreachable. Caller holds p.mu.
+// halt or a failed egress proxy (for its rest) make it unreachable. Caller
+// holds p.mu.
 func (p *servicePool) refreshWeb(now time.Time) {
 	s := p.entries["web"]
 	if !s.enabled {
@@ -341,7 +424,7 @@ func (p *servicePool) refreshWeb(now time.Time) {
 	case now.Before(s.restUntil):
 		s.state, s.lastError = "unreachable", "web_proxy_failed"
 	case s.state != "ready":
-		s.state, s.lastError, s.restUntil = "configured", "", time.Time{}
+		s.state, s.lastError, s.restUntil, p.webRestReason = "configured", "", time.Time{}, ""
 	}
 }
 
@@ -366,7 +449,11 @@ func (p *servicePool) acquireWebLocked(browser bool) (*accountLease, bool) {
 		// The worker reports this page's relay outcomes to the limit.
 		c.WebObserver = p.webLimit.Admit(s.inFlight)
 	}
-	return &accountLease{id: "web", kind: "web", config: c, account: p.web, browser: browser}, true
+	lease := &accountLease{id: "web", kind: "web", account: p.web, browser: browser}
+	// The worker reports how the page left, which settleWeb reads.
+	c.WebEgressObserver = func(o config.WebEgressOutcome) { p.observeWebEgress(lease, o) }
+	lease.config = c
+	return lease, true
 }
 
 // browserReasons is the closed set of reasons an unavailable browser tier
@@ -425,14 +512,25 @@ func browserSolvers(in []string) []string {
 }
 
 // settleWeb applies one finished web job. Only the node's own egress proxy
-// failing rests the service; a target that fails, refuses or does not resolve
-// says nothing about this node. Caller holds p.mu.
-func (p *servicePool) settleWeb(code string) {
+// failing rests the service, for as long as its proxy class says; a target
+// that fails, refuses or does not resolve says nothing about this node, and
+// neither does a proxy that refused one target or whose exit failed. A
+// resting node never sends a page from its own network instead. Caller
+// holds p.mu.
+func (p *servicePool) settleWeb(code, class string) {
 	s := p.entries["web"]
 	switch code {
 	case "":
 		s.state, s.lastError = "ready", ""
 	case "web_proxy_failed":
-		s.state, s.lastError, s.restUntil = "unreachable", code, time.Now().Add(webProxyRest)
+		rest, ok := webProxyRests[class]
+		if !ok {
+			class, rest = "proxy_unreachable", time.Minute
+		}
+		until := time.Now().Add(rest)
+		if until.After(s.restUntil) {
+			s.restUntil, p.webRestReason = until, class
+		}
+		s.state, s.lastError = "unreachable", code
 	}
 }

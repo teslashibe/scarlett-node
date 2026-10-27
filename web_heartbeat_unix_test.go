@@ -70,15 +70,22 @@ func relayWebInput(raw []byte) (map[string]any, error) {
 // offer, runs the relay-web helper against the checked address and reports
 // proven, or reports the hop-0 failure code.
 func TestRunLoopServesWebLease(t *testing.T) {
+	public := map[string][]netip.Addr{"example.com": {netip.MustParseAddr("93.184.215.14")}}
+	proxyHost := map[string][]netip.Addr{"example.com": {netip.MustParseAddr("93.184.215.14")}, "p.webshare.io": {netip.MustParseAddr("104.16.0.10")}}
 	for _, tc := range []struct {
 		name    string
 		answers map[string][]netip.Addr
 		route   string
 		code    string
+		// proxied runs on a node with a proxy for limited sites, offered the
+		// job with web_egress proxy.
+		proxied bool
 	}{
-		{"proven", map[string][]netip.Addr{"example.com": {netip.MustParseAddr("93.184.215.14")}}, "/proven", ""},
-		{"dns failure", map[string][]netip.Addr{}, "/fail", "web_dns_failed"},
-		{"private target", map[string][]netip.Addr{"example.com": {netip.MustParseAddr("192.168.0.10")}}, "/fail", "web_egress_denied"},
+		{"proven", public, "/proven", "", false},
+		{"dns failure", map[string][]netip.Addr{}, "/fail", "web_dns_failed", false},
+		{"private target", map[string][]netip.Addr{"example.com": {netip.MustParseAddr("192.168.0.10")}}, "/fail", "web_egress_denied", false},
+		{"proven through the proxy", proxyHost, "/proven", "", true},
+		{"unchecked proxy", public, "/fail", "web_proxy_failed", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			worker.ResetRelayHaltForTests()
@@ -102,6 +109,9 @@ func TestRunLoopServesWebLease(t *testing.T) {
 			}
 			t.Cleanup(func() { webWorker = previous })
 			offer := webOfferFixture(t)
+			if tc.proxied {
+				offer.WebEgress = "proxy"
+			}
 			heartbeats := make(chan coordinator.Heartbeat, 16)
 			reports := make(chan []byte, 1)
 			var mu sync.Mutex
@@ -146,6 +156,13 @@ func TestRunLoopServesWebLease(t *testing.T) {
 			}))
 			t.Cleanup(server.Close)
 			c := config.Config{Executor: config.ExecutorServices, Services: []string{"web"}, Profile: "standard", StateDir: filepath.Join(dir, "state"), AccountsFile: filepath.Join(dir, "state", "accounts.json"), AccountsRequired: true, Credential: "synthetic-credential", NodeID: "synthetic-node", CodexConcurrency: 1, XConcurrency: 1, WebConcurrency: 2, Bid: 100, Verifier: "verifier:7047", Prover: prover, JournalLimits: attempts.DefaultLimits(), MaxInputBytes: 32768, MaxOutputTokens: 20, InferenceTimeout: 3 * time.Second, DiagnosticsDisabled: true}
+			if tc.proxied {
+				proxy, err := config.ParseWebProxy([]byte(`{"provider":"webshare","username":"synthetic0user","password":"synthetic-secret","country":"us","port":80,"use":"limited_sites"}`))
+				if err != nil {
+					t.Fatal(err)
+				}
+				c.WebEgressProxy = proxy
+			}
 			c.Coordinator = server.URL
 			c.CoordinatorCA = filepath.Join(privateTestDir(t), "synthetic-coordinator-ca.pem")
 			if err := writePrivateFixture(c.CoordinatorCA, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600); err != nil {
@@ -167,7 +184,11 @@ func TestRunLoopServesWebLease(t *testing.T) {
 				reader.Close()
 			}()
 			first := <-heartbeats
-			if len(first.Services) != 3 || first.Services[2].Kind != "web" || first.Services[2].State != "configured" || first.Services[2].Capacity != 2 || first.Services[2].Egress != "direct" || first.Capacity != 2 || first.State != "available" {
+			egress, via := "direct", "direct"
+			if tc.proxied {
+				egress, via = "both", "proxy"
+			}
+			if len(first.Services) != 3 || first.Services[2].Kind != "web" || first.Services[2].State != "configured" || first.Services[2].Capacity != 2 || first.Services[2].Egress != egress || first.Capacity != 2 || first.State != "available" {
 				t.Fatalf("web heartbeat %+v", first)
 			}
 			var body []byte
@@ -176,8 +197,13 @@ func TestRunLoopServesWebLease(t *testing.T) {
 			case <-time.After(10 * time.Second):
 				t.Fatal("no report")
 			}
+			// Every web report says how the page left; the probe's exit host
+			// does not resolve here, so a proxied report names no exit.
+			if bytes.Contains(body, []byte("synthetic")) {
+				t.Fatalf("report carries the proxy %s", body)
+			}
 			if tc.code == "" {
-				want, _ := json.Marshal(coordinator.Proven{Version: coordinator.Version, Attempt: offer.Attempt, Fence: offer.Fence})
+				want, _ := json.Marshal(coordinator.Proven{Version: coordinator.Version, Attempt: offer.Attempt, Fence: offer.Fence, Egress: &coordinator.WebEgress{Via: via}})
 				if !bytes.Equal(body, want) {
 					t.Fatalf("proven body %s", body)
 				}
@@ -186,9 +212,12 @@ func TestRunLoopServesWebLease(t *testing.T) {
 				if err != nil || inErr != nil || in["ip"] != "93.184.215.14" || in["url"] != "https://example.com/" || in["token"] != strings.Repeat("ab", 32) || in["verifier"] != "verifier:7047" {
 					t.Fatalf("helper input %s %v %v", raw, err, inErr)
 				}
+				if proxy, _ := in["proxy"].(map[string]any); tc.proxied != (proxy != nil) || tc.proxied && (proxy["host"] != "104.16.0.10" || proxy["port"] != float64(80)) {
+					t.Fatalf("helper proxy %v", in["proxy"])
+				}
 			} else {
-				var failure coordinator.Failure
-				if json.Unmarshal(body, &failure) != nil || failure.Code != tc.code || failure.Attempt != offer.Attempt {
+				want, _ := json.Marshal(coordinator.Failure{Version: coordinator.Version, Attempt: offer.Attempt, Fence: offer.Fence, Code: tc.code, Egress: &coordinator.WebEgress{Via: via}})
+				if !bytes.Equal(body, want) {
 					t.Fatalf("failure body %s", body)
 				}
 				if _, err := os.Stat(stdin); !os.IsNotExist(err) {
@@ -208,7 +237,12 @@ func TestRunLoopServesWebLease(t *testing.T) {
 				web := h.Services[2]
 				if web.InFlight == 0 && len(web.ActiveLeases) == 0 {
 					want := "ready"
-					if tc.code != "" {
+					switch tc.code {
+					case "":
+					case "web_proxy_failed":
+						// The proxy failing rests web; nothing goes out direct.
+						want = "unreachable"
+					default:
 						want = "configured"
 					}
 					if web.State != want {
@@ -235,7 +269,7 @@ func TestRunLoopServesWebLease(t *testing.T) {
 					t.Fatal(err)
 				}
 				records++
-				if record.ProviderService != "web" || record.ProviderAccountID != "web" || record.State != "terminal" {
+				if record.ProviderService != "web" || record.ProviderAccountID != "web" || record.State != "terminal" || record.WebEgress != via {
 					t.Fatalf("journal record %+v", record)
 				}
 				if tc.code == "" && (record.ProofTraffic == nil || record.ProofTraffic.MaxSamples != 6 || len(record.ProofTraffic.Samples) != 1 || record.ProofTraffic.Samples[0].State != "complete") {

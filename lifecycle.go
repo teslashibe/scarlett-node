@@ -45,6 +45,10 @@ type runtimeStatus struct {
 	// SCARLETT_WEB_CONCURRENCY=auto, why and when that last changed. Local
 	// only: heartbeats carry the capacity alone.
 	WebLimit *webLimitStatus `json:"web_limit,omitempty"`
+	// WebEgress is how web leaves this node, its proxy's provider and
+	// country, the last proxy exit and the reason for a proxy rest. Local
+	// only: never a credential or session, never in a heartbeat.
+	WebEgress *webEgressStatus `json:"web_egress,omitempty"`
 	// Release is this build's release version. LatestRelease is the newest
 	// release the coordinator last reported; UpdateAvailable is set when it is
 	// newer than Release, and UpdateRequired while the coordinator offers this
@@ -246,6 +250,9 @@ func localCommandDir(dir, command string, output io.Writer) error {
 		}
 		if !validWebLimitStatus(status.WebLimit) {
 			return errors.New("invalid local web limit status")
+		}
+		if !validWebEgressStatus(status.WebEgress) {
+			return errors.New("invalid local web egress status")
 		}
 		if (status.LatestRelease != "" && !coordinator.ValidVersion(status.LatestRelease)) || (status.UpdateAvailable || status.UpdateRequired) && status.LatestRelease == "" {
 			return errors.New("invalid local release status")

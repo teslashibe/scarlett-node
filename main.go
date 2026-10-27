@@ -567,7 +567,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			observation.Finish("rejected")
 			if l.AcceptanceRequired {
 				reject(l.OfferAttempt(), coordinator.RejectNoSlot)
-			} else if err := rejectLease(coordinator.WithoutAcceptRetry(workCtx), client, journal, l, "service_unavailable"); err != nil {
+			} else if err := rejectLease(coordinator.WithoutAcceptRetry(workCtx), client, journal, c, l, "service_unavailable"); err != nil {
 				fmt.Fprintln(os.Stderr, "rejection:", err)
 			}
 			return
@@ -636,7 +636,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			if !serviceAvailable {
 				// A legacy lease without funded acceptance is failed at once.
 				code = "service_unavailable"
-				err = rejectLease(attemptCtx, client, journal, l, code)
+				err = rejectLease(attemptCtx, client, journal, selected, l, code)
 			} else {
 				code, err = submitLease(attemptCtx, client, selected, l, local, journal)
 				if services != nil {
@@ -695,7 +695,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 				rejectedForDrain = true
 				if l.AcceptanceRequired {
 					reject(l.OfferAttempt(), coordinator.RejectDraining)
-				} else if err := rejectLease(coordinator.WithoutAcceptRetry(workCtx), client, journal, l, "service_unavailable"); err != nil {
+				} else if err := rejectLease(coordinator.WithoutAcceptRetry(workCtx), client, journal, c, l, "service_unavailable"); err != nil {
 					fmt.Fprintln(os.Stderr, "drain rejection:", err)
 				}
 				continue
@@ -809,6 +809,7 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 		if services != nil {
 			status.Accounts = services.accountStatus()
 			status.WebLimit = services.webLimitStatus() // S4b: adaptive web limit, local status only
+			status.WebEgress = services.webEgressStatus()
 		}
 		status.InFlight = len(slots)
 		if records, err := journal.Pending(); err != nil {
@@ -942,6 +943,11 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 		declineOffer(ctx, client, l, servableDeclineReason(c, l))
 		return "invalid_lease", errors.New("x_read offer asks for a proof mode this node does not serve")
 	}
+	// Only a node with a proxy takes a job that must go through one.
+	if l.ServiceType == "web" && l.WebEgress != "" && c.WebEgress() == "direct" {
+		declineOffer(ctx, client, l, coordinator.RejectInvalidOffer)
+		return "invalid_lease", errors.New("web offer asks for a proxy this node does not have")
+	}
 	// For a browser offer, or a relay offer with the pre-warm hint, this also
 	// starts the browser while the node accepts.
 	if l.ServiceType == "web" && !worker.WebOfferServable(c, l, currentBrowser()) {
@@ -954,6 +960,10 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 	}
 	if c.LocalAccountID != "" {
 		record.ProviderAccountID, record.ProviderService = c.LocalAccountID, l.ServiceType
+	}
+	if record.ProviderService == "web" {
+		// A recovered attempt's report must say how the page left.
+		record.WebEgress = webReportVia(c, l)
 	}
 	// Offer terms are checked before the journal: nothing is bound to an
 	// account or sent yet, so a refused offer leaves no record and a
@@ -1054,14 +1064,22 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 		if detail != "" && c.Executor != config.ExecutorServices {
 			fmt.Fprintln(os.Stderr, detail)
 		}
+		// Every web report says how the page left; no other report does.
+		var egress *coordinator.WebEgress
+		if c.Executor == config.ExecutorServices && l.ServiceType == "web" {
+			egress = &webReport.Egress
+			if egress.Via == "" {
+				egress = &coordinator.WebEgress{Via: webReportVia(c, l)}
+			}
+		}
 		if code != "" {
-			failure := coordinator.Failure{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence, Code: code}
+			failure := coordinator.Failure{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence, Code: code, Egress: egress}
 			if code == "page_too_large" {
 				failure.Stage, failure.ObservedBytes = webReport.Stage, webReport.ObservedBytes
 			}
 			body = failure
 		} else {
-			body = coordinator.Proven{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence}
+			body = coordinator.Proven{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence, Egress: egress}
 		}
 	} else {
 		var result coordinator.Result
@@ -1109,6 +1127,16 @@ func submitLease(ctx context.Context, client *coordinator.Client, c config.Confi
 		return code, &stageError{"report", err}
 	}
 	return code, nil
+}
+
+// webReportVia is how lease l's page leaves this node, "direct" or "proxy",
+// for a web report with no egress of the worker's own: a lease refused
+// before it ran, or an attempt recovered after a crash.
+func webReportVia(c config.Config, l coordinator.Lease) string {
+	if worker.UsesProxy(c, l) {
+		return "proxy"
+	}
+	return "direct"
 }
 
 // stageError names the coordinator call a submitLease error came from, so

@@ -540,7 +540,7 @@ func TestWebDaemonPageTooLargeReachesTheReport(t *testing.T) {
 	_, webLog, _ := useWebDaemon(t, "web-daemon-too-large")
 	started := time.Now()
 	report := webWorkerFor(publicAnswers).Report(context.Background(), webFixtureLease(t))
-	if report != (WebReport{Code: "page_too_large", Stage: "wire", ObservedBytes: coordinator.PageMax + 1}) || time.Since(started) > 5*time.Second {
+	if report != (WebReport{Code: "page_too_large", Stage: "wire", ObservedBytes: coordinator.PageMax + 1, Egress: coordinator.WebEgress{Via: "direct"}}) || time.Since(started) > 5*time.Second {
 		t.Fatalf("report %+v after %s", report, time.Since(started))
 	}
 	if lines := fakeLines(t, webLog); len(lines) != 0 {
@@ -697,7 +697,7 @@ func TestRealWebDaemonSpeaksTheProtocol(t *testing.T) {
 	// With its token: the proxy is unreachable, so it fails before the token goes out.
 	in.Token = strings.Repeat("ab", 32)
 	result, ok := d.run(ctx, in)
-	if !ok || !result.fromDaemon || result.class != "proxy_failed" || result.err == nil {
+	if !ok || !result.fromDaemon || result.class != "proxy_unreachable" || result.err == nil {
 		t.Fatalf("hop result %+v %v", result, ok)
 	}
 	if code := webFailureCode(ctx, result.cause, result.class); code != "web_proxy_failed" {

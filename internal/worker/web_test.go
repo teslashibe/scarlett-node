@@ -102,10 +102,17 @@ func fakeWebProver(mode string) {
 		redirect("https://www.example.com/")
 	case "web-connect":
 		fail("connect_failed")
-	case "web-proxy":
-		fail("proxy_failed")
+	case "web-proxy-exit-once":
+		// The first session's exit fails; the rotated session's works.
+		if raw, _ := os.ReadFile(os.Getenv("SCARLETT_FAKE_WEB_LOG")); bytes.Count(raw, []byte("\n")) < 2 {
+			fail("proxy_exit")
+		}
 	case "web-fetch":
 		fail("fetch_failed")
+	default:
+		if class, ok := strings.CutPrefix(mode, "web-class-"); ok {
+			fail(class)
+		}
 	case "web-unclassified":
 		fmt.Fprintln(os.Stderr, "Error: something else")
 		os.Exit(1)
@@ -437,7 +444,13 @@ func TestWebRunHops(t *testing.T) {
 		{"private address", "web-final", "web_egress_denied", map[string][]netip.Addr{"example.com": addrs("10.1.2.3")}},
 		{"mixed public and private", "web-final", "web_egress_denied", map[string][]netip.Addr{"example.com": addrs("93.184.215.14", "127.0.0.1")}},
 		{"connect", "web-connect", "web_connect_failed", publicAnswers},
-		{"proxy", "web-proxy", "web_proxy_failed", publicAnswers},
+		{"proxy unreachable", "web-class-proxy_unreachable", "web_proxy_failed", publicAnswers},
+		{"proxy auth", "web-class-proxy_auth", "web_proxy_failed", publicAnswers},
+		{"proxy quota", "web-class-proxy_quota", "web_proxy_failed", publicAnswers},
+		{"proxy busy", "web-class-proxy_busy", "web_proxy_failed", publicAnswers},
+		{"proxy refused", "web-class-proxy_refused", "web_proxy_refused", publicAnswers},
+		{"proxy exit", "web-class-proxy_exit", "web_connect_failed", publicAnswers},
+		{"retired proxy class", "web-class-proxy_failed", "web_fetch_failed", publicAnswers},
 		{"fetch", "web-fetch", "web_fetch_failed", publicAnswers},
 		{"unclassified", "web-unclassified", "web_fetch_failed", publicAnswers},
 		{"stdout over the cap", "web-big", "web_fetch_failed", publicAnswers},
@@ -463,7 +476,7 @@ func TestWebRunHops(t *testing.T) {
 	})
 	t.Run("non-canonical hop", func(t *testing.T) {
 		r := &fakeResolver{answers: publicAnswers}
-		out := Web{Config: c, Resolver: r.resolve, Egress: staticEgress()}.hop(context.Background(), webPlan{}, "", 0, "https://Example.com/", r.resolve, staticEgress(), nil)
+		out := Web{Config: c, Resolver: r.resolve, Egress: staticEgress()}.hop(context.Background(), webPlan{}, "", 0, "https://Example.com/", r.resolve, staticEgress(), nil, nil)
 		if out.code != "web_egress_denied" || len(r.asked) != 0 {
 			t.Fatal("non-canonical hop URL resolved", out.code)
 		}
@@ -500,34 +513,6 @@ func TestWebRunDeadline(t *testing.T) {
 	l.SettlementDeadline = l.LeaseDeadline
 	if run = runWeb(t, "web-final", l, webConfig(), publicAnswers); run.code != "expired" || len(run.inputs) != 0 {
 		t.Fatal("a hop with under a second left ran", run.code)
-	}
-}
-
-// The proxy reaches the helper, which needs it, and nothing else: no status,
-// heartbeat, formatted configuration or log line repeats it.
-func TestWebProxyStaysLocal(t *testing.T) {
-	ResetRelayHaltForTests()
-	proxy, err := config.ParseWebProxy("http://synthetic-user:synthetic-secret@proxy.synthetic.invalid:8080")
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := webConfig()
-	c.WebEgressProxy = proxy
-	run := runWeb(t, "web-final", webFixtureLease(t), c, publicAnswers)
-	if run.code != "" || len(run.inputs) != 1 {
-		t.Fatal(run.code)
-	}
-	in := run.inputs[0]
-	if in.Proxy == nil || in.Proxy.Host != "proxy.synthetic.invalid" || in.Proxy.Port != 8080 || in.Proxy.Authorization != "Basic c3ludGhldGljLXVzZXI6c3ludGhldGljLXNlY3JldA==" || in.IP != "93.184.215.14" {
-		t.Fatalf("proxy hop input %+v", in.Proxy)
-	}
-	for _, format := range []string{"%v", "%+v", "%#v", "%s"} {
-		text := fmt.Sprintf(format, c) + fmt.Sprintf(format, *c.WebEgressProxy) + fmt.Sprintf(format, c.WebEgressProxy)
-		for _, secret := range []string{"synthetic-secret", "synthetic-user", "proxy.synthetic.invalid", "c3ludGhldGlj"} {
-			if strings.Contains(text, secret) {
-				t.Fatalf("%s prints the proxy: %s", format, secret)
-			}
-		}
 	}
 }
 
@@ -626,10 +611,10 @@ func TestWebRunPageTooLarge(t *testing.T) {
 	ResetRelayHaltForTests()
 	t.Cleanup(ResetRelayHaltForTests)
 	run := runWeb(t, "web-too-large", webFixtureLease(t), webConfig(), publicAnswers)
-	if run.report != (WebReport{Code: "page_too_large", Stage: "wire", ObservedBytes: coordinator.PageMax + 1}) || len(run.inputs) != 1 {
+	if run.report != (WebReport{Code: "page_too_large", Stage: "wire", ObservedBytes: coordinator.PageMax + 1, Egress: coordinator.WebEgress{Via: "direct"}}) || len(run.inputs) != 1 {
 		t.Fatalf("%+v", run.report)
 	}
-	if run = runWeb(t, "web-later-too-large", webFixtureLease(t), webConfig(), publicAnswers); run.report != (WebReport{}) || len(run.inputs) != 2 {
+	if run = runWeb(t, "web-later-too-large", webFixtureLease(t), webConfig(), publicAnswers); run.report != (WebReport{Egress: coordinator.WebEgress{Via: "direct"}}) || len(run.inputs) != 2 {
 		t.Fatalf("later hop: %+v", run.report)
 	}
 	if maxWebResponseBytes != 67108864 || webHopLimit != 280*time.Second {
