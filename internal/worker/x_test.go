@@ -576,6 +576,122 @@ func TestCaughtVerifierMisuseHaltsRelayNodeWide(t *testing.T) {
 	}
 }
 
+// A session that ended before the verifier opened the node's request record
+// proves nothing about the verifier: it never halts relay. The read is
+// execution_uncertain, since the request went out with the account's cookie.
+// Three within ten minutes rest relay for ten minutes, then it resumes on
+// its own.
+func TestUnopenedRelaySessionsRestRelayAndResumeOnTheirOwn(t *testing.T) {
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	ctx := context.Background()
+	c := config.Config{Prover: "p", Verifier: "v:1", XRelay: true}
+	relayOffer := json.RawMessage(`{"proof_mode":"relay","proof_policy":"x-relay-v1"}`)
+	mpcOffer := json.RawMessage(`{"proof_mode":"mpc"}`)
+	relayPlan := xPlan{ProofMode: "relay", ProofPolicy: xRelayPolicy}
+	unopened := errors.New("prover: exit status 1: Error: " + relayUnopenedMarker + ": the verifier connection ended first: verifier connection ended")
+	if strings.Contains(unopened.Error(), relayMisuseMarker) || strings.Contains(relayMisuseMarker, legacyRelayMisuseMarker) {
+		t.Fatal("unopened and misuse texts overlap")
+	}
+	if code := xFailure(ctx, unopened); code != "execution_uncertain" || RelayPaused() {
+		t.Fatalf("first unopened session: code %q paused %v", code, RelayPaused())
+	}
+	// Also under an expired lease: the request went out all the same.
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if code := xFailure(cancelled, unopened); code != "execution_uncertain" || RelayPaused() || !XOfferServable(c, relayOffer) {
+		t.Fatalf("second unopened session: code %q paused %v", code, RelayPaused())
+	}
+	if code := xFailure(ctx, unopened); code != "execution_uncertain" || RelayHalted() {
+		t.Fatalf("third unopened session: code %q halted %v", code, RelayHalted())
+	}
+	until := RelayRestUntil()
+	if left := time.Until(until); left <= relayRestFor-time.Minute || left > relayRestFor || !RelayPaused() || RelayHaltReason() != "" {
+		t.Fatalf("rest %v left, paused %v", left, RelayPaused())
+	}
+	// Resting: relay offers wait, MPC is served, accepted relay work runs.
+	if XOfferServable(c, relayOffer) || !XOfferServable(c, mpcOffer) || !xTransport(c, relayPlan, "t").Relay {
+		t.Fatal("rest admission")
+	}
+	// Further unopened sessions neither extend the rest nor halt.
+	xFailure(ctx, unopened)
+	if !RelayRestUntil().Equal(until) || RelayHalted() {
+		t.Fatal("a session during the rest changed it")
+	}
+	// The rest ends on its own, including after a machine slept through it
+	// (wall time) or a wall clock set back past it.
+	for _, end := range []time.Time{time.Now().Add(-time.Second), time.Now().Add(2 * relayRestFor)} {
+		relayRest.Lock()
+		relayRest.until = end.Round(0)
+		relayRest.Unlock()
+		if !RelayRestUntil().IsZero() || RelayPaused() || !XOfferServable(c, relayOffer) {
+			t.Fatalf("rest ending %v still held relay", end)
+		}
+	}
+	// Only sessions within the window count toward a rest.
+	ResetRelayHaltForTests()
+	relayRest.Lock()
+	old := time.Now().Add(-relayUnopenedWindow - time.Second).Round(0)
+	relayRest.unopened = []time.Time{old, old}
+	relayRest.Unlock()
+	xFailure(ctx, unopened)
+	if RelayPaused() {
+		t.Fatal("sessions outside the window rested relay")
+	}
+}
+
+// Releases through 0.1.19 halted on unopened sessions too, under one text.
+// Such a marker is cleared at startup; a marker from a proven misuse stays.
+func TestLoadRelayHaltClearsLegacyMarkersOnly(t *testing.T) {
+	for _, tc := range []struct {
+		content string
+		halted  bool
+	}{
+		{legacyRelayMisuseMarker + "\n", false},
+		{relayMisuseMarker + "\n", true},
+		{"synthetic failure\n", true},
+	} {
+		ResetRelayHaltForTests()
+		t.Cleanup(ResetRelayHaltForTests)
+		dir := filepath.Join(t.TempDir(), "state")
+		if err := localfs.EnsureDir(dir); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(dir, RelayHaltFile)
+		if err := localfs.WriteAtomic(marker, []byte(tc.content), true); err != nil {
+			t.Fatal(err)
+		}
+		if err := LoadRelayHalt(dir); err != nil {
+			t.Fatal(err)
+		}
+		_, statErr := os.Lstat(marker)
+		if RelayHalted() != tc.halted || os.IsNotExist(statErr) == tc.halted {
+			t.Fatalf("%q: halted %v, marker error %v", tc.content, RelayHalted(), statErr)
+		}
+		if tc.halted && RelayHaltReason() != strings.TrimSpace(tc.content) {
+			t.Fatalf("%q: reason %q", tc.content, RelayHaltReason())
+		}
+	}
+	// A new misuse after a cleared legacy marker still halts and is saved.
+	ResetRelayHaltForTests()
+	dir := filepath.Join(t.TempDir(), "state")
+	if err := localfs.EnsureDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := localfs.WriteAtomic(filepath.Join(dir, RelayHaltFile), []byte(legacyRelayMisuseMarker+"\n"), true); err != nil {
+		t.Fatal(err)
+	}
+	if err := LoadRelayHalt(dir); err != nil || RelayHalted() {
+		t.Fatal("legacy marker kept relay halted", err)
+	}
+	if code := xFailure(context.Background(), errors.New("Error: "+relayMisuseMarker+": the record it sealed was not this node's request")); code != "relay_misuse" || !RelayHalted() {
+		t.Fatal("misuse after a cleared marker", code)
+	}
+	if raw, err := os.ReadFile(filepath.Join(dir, RelayHaltFile)); err != nil || string(raw) != relayMisuseMarker+"\n" {
+		t.Fatalf("new halt not saved: %q, %v", raw, err)
+	}
+}
+
 func TestRelayResumeClearsLiveAdmissionAndNewFailureRelatches(t *testing.T) {
 	ResetRelayHaltForTests()
 	t.Cleanup(ResetRelayHaltForTests)

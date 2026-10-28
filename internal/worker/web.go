@@ -128,8 +128,8 @@ type webPlan struct {
 
 // WebOfferServable reports whether this node could serve a web offer: its
 // proof mode and policy, and for a browser offer a ready browser tier. A
-// halted relay serves no web: web has no MPC mode to fall back to, and a
-// browser job's re-fetch is relay too. A servable browser offer, or a relay
+// halted or resting relay serves no web: web has no MPC mode to fall back
+// to, and a browser job's re-fetch is relay too. A servable browser offer, or a relay
 // offer carrying the pre-warm hint while the browser is ready, starts the
 // browser in the background while the node accepts. The service pool has
 // already reserved the browser slot; this checks only readiness.
@@ -138,7 +138,7 @@ func WebOfferServable(c config.Config, l coordinator.Lease, browser BrowserTier)
 		ProofMode   string `json:"proof_mode"`
 		ProofPolicy string `json:"proof_policy"`
 	}
-	if len(l.WebPayload) == 0 || len(l.WebPayload) > maxWebPayloadBytes || json.Unmarshal(l.WebPayload, &plan) != nil || l.WebRequest == nil || plan.ProofMode != "relay" || RelayHalted() {
+	if len(l.WebPayload) == 0 || len(l.WebPayload) > maxWebPayloadBytes || json.Unmarshal(l.WebPayload, &plan) != nil || l.WebRequest == nil || plan.ProofMode != "relay" || RelayPaused() {
 		return false
 	}
 	ready := c.WebBrowser && browser != nil && browser.Status().Ready

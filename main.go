@@ -817,6 +817,11 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			status.UnresolvedAttempts = len(records)
 		}
 		status.RelayHalted = worker.RelayHalted()
+		status.RelayRestUntil = nil
+		if until := worker.RelayRestUntil(); !until.IsZero() {
+			until = until.UTC()
+			status.RelayRestUntil = &until
+		}
 		status.observeRelease(client.Release())
 		status.HeartbeatDiagnostics = counters.snapshot(client.Stats())
 		if err := saveRuntimeStatus(c.StateDir, status); err != nil {
@@ -916,13 +921,13 @@ type advertisement struct {
 }
 
 // servableDeclineReason is the rejection reason for an offer whose proof
-// mode the node will not serve. A keyed-relay halt or a browser tier that is
-// not ready is the node's own state, which changed after it advertised; only
-// an offer for a mode the node never advertised is invalid.
+// mode the node will not serve. A keyed-relay halt or rest, or a browser tier
+// that is not ready, is the node's own state, which changed after it
+// advertised; only an offer for a mode the node never advertised is invalid.
 func servableDeclineReason(c config.Config, l coordinator.Lease) string {
 	browser := currentBrowser()
 	switch {
-	case worker.RelayHalted():
+	case worker.RelayPaused():
 		return coordinator.RejectOther
 	case l.ServiceType == "web" && l.WebRequest != nil && l.WebRequest.Mode == "browser" && !(c.WebBrowser && browser != nil && browser.Status().Ready):
 		return coordinator.RejectNoSlot

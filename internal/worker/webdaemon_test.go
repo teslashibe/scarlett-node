@@ -105,6 +105,9 @@ func fakeWebDaemon(mode string) {
 		case "web-daemon-misuse":
 			write(map[string]any{"type": "error", "id": id, "class": "fetch_failed", "error": relayMisuseMarker + ": synthetic", "presented": true, "diagnostics": json.RawMessage(`{"version":1,"duration_ms":4,"outcome":"error","spans":[]}`)})
 			return
+		case "web-daemon-unopened":
+			write(map[string]any{"type": "error", "id": id, "class": "fetch_failed", "error": relayUnopenedMarker + ": it ended the hop first (session_timeout)", "presented": true, "diagnostics": json.RawMessage(`{"version":1,"duration_ms":4,"outcome":"error","spans":[]}`)})
+			return
 		case "web-daemon-too-large":
 			write(map[string]any{"type": "error", "id": id, "class": "page_too_large", "error": "verifier ended the hop: page_too_large", "presented": true, "diagnostics": json.RawMessage(`{"version":1,"duration_ms":40,"outcome":"error","spans":[{"phase":"relay_session","start_ms":2,"duration_ms":38,"outcome":"error"}]}`)})
 			return
@@ -321,6 +324,18 @@ func TestWebDaemonMisuseHaltsRelay(t *testing.T) {
 	report := webWorkerFor(publicAnswers).Report(context.Background(), webFixtureLease(t))
 	if report.Code != "relay_misuse" || !RelayHalted() {
 		t.Fatal("misuse not latched", report.Code)
+	}
+}
+
+// A daemon hop the verifier ended before opening the request is the
+// node's uncertain attempt, not misuse: relay is not halted.
+func TestWebDaemonUnopenedSessionIsUncertainNotMisuse(t *testing.T) {
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	useWebDaemon(t, "web-daemon-unopened")
+	report := webWorkerFor(publicAnswers).Report(context.Background(), webFixtureLease(t))
+	if report.Code != "execution_uncertain" || RelayHalted() || RelayPaused() {
+		t.Fatal("unopened daemon hop", report.Code, RelayHalted(), RelayPaused())
 	}
 }
 

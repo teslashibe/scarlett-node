@@ -221,10 +221,11 @@ func (p *servicePool) health() []coordinator.ServiceHealth {
 			}
 			// Only an opted-in node says so, and a node that has not opted
 			// in sends exactly the heartbeat it sent before the field existed.
-			// A node that has halted relay after catching its verifier keeps
-			// advertising MPC so the coordinator keeps sending it that work.
+			// A node that has halted relay after catching its verifier, or
+			// rests it after unopened sessions, keeps advertising MPC so the
+			// coordinator keeps sending it that work.
 			if kind == "x_read" && p.config.XRelay {
-				if worker.RelayHalted() {
+				if worker.RelayPaused() {
 					h.ProofModes = []string{"mpc"}
 				} else {
 					h.ProofModes = []string{"mpc", "relay"}
@@ -318,7 +319,8 @@ const webProxyRest = 60 * time.Second
 
 // refreshWeb derives the web state. Web has no accounts: it is configured
 // once enabled with the proof helper present, and only the helper, a relay
-// halt or a failed egress proxy make it unreachable. Caller holds p.mu.
+// halt or rest, or a failed egress proxy make it unreachable. Caller holds
+// p.mu.
 func (p *servicePool) refreshWeb(now time.Time) {
 	s := p.entries["web"]
 	if !s.enabled {
@@ -338,6 +340,10 @@ func (p *servicePool) refreshWeb(now time.Time) {
 	case worker.RelayHalted():
 		// Web is keyed relay only, through the one verifier that misbehaved.
 		s.state, s.lastError = "unreachable", "relay_misuse"
+	case !worker.RelayRestUntil().IsZero():
+		// Relay sessions kept ending before the verifier opened the request;
+		// web resumes when the rest ends.
+		s.state, s.lastError = "unreachable", "execution_uncertain"
 	case now.Before(s.restUntil):
 		s.state, s.lastError = "unreachable", "web_proxy_failed"
 	case s.state != "ready":

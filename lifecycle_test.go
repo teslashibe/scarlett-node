@@ -127,8 +127,8 @@ func TestRelayHaltPersistsUntilRelayResume(t *testing.T) {
 	if e := worker.LoadRelayHalt(dir); e != nil || worker.RelayHalted() {
 		t.Fatal("fresh state directory reported a halt", e)
 	}
-	worker.HaltRelay("verifier misused this node's X session")
-	if raw, e := os.ReadFile(filepath.Join(dir, worker.RelayHaltFile)); e != nil || !bytes.Contains(raw, []byte("misused")) {
+	worker.HaltRelay("verifier sealed a request this node did not authorize")
+	if raw, e := os.ReadFile(filepath.Join(dir, worker.RelayHaltFile)); e != nil || !bytes.Contains(raw, []byte("did not authorize")) {
 		t.Fatal("halt not recorded", e)
 	}
 	// "Restart": forget the in-memory latch, load the directory again.
@@ -162,6 +162,34 @@ func TestRelayHaltPersistsUntilRelayResume(t *testing.T) {
 	// Resuming when nothing is halted is harmless.
 	if e := localCommand("relay-resume", &output); e != nil {
 		t.Fatal(e)
+	}
+}
+
+// A relay rest is local status, not a halt: status shows when it ends and
+// writes no marker, so nothing is left for the operator to clear.
+func TestRelayRestShowsInStatusWithoutAMarker(t *testing.T) {
+	dir := privateTestDir(t)
+	t.Setenv("SCARLETT_STATE_DIR", dir)
+	worker.ResetRelayHaltForTests()
+	t.Cleanup(worker.ResetRelayHaltForTests)
+	if e := worker.LoadRelayHalt(dir); e != nil {
+		t.Fatal(e)
+	}
+	worker.RestRelayForTests()
+	until := worker.RelayRestUntil().UTC()
+	if until.IsZero() || worker.RelayHalted() {
+		t.Fatal("no rest, or a halt")
+	}
+	if _, e := os.Lstat(filepath.Join(dir, worker.RelayHaltFile)); !os.IsNotExist(e) {
+		t.Fatal("a rest wrote the halt marker", e)
+	}
+	s := runtimeStatus{Version: coordinator.Version, State: "running", NodeID: "synthetic-node", Services: []coordinator.ServiceHealth{{Kind: "x_read", State: "ready", Capacity: 1}}, RelayRestUntil: &until}
+	if e := saveRuntimeStatus(dir, s); e != nil {
+		t.Fatal(e)
+	}
+	var output bytes.Buffer
+	if e := localCommand("status", &output); e != nil || !bytes.Contains(output.Bytes(), []byte(`"relay_rest_until":"`+until.Format(time.RFC3339Nano)+`"`)) || bytes.Contains(output.Bytes(), []byte("relay_halted")) {
+		t.Fatal("status does not show the rest", e, output.String())
 	}
 }
 
