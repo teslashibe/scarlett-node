@@ -220,7 +220,10 @@ New frame kind **26** (`FAILED`), verifier to node, JSON of at most 256 bytes:
 hop that fails after the token was accepted gets one `FAILED` after the
 rejection is committed (and after `OPENING`, when a request was sealed), then
 the connection closes. A node that receives `FAILED` before `OPENING` for a
-request it sent reports relay misuse, as for any session that ends that way.
+request it sent cannot check what was sealed. It reports the hop
+`execution_uncertain` (helper error `verifier did not open this node's request
+record`) and counts it toward a relay rest, as for any session that ends that
+way; only an opening that fails the node's check is relay misuse.
 
 `relay-web` maps the reason to its stderr class
 (`SCARLETT_WEB_ERROR=<class>`): `verifier_busy` → `verifier_busy` (the node
@@ -460,7 +463,7 @@ only replies.
 | `{"type":"ready","version":1}` | once, at start |
 | `{"type":"presenting","id":"…"}` | written and flushed right before the hop's token goes out. A node that never got it knows the token was not sent |
 | `{"type":"summary","id":"…","summary":{…}}` | `relay-web`'s summary; its verifier counters cover only what this hop used of the connection |
-| `{"type":"error","id":"…","class":"…","error":"…","presented":false,"diagnostics":{…}}` | `class` as `SCARLETT_WEB_ERROR`; `error` is the one-line cause (it keeps the relay misuse text) |
+| `{"type":"error","id":"…","class":"…","error":"…","presented":false,"diagnostics":{…}}` | `class` as `SCARLETT_WEB_ERROR`; `error` is the one-line cause (it keeps the relay misuse and unopened texts) |
 | `{"type":"cancelled","id":"…","diagnostics":{…}}` | the hop ended before its token: nothing sent, no target reached |
 
 Pool policy: warm connections are dialed in the background, pinged at once
