@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -609,7 +610,8 @@ func TestUnopenedRelaySessionsRestRelayAndResumeOnTheirOwn(t *testing.T) {
 	if left := time.Until(until); left <= relayRestFor-time.Minute || left > relayRestFor || !RelayPaused() || RelayHaltReason() != "" {
 		t.Fatalf("rest %v left, paused %v", left, RelayPaused())
 	}
-	// Resting: relay offers wait, MPC is served, accepted relay work runs.
+	// Resting: relay offers wait and MPC is served. A relay job already
+	// running keeps its relay transport (X.Run refuses only new ones).
 	if XOfferServable(c, relayOffer) || !XOfferServable(c, mpcOffer) || !xTransport(c, relayPlan, "t").Relay {
 		t.Fatal("rest admission")
 	}
@@ -637,6 +639,88 @@ func TestUnopenedRelaySessionsRestRelayAndResumeOnTheirOwn(t *testing.T) {
 	xFailure(ctx, unopened)
 	if RelayPaused() {
 		t.Fatal("sessions outside the window rested relay")
+	}
+}
+
+// A relay job that starts while relay rests sends nothing and fails as the
+// node's unavailable service; an MPC job runs. A relay read that the job's
+// deadline stopped while it was with the helper may have reached X: it is
+// execution_uncertain and counts toward a rest. Under MPC it is expiry.
+func TestRelayJobsDuringARestAndRelayReadsTheDeadlineStops(t *testing.T) {
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	c, mpc, plan := xFixture(t, coordinator.XRequest{Operation: "profile", Username: "fixture"})
+	c.XRelay = true
+	relay := mpc
+	plan.ProofMode, plan.ProofPolicy = "relay", xRelayPolicy
+	relay.XPayload, _ = json.Marshal(plan)
+	clients := NewXClients()
+	clients.log = io.Discard
+	clients.minGap = 5 * time.Millisecond
+	t.Cleanup(clients.Stop)
+	var proofs atomic.Int32
+	answer := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		proofs.Add(1)
+		return xBootstrap(r)
+	})
+	run := func(proof http.RoundTripper, l coordinator.Lease) string {
+		return X{Config: c, Base: roundTripFunc(xBootstrap), Proof: proof, Clients: clients}.Run(context.Background(), l)
+	}
+	unopened := func() int {
+		relayRest.Lock()
+		defer relayRest.Unlock()
+		return len(relayRest.unopened)
+	}
+	RestRelayForTests()
+	if code := run(answer, relay); code != "service_unavailable" || proofs.Load() != 0 {
+		t.Fatalf("relay job during a rest: code %q, %d proofs", code, proofs.Load())
+	}
+	if code := run(answer, mpc); code != "" || proofs.Load() != 1 {
+		t.Fatalf("MPC job during a rest: code %q, %d proofs", code, proofs.Load())
+	}
+	ResetRelayHaltForTests()
+	if code := run(answer, relay); code != "" || proofs.Load() != 2 {
+		t.Fatalf("relay job after the rest: code %q, %d proofs", code, proofs.Load())
+	}
+	// The helper is stopped at the job's deadline and says nothing.
+	stopped := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		<-r.Context().Done()
+		return nil, errors.New("prover: signal: killed: ")
+	})
+	short := func(l coordinator.Lease) coordinator.Lease {
+		l.LeaseDeadline = time.Now().Add(xReportMargin + 300*time.Millisecond)
+		return l
+	}
+	if code := run(stopped, short(relay)); code != "execution_uncertain" || unopened() != 1 || RelayHalted() {
+		t.Fatalf("relay read stopped by the deadline: code %q, %d unopened", code, unopened())
+	}
+	if code := run(stopped, short(mpc)); code != "expired" || unopened() != 1 {
+		t.Fatalf("MPC read stopped by the deadline: code %q, %d unopened", code, unopened())
+	}
+}
+
+// A relay helper from 0.1.19 or earlier, run through SCARLETT_PROVER, said
+// misuse for both cases. What followed tells them apart, so proof of misuse
+// still halts and an unopened session is uncertain, never a plain failure.
+func TestLegacyHelperTextIsReadForWhatItProved(t *testing.T) {
+	t.Cleanup(ResetRelayHaltForTests)
+	for _, tc := range []struct{ ending, code string }{
+		{"the session ended before it opened the request record: verifier connection ended", "execution_uncertain"},
+		{"it ended the session before it opened the request record", "execution_uncertain"},
+		{"it did not open the request record", "execution_uncertain"},
+		{"malformed record opening", "relay_misuse"},
+		{"the record it sealed was not this node's request", "relay_misuse"},
+		{"its key does not open the request record", "relay_misuse"},
+	} {
+		cause := "Error: " + legacyRelayMisuseMarker + ": " + tc.ending
+		ResetRelayHaltForTests()
+		if code := xFailure(context.Background(), errors.New("prover: exit status 1: "+cause)); code != tc.code || RelayHalted() != (tc.code == "relay_misuse") {
+			t.Fatalf("X %q: code %q halted %v", tc.ending, code, RelayHalted())
+		}
+		ResetRelayHaltForTests()
+		if code := webFailureCode(context.Background(), cause, "fetch_failed"); code != tc.code || RelayHalted() != (tc.code == "relay_misuse") {
+			t.Fatalf("web %q: code %q halted %v", tc.ending, code, RelayHalted())
+		}
 	}
 }
 
@@ -689,6 +773,44 @@ func TestLoadRelayHaltClearsLegacyMarkersOnly(t *testing.T) {
 	}
 	if raw, err := os.ReadFile(filepath.Join(dir, RelayHaltFile)); err != nil || string(raw) != relayMisuseMarker+"\n" {
 		t.Fatalf("new halt not saved: %q, %v", raw, err)
+	}
+}
+
+// A legacy marker the node cannot remove yet does not halt either. Nothing
+// reports a resume no operator made, and the next start removes it.
+func TestLegacyMarkerThatCannotBeRemovedDoesNotHalt(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs a directory this user cannot remove files from")
+	}
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	dir := filepath.Join(t.TempDir(), "state")
+	if err := localfs.EnsureDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, RelayHaltFile)
+	if err := localfs.WriteAtomic(marker, []byte(legacyRelayMisuseMarker+"\n"), true); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	if err := LoadRelayHalt(dir); err != nil || RelayHalted() || RelayHaltReason() != "" {
+		t.Fatal("legacy marker halted relay", err, RelayHaltReason())
+	}
+	if _, err := os.Lstat(marker); err != nil {
+		t.Fatal("marker removed from a read-only directory", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ResetRelayHaltForTests()
+	if err := LoadRelayHalt(dir); err != nil || RelayHalted() {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(marker); !os.IsNotExist(err) {
+		t.Fatal("the next start left the legacy marker", err)
 	}
 }
 

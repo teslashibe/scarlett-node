@@ -258,7 +258,8 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 		return err
 	}
 	// A relay halt from an earlier run stays in force until the operator
-	// clears it; a restart alone must not re-arm relay.
+	// clears it; a restart alone must not re-arm relay. The one exception is
+	// a marker from 0.1.19 or earlier, which proved no misuse: it is cleared.
 	if err := worker.LoadRelayHalt(c.StateDir); err != nil {
 		return err
 	}
@@ -400,6 +401,9 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	defer func() {
 		status.State = "draining"
 		status.InFlight = len(slots)
+		// A relay rest is held in memory and ends with this process. Leaving
+		// it out also keeps the file readable by 0.1.19 after a rollback.
+		status.RelayRestUntil = nil
 		if services != nil {
 			status.Services = services.health()
 			status.Accounts = services.accountStatus()

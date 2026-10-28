@@ -301,6 +301,11 @@ func (w Web) Run(ctx context.Context, l coordinator.Lease) string {
 // there. A browser job is run by runBrowser.
 func (w Web) Report(ctx context.Context, l coordinator.Lease) WebReport {
 	plan, deadline, code := validateWebLease(w.Config, l)
+	// Every web job is relay. One that starts while relay rests was accepted
+	// during the rest or just before it began; it sends nothing.
+	if code == "" && !RelayRestUntil().IsZero() {
+		code = "service_unavailable"
+	}
 	if code != "" {
 		w.observePage(code, false)
 		return WebReport{Code: code}

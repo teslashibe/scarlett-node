@@ -228,11 +228,11 @@ func webHelperFailure(ctx, hopCtx context.Context, err error, stderr string) str
 // receipt when that holds it, and otherwise fails the job as the node's,
 // for the buyer to retry.
 func webRelayVerdict(cause string) (string, bool) {
-	switch {
-	case strings.Contains(cause, relayMisuseMarker):
+	switch misuse, unopened := relayVerdict(cause); {
+	case misuse:
 		HaltRelay(relayMisuseMarker)
 		return "relay_misuse", true
-	case strings.Contains(cause, relayUnopenedMarker):
+	case unopened:
 		noteRelayUnopened()
 		return "execution_uncertain", true
 	}

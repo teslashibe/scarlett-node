@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -190,6 +192,35 @@ func TestRelayRestShowsInStatusWithoutAMarker(t *testing.T) {
 	var output bytes.Buffer
 	if e := localCommand("status", &output); e != nil || !bytes.Contains(output.Bytes(), []byte(`"relay_rest_until":"`+until.Format(time.RFC3339Nano)+`"`)) || bytes.Contains(output.Bytes(), []byte("relay_halted")) {
 		t.Fatal("status does not show the rest", e, output.String())
+	}
+}
+
+// The rest lives in memory: a node that stops during one leaves no
+// relay_rest_until behind, which 0.1.19 could not read after a rollback.
+func TestStoppedStatusCarriesNoRelayRest(t *testing.T) {
+	worker.ResetRelayHaltForTests()
+	t.Cleanup(worker.ResetRelayHaltForTests)
+	worker.RestRelayForTests()
+	c, stop := startLongPollNode(t, func(w http.ResponseWriter, r *http.Request) {
+		if controlRoute(w, r) {
+			return
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		<-r.Context().Done()
+	})
+	path := filepath.Join(c.StateDir, "status.json")
+	for start := time.Now(); ; time.Sleep(20 * time.Millisecond) {
+		if raw, _ := os.ReadFile(path); bytes.Contains(raw, []byte(`"relay_rest_until":`)) {
+			break
+		}
+		if time.Since(start) > 5*time.Second {
+			t.Fatal("running status never showed the rest")
+		}
+	}
+	stop()
+	raw, err := os.ReadFile(path)
+	if err != nil || !bytes.Contains(raw, []byte(`"state":"stopped"`)) || bytes.Contains(raw, []byte("relay_rest_until")) {
+		t.Fatalf("stopped status: %s %v", raw, err)
 	}
 }
 

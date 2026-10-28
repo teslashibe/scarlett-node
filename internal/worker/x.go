@@ -89,8 +89,9 @@ func (p xPlan) relay(c config.Config) (relay, ok bool) {
 		// The operator must have opted in: this mode changes who could read
 		// the session cookie, so a coordinator cannot select it alone. A node
 		// that has caught its verifier misusing the session serves no more
-		// relay until an operator resumes it. A relay rest declines offers
-		// only (XOfferServable): work already accepted still runs.
+		// relay until an operator resumes it. A relay rest is not checked
+		// here: it declines offers (XOfferServable) and jobs that start
+		// during it (X.Run), while a job already running finishes.
 		return true, c.XRelay && !RelayHalted()
 	}
 	return false, false
@@ -104,6 +105,37 @@ const relayMisuseMarker = "verifier sealed a request this node did not authorize
 // They also wrote it when a session merely ended before the verifier opened
 // the node's request record, which is what every observed case was.
 const legacyRelayMisuseMarker = "verifier misused this node's X session"
+
+// legacyRelayUnopened are the endings a relay helper from 0.1.19 or earlier
+// put after legacyRelayMisuseMarker for a session that ended before the
+// verifier opened the record. Its other endings were proof of misuse.
+var legacyRelayUnopened = []string{
+	"the session ended before it opened the request record",
+	"it ended the session before it opened the request record",
+	"it did not open the request record",
+}
+
+// relayVerdict reads what a relay helper's error says about the verifier's
+// handling of the node's request record: misuse it proved, or a session that
+// ended before the verifier opened the record. A helper from an older
+// release than the node, run through SCARLETT_PROVER, said both under the
+// legacy text; its ending tells them apart.
+func relayVerdict(cause string) (misuse, unopened bool) {
+	switch {
+	case strings.Contains(cause, relayMisuseMarker):
+		return true, false
+	case strings.Contains(cause, relayUnopenedMarker):
+		return false, true
+	case strings.Contains(cause, legacyRelayMisuseMarker):
+		for _, ending := range legacyRelayUnopened {
+			if strings.Contains(cause, legacyRelayMisuseMarker+": "+ending) {
+				return false, true
+			}
+		}
+		return true, false
+	}
+	return false, false
+}
 
 // relayUnopenedMarker is how a session that ended after the node's request
 // record went out, but before the verifier opened it, arrives from the relay
@@ -197,8 +229,9 @@ var relayHalt struct {
 const RelayHaltFile = "relay-halt"
 
 // LoadRelayHalt makes the halt durable under dir and restores one left by an
-// earlier run. A marker with the legacy text is removed instead: it never
-// proved misuse. Call once at startup, before any heartbeat.
+// earlier run. A marker with the legacy text never halts: it proved no
+// misuse, so it is removed, and one that cannot be removed yet is left for
+// the next start. Call once at startup, before any heartbeat.
 func LoadRelayHalt(dir string) error {
 	path := filepath.Join(dir, RelayHaltFile)
 	raw, err := os.ReadFile(path)
@@ -212,16 +245,15 @@ func LoadRelayHalt(dir string) error {
 		return err
 	}
 	if strings.TrimSpace(string(raw)) == legacyRelayMisuseMarker {
-		err := os.Remove(path)
-		if err == nil || os.IsNotExist(err) {
-			err = localfs.SyncDir(dir)
+		const cleared = "keyed relay halt from an earlier release cleared: a session that ended before the verifier opened this node's request no longer halts the node"
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintln(os.Stderr, cleared+"; its marker could not be removed and is tried again at the next start:", err)
+		} else if err := localfs.SyncDir(dir); err != nil {
+			fmt.Fprintln(os.Stderr, cleared+"; the state directory could not be synced:", err)
+		} else {
+			fmt.Fprintln(os.Stderr, cleared)
 		}
-		if err == nil {
-			fmt.Fprintln(os.Stderr, "keyed relay halt from an earlier release cleared: a session that ended before the verifier opened this node's request no longer halts the node")
-			return nil
-		}
-		// The marker stays, and so does the halt it records.
-		fmt.Fprintln(os.Stderr, "keyed relay halt from an earlier release could not be cleared:", err)
+		return nil
 	}
 	relayHalt.halted = true
 	relayHalt.recorded = true
@@ -573,6 +605,15 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 	if code != "" {
 		return code
 	}
+	// Whether this job's reads go over keyed relay, as xTransport decides.
+	relay, ok := plan.relay(w.Config)
+	relayed := relay && ok
+	// A relay job that starts while relay rests was accepted during the rest
+	// or just before it began, such as an offer that carried no payload to
+	// judge. It spends nothing: no read goes out.
+	if relayed && !RelayRestUntil().IsZero() {
+		return "service_unavailable"
+	}
 	ids := map[string]string{}
 	for _, s := range plan.Exchanges {
 		if previous, ok := ids[s.Operation]; ok && previous != s.QueryID {
@@ -656,6 +697,16 @@ func (w X) Run(ctx context.Context, l coordinator.Lease) string {
 				return w.limitedEligibility(warm.client.NextEligibility(time.Now(), XGraphQLOperation(l.XRequest.Operation)))
 			}
 			account.replace(warm)
+		} else if relayed && ctx.Err() != nil {
+			// The job ended while a relay read was with the helper, which was
+			// stopped before it could say how its session went. The request may
+			// have reached X with the account's cookie, so it is not run again
+			// on its own, and it counts toward a relay rest as an unopened
+			// session does.
+			if misuse, unopened := relayVerdict(e.Error()); !misuse && !unopened {
+				noteRelayUnopened()
+				return "execution_uncertain"
+			}
 		}
 		return w.failure(ctx, e)
 	}
@@ -728,14 +779,18 @@ func xFailure(ctx context.Context, e error) string {
 	// node's own request. The request has already gone out; what the node can
 	// still do is refuse to be used that way again and make the operator look.
 	// That holds even when the lease has meanwhile expired.
-	if e != nil && strings.Contains(e.Error(), relayMisuseMarker) {
+	var misuse, unopened bool
+	if e != nil {
+		misuse, unopened = relayVerdict(e.Error())
+	}
+	if misuse {
 		HaltRelay(relayMisuseMarker)
 		return "relay_misuse"
 	}
 	// The session ended before the verifier opened the request record. The
 	// request went out with the account's cookie, so the read must not run
 	// again on its own; enough of these rest relay for a while.
-	if e != nil && strings.Contains(e.Error(), relayUnopenedMarker) {
+	if unopened {
 		noteRelayUnopened()
 		return "execution_uncertain"
 	}

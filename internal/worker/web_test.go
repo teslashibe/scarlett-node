@@ -517,9 +517,14 @@ func TestWebRunUnopenedIsUncertainAndRestsRelay(t *testing.T) {
 	if RelayHalted() || !RelayPaused() || WebOfferServable(webConfig(), webFixtureLease(t), nil) {
 		t.Fatalf("third unopened session: halted %v paused %v", RelayHalted(), RelayPaused())
 	}
-	// Accepted work still validates during a rest; only new offers wait.
-	if _, _, code := validateWebLease(webConfig(), webFixtureLease(t)); code != "" {
-		t.Fatalf("accepted lease refused during a rest: %q", code)
+	// A page that starts during the rest was accepted during it or just
+	// before it began: it sends nothing and fails as the node's service.
+	if run := runWeb(t, "web-final", webFixtureLease(t), webConfig(), publicAnswers); run.code != "service_unavailable" || len(run.inputs) != 0 {
+		t.Fatalf("page during a rest: code %q, %d hops", run.code, len(run.inputs))
+	}
+	ResetRelayHaltForTests()
+	if run := runWeb(t, "web-final", webFixtureLease(t), webConfig(), publicAnswers); run.code != "" || len(run.inputs) != 1 {
+		t.Fatalf("page after the rest: code %q, %d hops", run.code, len(run.inputs))
 	}
 }
 
