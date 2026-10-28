@@ -708,7 +708,7 @@ func TestRelayJobsDuringARestAndRelayReadsTheDeadlineStops(t *testing.T) {
 		return nil, errors.New("prover: signal: killed: ")
 	})
 	short := func(l coordinator.Lease) coordinator.Lease {
-		l.LeaseDeadline = time.Now().Add(xReportMargin + 300*time.Millisecond)
+		l.LeaseDeadline = time.Now().Add(xReportMargin + time.Second)
 		return l
 	}
 	if code := run(stopped, short(relay)); code != "execution_uncertain" || unopened() != 1 || RelayHalted() {

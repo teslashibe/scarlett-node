@@ -4,7 +4,10 @@
 use std::{
     net::SocketAddr,
     ops::Range,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -751,9 +754,14 @@ async fn an_x_session_whose_verifier_keeps_the_opening_until_the_deadline_is_uno
     // The verifier keeps its connection open after the record went out and
     // never sends the opening; the session's own deadline ends it. This link
     // drops OPENING and DONE and never lets the node hear the verifier go.
+    // The deadline leaves a slow CI runner ample time for the honest exchange
+    // to reach the opening before it fires.
+    const DEADLINE: Duration = Duration::from_secs(10);
     let server = server(response(), |_| {}).await;
     let (node_end, node_far) = tokio::io::duplex(1 << 20);
     let (verifier_end, verifier_far) = tokio::io::duplex(1 << 20);
+    let withheld = Arc::new(AtomicBool::new(false));
+    let saw = withheld.clone();
     let held = tokio::spawn(async move {
         let (mut from_node, mut to_node) = tokio::io::split(node_far);
         let (mut from_verifier, mut to_verifier) = tokio::io::split(verifier_far);
@@ -761,9 +769,14 @@ async fn an_x_session_whose_verifier_keeps_the_opening_until_the_deadline_is_uno
             while let Ok((kind, payload)) = wire::recv(&mut from_node).await {
                 let _ = wire::send(&mut to_verifier, kind, &payload).await;
             }
+            // The node went: let the verifier see it, so it never waits on us.
+            let _ = to_verifier.shutdown().await;
         };
         let down = async {
             while let Ok((kind, payload)) = wire::recv(&mut from_verifier).await {
+                if kind == wire::OPENING {
+                    saw.store(true, Ordering::SeqCst);
+                }
                 if kind != wire::OPENING && kind != wire::DONE {
                     let _ = wire::send(&mut to_node, kind, &payload).await;
                 }
@@ -777,12 +790,14 @@ async fn an_x_session_whose_verifier_keeps_the_opening_until_the_deadline_is_uno
     let tcp = TcpStream::connect(server.addr).await.unwrap();
     let raw = request();
     let started = std::time::Instant::now();
-    let result = within(node::x_session(&mut node::RelayConn::new(node_end), tcp, &raw, xpolicy::HOST, Duration::from_secs(2), &crate::diagnostics::Trace::new())).await;
-    // The verifier itself was honest and saw the whole response.
+    let result = within(node::x_session(&mut node::RelayConn::new(node_end), tcp, &raw, xpolicy::HOST, DEADLINE, &crate::diagnostics::Trace::new())).await;
+    // The verifier itself was honest, saw the whole response and sent the
+    // opening this link kept from the node.
     assert!(within(verifier).await.unwrap().is_ok());
     held.abort();
+    assert!(withheld.load(Ordering::SeqCst), "the verifier never sent its opening");
     let error = format!("{:#}", result.expect_err("no opening, no response"));
-    assert!(started.elapsed() >= Duration::from_secs(2), "{error}");
+    assert!(started.elapsed() >= DEADLINE, "{error}");
     assert!(error.starts_with(node::UNOPENED) && error.contains("timed out") && !error.contains(node::MISUSE), "{error}");
 }
 
