@@ -168,11 +168,16 @@ var relayRest struct {
 }
 
 // noteRelayUnopened counts one unopened session and starts a rest when it
-// makes relayUnopenedLimit within relayUnopenedWindow.
+// makes relayUnopenedLimit within relayUnopenedWindow. A session that ends
+// during a rest is not counted: it was already running when the rest began,
+// as part of whatever started it, so it must not count toward the next one.
 func noteRelayUnopened() {
 	now := time.Now().Round(0)
 	relayRest.Lock()
 	defer relayRest.Unlock()
+	if relayRestingLocked(now) {
+		return
+	}
 	recent := relayRest.unopened[:0]
 	for _, at := range relayRest.unopened {
 		if age := now.Sub(at); age >= 0 && age < relayUnopenedWindow {
@@ -180,7 +185,7 @@ func noteRelayUnopened() {
 		}
 	}
 	relayRest.unopened = append(recent, now)
-	if len(relayRest.unopened) < relayUnopenedLimit || relayRestingLocked(now) {
+	if len(relayRest.unopened) < relayUnopenedLimit {
 		return
 	}
 	rest := relayRestFirst

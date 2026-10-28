@@ -580,8 +580,8 @@ func TestCaughtVerifierMisuseHaltsRelayNodeWide(t *testing.T) {
 // A session that ended before the verifier opened the node's request record
 // proves nothing about the verifier: it never halts relay. The read is
 // execution_uncertain, since the request went out with the account's cookie.
-// Three within ten minutes rest relay for ten minutes, then it resumes on
-// its own.
+// Three within ten minutes rest relay, for a minute at first, then it
+// resumes on its own.
 func TestUnopenedRelaySessionsRestRelayAndResumeOnTheirOwn(t *testing.T) {
 	ResetRelayHaltForTests()
 	t.Cleanup(ResetRelayHaltForTests)
@@ -649,6 +649,19 @@ func TestUnopenedRelaySessionsRestRelayAndResumeOnTheirOwn(t *testing.T) {
 	RestRelayForTests()
 	if left := time.Until(RelayRestUntil()); left <= relayRestFirst/2 || left > relayRestFirst {
 		t.Fatalf("rest after a calm hour: %v left", left)
+	}
+	// Sessions that end during a rest, such as the rest of a burst a verifier
+	// restart dropped, do not count toward the next one.
+	ResetRelayHaltForTests()
+	for range 10 {
+		xFailure(ctx, unopened)
+	}
+	relayRest.Lock()
+	relayRest.until = time.Now().Add(-time.Second).Round(0)
+	relayRest.Unlock()
+	xFailure(ctx, unopened)
+	if RelayPaused() {
+		t.Fatal("sessions from the last burst counted toward another rest")
 	}
 	// Only sessions within the window count toward a rest.
 	ResetRelayHaltForTests()

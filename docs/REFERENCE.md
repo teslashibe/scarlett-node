@@ -415,7 +415,7 @@ reported `proven`, because the verifier already holds the verified hops.
 **Readiness.** The web entry is `configured` when enabled with the helper
 present and `ready` after a proven job. It is `unreachable` with
 `last_error_code` `prover_error` while the helper is missing, `relay_misuse`
-while relay is halted, `execution_uncertain` during a 10-minute relay rest and
+while relay is halted, `execution_uncertain` during a relay rest (one minute at first, up to 10) and
 `web_proxy_failed` for 60 s after the egress proxy failed. Failures on the target's side (`web_dns_failed`, `web_egress_denied`,
 `web_connect_failed`, `web_fetch_failed`) never change it. Account files, their
 errors and account mode never apply to web, so a desktop node with Serve web
