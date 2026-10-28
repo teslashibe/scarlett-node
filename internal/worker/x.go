@@ -145,12 +145,16 @@ func relayVerdict(cause string) (misuse, unopened bool) {
 const relayUnopenedMarker = "verifier did not open this node's request record"
 
 // A node that sees relayUnopenedLimit unopened sessions within
-// relayUnopenedWindow rests keyed relay for relayRestFor, then resumes on
-// its own.
+// relayUnopenedWindow rests keyed relay, then resumes on its own. The first
+// rest is relayRestFirst, about what a verifier restart that drops the
+// sessions in flight should cost; a rest that starts within relayRestCalm of
+// the last one ending is twice as long as that one, up to relayRestMax.
 const (
 	relayUnopenedLimit  = 3
 	relayUnopenedWindow = 10 * time.Minute
-	relayRestFor        = 10 * time.Minute
+	relayRestFirst      = time.Minute
+	relayRestMax        = 10 * time.Minute
+	relayRestCalm       = time.Hour
 )
 
 // relayRest throttles keyed relay, X and web alike, after unopened sessions.
@@ -160,6 +164,7 @@ var relayRest struct {
 	sync.Mutex
 	unopened []time.Time
 	until    time.Time
+	length   time.Duration // of the latest rest
 }
 
 // noteRelayUnopened counts one unopened session and starts a rest when it
@@ -178,15 +183,19 @@ func noteRelayUnopened() {
 	if len(relayRest.unopened) < relayUnopenedLimit || relayRestingLocked(now) {
 		return
 	}
-	relayRest.until, relayRest.unopened = now.Add(relayRestFor), nil
-	fmt.Fprintf(os.Stderr, "keyed relay resting until %s: %d relay sessions within %s ended before the verifier opened this node's request; it resumes on its own\n", relayRest.until.UTC().Format(time.RFC3339), relayUnopenedLimit, relayUnopenedWindow)
+	rest := relayRestFirst
+	if since := now.Sub(relayRest.until); relayRest.length > 0 && since >= 0 && since < relayRestCalm {
+		rest = min(2*relayRest.length, relayRestMax)
+	}
+	relayRest.until, relayRest.length, relayRest.unopened = now.Add(rest), rest, nil
+	fmt.Fprintf(os.Stderr, "keyed relay resting until %s (%s): %d relay sessions within %s ended before the verifier opened this node's request; it resumes on its own\n", relayRest.until.UTC().Format(time.RFC3339), rest, relayUnopenedLimit, relayUnopenedWindow)
 }
 
-// relayRestingLocked also ends a rest whose end is further off than a whole
+// relayRestingLocked also ends a rest whose end is further off than the whole
 // rest, which only a wall clock set back can cause.
 func relayRestingLocked(now time.Time) bool {
 	left := relayRest.until.Sub(now)
-	return left > 0 && left <= relayRestFor
+	return left > 0 && left <= relayRest.length
 }
 
 // RelayRestUntil is when the current relay rest ends, or zero when keyed
@@ -343,7 +352,7 @@ func ResetRelayHaltForTests() {
 	relayHalt.recorded = false
 	relayHalt.Unlock()
 	relayRest.Lock()
-	relayRest.unopened, relayRest.until = nil, time.Time{}
+	relayRest.unopened, relayRest.until, relayRest.length = nil, time.Time{}, 0
 	relayRest.Unlock()
 }
 

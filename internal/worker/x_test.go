@@ -607,7 +607,7 @@ func TestUnopenedRelaySessionsRestRelayAndResumeOnTheirOwn(t *testing.T) {
 		t.Fatalf("third unopened session: code %q halted %v", code, RelayHalted())
 	}
 	until := RelayRestUntil()
-	if left := time.Until(until); left <= relayRestFor-time.Minute || left > relayRestFor || !RelayPaused() || RelayHaltReason() != "" {
+	if left := time.Until(until); left <= relayRestFirst/2 || left > relayRestFirst || !RelayPaused() || RelayHaltReason() != "" {
 		t.Fatalf("rest %v left, paused %v", left, RelayPaused())
 	}
 	// Resting: relay offers wait and MPC is served. A relay job already
@@ -622,13 +622,33 @@ func TestUnopenedRelaySessionsRestRelayAndResumeOnTheirOwn(t *testing.T) {
 	}
 	// The rest ends on its own, including after a machine slept through it
 	// (wall time) or a wall clock set back past it.
-	for _, end := range []time.Time{time.Now().Add(-time.Second), time.Now().Add(2 * relayRestFor)} {
+	for _, end := range []time.Time{time.Now().Add(-time.Second), time.Now().Add(2 * relayRestFirst)} {
 		relayRest.Lock()
 		relayRest.until = end.Round(0)
 		relayRest.Unlock()
 		if !RelayRestUntil().IsZero() || RelayPaused() || !XOfferServable(c, relayOffer) {
 			t.Fatalf("rest ending %v still held relay", end)
 		}
+	}
+	// A rest that comes back soon after the last one ended is twice as long,
+	// up to relayRestMax; after relayRestCalm without one it is short again.
+	want := relayRestFirst
+	for range 6 {
+		relayRest.Lock()
+		relayRest.until = time.Now().Add(-time.Second).Round(0)
+		relayRest.Unlock()
+		want = min(2*want, relayRestMax)
+		RestRelayForTests()
+		if left := time.Until(RelayRestUntil()); left <= want-time.Minute/2 || left > want {
+			t.Fatalf("repeated rest: %v left, want %v", left, want)
+		}
+	}
+	relayRest.Lock()
+	relayRest.until = time.Now().Add(-relayRestCalm - time.Second).Round(0)
+	relayRest.Unlock()
+	RestRelayForTests()
+	if left := time.Until(RelayRestUntil()); left <= relayRestFirst/2 || left > relayRestFirst {
+		t.Fatalf("rest after a calm hour: %v left", left)
 	}
 	// Only sessions within the window count toward a rest.
 	ResetRelayHaltForTests()
