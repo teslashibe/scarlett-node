@@ -2397,7 +2397,7 @@ mod web_tests {
         conn.present(token).await?;
         let tcp = TcpStream::connect(origin.addr).await?;
         let raw = webpolicy::request(url, &web_headers());
-        tokio::time::timeout(Duration::from_secs(30), node::web_session_on(conn, tcp, &raw, webpolicy::url_host(url), index, url, &Trace::new())).await?
+        tokio::time::timeout(Duration::from_secs(30), node::web_session_on(conn, tcp, &raw, webpolicy::url_host(url), index, url, &node::Sealing::default(), &Trace::new())).await?
     }
 
     /// Registers web job attempt `attempt` for `url` and returns its token.

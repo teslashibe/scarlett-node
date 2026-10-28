@@ -217,7 +217,7 @@ func readFailureCode(t *testing.T, name string) string {
 // 64 MiB page ceiling and so their request_sha256. Protocol node-v2 (node
 // 0.1.17) changed every body's version to node-v2 and gave the heartbeat its
 // required offers_seen; the digests inside the leases did not change. Proxy
-// egress (node 0.1.20) made egress required in every web report, so the
+// egress (node 0.1.21) made egress required in every web report, so the
 // failure gained {"via":"direct"}.
 func TestCoreWebFixturesUnchanged(t *testing.T) {
 	for name, want := range map[string]string{

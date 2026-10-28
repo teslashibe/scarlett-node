@@ -37,6 +37,10 @@ type runtimeStatus struct {
 	// RelayHalted is set while this node refuses keyed relay after catching
 	// its verifier misusing a session; cleared by `scarlett-node relay-resume`.
 	RelayHalted bool `json:"relay_halted,omitempty"`
+	// RelayRestUntil is when a keyed-relay rest ends, present while relay
+	// sessions that ended before the verifier opened the request hold relay
+	// back. It ends on its own.
+	RelayRestUntil *time.Time `json:"relay_rest_until,omitempty"`
 	// JournalFull is set while the attempt journal alone stops new work:
 	// unfinished attempts, or receipts too recent to prune, fill it.
 	JournalFull bool `json:"journal_full,omitempty"`

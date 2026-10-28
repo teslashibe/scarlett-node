@@ -242,6 +242,11 @@ test("X proof modes come from what the running node advertises", () => {
   assert.equal(xProofModes(advertised(["mpc"])), "MPC only");
   assert.equal(xProofModes(advertised(undefined)), "MPC only");
   assert.equal(xProofModes(advertised(["mpc"], { relay_halt_marker: true })), "MPC only · relay paused");
+  // A rest after unopened sessions ends on its own; only a halt asks for a resume.
+  const resting = advertised(["mpc"]);
+  resting.observation = { ...resting.observation, relay_rest_until: "2026-10-28T18:00:00Z" };
+  assert.equal(xProofModes(resting), "MPC only · relay resting");
+  assert.equal(relayState(resting), "");
   assert.equal(xProofModes(advertised(["mpc", "relay"], {}, "draining")), "MPC + relay");
   // A stopped node offers nothing, and a node without X accounts has no X service to show.
   assert.equal(xProofModes(advertised(["mpc", "relay"], {}, "offline")), "");
@@ -397,6 +402,7 @@ test("A paused node or web service says why it takes no new pages", () => {
   assert.deepEqual(webServing(webNode(readyWeb, { state: "draining" })), { value: "Paused", note: "Finishing accepted work" });
   for (const [code, note] of [
     ["relay_misuse", "Relay paused on this node"],
+    ["execution_uncertain", "Relay resting · resumes on its own"],
     ["web_proxy_failed", "Proxy failed · retrying in a minute"],
     ["prover_error", "Proof helper missing"],
     ["something_new", "Not taking new pages"],

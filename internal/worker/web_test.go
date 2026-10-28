@@ -119,6 +119,15 @@ func fakeWebProver(mode string) {
 	case "web-misuse":
 		fmt.Fprintln(os.Stderr, "Error: "+relayMisuseMarker)
 		os.Exit(1)
+	case "web-unopened":
+		fmt.Fprintln(os.Stderr, "Error: "+relayUnopenedMarker+": it ended the hop first (session_timeout)")
+		os.Exit(1)
+	case "web-later-unopened":
+		if in.Hop > 0 {
+			fmt.Fprintln(os.Stderr, "Error: "+relayUnopenedMarker+": the verifier connection ended first")
+			os.Exit(1)
+		}
+		redirect("https://www.example.com/")
 	case "web-sleep":
 		time.Sleep(time.Minute)
 	case "web-big":
@@ -496,6 +505,39 @@ func TestWebRunMisuseHaltsRelay(t *testing.T) {
 				t.Fatal("halted node still offers web")
 			}
 		})
+	}
+}
+
+// A hop the verifier ended before opening the node's request is the node's
+// uncertain attempt: never relay misuse, never a halt. Three within ten
+// minutes rest relay, which declines web offers until it ends on its own.
+func TestWebRunUnopenedIsUncertainAndRestsRelay(t *testing.T) {
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	// After a verified first hop the job stands, as for any later failure.
+	if run := runWeb(t, "web-later-unopened", webFixtureLease(t), webConfig(), publicAnswers); run.code != "" || len(run.inputs) != 2 {
+		t.Fatalf("later unopened hop: code %q, %d hops", run.code, len(run.inputs))
+	}
+	if run := runWeb(t, "web-unopened", webFixtureLease(t), webConfig(), publicAnswers); run.code != "execution_uncertain" || RelayHalted() {
+		t.Fatalf("unopened first hop: code %q halted %v", run.code, RelayHalted())
+	}
+	if !WebOfferServable(webConfig(), webFixtureLease(t), nil) || RelayPaused() {
+		t.Fatal("two unopened sessions rested relay")
+	}
+	if run := runWeb(t, "web-unopened", webFixtureLease(t), webConfig(), publicAnswers); run.code != "execution_uncertain" {
+		t.Fatal(run.code)
+	}
+	if RelayHalted() || !RelayPaused() || WebOfferServable(webConfig(), webFixtureLease(t), nil) {
+		t.Fatalf("third unopened session: halted %v paused %v", RelayHalted(), RelayPaused())
+	}
+	// A page that starts during the rest was accepted during it or just
+	// before it began: it sends nothing and fails as the node's service.
+	if run := runWeb(t, "web-final", webFixtureLease(t), webConfig(), publicAnswers); run.code != "service_unavailable" || len(run.inputs) != 0 {
+		t.Fatalf("page during a rest: code %q, %d hops", run.code, len(run.inputs))
+	}
+	ResetRelayHaltForTests()
+	if run := runWeb(t, "web-final", webFixtureLease(t), webConfig(), publicAnswers); run.code != "" || len(run.inputs) != 1 {
+		t.Fatalf("page after the rest: code %q, %d hops", run.code, len(run.inputs))
 	}
 }
 

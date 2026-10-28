@@ -137,6 +137,7 @@ input.locked { color: var(--faint); border-color: var(--border); }
 .relay-banner h2 { font-size: 15px; color: #f3dec1; }
 .relay-banner p { margin-top: 6px; color: #c9bba3; font-size: 13px; }
 .relay-banner button { flex: 0 0 auto; }
+#relay-banner > .actions { flex: 0 0 auto; }
 .relay-banner.danger { border-color: #71372f; background: #1d1210; }
 .relay-banner.danger h2 { color: #ffc4ba; }
 .relay-banner.danger p { color: #dcb5ad; }

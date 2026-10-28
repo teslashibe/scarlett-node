@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "version": "0.1.20",
-  "date": "2026-10-27",
-  "title": "Send web pages through your own proxy",
+  "date": "2026-10-28",
+  "title": "Your node keeps serving after your computer sleeps",
   "highlights": [
-    "New setting: send web pages through your own Webshare proxy, either for every page or only for sites that limit your network",
-    "Each job gets its own proxy session, so a page and its check leave from one address and the next job gets a new one",
-    "Your proxy password stays in your system keychain and is only ever sent to Webshare"
+    "A dropped connection or a sleeping computer no longer pauses keyed relay. Only the job in progress fails, and a pause left by an older version clears itself",
+    "If dropped sessions keep happening, relay rests for a minute or more and then resumes by itself",
+    "The Resume relay button now works and asks you to confirm inside the app"
   ]
 }

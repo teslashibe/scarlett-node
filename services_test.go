@@ -109,6 +109,37 @@ func healthKind(t *testing.T, p *servicePool, kind string) coordinator.ServiceHe
 	t.Fatal("missing service")
 	return coordinator.ServiceHealth{}
 }
+
+// A relay rest after unopened sessions drops relay from the heartbeat the
+// same way, keeps the account ready for MPC, and ends on its own.
+func TestRelayRestDropsRelayFromHeartbeatUntilItEnds(t *testing.T) {
+	worker.ResetRelayHaltForTests()
+	t.Cleanup(worker.ResetRelayHaltForTests)
+	p := poolFixture(t, "x_read")
+	p.config.XRelay = true
+	before := healthKind(t, p, "x_read").State
+	if !p.acquire("x_read") {
+		t.Fatal("ready account refused work")
+	}
+	// The unopened session does not count against the account.
+	p.finish("x_read", "execution_uncertain")
+	worker.RestRelayForTests()
+	h := healthKind(t, p, "x_read")
+	if !reflect.DeepEqual(h.ProofModes, []string{"mpc"}) || h.State != before {
+		t.Fatalf("resting heartbeat: modes %v state %q, was %q", h.ProofModes, h.State, before)
+	}
+	if !p.acquire("x_read") {
+		t.Fatal("account unavailable for MPC work during a relay rest")
+	}
+	p.finish("x_read", "")
+	if servableDeclineReason(p.config, coordinator.Lease{ServiceType: "x_read"}) != coordinator.RejectOther {
+		t.Fatal("a relay offer during the rest is not declined as the node's own state")
+	}
+	worker.ResetRelayHaltForTests()
+	if got := healthKind(t, p, "x_read").ProofModes; !reflect.DeepEqual(got, []string{"mpc", "relay"}) {
+		t.Fatalf("relay not advertised after the rest: %v", got)
+	}
+}
 func TestServicesIndependentCapacityQuotaAndAuthentication(t *testing.T) {
 	p := poolFixture(t, "codex", "x_read")
 	if p.capacity() != 3 || !p.acquire("x_read") || p.acquire("x_read") {

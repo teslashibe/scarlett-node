@@ -24,7 +24,7 @@ export const layout = `
     </div>
     <div class="node-controls"><div class="actions"><button id="start">Start node</button><button id="pause">Pause</button><button id="resume">Resume</button><button id="stop" class="quiet">Stop</button></div><p id="work" class="muted"></p></div>
   </section>
-  <section id="relay-banner" class="relay-banner" aria-labelledby="relay-heading" hidden><div><h2 id="relay-heading">Keyed relay is paused on this node</h2><p id="relay-detail" tabindex="-1"></p></div><button id="relay-resume" type="button">Resume relay</button></section>
+  <section id="relay-banner" class="relay-banner" aria-labelledby="relay-heading" hidden><div><h2 id="relay-heading">Keyed relay is paused on this node</h2><p id="relay-detail" tabindex="-1"></p><p id="relay-confirm-detail" hidden>Resume only after the operator confirms the verifier has been checked. The node keeps running, its current work continues, and relay resumes at the next status update.</p></div><div class="actions"><button id="relay-resume" type="button">Resume relay</button><button id="relay-cancel" type="button" class="secondary" aria-describedby="relay-confirm-detail" hidden>Keep paused</button><button id="relay-confirm" type="button" aria-describedby="relay-confirm-detail" hidden>Confirm resume</button></div></section>
   <div class="metrics" role="group" aria-label="Local node activity">
     <div class="metric"><span class="metric-label">Saved X accounts</span><strong id="metric-accounts">—</strong><span class="metric-note">On this device</span></div>
     <div class="metric"><span class="metric-label">Available X slots</span><strong id="metric-capacity">—</strong><span class="metric-note">Ready for new work</span></div>

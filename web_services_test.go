@@ -85,6 +85,21 @@ func TestWebServiceReadinessAndCapacity(t *testing.T) {
 		t.Fatalf("web did not resume: %+v", h)
 	}
 	p.finish("web", "")
+	// An unopened session is the node's uncertain attempt, not the target's
+	// failure: it leaves web as it was. A relay rest stops web until it ends.
+	p.finish("web", "execution_uncertain")
+	if h = healthKind(t, p, "web"); h.State != "ready" || h.LastErrorCode != "" {
+		t.Fatalf("unopened session changed web state: %+v", h)
+	}
+	worker.RestRelayForTests()
+	if h = healthKind(t, p, "web"); h.State != "unreachable" || h.LastErrorCode != "execution_uncertain" || h.Capacity != 0 || p.acquire("web") {
+		t.Fatalf("resting relay still offers web: %+v", h)
+	}
+	worker.ResetRelayHaltForTests()
+	if h = healthKind(t, p, "web"); h.State != "configured" || h.LastErrorCode != "" || !p.acquire("web") {
+		t.Fatalf("web did not resume after the rest: %+v", h)
+	}
+	p.finish("web", "")
 	// A missing helper makes web unreachable until it returns.
 	if err := os.Remove(p.config.Prover); err != nil {
 		t.Fatal(err)

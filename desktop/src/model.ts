@@ -116,6 +116,9 @@ export type Snapshot = {
     services?: ServiceHealth[];
     drain_requested?: boolean;
     relay_halted?: boolean;
+    // Present while keyed relay rests after sessions the verifier ended before
+    // opening this node's request; the rest ends on its own.
+    relay_rest_until?: string;
     // The attempt journal alone stops new work.
     journal_full?: boolean;
     // This build's release and the coordinator's last release notice.
@@ -223,6 +226,7 @@ function webOn(s: Snapshot): boolean | undefined {
 // Why an enabled web service is not taking new pages (services.go refreshWeb).
 const WEB_PAUSED: Record<string, string> = {
   relay_misuse: "Relay paused on this node",
+  execution_uncertain: "Relay resting · resumes on its own",
   web_proxy_failed: "Proxy failed · retrying in a minute",
   prover_error: "Proof helper missing",
 };
@@ -544,7 +548,8 @@ export function xProofModes(s: Snapshot): string {
   const x = s.observation?.services?.find((v) => v.kind === "x_read");
   if (!x) return "";
   if (x.proof_modes?.includes("relay")) return "MPC + relay";
-  return relayState(s) ? "MPC only · relay paused" : "MPC only";
+  if (relayState(s)) return "MPC only · relay paused";
+  return s.observation?.relay_rest_until ? "MPC only · relay resting" : "MPC only";
 }
 export function drainingAccounts(s: Snapshot): AccountHealth[] {
   return (s.observation?.accounts ?? []).filter(

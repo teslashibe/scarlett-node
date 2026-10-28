@@ -18,7 +18,7 @@ use std::{
     ops::Range,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -179,9 +179,7 @@ async fn run_observed(request: Request, trace: &Trace) -> Result<Summary> {
     // One X session per connection: it closes when this returns.
     let mut conn = RelayConn::new(socket);
     conn.present(&request.token).await?;
-    let response = trace.measure(Phase::RelaySession, async {
-        tokio::time::timeout(std::time::Duration::from_secs(120), exchange(&mut conn, server, &raw, HOST, Mode::X, trace)).await.context("relay session timed out")?.map(|(response, ..)| response)
-    }).await?;
+    let response = trace.measure(Phase::RelaySession, x_session(&mut conn, server, &raw, HOST, X_SESSION_LIMIT, trace)).await?;
     Ok(Summary {
         verifier_transport: traffic.snapshot(),
         status: "proof_sent",
@@ -191,6 +189,24 @@ async fn run_observed(request: Request, trace: &Trace) -> Result<Summary> {
         duration_ms: started.elapsed().as_millis(),
         diagnostics: None,
     })
+}
+
+/// How long an X session may run once its token is presented.
+const X_SESSION_LIMIT: Duration = Duration::from_secs(120);
+
+/// One X session on `conn`, whose token was just presented, within `limit`:
+/// the response the verifier decrypted. A session its limit ends after the
+/// request record went out, and before the verifier opened it, is `UNOPENED`.
+pub(crate) async fn x_session<V, X>(conn: &mut RelayConn<V>, server: X, raw: &[u8], host: &str, limit: Duration, trace: &Trace) -> Result<Vec<u8>>
+where
+    V: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    X: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let sealing = Sealing::default();
+    match tokio::time::timeout(limit, exchange(conn, server, raw, host, Mode::X, &sealing, trace)).await {
+        Ok(result) => result.map(|(response, ..)| response),
+        Err(_) => Err(sealing.timed_out()),
+    }
 }
 
 /// Input of `scarlett-prover relay-web` and of a `serve` hop: one hop of a
@@ -540,6 +556,7 @@ pub async fn finish(hop: &Hop, token: &str, source: Source, trace: &Trace, prese
     };
     let (server, target) = crate::control::metered(server);
     let host = webpolicy::url_host(&request.url);
+    let sealing = Sealing::default();
     let session = async {
         // A connection the verifier may already have given up on is replaced: that costs a dial, never a token.
         let mut link = match link.and_then(|mut link| link.usable().then_some(link)) {
@@ -557,7 +574,7 @@ pub async fn finish(hop: &Hop, token: &str, source: Source, trace: &Trace, prese
         link.conn.present(token).await.map_err(|e| (e, true))?;
         hop.step(Step::InSession);
         hop.detail(format_args!("token presented at {} ms", hop.ms()));
-        let (outcome, keep) = trace.measure(Phase::RelaySession, web_session_on(&mut link.conn, server, &hop.raw, host, request.hop, &request.url, trace)).await.map_err(|e| (e, true))?;
+        let (outcome, keep) = trace.measure(Phase::RelaySession, web_session_on(&mut link.conn, server, &hop.raw, host, request.hop, &request.url, &sealing, trace)).await.map_err(|e| (e, true))?;
         Ok::<_, (anyhow::Error, bool)>((outcome, keep, link))
     };
     let (outcome, keep, mut link) = match tokio::time::timeout_at(hop.deadline, session).await {
@@ -568,7 +585,7 @@ pub async fn finish(hop: &Hop, token: &str, source: Source, trace: &Trace, prese
         }
         Err(_) => {
             hop.detail(format_args!("session timed out at {} ms", hop.ms()));
-            return Err(Failed { error: WebError::fetch(anyhow::anyhow!("relay session timed out")), presented: true, link: None });
+            return Err(Failed { error: WebError::fetch(sealing.timed_out()), presented: true, link: None });
         }
     };
     hop.detail(format_args!("session done at {} ms (keep {keep})", hop.ms()));
@@ -936,7 +953,7 @@ where
     V: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     X: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    exchange(&mut RelayConn::new(verifier), server, raw, host, Mode::X, trace).await.map(|(response, ..)| response)
+    exchange(&mut RelayConn::new(verifier), server, raw, host, Mode::X, &Sealing::default(), trace).await.map(|(response, ..)| response)
 }
 
 /// Runs one web hop over an established verifier socket and a connection to
@@ -948,18 +965,19 @@ where
     V: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     X: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    web_session_on(&mut RelayConn::new(verifier), server, raw, host, hop, url, trace).await.map(|(outcome, _)| outcome)
+    web_session_on(&mut RelayConn::new(verifier), server, raw, host, hop, url, &Sealing::default(), trace).await.map(|(outcome, _)| outcome)
 }
 
 /// One web hop on `conn`, whose token was just presented: what the
 /// verifier reported, and whether it keeps the connection for another
-/// session.
-pub(crate) async fn web_session_on<V, X>(conn: &mut RelayConn<V>, server: X, raw: &[u8], host: &str, hop: u32, url: &str, trace: &Trace) -> Result<(HopOutcome, bool)>
+/// session. `sealing` follows its request record for the caller's deadline.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn web_session_on<V, X>(conn: &mut RelayConn<V>, server: X, raw: &[u8], host: &str, hop: u32, url: &str, sealing: &Sealing, trace: &Trace) -> Result<(HopOutcome, bool)>
 where
     V: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     X: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (_, outcome, keep) = exchange(conn, server, raw, host, Mode::Web { hop, url }, trace).await?;
+    let (_, outcome, keep) = exchange(conn, server, raw, host, Mode::Web { hop, url }, sealing, trace).await?;
     Ok((outcome.context("verifier finished without reporting the hop")?, keep))
 }
 
@@ -1000,8 +1018,18 @@ struct Done {
 
 /// One session on `conn`, whose token was just presented: the X response
 /// (empty for a web hop), the web hop's outcome, and whether the verifier
-/// keeps the connection for another session.
-async fn exchange<V, X>(conn: &mut RelayConn<V>, server: X, raw: &[u8], host: &str, mode: Mode<'_>, trace: &Trace) -> Result<(Vec<u8>, Option<HopOutcome>, bool)>
+/// keeps the connection for another session. However the session fails
+/// after the request record went out and before the verifier opened it, the
+/// error says so (`UNOPENED`), unless it proves misuse.
+async fn exchange<V, X>(conn: &mut RelayConn<V>, server: X, raw: &[u8], host: &str, mode: Mode<'_>, sealing: &Sealing, trace: &Trace) -> Result<(Vec<u8>, Option<HopOutcome>, bool)>
+where
+    V: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    X: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    run_exchange(conn, server, raw, host, mode, sealing, trace).await.map_err(|e| sealing.ended(e))
+}
+
+async fn run_exchange<V, X>(conn: &mut RelayConn<V>, server: X, raw: &[u8], host: &str, mode: Mode<'_>, sealing: &Sealing, trace: &Trace) -> Result<(Vec<u8>, Option<HopOutcome>, bool)>
 where
     V: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     X: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1075,7 +1103,7 @@ where
         match event {
             Event::Failed(e) => {
                 if record_sent && !checked {
-                    return Err(e.context(format!("{MISUSE}: the session ended before it opened the request record")));
+                    return Err(e.context(format!("{UNOPENED}: the verifier connection ended first")));
                 }
                 return Err(e);
             }
@@ -1136,8 +1164,10 @@ where
                 }
                 let record = tag::node_record(&material, &hidden, &secret, &blocks)?;
                 to_server.write_all(&record).await?;
-                to_server.flush().await?;
+                // Written whole, the record may reach the server whatever happens next.
                 record_sent = true;
+                sealing.sent();
+                to_server.flush().await?;
                 trace.milestone(Phase::RequestSent);
                 sealed = Some(record);
             }
@@ -1168,11 +1198,12 @@ where
                 record::wipe(&mut payload);
                 opened?;
                 checked = true;
+                sealing.opened();
             }
             Event::Frame(wire::FAILED, payload) if web => {
                 // A verifier opens a sealed record before it says why the hop failed.
                 if record_sent && !checked {
-                    bail!("{MISUSE}: it ended the session before it opened the request record");
+                    bail!("{UNOPENED}: it ended the hop first ({})", Refused::parse(&payload).0);
                 }
                 return Err(Refused::parse(&payload).into());
             }
@@ -1198,7 +1229,7 @@ where
                 }
                 // No result is reported for a record the supplier could not check.
                 if !checked {
-                    bail!("{MISUSE}: it did not open the request record");
+                    bail!("{UNOPENED}: it finished the session without opening it");
                 }
                 if web && outcome.is_none() {
                     bail!("verifier finished without reporting the hop");
@@ -1212,11 +1243,58 @@ where
     }
 }
 
-/// Start of the error a supplier reports when the verifier made it send
-/// something other than its own request, or would not show that it had not.
-/// Only the verifier holds the key, so it decides what is sealed; this check
-/// comes after the fact and cannot undo the request, but it is certain.
-pub const MISUSE: &str = "verifier misused this node's X session";
+/// Start of the error a supplier reports when the verifier opened the record
+/// and showed that it made the supplier send something other than its own
+/// request. Only the verifier holds the key, so it decides what is sealed;
+/// this check comes after the fact and cannot undo the request, but it is
+/// certain. Through release 0.1.19 this text was "verifier misused this
+/// node's X session" and also covered `UNOPENED`.
+pub const MISUSE: &str = "verifier sealed a request this node did not authorize";
+
+/// Start of the error a supplier reports when a session ends after its
+/// request record went out but before the verifier opened it. The supplier
+/// cannot tell what was sealed, but this proves nothing: a verifier that timed
+/// the session out, a dropped connection or a machine that slept ends a
+/// session the same way. The node rests relay after several of these and
+/// resumes on its own; only `MISUSE` halts it.
+pub const UNOPENED: &str = "verifier did not open this node's request record";
+
+/// Where a session's request record stands: not sent, sent, or opened by
+/// the verifier. It lives outside the session, so that a deadline that ends
+/// the session still knows.
+#[derive(Default)]
+pub(crate) struct Sealing(AtomicU8);
+
+impl Sealing {
+    const SENT: u8 = 1;
+    const OPENED: u8 = 2;
+
+    fn sent(&self) {
+        self.0.store(Self::SENT, Ordering::SeqCst);
+    }
+
+    fn opened(&self) {
+        self.0.store(Self::OPENED, Ordering::SeqCst);
+    }
+
+    /// `error` as the end of the session. Between the record going out and
+    /// the verifier opening it, every way a session ends is `UNOPENED`: a
+    /// stray frame, a timeout or a dropped connection leaves the supplier as
+    /// unable to tell what was sealed as a missing opening does. An error
+    /// that already proves misuse, or already says so, is kept as it is.
+    pub(crate) fn ended(&self, error: anyhow::Error) -> anyhow::Error {
+        let text = format!("{error:#}");
+        if self.0.load(Ordering::SeqCst) != Self::SENT || text.contains(MISUSE) || text.contains(UNOPENED) {
+            return error;
+        }
+        error.context(format!("{UNOPENED}: the session ended first"))
+    }
+
+    /// The error of a session that its deadline ended.
+    pub(crate) fn timed_out(&self) -> anyhow::Error {
+        self.ended(anyhow::anyhow!("relay session timed out"))
+    }
+}
 
 /// Checks, with the key the verifier revealed, that the record this supplier
 /// sent to X was exactly `raw`. A key that authenticates the record cannot
@@ -1322,6 +1400,27 @@ mod tests {
         assert!(!refuses(&[&hello, &CCS, &hello, &protected(53)]));
         // An alert or anything else unprotected is not part of a client handshake.
         assert!(refuses(&[&hello, &[21, 3, 3, 0, 2, 1, 0]]));
+    }
+
+    #[test]
+    fn only_a_session_that_ends_between_the_record_and_its_opening_is_unopened() {
+        let ended = |sealing: &Sealing, error: &str| format!("{:#}", sealing.ended(anyhow::anyhow!("{error}")));
+        let sealing = Sealing::default();
+        // Nothing went to the server yet: the error stands as it is.
+        assert_eq!(ended(&sealing, "verifier sent frame 9"), "verifier sent frame 9");
+        assert_eq!(format!("{:#}", sealing.timed_out()), "relay session timed out");
+        sealing.sent();
+        assert_eq!(ended(&sealing, "verifier sent frame 9"), format!("{UNOPENED}: the session ended first: verifier sent frame 9"));
+        assert!(format!("{:#}", sealing.timed_out()).starts_with(UNOPENED));
+        // Proof of misuse, or an error that already says unopened, is kept.
+        let misuse = format!("{MISUSE}: its key does not open the request record");
+        assert_eq!(ended(&sealing, &misuse), misuse);
+        let unopened = format!("{UNOPENED}: it finished the session without opening it");
+        assert_eq!(ended(&sealing, &unopened), unopened);
+        // Once the verifier opened the record, a later failure is an ordinary one.
+        sealing.opened();
+        assert_eq!(ended(&sealing, "invalid hop outcome"), "invalid hop outcome");
+        assert_eq!(format!("{:#}", sealing.timed_out()), "relay session timed out");
     }
 
     #[test]

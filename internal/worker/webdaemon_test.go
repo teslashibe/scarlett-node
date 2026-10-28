@@ -105,6 +105,14 @@ func fakeWebDaemon(mode string) {
 		case "web-daemon-misuse":
 			write(map[string]any{"type": "error", "id": id, "class": "fetch_failed", "error": relayMisuseMarker + ": synthetic", "presented": true, "diagnostics": json.RawMessage(`{"version":1,"duration_ms":4,"outcome":"error","spans":[]}`)})
 			return
+		case "web-daemon-unopened":
+			write(map[string]any{"type": "error", "id": id, "class": "fetch_failed", "error": relayUnopenedMarker + ": it ended the hop first (session_timeout)", "presented": true, "diagnostics": json.RawMessage(`{"version":1,"duration_ms":4,"outcome":"error","spans":[]}`)})
+			return
+		case "web-daemon-late-unopened":
+			// The session runs to its own deadline, after the job's.
+			time.Sleep(2500 * time.Millisecond)
+			write(map[string]any{"type": "error", "id": id, "class": "fetch_failed", "error": relayUnopenedMarker + ": the session ended first: relay session timed out", "presented": true, "diagnostics": json.RawMessage(`{"version":1,"duration_ms":2500,"outcome":"error","spans":[]}`)})
+			return
 		case "web-daemon-too-large":
 			write(map[string]any{"type": "error", "id": id, "class": "page_too_large", "error": "verifier ended the hop: page_too_large", "presented": true, "diagnostics": json.RawMessage(`{"version":1,"duration_ms":40,"outcome":"error","spans":[{"phase":"relay_session","start_ms":2,"duration_ms":38,"outcome":"error"}]}`)})
 			return
@@ -321,6 +329,46 @@ func TestWebDaemonMisuseHaltsRelay(t *testing.T) {
 	report := webWorkerFor(publicAnswers).Report(context.Background(), webFixtureLease(t))
 	if report.Code != "relay_misuse" || !RelayHalted() {
 		t.Fatal("misuse not latched", report.Code)
+	}
+}
+
+// A daemon hop the verifier ended before opening the request is the
+// node's uncertain attempt, not misuse: relay is not halted.
+func TestWebDaemonUnopenedSessionIsUncertainNotMisuse(t *testing.T) {
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	useWebDaemon(t, "web-daemon-unopened")
+	report := webWorkerFor(publicAnswers).Report(context.Background(), webFixtureLease(t))
+	if report.Code != "execution_uncertain" || RelayHalted() || RelayPaused() {
+		t.Fatal("unopened daemon hop", report.Code, RelayHalted(), RelayPaused())
+	}
+}
+
+// The node stops waiting for a daemon hop when its job ends; what the
+// daemon says about the verifier afterwards still counts toward a rest.
+func TestWebDaemonReplyAfterTheJobEndedStillCountsAnUnopenedRecord(t *testing.T) {
+	ResetRelayHaltForTests()
+	t.Cleanup(ResetRelayHaltForTests)
+	useWebDaemon(t, "web-daemon-late-unopened")
+	w := webWorkerFor(publicAnswers)
+	if daemonFor(w.Config) == nil {
+		t.Fatal("no daemon")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	if report := w.Report(ctx, webFixtureLease(t)); report.Code != "expired" {
+		t.Fatal("job past its deadline", report.Code)
+	}
+	for start := time.Now(); ; time.Sleep(20 * time.Millisecond) {
+		relayRest.Lock()
+		counted := len(relayRest.unopened)
+		relayRest.Unlock()
+		if counted == 1 && !RelayHalted() {
+			return
+		}
+		if time.Since(start) > 5*time.Second {
+			t.Fatalf("late reply counted %d unopened sessions, halted %v", counted, RelayHalted())
+		}
 	}
 }
 
