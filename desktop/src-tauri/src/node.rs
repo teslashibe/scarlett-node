@@ -25,6 +25,10 @@ const X_ACCOUNT_WRITE_TIMEOUT: u64 = 45;
 /// `scarlett-node relay-resume` removes it. A node from 0.1.20 on also removes
 /// one written by 0.1.19 or earlier when it starts: those never proved misuse.
 const RELAY_HALT_FILE: &str = "relay-halt";
+/// The text 0.1.19 and earlier wrote in every relay-halt marker
+/// (worker.legacyRelayMisuseMarker). The node no longer halts on it, so the
+/// app shows no halt for it either, even before the node has removed it.
+const LEGACY_RELAY_HALT: &str = "verifier misused this node's X session";
 
 #[derive(Clone)]
 struct Endpoints {
@@ -1379,7 +1383,17 @@ impl Node {
         Ok(())
     }
     fn relay_halt_marker(&self) -> bool {
-        std::fs::symlink_metadata(self.state.join(RELAY_HALT_FILE)).is_ok()
+        let path = self.state.join(RELAY_HALT_FILE);
+        match std::fs::symlink_metadata(&path) {
+            Err(_) => false,
+            // Only a small regular file is read; anything else is a halt.
+            Ok(meta) if meta.is_file() && meta.len() <= 4096 => {
+                std::fs::read(&path).map_or(true, |raw| {
+                    std::str::from_utf8(&raw).map_or(true, |text| text.trim() != LEGACY_RELAY_HALT)
+                })
+            }
+            Ok(_) => true,
+        }
     }
     pub async fn remove(&self, service: String, id: String) -> Result<()> {
         let _guard = self.mutation.lock().await;
@@ -2478,7 +2492,10 @@ esac
         );
         let unhalted = observation_projection(br#"{"state":"running","services":[]}"#).unwrap();
         assert!(unhalted.get("relay_halted").is_none());
-        let resting = observation_projection(br#"{"state":"running","relay_rest_until":"2026-10-28T18:00:00Z","services":[]}"#).unwrap();
+        let resting = observation_projection(
+            br#"{"state":"running","relay_rest_until":"2026-10-28T18:00:00Z","services":[]}"#,
+        )
+        .unwrap();
         assert_eq!(resting["relay_rest_until"], json!("2026-10-28T18:00:00Z"));
     }
     #[test]
@@ -2590,7 +2607,11 @@ esac
         let temp = tempfile::tempdir().unwrap();
         let node = relay_fixture(&temp);
         let marker = node.state.join(RELAY_HALT_FILE);
-        std::fs::write(&marker, "verifier sealed a request this node did not authorize\n").unwrap();
+        std::fs::write(
+            &marker,
+            "verifier sealed a request this node did not authorize\n",
+        )
+        .unwrap();
         node.start().await.unwrap();
         let calls = node.state.join("calls");
         let began = Instant::now();
@@ -2630,11 +2651,39 @@ esac
                 .any(|call| call == "drain" || call.starts_with("desktop"))
         );
         // A marker the command did not remove is reported, not assumed gone.
-        std::fs::write(&marker, "verifier sealed a request this node did not authorize\n").unwrap();
+        std::fs::write(
+            &marker,
+            "verifier sealed a request this node did not authorize\n",
+        )
+        .unwrap();
         std::fs::write(node.state.join("keep-halt"), "").unwrap();
         assert_eq!(node.resume_relay().await, Err(Error::CommandFailed));
         assert!(node.snapshot().await.relay_halt_marker);
         node.stop().await.unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_from_an_earlier_release_raises_no_relay_halt() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = relay_fixture(&temp);
+        let marker = node.state.join(RELAY_HALT_FILE);
+        assert!(!node.relay_halt_marker());
+        std::fs::write(&marker, format!("{LEGACY_RELAY_HALT}\n")).unwrap();
+        assert!(!node.relay_halt_marker());
+        std::fs::write(
+            &marker,
+            "verifier sealed a request this node did not authorize\n",
+        )
+        .unwrap();
+        assert!(node.relay_halt_marker());
+        // Anything the app cannot read as the legacy text stays a halt.
+        for content in [&b"\xff\xfe"[..], &[b' '; 5000][..], &b""[..]] {
+            std::fs::write(&marker, content).unwrap();
+            assert!(node.relay_halt_marker());
+        }
+        std::fs::remove_file(&marker).unwrap();
+        std::os::unix::fs::symlink(temp.path().join("helper"), &marker).unwrap();
+        assert!(node.relay_halt_marker());
     }
     #[tokio::test]
     async fn relay_resume_clears_the_real_node_marker_and_is_repeatable() {
@@ -2649,7 +2698,11 @@ esac
         );
         node.prepare().unwrap();
         let marker = node.state.join(RELAY_HALT_FILE);
-        std::fs::write(&marker, "verifier sealed a request this node did not authorize\n").unwrap();
+        std::fs::write(
+            &marker,
+            "verifier sealed a request this node did not authorize\n",
+        )
+        .unwrap();
         assert!(node.snapshot().await.relay_halt_marker);
         node.resume_relay().await.unwrap();
         assert!(!marker.exists());
