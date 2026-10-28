@@ -5,6 +5,7 @@ import { api } from "./api.ts";
 import { scheduleXLoginExpiry } from "./x-login-expiry.ts";
 import { accountRemovalConfirmation } from "./account-removal.ts";
 import { relayResumeConfirmation } from "./relay-resume.ts";
+import { proxyRemovalConfirmation } from "./proxy-removal.ts";
 import { failureNotice, updatedBanner, updateSummary, updateToast, validVersion, type UpdateAction, type UpdateStatus } from "./update.ts";
 import { availableXSlots, diagnosticsNote, localCapacity, renderDiagnostics, webPagesServed, xDiagnostics, type Diagnostics } from "./diagnostics.ts";
 import {
@@ -69,6 +70,12 @@ const confirmRemoval = accountRemovalConfirmation({
   cancel: $<HTMLButtonElement>("remove-account-cancel"),
   confirm: $<HTMLButtonElement>("remove-account-confirm"),
   restoreFocus: restoreAccountFocus,
+});
+const confirmProxyRemoval = proxyRemovalConfirmation({
+  dialog: $<HTMLDialogElement>("remove-proxy-dialog"),
+  cancel: $<HTMLButtonElement>("remove-proxy-cancel"),
+  confirm: $<HTMLButtonElement>("remove-proxy-confirm"),
+  restoreFocus: () => $("web-proxy-remove").focus(),
 });
 const relayResume = relayResumeConfirmation({
   banner: $("relay-banner"),
@@ -792,17 +799,19 @@ $("web-proxy-form").addEventListener("submit", (event) => {
   }, () => outcome);
 });
 $("web-proxy-remove").addEventListener("click", () => {
-  if (!confirm("Remove the saved proxy?\n\nThe proxy username and password are deleted from this device and the proxy is turned off. A running node keeps its proxy until it next starts."))
-    return;
-  showProxyResult("");
-  void act(async () => {
-    try { await api.removeWebProxy(); }
-    finally {
-      const saved = await api.preferences().catch(() => undefined);
-      if (saved) { savedPreferences = saved; showWebProxySettings(saved); }
-      await loadWebProxy();
-    }
-  }, snapshot?.supervised ? "Proxy removed. Stop and start the node to apply it" : "Proxy removed");
+  if (busy) return;
+  void confirmProxyRemoval().then((confirmed) => {
+    if (!confirmed) return;
+    showProxyResult("");
+    void act(async () => {
+      try { await api.removeWebProxy(); }
+      finally {
+        const saved = await api.preferences().catch(() => undefined);
+        if (saved) { savedPreferences = saved; showWebProxySettings(saved); }
+        await loadWebProxy();
+      }
+    }, snapshot?.supervised ? "Proxy removed. Stop and start the node to apply it" : "Proxy removed");
+  });
 });
 $("autostart").addEventListener("change", () => {
   const input = $<HTMLInputElement>("autostart");
