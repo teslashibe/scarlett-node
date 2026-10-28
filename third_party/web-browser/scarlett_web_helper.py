@@ -4,8 +4,11 @@ The node (internal/webruntime) starts this module inside its bundled Python
 with an allowlisted environment, then talks to it over loopback HTTP with a
 bearer. It renders one page per request in a fresh browser context through
 Scrapling's AsyncStealthySession and Chrome for Testing. Every per-job context
-uses the node's filtering egress proxy; the browser's own background traffic
-goes to the node's deny listener.
+uses the node's filtering egress proxy: the shared one in WEB_EGRESS_PROXY, or
+for a page the node sends through the operator's proxy, the loopback proxy the
+node opened for that job alone (egress_proxy in the request). The helper never
+sees the operator's proxy or its credentials. The browser's own background
+traffic goes to the node's deny listener.
 
 Bot protection is handled by the Scrapling build the runtime pins
 (0.4.15+scarlett.2, teslashibe/Scrapling): with solve_antibot on the session
@@ -157,6 +160,8 @@ DISPLAY_POLICY = "canonical"
 DATADOME_DRAG_SLIDER = False
 TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9a-z-]{1,64}$")
 SELECTOR = re.compile(r"^[\x20-\x7e]{1,256}$")
+# A job's own egress proxy: a loopback URL the node opened, never credentials.
+EGRESS_PROXY = re.compile(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})")
 URL_STRIP = re.compile(r"[\t\n\r]")
 
 logging.getLogger("scrapling").disabled = True
@@ -403,7 +408,7 @@ def self_check():
 class Request:
     def __init__(self, raw):
         if not isinstance(raw, dict) or set(raw) - {"url", "wait", "wait_ms", "wait_selector", "timeout_ms",
-                                                     "block_resources", "solve_challenge", "solver"}:
+                                                     "block_resources", "solve_challenge", "solver", "egress_proxy"}:
             raise ValueError("fields")
         self.url = raw.get("url")
         self.wait = raw.get("wait", "networkidle")
@@ -414,6 +419,9 @@ class Request:
         self.solve_challenge = raw.get("solve_challenge", True)
         # The node turns the operator's solver off once its daily cap is spent.
         self.solver = raw.get("solver", False)
+        # A page the node sends through the operator's proxy names the job's
+        # own loopback egress proxy; every other page uses the shared one.
+        self.egress_proxy = raw.get("egress_proxy")
         if not isinstance(self.url, str) or len(self.url) > 2048 or not self.url.startswith(("https://", "http://")) or \
                 any(c <= " " or c == "\x7f" for c in self.url):
             raise ValueError("url")
@@ -427,6 +435,10 @@ class Request:
             raise ValueError("wait_selector")
         if type(self.block_resources) is not bool or type(self.solve_challenge) is not bool or type(self.solver) is not bool:
             raise ValueError("flags")
+        if self.egress_proxy is not None:
+            match = EGRESS_PROXY.fullmatch(self.egress_proxy) if isinstance(self.egress_proxy, str) else None
+            if match is None or int(match.group(1)) > 65535:
+                raise ValueError("egress_proxy")
 
 
 def dom_bytes(body):
@@ -658,7 +670,8 @@ class Fetcher:
             deadline = started + request.timeout_ms / 1000
             # One solver scope per job: both passes share its per-fetch caps
             # and its spend ledger, which books a task when it is sent, so a
-            # pass that timed out mid-solve still reports what it spent.
+            # pass that timed out mid-solve still reports what it spent. Both
+            # passes leave through the job's egress proxy.
             scope = self.solver.scope() if self.solver is not None and request.solver else None
             result = await self._once(request, deadline, scope)
             if result["data"]["challenge"] == "unsolved" and not result["no_retry"] and deadline - loop.time() >= 15:
@@ -755,7 +768,7 @@ class Fetcher:
         timeout_ms = max(1000, min(request.timeout_ms, int(remaining() * 1000) - 250))
         try:
             response = await asyncio.wait_for(session.fetch(
-                request.url, proxy=self.proxy, timeout=timeout_ms, network_idle=False, solve_cloudflare=False,
+                request.url, proxy=request.egress_proxy or self.proxy, timeout=timeout_ms, network_idle=False, solve_cloudflare=False,
                 solve_antibot=request.solve_challenge, captcha_solver=scope if request.solve_challenge else None,
                 load_dom=True, google_search=False, disable_resources=request.block_resources, wait=0,
                 page_setup=setup, page_action=act), max(0.1, remaining()))

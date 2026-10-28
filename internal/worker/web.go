@@ -3,9 +3,11 @@ package worker
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/netip"
 	"slices"
 	"strings"
@@ -41,15 +43,24 @@ type Web struct {
 	// from gzipPath (with manifest.DOM "ok") and then the manifest. nil never
 	// stores one.
 	Upload func(ctx context.Context, jobID string, manifest coordinator.BrowserResult, gzipPath string, report time.Time) error
+	// exitTarget, exitRoots and proxyDial override the exit probe's host, its
+	// TLS roots and its dial of the proxy's checked address (webExitHost, the
+	// system roots and a plain dial); tests point them at a local proxy and
+	// echo.
+	exitTarget string
+	exitRoots  *x509.CertPool
+	proxyDial  func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 // WebReport is a web job's outcome: Code is "" when proven, else its failure
 // code; with page_too_large, Stage ("wire" or "dom") and ObservedBytes (a
-// lower bound) say where and how large.
+// lower bound) say where and how large. Egress, which every web report
+// carries, says how the page left this node.
 type WebReport struct {
 	Code          string
 	Stage         string
 	ObservedBytes int64
+	Egress        coordinator.WebEgress
 }
 
 // The web proof policies: keyed relay with no hidden bits, so the verifier
@@ -251,6 +262,10 @@ func validateWebLease(c config.Config, l coordinator.Lease) (webPlan, time.Time,
 	if !ok || plan.URL != l.WebRequest.URL || RelayHalted() {
 		return plan, time.Time{}, "invalid_lease"
 	}
+	// The proxy hint needs a proxy: a direct node refused such an offer.
+	if l.WebEgress != "" && (l.WebEgress != "proxy" || c.WebEgressProxy == nil) {
+		return plan, time.Time{}, "invalid_lease"
+	}
 	// Mode, policy, browser options and node headers go together, and the
 	// pre-warm hint belongs to relay jobs only.
 	browser := l.WebRequest.Mode == "browser"
@@ -298,7 +313,9 @@ func (w Web) Run(ctx context.Context, l coordinator.Lease) string {
 // Report fetches the lease's page, following redirects only as the verifier
 // authorizes them, and returns code "" once at least the first hop was
 // proven. The verifier holds every verified hop; the coordinator reads them
-// there. A browser job is run by runBrowser.
+// there. A browser job is run by runBrowser. A proxied job goes through the
+// proxy on its own session, with its exit probed beside it, and fails
+// rather than leave from this node's own network.
 func (w Web) Report(ctx context.Context, l coordinator.Lease) WebReport {
 	plan, deadline, code := validateWebLease(w.Config, l)
 	// Every web job is relay. One that starts while relay rests was accepted
@@ -308,19 +325,45 @@ func (w Web) Report(ctx context.Context, l coordinator.Lease) WebReport {
 	}
 	if code != "" {
 		w.observePage(code, false)
-		return WebReport{Code: code}
+		return w.egressReport(WebReport{Code: code, Egress: coordinator.WebEgress{Via: leaseVia(w.Config, l)}}, "")
 	}
-	ctx, cancel := context.WithDeadline(ctx, deadline)
+	route, ok := w.jobRoute(ctx, l)
+	if !ok {
+		// The proxy's host did not resolve or failed its check: no hop runs.
+		w.observePage("web_proxy_failed", false)
+		return w.egressReport(WebReport{Code: "web_proxy_failed", Egress: coordinator.WebEgress{Via: "proxy"}}, proxyUnreachable)
+	}
+	jobCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	var report WebReport
 	if l.WebRequest.Mode == "browser" {
-		report = w.runBrowser(ctx, l, plan, deadline)
+		report = w.runBrowser(jobCtx, l, plan, deadline, route)
 	} else {
-		code, _ = w.relay(ctx, plan, l.VerifierToken, nil)
+		code, _ = w.relay(jobCtx, plan, l.VerifierToken, nil, route)
 		report = wireReport(code)
 	}
 	// A page that ran into its deadline timed out, whatever it reports.
-	w.observePage(report.Code, errors.Is(ctx.Err(), context.DeadlineExceeded))
+	w.observePage(report.Code, errors.Is(jobCtx.Err(), context.DeadlineExceeded))
+	egress, class := route.finish(report.Code)
+	report.Egress = egress
+	return w.egressReport(report, class)
+}
+
+// leaseVia is how lease l's page would leave this node.
+func leaseVia(c config.Config, l coordinator.Lease) string {
+	if UsesProxy(c, l) {
+		return "proxy"
+	}
+	return "direct"
+}
+
+// egressReport passes the page's egress to the service pool, when it gave
+// the lease an observer: how it left, the exit the probe found, and for a
+// web_proxy_failed job the proxy class, which decides how long web rests.
+func (w Web) egressReport(report WebReport, class string) WebReport {
+	if o := w.Config.WebEgressObserver; o != nil {
+		o(config.WebEgressOutcome{Via: report.Egress.Via, Exit: exitOf(report.Egress), ProxyClass: class})
+	}
 	return report
 }
 
@@ -390,8 +433,9 @@ func (w Web) resolver() func(context.Context, string) ([]netip.Addr, error) {
 // relay runs the hop loop and returns the job's code and how many hops the
 // verifier holds. One verified hop already makes the job: a later hop failing
 // for any reason but relay misuse still reports proven. nodeHeaders, set for
-// browser jobs, gives each hop's node-supplied User-Agent and Cookie.
-func (w Web) relay(ctx context.Context, plan webPlan, token string, nodeHeaders func(hopURL string) *webNodeHeaders) (string, int) {
+// browser jobs, gives each hop's node-supplied User-Agent and Cookie; route
+// is the job's egress (nil for direct).
+func (w Web) relay(ctx context.Context, plan webPlan, token string, nodeHeaders func(hopURL string) *webNodeHeaders, route *webRoute) (string, int) {
 	resolve, egress := w.resolver(), w.egress()
 	target := plan.URL
 	for hop := 0; hop <= plan.MaxRedirects; hop++ {
@@ -401,12 +445,13 @@ func (w Web) relay(ctx context.Context, plan webPlan, token string, nodeHeaders 
 		if nodeHeaders != nil {
 			headers = nodeHeaders(target)
 		}
-		outcome := w.hop(hopCtx, plan, token, hop, target, resolve, egress, headers)
+		outcome := w.hop(hopCtx, plan, token, hop, target, resolve, egress, headers, route)
 		end(webDiagnosticOutcome(hopCtx, outcome.code))
 		if outcome.code != "" {
 			if hop > 0 && outcome.code != "relay_misuse" {
 				return "", hop
 			}
+			route.failed(outcome.proxyClass)
 			return outcome.code, hop
 		}
 		if outcome.final {
@@ -433,12 +478,18 @@ type webHopOutcome struct {
 	code  string
 	final bool
 	next  string
+	// proxyClass is the proxy class behind a failed proxied hop's code.
+	proxyClass string
 }
 
 // hop runs one relay session for target, the job URL or the previous hop's
 // verified redirect. Its failure codes describe this hop; Run decides what a
-// failure after a verified hop means for the job.
-func (w Web) hop(ctx context.Context, plan webPlan, token string, hop int, target string, resolve func(context.Context, string) ([]netip.Addr, error), egress *WebEgress, headers *webNodeHeaders) webHopOutcome {
+// failure after a verified hop means for the job. A proxied hop dials IPv4
+// only, as proxy exits are IPv4: a host with only IPv6 answers fails
+// web_dns_failed. A proxy exit failure on hop 0 rotates a sticky session
+// once and runs the hop again on the fresh one, except on a browser job's
+// re-fetch, which stays on the page's exit.
+func (w Web) hop(ctx context.Context, plan webPlan, token string, hop int, target string, resolve func(context.Context, string) ([]netip.Addr, error), egress *WebEgress, headers *webNodeHeaders, route *webRoute) webHopOutcome {
 	if ctx.Err() != nil {
 		return webHopOutcome{code: "expired"}
 	}
@@ -455,14 +506,20 @@ func (w Web) hop(ctx context.Context, plan webPlan, token string, hop int, targe
 	if err != nil || len(addrs) == 0 {
 		return webHopOutcome{code: "web_dns_failed"}
 	}
-	addr, ok := egress.pickWebAddr(ctx, addrs)
-	if !ok {
-		return webHopOutcome{code: "web_egress_denied"}
+	addr, code := pickHopAddr(ctx, egress, addrs, route.proxied())
+	if code != "" {
+		return webHopOutcome{code: code}
 	}
 	for try := 0; ; try++ {
 		started := time.Now()
-		outcome := w.prove(ctx, plan, token, hop, canonical, addr, headers)
+		outcome := w.prove(ctx, plan, token, hop, canonical, addr, headers, route)
 		w.observeHop(ctx, outcome.code, started)
+		// Nothing reached the verifier before the target's connection, so
+		// the hop runs again with its token on the fresh session's exit.
+		if hop == 0 && outcome.proxyClass == proxyExit && route.rotate() {
+			try--
+			continue
+		}
 		if outcome.code != "verifier_busy" {
 			return outcome
 		}
@@ -493,6 +550,27 @@ func (w Web) hop(ctx context.Context, plan webPlan, token string, hop int, targe
 			return webHopOutcome{code: "web_fetch_failed"}
 		}
 	}
+}
+
+// pickHopAddr checks a hop host's answers and picks the address to dial:
+// IPv4 only for a proxied hop. A denied answer is web_egress_denied; a
+// proxied host without an IPv4 answer is web_dns_failed.
+func pickHopAddr(ctx context.Context, egress *WebEgress, addrs []netip.Addr, proxied bool) (netip.Addr, string) {
+	if !proxied {
+		addr, ok := egress.pickWebAddr(ctx, addrs)
+		if !ok {
+			return netip.Addr{}, "web_egress_denied"
+		}
+		return addr, ""
+	}
+	addr, allowed := egress.pickWebAddr4(ctx, addrs)
+	switch {
+	case !allowed:
+		return netip.Addr{}, "web_egress_denied"
+	case !addr.IsValid():
+		return netip.Addr{}, "web_dns_failed"
+	}
+	return addr, ""
 }
 
 var errWebSummary = errors.New("unexpected relay-web summary")

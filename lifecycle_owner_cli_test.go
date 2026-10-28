@@ -134,6 +134,12 @@ func testActualCLIDrain(t *testing.T, owned bool) {
 		if e := cmd.Start(); e != nil {
 			t.Fatal(e)
 		}
+		if owned {
+			// The app's start line, before any owner command.
+			if _, e := io.WriteString(owners[cmd], "{}\n"); e != nil {
+				t.Fatal(e)
+			}
+		}
 		t.Cleanup(func() {
 			if cmd.ProcessState == nil {
 				cmd.Process.Kill()

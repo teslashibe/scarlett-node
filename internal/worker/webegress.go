@@ -283,13 +283,34 @@ func (g *WebEgress) Allowed(ctx context.Context, addr netip.Addr) bool {
 // first IPv4 address, else the first IPv6 address. Any denied address refuses
 // the hop, so a host cannot mix a public answer with a private one.
 func (g *WebEgress) pickWebAddr(ctx context.Context, addrs []netip.Addr) (netip.Addr, bool) {
-	if len(addrs) == 0 {
+	v4, v6, ok := g.checkWebAddrs(ctx, addrs)
+	if !ok {
 		return netip.Addr{}, false
 	}
-	var v4, v6 netip.Addr
+	if v4.IsValid() {
+		return v4, true
+	}
+	return v6, v6.IsValid()
+}
+
+// pickWebAddr4 is pickWebAddr for a proxied hop, whose proxy exits are IPv4
+// only: every address is still checked, and the first IPv4 one is dialled.
+// allowed is false when any address is denied; addr is invalid when every
+// address passed but none is IPv4.
+func (g *WebEgress) pickWebAddr4(ctx context.Context, addrs []netip.Addr) (addr netip.Addr, allowed bool) {
+	v4, _, ok := g.checkWebAddrs(ctx, addrs)
+	return v4, ok
+}
+
+// checkWebAddrs checks every address and returns the first IPv4 and the
+// first IPv6 one; ok is false when there is none or any is denied.
+func (g *WebEgress) checkWebAddrs(ctx context.Context, addrs []netip.Addr) (v4, v6 netip.Addr, ok bool) {
+	if len(addrs) == 0 {
+		return netip.Addr{}, netip.Addr{}, false
+	}
 	for _, a := range addrs {
 		if !g.Allowed(ctx, a) {
-			return netip.Addr{}, false
+			return netip.Addr{}, netip.Addr{}, false
 		}
 		a = a.Unmap()
 		if a.Is4() && !v4.IsValid() {
@@ -298,8 +319,12 @@ func (g *WebEgress) pickWebAddr(ctx context.Context, addrs []netip.Addr) (netip.
 			v6 = a
 		}
 	}
-	if v4.IsValid() {
-		return v4, true
-	}
-	return v6, v6.IsValid()
+	return v4, v6, true
+}
+
+// publicIPv4 reports whether addr is a public IPv4 address by the guard's
+// fixed rules: not private, shared, loopback, link-local, documentation,
+// benchmarking, multicast or reserved. A proxy exit must be one.
+func publicIPv4(addr netip.Addr) bool {
+	return addr.Is4() && !inAny(addr, deniedWebIPv4)
 }

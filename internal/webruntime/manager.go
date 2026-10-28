@@ -56,13 +56,9 @@ type Config struct {
 	XLoginNode string
 	Guard      EgressGuard
 	// Resolver resolves page-chosen names; default net.DefaultResolver.
+	// A proxied page's names resolve here too: only its connections go
+	// through its upstream (FetchRequest.Upstream).
 	Resolver func(ctx context.Context, host string) ([]netip.Addr, error)
-	// UpstreamProxy is SCARLETT_WEB_EGRESS_PROXY; the egress proxy then
-	// reaches every checked address through it with CONNECT <ip>:<port>.
-	UpstreamProxy *url.URL
-	// UpstreamAuthorization is its Proxy-Authorization value, as config.WebProxy
-	// holds it; userinfo in UpstreamProxy is used when this is empty.
-	UpstreamAuthorization string
 	// Capacity is browser pages at once, 1–4; 0 picks 1 below 16 GiB of
 	// physical memory and 2 otherwise.
 	Capacity int
@@ -113,6 +109,11 @@ type FetchRequest struct {
 	TimeoutMS      int    `json:"timeout_ms"`
 	BlockResources bool   `json:"block_resources"`
 	SolveChallenge bool   `json:"solve_challenge"`
+	// Upstream is a proxied page's proxy and session, nil for a direct one.
+	// Fetch gives such a page its own egress proxy, which reaches every
+	// checked address through it; the helper sees only that proxy's
+	// loopback URL, never the upstream.
+	Upstream *Upstream `json:"-"`
 }
 
 func (r FetchRequest) String() string   { return "web browser fetch [redacted]" }
@@ -131,14 +132,20 @@ func (r FetchRequest) validate() error {
 			return invalid
 		}
 	}
+	if r.Upstream != nil && !r.Upstream.valid() {
+		return invalid
+	}
 	return nil
 }
 
 // helperFetch is POST /v1/fetch: the request plus whether this fetch may use
-// the operator's solver, which the Manager decides from today's spend.
+// the operator's solver, which the Manager decides from today's spend, and
+// for a proxied page the loopback URL of its own egress proxy (no
+// credentials), which the helper uses in place of WEB_EGRESS_PROXY.
 type helperFetch struct {
 	FetchRequest
-	Solver bool `json:"solver"`
+	Solver      bool   `json:"solver"`
+	EgressProxy string `json:"egress_proxy,omitempty"`
 }
 
 // FetchResult is the helper's answer. It holds page content and cookie
@@ -172,6 +179,13 @@ type FetchResult struct {
 	// TreePeakBytes is the largest helper tree size sampled while this page
 	// was in flight. Set by Fetch, never by the helper.
 	TreePeakBytes uint64 `json:"-"`
+	// ProxyClass is, for a proxied page whose navigation failed, the proxy
+	// class of the first upstream tunnel to the page's own host that would
+	// not open (proxy_auth, proxy_refused and the like), else "". The main
+	// document is the page's first connection to it, so a refused one is
+	// the first to fail; a refused redirect target or subresource elsewhere
+	// leaves it "". Set by Fetch, never by the helper.
+	ProxyClass string `json:"-"`
 }
 
 func (FetchResult) String() string   { return "web browser result [redacted]" }
@@ -371,6 +385,11 @@ type helper struct {
 	// watches are the fetches in flight on this helper, for their tree peak
 	// and whether a memory kill ended them.
 	watches map[*fetchWatch]struct{}
+	// held are the retired egress proxies of proxied pages this helper
+	// never answered for; cleanup closes them once the helper is gone, and
+	// stopped says it has run. Both under the Manager's mu.
+	held    []*egressProxy
+	stopped bool
 }
 
 type fetchWatch struct {
@@ -464,7 +483,13 @@ func (m *Manager) healthLocked() Health {
 // Fetch renders one page. Errors wrapping ErrUnavailable mean the tier could
 // not take the job (web_browser_unavailable); ErrHelper means the render or
 // the helper failed (web_browser_failed). A result whose Outcome is not "ok"
-// is returned without an error.
+// is returned without an error. A proxied page (req.Upstream) gets its own
+// loopback egress proxy, at most 48 tunnels, which carries that job's
+// Proxy-Authorization and closes when Fetch returns; every other page uses
+// the helper's shared one, which has no upstream. When the helper never
+// answered for a proxied page (Go's deadline, a broken exchange), that
+// proxy stops tunnelling at once but keeps its port until the draining
+// helper is gone.
 func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (FetchResult, error) {
 	if err := req.validate(); err != nil {
 		return FetchResult{}, err
@@ -488,6 +513,26 @@ func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 		m.notify()
 		m.mu.Unlock()
 	}()
+	var job *egressProxy
+	held := false
+	if req.Upstream != nil {
+		page, err := url.Parse(req.URL)
+		if err != nil {
+			return FetchResult{}, errors.New("web browser fetch request invalid")
+		}
+		if job, err = newEgressProxy(m.cfg.Guard, m.cfg.Resolver, req.Upstream, page.Hostname(), jobTunnels, &m.stats); err != nil {
+			return FetchResult{}, fmt.Errorf("%w: job egress proxy unavailable", ErrUnavailable)
+		}
+		// Closed before the page slot is released: nothing of this page
+		// leaves through the job's session afterwards. A page the helper
+		// never answered for keeps its proxy's port, refusing, until the
+		// helper is gone.
+		defer func() {
+			if !held {
+				job.Close()
+			}
+		}()
+	}
 	h, err := m.acquire(ctx, false)
 	if err != nil {
 		return FetchResult{}, err
@@ -500,7 +545,15 @@ func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 	}
 	h.watches[watch] = struct{}{}
 	m.mu.Unlock()
-	res, err := m.call(ctx, h, helperFetch{FetchRequest: req, Solver: solver})
+	fetch := helperFetch{FetchRequest: req, Solver: solver}
+	if job != nil {
+		fetch.EgressProxy = job.URL()
+	}
+	res, err := m.call(ctx, h, fetch)
+	abandoned := err != nil
+	if err == nil && job != nil && res.Outcome == "failed" && res.Error == "navigation_failed" {
+		res.ProxyClass = job.Failure()
+	}
 	if err == nil {
 		m.recordSpend(res.SolverCostMicroUSD)
 		if res.HTMLPath, err = m.adoptDOM(res); err != nil {
@@ -523,8 +576,21 @@ func (m *Manager) Fetch(ctx context.Context, req FetchRequest) (FetchResult, err
 		// holding a page slot; restart once the others finish.
 		h.draining = true
 	}
+	closeNow := false
+	if job != nil && abandoned {
+		// The page may still be loading in the helper: its tunnels end now,
+		// and its port stays bound until cleanup.
+		job.retire()
+		held = true
+		if closeNow = h.stopped; !closeNow {
+			h.held = append(h.held, job)
+		}
+	}
 	m.notify()
 	m.mu.Unlock()
+	if closeNow {
+		job.Close()
+	}
 	m.wake()
 	return res, err
 }
@@ -1130,7 +1196,7 @@ func (m *Manager) startHelper(ctx context.Context) (*helper, error) {
 			m.cleanup(h)
 		}
 	}()
-	if h.proxy, err = newEgressProxy(m.cfg.Guard, m.cfg.Resolver, m.cfg.UpstreamProxy, m.cfg.UpstreamAuthorization, 32*capacity+16, &m.stats); err != nil {
+	if h.proxy, err = newEgressProxy(m.cfg.Guard, m.cfg.Resolver, nil, "", 32*capacity+16, &m.stats); err != nil {
 		return nil, errors.New("egress proxy unavailable")
 	}
 	if h.deny, err = newDenyListener(&m.stats); err != nil {
@@ -1323,6 +1389,15 @@ func (m *Manager) cleanup(h *helper) {
 	}
 	if h.client != nil {
 		h.client.CloseIdleConnections()
+	}
+	// The helper and its pages are gone: the ports of the pages it never
+	// answered for can be freed.
+	m.mu.Lock()
+	held := h.held
+	h.held, h.stopped = nil, true
+	m.mu.Unlock()
+	for _, p := range held {
+		p.Close()
 	}
 	if h.proxy != nil {
 		h.proxy.Close()

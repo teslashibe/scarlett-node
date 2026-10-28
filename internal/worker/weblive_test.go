@@ -27,7 +27,7 @@ import (
 //	SCARLETT_VERIFIER_KEY=... SCARLETT_VERIFIER_STATE_DIR=/absolute/state scarlett-prover verifier
 //	SCARLETT_TEST_WEB_LIVE=1 SCARLETT_TEST_WEB_VERIFIER=127.0.0.1:7047 SCARLETT_VERIFIER_API=http://127.0.0.1:7070 \
 //	SCARLETT_VERIFIER_KEY=... SCARLETT_PROVER=path/to/scarlett-prover [SCARLETT_VERIFIER_CA_FILE=/absolute/ca.pem] \
-//	[SCARLETT_TEST_WEB_URL=https://example.com/] [SCARLETT_WEB_EGRESS_PROXY=http://...] \
+//	[SCARLETT_TEST_WEB_URL=https://example.com/] [SCARLETT_WEB_EGRESS_PROXY_FILE=/absolute/proxy.json] \
 //	[SCARLETT_TEST_WEB_PLAINTEXT=1] [SCARLETT_TEST_WEB_EXPECT=page_too_large] \
 //	go test -run TestWebLive -v ./internal/worker
 //
@@ -56,8 +56,8 @@ func TestWebLive(t *testing.T) {
 	c := webConfig()
 	c.Prover, c.Verifier, c.VerifierCA = prover, verifier, os.Getenv("SCARLETT_VERIFIER_CA_FILE")
 	c.VerifierPlaintextFixture = os.Getenv("SCARLETT_TEST_WEB_PLAINTEXT") == "1"
-	if raw := os.Getenv("SCARLETT_WEB_EGRESS_PROXY"); raw != "" {
-		proxy, err := config.ParseWebProxy(raw)
+	if path := os.Getenv("SCARLETT_WEB_EGRESS_PROXY_FILE"); path != "" {
+		proxy, err := config.ReadWebProxyFile(path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -78,6 +78,10 @@ func TestWebLive(t *testing.T) {
 	request := coordinator.WebRequest{Operation: "scrape", URL: target}
 	encoded, _ := json.Marshal(request)
 	l := coordinator.Lease{Version: coordinator.Version, ServiceType: "web", JobID: jobID, SignedJobID: strings.Repeat("a", 64), Profile: c.Profile, InputSHA256: SHA(string(encoded)), Attempt: "1", Fence: "f1", LeaseDeadline: deadline, SettlementDeadline: deadline, WebRequest: &request, WebPayload: payload, VerifierToken: created.Token, AcceptanceRequired: true}
+	if c.WebEgressProxy != nil {
+		// With a proxy file the page goes through it, whatever its use.
+		l.WebEgress = "proxy"
+	}
 	started := time.Now()
 	report := (Web{Config: c}).Report(ctx, l)
 	t.Logf("node wall %s, report %+v", time.Since(started).Round(time.Millisecond), report)

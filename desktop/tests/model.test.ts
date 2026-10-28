@@ -36,7 +36,21 @@ import {
   lastHeartbeat,
   missedJobs,
   HEARTBEAT_LATE_MS,
+  webEgress,
+  webProxyCredentialsError,
+  webProxyNote,
+  webProxyPlaceholders,
+  webProxyRemovable,
+  webProxySaved,
+  webProxyTestText,
+  PROXY_REST,
+  WEB_PROXY_PORTS,
+  validWebProxyPassword,
+  validWebProxyPort,
+  validWebProxyUse,
+  validWebProxyUsername,
   type DispatchHealth,
+  type Preferences,
   type ServiceHealth,
   type Snapshot,
 } from "../src/model.ts";
@@ -540,4 +554,122 @@ test("The connection tiles have the values and notes render fills", () => {
   assert.match(layout, /<div class="metrics metrics-pair" role="group" aria-label="Connection to Scarlett">/);
   assert.match(layout, /<span class="metric-label">Last heartbeat<\/span>/);
   assert.match(layout, /<span class="metric-label">Missed jobs<\/span>/);
+});
+
+test("The status card says how web pages leave this device", () => {
+  // Stopped: the saved setting.
+  const stopped = webNode(readyWeb, { state: "offline" });
+  assert.equal(webEgress(stopped), "Web traffic · Direct");
+  assert.equal(webEgress({ ...stopped, web_proxy: { use: "limited_sites", port: 80 } }), "Web traffic · Proxy for limited sites · Webshare US");
+  assert.equal(webEgress({ ...stopped, web_proxy: { use: "all", port: 3128 } }), "Web traffic · Proxy for every page · Webshare US");
+  // Running: what the node reports locally, else its web entry's egress.
+  assert.equal(webEgress(webNode(readyWeb)), "Web traffic · Direct");
+  assert.equal(webEgress(webNode({ ...readyWeb, egress: "both" })), "Web traffic · Proxy for limited sites · Webshare US");
+  const local = (web_egress: NonNullable<Snapshot["observation"]>["web_egress"], egress = "both") => webEgress(webNode({ ...readyWeb, egress }, { web_egress }));
+  assert.equal(local({ via: "direct", provider: null, last_exit: null }, "direct"), "Web traffic · Direct");
+  assert.equal(local({ via: "proxy", provider: "webshare", country: "us" }, "proxy"), "Web traffic · Proxy for every page · Webshare US");
+  assert.equal(local({ via: "both", provider: "webshare", country: "us", last_exit: "45.86.200.17", last_exit_at: "2026-10-26T10:00:00Z" }), "Web traffic · Proxy · last exit 45.86.200.17");
+  assert.equal(local({ via: "both", last_exit: "45.86.200.17", rest_reason: "proxy_auth" }), "Web traffic · Proxy resting · sign-in failed");
+  assert.equal(local({ via: "proxy", rest_reason: "proxy_quota" }, "proxy"), "Web traffic · Proxy resting · plan out of bandwidth");
+  // Anything unknown is left out rather than guessed.
+  assert.equal(local({ via: "both", last_exit: "not an address" }), "Web traffic · Proxy for limited sites · Webshare US");
+  assert.equal(local({ via: "both", rest_reason: "something_new" }), "Web traffic · Proxy for limited sites · Webshare US");
+  assert.equal(webEgress(webNode({ ...readyWeb, egress: undefined })), "");
+  // Web pages off, or unknown: no line.
+  assert.equal(webEgress({ ...stopped, web_enabled: false, web_proxy: { use: "all", port: 80 } }), "");
+  assert.equal(webEgress(webNode(undefined)), "");
+});
+test("A resting proxy says why and for how long on the web tile", () => {
+  const resting = (rest_reason?: string) => webServing(webNode({ ...readyWeb, egress: "both", state: "unreachable", last_error_code: "web_proxy_failed" }, { web_egress: { via: "both", rest_reason } }));
+  assert.deepEqual(resting("proxy_auth"), { value: "Paused", note: "Proxy sign-in failed · retrying in 10 min" });
+  assert.deepEqual(resting("proxy_quota"), { value: "Paused", note: "Proxy plan out of bandwidth · retrying in 30 min" });
+  assert.deepEqual(resting("proxy_unreachable"), { value: "Paused", note: "Proxy unreachable · retrying in a minute" });
+  assert.deepEqual(resting("proxy_busy"), { value: "Paused", note: "Proxy busy · retrying in a minute" });
+  // Without a reason, the node's error code still explains it.
+  assert.deepEqual(resting(undefined), { value: "Paused", note: "Proxy failed · retrying in a minute" });
+  assert.deepEqual(Object.keys(PROXY_REST).sort(), ["proxy_auth", "proxy_busy", "proxy_quota", "proxy_unreachable"]);
+});
+test("Proxy test and save results say what happened in plain words", () => {
+  assert.equal(webProxyTestText({ ok: true, exit: "45.86.200.17" }), "Proxy works · exit IP 45.86.200.17");
+  for (const failure of ["proxy_unreachable", "proxy_auth", "proxy_quota", "proxy_busy", "proxy_refused", "proxy_exit", "invalid"]) {
+    const text = webProxyTestText({ ok: false, class: failure });
+    assert.notEqual(text, "The proxy test did not pass", failure);
+    assert.doesNotMatch(text, /proxy_|\.$/, failure);
+  }
+  assert.equal(webProxyTestText({ ok: false, class: "something_new" }), "The proxy test did not pass");
+  // A failed test leaves the switch off and says why; a passing one turns it on.
+  const failed = webProxySaved({ saved: true, username: "syn••••", store: "Keychain", enabled: false, test: { ok: false, class: "proxy_auth" } }, false);
+  assert.deepEqual(failed, { text: "Proxy saved but left off. Proxy sign-in failed. Check the proxy username and password from your Webshare dashboard", error: true });
+  assert.deepEqual(webProxySaved({ saved: true, store: "Keychain", enabled: true, test: { ok: true, exit: "45.86.200.17" } }, false), { text: "Proxy saved and on. The node uses it when it starts", error: false });
+  assert.deepEqual(webProxySaved({ saved: true, store: "Keychain", enabled: true, test: { ok: true, exit: "45.86.200.17" } }, true), { text: "Proxy saved and on. Stop and start the node to apply it", error: false });
+  assert.deepEqual(webProxySaved({ saved: true, store: "Keychain", enabled: false, test: null }, true), { text: "Proxy saved and off. Stop and start the node to apply it", error: false });
+  // Switched off with the keychain item already gone: off, nothing saved.
+  assert.deepEqual(webProxySaved({ saved: false, username: null, store: "Keychain", enabled: false, test: null }, false), { text: "Proxy off", error: false });
+  assert.deepEqual(webProxySaved({ saved: false, username: null, store: "Keychain", enabled: false, test: null }, true), { text: "Proxy off. Stop and start the node to apply it", error: false });
+  assert.equal(webProxyNote({ ...base, supervised: true, web_proxy_restart_pending: true }), "Saved · stop and start the node to apply the proxy change. Accepted jobs finish before it stops");
+  assert.equal(webProxyNote({ ...base, supervised: true }), "");
+  for (const code of ["keychain_unavailable", "web_proxy_not_saved", "proxy_test_unavailable"])
+    assert.notEqual(errorMessage(code), errorMessage("unknown"), code);
+});
+test("The proxy password is never shown again, only what is saved", () => {
+  assert.deepEqual(webProxyPlaceholders(undefined), { username: "", password: "" });
+  assert.deepEqual(webProxyPlaceholders({ saved: false, username: null, store: "Keychain" }), { username: "", password: "" });
+  assert.deepEqual(webProxyPlaceholders({ saved: true, username: "syn••••", store: "Keychain" }), { username: "syn••••", password: "Saved in Keychain" });
+  assert.deepEqual(webProxyPlaceholders({ saved: true, username: "syn••••", store: "Credential Manager" }).password, "Saved in Credential Manager");
+  // The fields start empty, and the password field is a password field.
+  assert.match(layout, /<input id="web-proxy-password" type="password" autocomplete="new-password"[^>]*>/);
+  for (const id of ["web-proxy-username", "web-proxy-password"]) assert.doesNotMatch(layout, new RegExp(`<input id="${id}"[^>]* value=`));
+});
+test("A proxy left on with nothing saved can still be turned off or removed", () => {
+  const typo = "Enter the proxy username (letters and digits) and its password from your Webshare dashboard";
+  // Empty fields keep the saved credentials; with none saved, Test and
+  // switching on ask for them, but switching off does not.
+  assert.equal(webProxyCredentialsError("", "", true, true), undefined);
+  assert.equal(webProxyCredentialsError("", "", false, true), errorMessage("web_proxy_not_saved"));
+  assert.equal(webProxyCredentialsError("", "", false, false), undefined);
+  assert.equal(webProxyCredentialsError("synthuser", "synthetic-pass", false, true), undefined);
+  for (const [username, password] of [["synthuser", ""], ["", "synthetic-pass"], ["synth-user", "synthetic-pass"], ["synthuser", "with space"]])
+    for (const needed of [true, false]) assert.equal(webProxyCredentialsError(username, password, true, needed), typo, `${username} ${password} ${needed}`);
+  // Remove is there for a saved item, an unreadable one, or a proxy that is
+  // on with nothing saved (its keychain item deleted outside the app).
+  const prefs = (web_proxy: boolean): Preferences => ({ schema: 1, local_api_port: 8088, background: false, x_concurrency: 2, updates: "notify", resume_serving: false, serve_web: true, web_concurrency: 0, web_browser_concurrency: 0, web_proxy, web_proxy_use: "limited_sites", web_proxy_port: 80 });
+  const none = { saved: false, username: null, store: "Keychain" };
+  assert.equal(webProxyRemovable(none, false, prefs(false)), false);
+  assert.equal(webProxyRemovable(undefined, false, undefined), false);
+  assert.equal(webProxyRemovable(none, false, prefs(true)), true);
+  assert.equal(webProxyRemovable(none, true, prefs(false)), true);
+  assert.equal(webProxyRemovable({ saved: true, username: "syn••••", store: "Keychain" }, false, prefs(false)), true);
+});
+test("The proxy form accepts what the node accepts", () => {
+  assert.deepEqual([...WEB_PROXY_PORTS], [80, 1080, 3128]);
+  for (const port of WEB_PROXY_PORTS) assert.ok(validWebProxyPort(port));
+  for (const port of [0, 443, 8080, 1080.5]) assert.equal(validWebProxyPort(port), false, String(port));
+  assert.ok(validWebProxyUse("limited_sites") && validWebProxyUse("all"));
+  assert.equal(validWebProxyUse("every"), false);
+  assert.ok(validWebProxyUsername("abcDEF123") && validWebProxyUsername("a".repeat(32)));
+  for (const name of ["", "a".repeat(33), "user-name", "user name", "user-us-1"]) assert.equal(validWebProxyUsername(name), false, name);
+  assert.ok(validWebProxyPassword("p@ss:w0rd!") && validWebProxyPassword("~".repeat(128)));
+  for (const password of ["", "with space", "tab\t", "p".repeat(129), "naïve"]) assert.equal(validWebProxyPassword(password), false, password);
+  // The menus offer exactly these choices, the defaults first.
+  const ports = /<select id="web-proxy-port"[^>]*>(.*?)<\/select>/.exec(layout)?.[1] ?? "";
+  assert.deepEqual([...ports.matchAll(/<option value="(\d+)">/g)].map(m => Number(m[1])), [...WEB_PROXY_PORTS]);
+  const uses = /<select id="web-proxy-use"[^>]*>(.*?)<\/select>/.exec(layout)?.[1] ?? "";
+  assert.deepEqual([...uses.matchAll(/<option value="([a-z_]+)">([^<]+)<\/option>/g)].map(m => [m[1], m[2]]), [["limited_sites", "Sites that limit this network"], ["all", "Every web page"]]);
+});
+test("The web proxy group sits under Serve web pages with short labels", () => {
+  const group = /<form id="web-proxy-form"[^>]*>(.*?)<\/form>/.exec(layout)?.[1] ?? "";
+  assert.ok(group, "web proxy group missing");
+  assert.ok(layout.indexOf('id="serve-web"') < layout.indexOf('id="web-proxy-form"'));
+  assert.ok(layout.indexOf('id="web-proxy-form"') < layout.indexOf('id="autostart"'));
+  assert.match(group, /<h3 id="web-proxy-heading">Web proxy<\/h3>/);
+  assert.match(group, /<input id="web-proxy" type="checkbox" role="switch" disabled>Send web pages through my proxy<\/label>/);
+  assert.match(group, /<option>Webshare · United States<\/option>/);
+  assert.match(group, /Webshare account, which bills you for the traffic/);
+  assert.match(group, /not your Webshare login password/);
+  assert.match(group, /Changes apply when the node next starts/);
+  // Headings, labels, options, buttons and notes end without a period.
+  const texts = [...group.matchAll(/>([^<>]+)</g)].map(m => m[1].trim()).filter(Boolean);
+  assert.ok(texts.includes("Save proxy") && texts.includes("Test") && texts.includes("Remove"));
+  for (const text of texts) assert.doesNotMatch(text, /\.$/, text);
+  assert.match(layout, /<p id="web-egress" class="proof-chip" hidden><\/p>/);
 });

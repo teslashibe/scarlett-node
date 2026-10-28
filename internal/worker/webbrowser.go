@@ -61,6 +61,11 @@ type BrowserFetchRequest struct {
 	TimeoutMS      int    `json:"timeout_ms"`
 	BlockResources bool   `json:"block_resources"`
 	SolveChallenge bool   `json:"solve_challenge"`
+	// Upstream is a proxied job's proxy and session, nil for a direct one.
+	// The tier must send the whole page through it, or not render it: a
+	// proxied page never leaves from this node's own network. It never
+	// reaches the helper, which sees only the node's loopback egress proxy.
+	Upstream *ProxyUpstream `json:"-"`
 }
 
 // BrowserFetchResult is the helper's answer for one page. Cookies carry
@@ -90,6 +95,12 @@ type BrowserFetchResult struct {
 	StartedAtMS   int64                         `json:"started_at_ms"`
 	// Solver is "used", "needed" or "" (see coordinator.BrowserResult).
 	Solver string `json:"solver"`
+	// ProxyClass is, for a proxied page whose navigation failed, the proxy
+	// class of the first tunnel to the page's own host the job's proxy
+	// would not open (its main document's, as that is the page's first
+	// connection), else "". The tier sets it; the helper never sees the
+	// proxy.
+	ProxyClass string `json:"-"`
 }
 
 // The browser failures that still produce a browser-result manifest.
@@ -132,8 +143,10 @@ const (
 // proven if either the manifest was stored or the verifier holds a hop. A
 // DOM over the page ceiling, or a browser killed for memory, still runs the
 // re-fetch and posts a manifest saying so (dom too_large or memory), so the
-// coordinator can serve the re-fetch.
-func (w Web) runBrowser(ctx context.Context, l coordinator.Lease, plan webPlan, report time.Time) WebReport {
+// coordinator can serve the re-fetch. A proxied job's page and re-fetch both
+// go through route's session, which never rotates: the re-fetch leaves from
+// the page's exit.
+func (w Web) runBrowser(ctx context.Context, l coordinator.Lease, plan webPlan, report time.Time, route *webRoute) WebReport {
 	opts := *l.WebRequest.Browser
 	budget := min(time.Duration(opts.TimeoutMS)*time.Millisecond, time.Until(report.Add(-webRefetchReserve)))
 	if budget < webBrowserMinBudget {
@@ -154,8 +167,8 @@ func (w Web) runBrowser(ctx context.Context, l coordinator.Lease, plan webPlan, 
 	if err != nil || len(addrs) == 0 {
 		return WebReport{Code: "web_dns_failed"}
 	}
-	if _, ok := w.egress().pickWebAddr(ctx, addrs); !ok {
-		return WebReport{Code: "web_egress_denied"}
+	if _, code := pickHopAddr(ctx, w.egress(), addrs, route.proxied()); code != "" {
+		return WebReport{Code: code}
 	}
 	if w.Browser == nil {
 		return WebReport{Code: "web_browser_unavailable"}
@@ -165,10 +178,12 @@ func (w Web) runBrowser(ctx context.Context, l coordinator.Lease, plan webPlan, 
 		return WebReport{Code: "web_browser_unavailable"}
 	}
 
+	// The page leaves on the route's session, so its re-fetch keeps it.
+	route.pin()
 	started := time.Now()
 	fetchCtx, cancel := context.WithTimeout(ctx, budget+webBrowserOverrun)
 	end := diagnostics.Start(ctx, "browser_fetch", 0)
-	res, err := w.Browser.Fetch(fetchCtx, BrowserFetchRequest{URL: plan.URL, Wait: opts.Wait, WaitMS: opts.WaitMS, WaitSelector: opts.WaitSelector, TimeoutMS: int(budget.Milliseconds()), BlockResources: opts.BlockResources, SolveChallenge: opts.SolveChallenge})
+	res, err := w.Browser.Fetch(fetchCtx, BrowserFetchRequest{URL: plan.URL, Wait: opts.Wait, WaitMS: opts.WaitMS, WaitSelector: opts.WaitSelector, TimeoutMS: int(budget.Milliseconds()), BlockResources: opts.BlockResources, SolveChallenge: opts.SolveChallenge, Upstream: route.upstream()})
 	cancel()
 	duration := time.Since(started)
 	if err != nil {
@@ -179,9 +194,15 @@ func (w Web) runBrowser(ctx context.Context, l coordinator.Lease, plan webPlan, 
 		end("web_browser_unavailable")
 		return WebReport{Code: "web_browser_unavailable"}
 	}
-	browserCode := ""
+	browserCode, browserClass := "", ""
 	if err != nil || res.Outcome != "ok" {
 		browserCode = "web_browser_failed"
+		// A main document the job's proxy would not tunnel fails as a
+		// relay hop 0 would: the proxy itself, its refusal of the target,
+		// or its exit.
+		if class := proxyClass(res.ProxyClass); class != "" && route.proxied() {
+			browserCode, browserClass = proxyCode(class), class
+		}
 	}
 	end(webDiagnosticOutcome(ctx, browserCode))
 	// What the manifest says about the DOM: uploaded, over the ceiling, or
@@ -240,7 +261,7 @@ func (w Web) runBrowser(ctx context.Context, l coordinator.Lease, plan webPlan, 
 			defer wg.Done()
 			code, hops := w.relay(ctx, plan, l.VerifierToken, func(hopURL string) *webNodeHeaders {
 				return &webNodeHeaders{UserAgent: userAgent, Cookie: CookieHeader(cookies, hopURL, time.Now())}
-			})
+			}, route)
 			mu.Lock()
 			refetchCode, verified = code, hops
 			mu.Unlock()
@@ -270,6 +291,9 @@ func (w Web) runBrowser(ctx context.Context, l coordinator.Lease, plan webPlan, 
 	case refetch && refetchCode == "page_too_large":
 		return wireReport(refetchCode)
 	case browserCode != "":
+		// The proxy class behind the reported code is the browser's, which
+		// decides how long web rests, whatever the re-fetch ran into.
+		route.failed(browserClass)
 		return WebReport{Code: browserCode}
 	case refetch && refetchCode != "":
 		return wireReport(refetchCode)

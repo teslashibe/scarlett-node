@@ -270,7 +270,8 @@ For Codex this counts prompt UTF-8 bytes; for X it counts the serialized
 `x_request`, and for web the serialized `web_request`, as the workers do. Codex
 also reports its configured `max_output_tokens` and the accepted base-model
 catalog. X and web report neither. An enabled web entry also reports `egress`
-(`direct` or `proxy`) and `browser`, the browser tier's readiness (see
+(`direct`, `both` or `proxy`; see [Proxy egress](#proxy-egress)) and
+`browser`, the browser tier's readiness (see
 [Browser tier](#browser-tier)). Disabled services report `not_added` and no limits. These
 reports describe local validation, not verified provider access, successful
 work or payment evidence. A heartbeat lists at most three services and a total
@@ -352,6 +353,8 @@ A browser-mode lease (`web_request.mode` `browser`) also carries
 [Browser tier](#browser-tier). A relay offer may carry the lease-level hint
 `web_prewarm_browser: true` (fixture `lease-web-prewarm-offer.json`), which
 is outside `web_request`, never hashed and not part of the accepted terms.
+Any web offer may carry `web_egress: "proxy"` (fixture
+`lease-web-proxy.json`) the same way; see [Proxy egress](#proxy-egress).
 **Canonical URLs.** The strict rules are shared with the app and the verifier
 through `api/web-vectors.json`: absolute `https`, lowercase ASCII host with at
 least two labels and a letter in the last, port 443 only, no userinfo, no IP
@@ -369,7 +372,8 @@ verifier token, at most `max_redirects + 1` of them. For each hop the node:
 2. resolves the host with the system resolver (5 s);
 3. checks every returned address with the egress guard, refusing the hop if any
    is denied;
-4. picks the first IPv4 address, else the first IPv6 address;
+4. picks the first IPv4 address, else the first IPv6 address (a proxied hop
+   takes IPv4 only, and fails `web_dns_failed` without one);
 5. runs the helper with stdin `{verifier, verifier_ca_file?, plaintext_fixture?,
    token, hop, url, ip, port: 443, proxy?, payload, timeout_ms, node_headers?}`,
    where `timeout_ms` is the smaller of 280 s and the time left and
@@ -400,8 +404,9 @@ reported `proven`, because the verifier already holds the verified hops.
 | --- | --- |
 | `web_egress_denied` | The URL failed node validation, or the host resolved to a denied address |
 | `web_dns_failed` | No address within 5 s |
-| `web_connect_failed` | The helper could not open TCP to the checked address (`SCARLETT_WEB_ERROR=connect_failed`); no verifier session was spent |
-| `web_proxy_failed` | The egress proxy was unreachable, refused authentication or did not answer 200 (`SCARLETT_WEB_ERROR=proxy_failed`) |
+| `web_connect_failed` | The helper could not open TCP to the checked address (`SCARLETT_WEB_ERROR=connect_failed`), or through the proxy its exit could not: the CONNECT was answered 502 or another status not listed here, or never answered (`proxy_exit`), after one retry of hop 0 on a fresh session. No verifier session was spent |
+| `web_proxy_failed` | The egress proxy was unreachable or did not answer as HTTP (`proxy_unreachable`), refused the sign-in (407, `proxy_auth`), was out of bandwidth (402, `proxy_quota`) or busy (429, `proxy_busy`), or its host failed the node's check |
+| `web_proxy_refused` | The egress proxy answered the CONNECT 403 (`proxy_refused`): it will not tunnel to this target |
 | `web_fetch_failed` | The relay session failed after the token was presented, the verifier stayed busy for the whole hop budget, or the helper's summary was invalid |
 | `page_too_large` | The page is over the 64 MiB ceiling: `stage` `wire` when the verifier refused the first hop's entity (`observed_bytes` 67108865, a lower bound; the coordinator reads the verifier's own counts), or `stage` `dom` for a browser job whose DOM was over 64 MiB when neither its manifest was stored nor a re-fetch hop verified (`observed_bytes` the DOM's UTF-8 size) |
 | `relay_misuse` | The helper caught the verifier misusing the session (its record opening was malformed, did not authenticate the record, or showed another request); keyed relay halts node-wide, for X and web alike, until `scarlett-node relay-resume` |
@@ -415,9 +420,12 @@ reported `proven`, because the verifier already holds the verified hops.
 **Readiness.** The web entry is `configured` when enabled with the helper
 present and `ready` after a proven job. It is `unreachable` with
 `last_error_code` `prover_error` while the helper is missing, `relay_misuse`
-while relay is halted, `execution_uncertain` during a relay rest (one minute at first, up to 10) and
-`web_proxy_failed` for 60 s after the egress proxy failed. Failures on the target's side (`web_dns_failed`, `web_egress_denied`,
-`web_connect_failed`, `web_fetch_failed`) never change it. Account files, their
+while relay is halted, `execution_uncertain` during a relay rest (one minute at
+first, up to 10) and `web_proxy_failed` while web rests after the egress proxy
+failed: 60 s for `proxy_unreachable` and `proxy_busy`, 10 minutes for
+`proxy_auth` and 30 minutes for `proxy_quota`. Failures on the target's side
+(`web_dns_failed`, `web_egress_denied`, `web_connect_failed`,
+`web_fetch_failed`), `web_proxy_refused` and an exit failure never change it. Account files, their
 errors and account mode never apply to web, so a desktop node with Serve web
 pages on (the default) can start with no accounts. The two browser codes
 never change it either.
@@ -435,16 +443,94 @@ local interface (refreshed each minute) is denied, and scoped addresses never
 pass. Only port 443 is dialled. The node's own public address behind NAT
 (hairpin) is not detected.
 
-**Proxy egress.** `SCARLETT_WEB_EGRESS_PROXY=http://[user:pass@]host:port`
-(services executor only; port required, no path, query or fragment) makes the
-helper send `CONNECT <checked-ip>:443` to the proxy, with
-`Proxy-Authorization: Basic …` when credentials are given, and require a `200`.
-DNS is still resolved and checked on the node. The proxy must be a
-non-intercepting tunnel. The value is never logged, printed in errors or
-status, or sent to the coordinator; the heartbeat reports only `egress: proxy`.
-The browser tier's filtering proxy chains through the same proxy, sending
-`CONNECT <checked-ip>:<port>` for both its forms. The browser download itself
-uses ordinary system networking, never the egress proxy.
+### Proxy egress
+
+A node may send web traffic through the operator's own HTTP `CONNECT` proxy.
+Headless, `SCARLETT_WEB_EGRESS_PROXY_FILE` (services executor only) names an
+absolute, private (0600) regular file of at most 4 KiB holding one JSON object
+with unique, known keys:
+
+```json
+{"provider":"webshare","username":"…","password":"…","country":"us","port":80,"use":"limited_sites"}
+{"provider":"http","host":"127.0.0.1","port":3128,"username":"…","password":"…","use":"all"}
+```
+
+Webshare is a Rotating Residential account: `username` is its base username
+(1–32 letters and digits), `country` is `us`, `port` is 80, 1080 or 3128, and
+the host is `p.webshare.io`. `http` is any other proxy, such as one in front
+of a cloud server, with an optional fixed sign-in and `use` `all`. The retired
+`SCARLETT_WEB_EGRESS_PROXY` stops the node from starting rather than leave its
+pages on the node's own network. The desktop app keeps the proxy in the OS
+keychain and passes it on the one start line it writes to
+`scarlett-node desktop run` before the owner commands, never in the
+environment, the command line or a file: `{}` or `{"web_egress_proxy":{…}}`
+with a Webshare object, at most 4 KiB, read a byte at a time before the
+configuration loads. `scarlett-node desktop proxy-test` reads that object on
+stdin, runs one exit probe through a fresh session and prints
+`{"ok":true,"exit":"<ipv4>"}` or `{"ok":false,"class":"<class>"}`, where
+class is `invalid` or one of the proxy classes below.
+
+`use` decides the heartbeat's `egress`: `all` is `proxy`, every page through
+the proxy; `limited_sites` is `both`, the node's own network by default and
+the proxy only for leases that say `web_egress: "proxy"`. The coordinator
+sets that hint for domains that recently rate-limited or hard-blocked a
+node's own network. Like `web_prewarm_browser` it sits outside `web_request`,
+is never hashed and is repeated, not compared, at acceptance. A node whose
+egress is `direct` rejects such an offer `invalid_offer`.
+
+For each proxied job the node resolves the proxy's host once (5 s) and checks
+every answer: a Webshare host must pass the egress guard like any target, and
+an `http` proxy may be on loopback or the LAN but never link-local,
+unspecified or multicast. The helper and the browser tier dial the checked
+address as an IP literal, so nothing resolves the proxy again. A Webshare job
+signs in as `<username>-us-<session>`. The 9-digit session is HMAC-SHA256 over
+the job, its attempt and a rotation counter, under a key made at node start
+and never stored. Every connection of one job therefore leaves from one exit,
+the same lease always maps to the same session (so the pre-dial stays
+usable), and Webshare cannot link a session to a job. An exit failure on hop
+0 moves the job once to a fresh session and runs the hop again; later hops
+keep the session, and so does a browser job's re-fetch, which reaches the
+site from the exit its page used. Set the dashboard's sticky timer to 10 minutes, longer than
+any web job. An `http` proxy keeps one fixed `Proxy-Authorization` and gets
+no probe.
+
+The helper sends `CONNECT <checked-ip>:443` and requires `200`. Any other
+reply maps to a class, a code and a rest, and the job never falls back to the
+node's own network:
+
+| CONNECT outcome | Class | Code | Web rests |
+| --- | --- | --- | --- |
+| No TCP to the proxy, or no HTTP reply | `proxy_unreachable` | `web_proxy_failed` | 60 s |
+| 407 | `proxy_auth` | `web_proxy_failed` | 10 minutes |
+| 402 | `proxy_quota` | `web_proxy_failed` | 30 minutes |
+| 429 | `proxy_busy` | `web_proxy_failed` | 60 s |
+| 403 | `proxy_refused` | `web_proxy_refused` | no |
+| 502, any other status, or no reply in time | `proxy_exit` | `web_connect_failed` | no; hop 0 retries once on a fresh session |
+
+In parallel with hop 0 or the browser page, a Webshare job fetches
+`https://ipv4.webshare.io/` once through its session: the node resolves
+and checks that host (IPv4 only), the tunnel goes to the checked
+address, TLS is verified against the system roots, at most 64 bytes are read
+and the body must be one public IPv4 address, all within 5 s. The report
+waits at most 2 s more for it. Every web report carries `egress`:
+`{"via":"direct"}`, `{"via":"proxy"}` or `{"via":"proxy","exit":"<ipv4>"}`
+(fixtures `proven-web-direct.json`, `proven-web-proxy.json`,
+`failure-web-proxy-refused.json`); no other report does. A direct report
+never carries an address. The exit is the node's word, like `egress`.
+
+DNS for targets is still resolved and checked on the node, and the proxy must
+be a non-intercepting tunnel. The proxy's address, credentials and sessions
+are never logged, printed in errors, put in the environment or a command
+line, or sent to the coordinator. `scarlett-node status` adds a local
+`web_egress` object: `via` (`direct`, `both` or `proxy`), `provider`,
+`country`, `last_exit` and `last_exit_at` from the last probe, and
+`rest_reason`, the class of a rest in progress. It is never in a heartbeat.
+A proxied browser job's page and its re-fetch use the job's one session: the
+browser tier opens a loopback filtering proxy for that page alone, which
+reaches every checked address through the operator's proxy with the job's
+`Proxy-Authorization`, and closes it when the page is done (see Browser tier,
+Network). The browser download itself uses ordinary system networking, never
+the egress proxy.
 
 ## Browser tier
 
@@ -517,7 +603,12 @@ left; under 5 s the job is `expired`. Then:
 1. The page's host is resolved and checked with the egress guard before any
    browser work: `web_dns_failed` or `web_egress_denied`.
 2. The browser renders the page in a fresh context: `web_browser_unavailable`
-   if it could not run at all, `web_browser_failed` if it failed. After the
+   if it could not run at all, `web_browser_failed` if it failed. A proxied
+   page whose main document the operator's proxy would not tunnel fails with
+   that proxy class's code and rest instead, as a relay hop 0 would
+   (`web_proxy_failed`, `web_proxy_refused` or `web_connect_failed`). Only a
+   tunnel to the page's own host counts: a refused redirect target or
+   subresource on another host leaves the page `web_browser_failed`. After the
    page loads, the anti-bot pass (below) runs within the browser budget.
 3. The final document must be an absolute `http` or `https` URL of at most
    2048 bytes and not an X host; otherwise the browser copy is dropped.
@@ -581,7 +672,7 @@ jigsaw slider and Turnstile challenge pages. The node reads the keys once at
 start and passes them to each helper in `WEB_SOLVER_CONFIG`, which the helper
 removes from its environment before the driver or the browser start. The
 helper reaches the providers directly over TLS verified against certifi's
-roots, never through the page's proxy or `SCARLETT_WEB_EGRESS_PROXY`, and
+roots, never through the page's proxy or the operator's egress proxy, and
 never hands a provider a proxy. For a token (Turnstile, hCaptcha, AWS WAF) a
 provider sees the challenge's site key and the page's address cut to
 `scheme://host/path`, never its query string, fragment or credentials (the
@@ -767,6 +858,26 @@ everything and never dials or resolves. QUIC is disabled, WebRTC may not send
 UDP outside the proxy, and multicast DNS candidates are off. Tunnels are capped
 at `32 × capacity + 16` per helper, 60 s idle and 128 MiB each. Hosts are never
 logged; only counters are kept.
+
+A page the job sends through the operator's proxy gets a filtering proxy of
+its own instead, on a new loopback port, capped at 48 tunnels. It applies the
+same rules, picks IPv4 only (proxy exits are IPv4; a host without an IPv4
+answer gets 502), and reaches each checked address with
+`CONNECT <checked-ip>:<port>` through the proxy's checked address with the
+job's `Proxy-Authorization`, so every connection of the page leaves from the
+job's exit. The helper gets only that listener's loopback URL in its request
+(`egress_proxy`), which it uses for both of the page's passes; it, Chrome and
+Scrapling never see the proxy's address or credentials. The listener closes
+when the page returns, ending any tunnel still open. When the node stopped
+waiting before the helper answered, the page may still be loading: its
+tunnels end at once, but the listener keeps its port, closing every new
+connection unanswered, until the helper (which then drains) has stopped, so
+no later page's listener can take that port and carry the stale page on
+another job's session. The first tunnel to the page's own host that the
+proxy would not open keeps its class (the table under Proxy egress), and a
+page whose navigation failed reports it; a refused tunnel to another host
+records nothing. The shared listener has no upstream, so a direct page never
+touches the proxy.
 
 **Lifecycle.** At start, with web and the tier on, the node prepares in the
 background: memory check, cleanup of crash dumps and partial downloads, runtime

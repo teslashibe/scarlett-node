@@ -7,6 +7,7 @@ mod node_log;
 mod power;
 mod preferences;
 mod updater;
+mod web_proxy;
 #[cfg(windows)]
 mod windows_autostart;
 use local_api::LocalApi;
@@ -192,6 +193,8 @@ async fn save_desktop_preferences(
     local_window(&window)?;
     data.validate()?;
     let _guard = runtime.0.lock().await;
+    // The web proxy has its own commands: only a passing test turns it on.
+    let data = data.keeping_web_proxy(&preferences.snapshot()?);
     node.save_preferences(&data).await?;
     node.set_x_concurrency(data.x_concurrency)?;
     node.set_web_concurrency(data.web_concurrency)?;
@@ -216,6 +219,74 @@ async fn set_web_serving(
     node.save_preferences(&data).await?;
     node.set_web(enabled);
     preferences.updated(data)
+}
+/// The saved web proxy as the settings page may see it: whether one is saved
+/// and a masked username, never the password.
+#[tauri::command]
+async fn get_web_proxy(
+    window: WebviewWindow,
+    node: State<'_, Arc<Node>>,
+) -> node::Result<web_proxy::Saved> {
+    local_window(&window)?;
+    web_proxy::saved(&node).await
+}
+/// "Save": keeps new credentials in the keychain and, with the switch on,
+/// runs Test first; a failed test leaves the proxy off. Empty username and
+/// password keep the saved ones. Applies when the node next starts.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn save_web_proxy(
+    window: WebviewWindow,
+    node: State<'_, Arc<Node>>,
+    preferences: State<'_, Arc<Preferences>>,
+    runtime: State<'_, RuntimeControl>,
+    enabled: bool,
+    pages: String,
+    port: u16,
+    username: String,
+    password: String,
+) -> node::Result<web_proxy::SaveResult> {
+    local_window(&window)?;
+    let route = web_proxy::Route::new(&pages, port)?;
+    let form = web_proxy::Form {
+        enabled,
+        route,
+        username,
+        password,
+    };
+    web_proxy::save(&node, &preferences, &runtime.0, form).await
+}
+/// "Test": one exit probe through a fresh session, with the form's
+/// credentials or the saved ones. Saves nothing.
+#[tauri::command]
+async fn test_web_proxy(
+    window: WebviewWindow,
+    node: State<'_, Arc<Node>>,
+    pages: String,
+    port: u16,
+    username: String,
+    password: String,
+) -> node::Result<web_proxy::TestResult> {
+    local_window(&window)?;
+    let route = web_proxy::Route::new(&pages, port)?;
+    let form = web_proxy::Form {
+        enabled: false,
+        route,
+        username,
+        password,
+    };
+    web_proxy::test(&node, form).await
+}
+/// "Remove": turns the proxy off and deletes its keychain item.
+#[tauri::command]
+async fn remove_web_proxy(
+    window: WebviewWindow,
+    node: State<'_, Arc<Node>>,
+    preferences: State<'_, Arc<Preferences>>,
+    runtime: State<'_, RuntimeControl>,
+) -> node::Result<()> {
+    local_window(&window)?;
+    web_proxy::remove(&node, &preferences, &runtime.0).await
 }
 #[tauri::command]
 fn desktop_autostart(window: WebviewWindow, app: tauri::AppHandle) -> node::Result<bool> {
@@ -672,6 +743,10 @@ fn main() {
             desktop_preferences,
             save_desktop_preferences,
             set_web_serving,
+            get_web_proxy,
+            save_web_proxy,
+            test_web_proxy,
+            remove_web_proxy,
             desktop_autostart,
             set_desktop_autostart,
             update_status,
@@ -737,6 +812,8 @@ fn main() {
                 .set_web_browser_concurrency(saved.web_browser_concurrency)
                 .map_err(|_| "invalid desktop browser concurrency")?;
             app.state::<Arc<Node>>().set_web(saved.serve_web);
+            app.state::<Arc<Node>>()
+                .set_web_proxy(saved.web_proxy_route());
             // Device sleep and wake reach the supervised node on its owner
             // pipe; without them the node's own clock check still notices.
             power::watch(app.state::<Arc<Node>>().inner().clone());

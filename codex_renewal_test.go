@@ -641,7 +641,7 @@ func TestLostAcceptanceStartedRecordReconcilesWithoutRestart(t *testing.T) {
 					t.Fatal("failed acceptance reported a provider outcome", code)
 				}
 			} else {
-				err = rejectLease(context.Background(), client, j, l, "service_unavailable")
+				err = rejectLease(context.Background(), client, j, config.Config{}, l, "service_unavailable")
 			}
 			pending, perr := j.Pending()
 			if err == nil || perr != nil || len(pending) != 1 || pending[0].State != "started" {

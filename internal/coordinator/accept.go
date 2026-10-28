@@ -140,8 +140,12 @@ func ValidOffer(offer Lease, now time.Time) error {
 	if !offer.AcceptanceRequired || offer.Version != Version || offer.VerifierToken != "" || !digest(offer.RequestSHA256) || !digest(offer.SignedJobID) || (offer.ServiceType != "codex" && offer.ServiceType != "x_read" && offer.ServiceType != "web") || !offer.LeaseDeadline.After(now) || offer.LeaseDeadline.After(now.Add(OfferLifetime(offer.ServiceType)+OfferClockSkew)) || !offer.SettlementDeadline.Equal(offer.LeaseDeadline) {
 		return errors.New("invalid community offer")
 	}
-	// The pre-warm hint belongs to relay web offers only.
+	// The pre-warm hint belongs to relay web offers only, the proxy hint to
+	// web offers.
 	if offer.WebPrewarmBrowser && (offer.ServiceType != "web" || offer.WebRequest == nil || offer.WebRequest.Mode != "") {
+		return errors.New("invalid community offer")
+	}
+	if offer.WebEgress != "" && (offer.WebEgress != "proxy" || offer.ServiceType != "web" || offer.WebRequest == nil) {
 		return errors.New("invalid community offer")
 	}
 	return nil
@@ -222,10 +226,12 @@ tries:
 	}
 	token := reply.Lease.VerifierToken
 	reply.Lease.VerifierToken = ""
-	// The pre-warm hint is advice decided at offer time, not part of the
-	// terms, so it is left out of the comparison and the offer's value kept.
-	prewarm := offer.WebPrewarmBrowser
+	// The pre-warm and proxy hints are advice decided at offer time, not part
+	// of the terms, so they are left out of the comparison and the offer's
+	// values kept.
+	prewarm, egress := offer.WebPrewarmBrowser, offer.WebEgress
 	offer.WebPrewarmBrowser, reply.Lease.WebPrewarmBrowser = false, false
+	offer.WebEgress, reply.Lease.WebEgress = "", ""
 	want, err := json.Marshal(offer)
 	if err != nil {
 		return Lease{}, err
@@ -235,6 +241,6 @@ tries:
 		return Lease{}, errors.New("accepted terms differ from offered work")
 	}
 	reply.Lease.VerifierToken = token
-	reply.Lease.WebPrewarmBrowser = prewarm
+	reply.Lease.WebPrewarmBrowser, reply.Lease.WebEgress = prewarm, egress
 	return reply.Lease, nil
 }

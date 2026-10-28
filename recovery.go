@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/teslashibe/scarlett-node/internal/attempts"
+	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
 	"github.com/teslashibe/scarlett-node/internal/diagnostics"
 )
@@ -50,7 +51,16 @@ func recoverAttempt(ctx context.Context, client *coordinator.Client, journal *at
 		return nil // verifier owns proof ingestion; don't rerun the provider
 	case "live":
 		if r.State == "started" {
-			body, err := json.Marshal(coordinator.Failure{Version: coordinator.Version, Attempt: r.Attempt, Fence: r.Fence, Code: "execution_uncertain"})
+			failure := coordinator.Failure{Version: coordinator.Version, Attempt: r.Attempt, Fence: r.Fence, Code: "execution_uncertain"}
+			if r.ProviderService == "web" {
+				// A web report says how the page left, as the attempt recorded
+				// it when it began.
+				failure.Egress = &coordinator.WebEgress{Via: r.WebEgress}
+				if r.WebEgress == "" {
+					failure.Egress.Via = "direct"
+				}
+			}
+			body, err := json.Marshal(failure)
 			if err != nil {
 				return err
 			}
@@ -150,7 +160,7 @@ func reportRetryAfter(err error, retry int) (time.Duration, bool) {
 	return step + rand.N(step/4+1), true
 }
 
-func rejectLease(ctx context.Context, client *coordinator.Client, journal *attempts.Journal, l coordinator.Lease, code string) error {
+func rejectLease(ctx context.Context, client *coordinator.Client, journal *attempts.Journal, c config.Config, l coordinator.Lease, code string) error {
 	if _, err := coordinator.JobPath(l.JobID, "fail"); err != nil {
 		return err
 	}
@@ -179,7 +189,12 @@ func rejectLease(ctx context.Context, client *coordinator.Client, journal *attem
 			return err
 		}
 	}
-	raw, err := json.Marshal(coordinator.Failure{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence, Code: code})
+	failure := coordinator.Failure{Version: coordinator.Version, Attempt: l.Attempt, Fence: l.Fence, Code: code}
+	if c.Executor == config.ExecutorServices && l.ServiceType == "web" {
+		// Nothing was fetched; the report names the egress the page would have had.
+		failure.Egress = &coordinator.WebEgress{Via: webReportVia(c, l)}
+	}
+	raw, err := json.Marshal(failure)
 	if err != nil {
 		return err
 	}

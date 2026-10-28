@@ -19,7 +19,7 @@ For the default Linux installation, copy `scarlett-node.service` to `~/.config/s
 
 Stopping the service (SIGTERM), a drain and a suspend tell the coordinator goodbye first, within a second, so jobs the node has not accepted go to other nodes at once; accepted jobs still finish within the unit's stop timeout. Linux needs no sleep hook: after a suspend the node notices the wall clock jump ahead of its monotonic clock and reconnects at once. `scarlett-node status` shows when the last heartbeat was answered (`last_heartbeat_ok_at`), why the last one failed (`heartbeat_error_class`) and whether the coordinator is holding back work for missed offers (`dispatch_health`). Run the node as Scarlett Node 0.1.17 or later: the coordinator answers older versions 426 `update_required` and gives them no work.
 
-Every setting, readiness state and failure code is described in the operator guide at <https://network.scarlett.ai/docs/>, including running a web node on a cloud server through `SCARLETT_WEB_EGRESS_PROXY`.
+Every setting, readiness state and failure code is described in the operator guide at <https://network.scarlett.ai/docs/>, including running a web node on a cloud server through a proxy named in `SCARLETT_WEB_EGRESS_PROXY_FILE`.
 
 ## Updates
 

@@ -137,6 +137,14 @@ pub enum Error {
     BrowserNoXSession,
     BrowserAmbiguous,
     BrowserUnsupported,
+    /// The OS credential store (Keychain, Credential Manager) refused or
+    /// failed, or holds an item this app did not save.
+    KeychainUnavailable,
+    /// The web proxy is on but no proxy username and password are saved.
+    WebProxyNotSaved,
+    /// `desktop proxy-test` did not finish or gave no reply the app reads, so
+    /// the proxy is untested.
+    ProxyTestUnavailable,
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -237,6 +245,11 @@ pub struct Snapshot {
     /// Whether a node this app starts with web runs the hidden browser tier,
     /// so a stopped node's dashboard can say so.
     pub web_browser: bool,
+    /// The saved web proxy for the next node with web, absent when it is off.
+    pub web_proxy: Option<crate::web_proxy::Route>,
+    /// The running node was started with another web proxy setting; it
+    /// changes on the next Stop and Start.
+    pub web_proxy_restart_pending: bool,
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
@@ -327,6 +340,14 @@ impl OwnerCommand {
 }
 /// The longest an owner line may take to reach the node.
 const OWNER_LINE_TIMEOUT: Duration = Duration::from_millis(250);
+/// The longest the start line may take to reach `desktop run`, which reads it
+/// before loading its config.
+const START_LINE_TIMEOUT: Duration = Duration::from_secs(5);
+/// One `desktop proxy-test`: a fresh session and one exit probe, which the
+/// node bounds at 5 s, plus process start.
+const PROXY_TEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// The longest `desktop proxy-test` reply.
+const PROXY_TEST_OUTPUT_LIMIT: usize = 256;
 pub struct Node {
     pub state: PathBuf,
     endpoints: Endpoints,
@@ -358,6 +379,19 @@ pub struct Node {
     /// Browser pages at once for the next child: 0 is Auto, the node's own
     /// choice from its memory.
     web_browser_concurrency: std::sync::atomic::AtomicU8,
+    /// The web proxy for the next child with web, None when off. Like web it
+    /// applies to the next child process; its username and password stay in
+    /// the keychain until that child's start line.
+    web_proxy: std::sync::Mutex<Option<crate::web_proxy::Route>>,
+    /// The web proxy the supervised child was started with (None without web)
+    /// and the credentials generation it read.
+    web_proxy_running: std::sync::Mutex<Option<(crate::web_proxy::Route, u64)>>,
+    /// Counts saves and deletes of the proxy credentials, so a node started
+    /// with older ones shows a restart pending; the credentials themselves
+    /// are never kept to compare.
+    web_proxy_generation: std::sync::atomic::AtomicU64,
+    /// Where the web proxy's username and password are saved.
+    keychain: std::sync::Arc<crate::web_proxy::Keychain>,
     /// An explicit SCARLETT_WEB_BROWSER ("on" or "off") from the same trusted
     /// environment, passed on only with web. Unset, the node's platform
     /// default applies (on for macOS, off for Windows in this release).
@@ -531,8 +565,8 @@ pub(crate) fn private_dir_with_helper(path: &Path, helper: &Path) -> Result<()> 
     }
 }
 /// The largest reply `private_helper` reads. The longest is the device
-/// preferences (185 bytes with every field at its widest, newline included).
-pub(crate) const PRIVATE_HELPER_REPLY_LIMIT: usize = 256;
+/// preferences (257 bytes with every field at its widest, newline included).
+pub(crate) const PRIVATE_HELPER_REPLY_LIMIT: usize = 512;
 pub(crate) fn private_helper(binary: &Path, action: &str, path: &Path) -> Result<Value> {
     if !path.is_absolute() || !regular(binary) {
         return Err(Error::PrivateStorageUnavailable);
@@ -731,7 +765,71 @@ fn observation_projection(raw: &[u8]) -> Result<Value> {
     if let Some(health) = source.get("dispatch_health").and_then(dispatch_health) {
         out.insert("dispatch_health".into(), health);
     }
+    if let Some(egress) = source.get("web_egress").and_then(web_egress) {
+        out.insert("web_egress".into(), egress);
+    }
     Ok(Value::Object(out))
+}
+/// The node's local-only web egress (never in its heartbeat): how pages leave,
+/// the proxy provider and country, the last exit a job reported and when, and
+/// why the proxy is resting. Every field is a closed value or an address, so
+/// nothing else the node knows about its proxy can reach the page.
+fn web_egress(value: &Value) -> Option<Value> {
+    let source = value.as_object()?;
+    let mut out = serde_json::Map::new();
+    let closed: [(&str, &[&str]); 4] = [
+        ("via", &["direct", "both", "proxy"]),
+        ("provider", &["webshare", "http"]),
+        ("country", &["us"]),
+        (
+            "rest_reason",
+            &[
+                "proxy_unreachable",
+                "proxy_auth",
+                "proxy_quota",
+                "proxy_busy",
+            ],
+        ),
+    ];
+    for (field, values) in closed {
+        match source.get(field) {
+            Some(Value::String(v)) if values.contains(&v.as_str()) => {
+                out.insert(field.into(), Value::String(v.clone()));
+            }
+            Some(Value::Null) => {
+                out.insert(field.into(), Value::Null);
+            }
+            _ => {}
+        }
+    }
+    match source.get("last_exit") {
+        Some(Value::String(exit)) => {
+            if let Some(ip) = crate::web_proxy::public_ipv4(exit) {
+                out.insert("last_exit".into(), Value::String(ip.to_string()));
+            }
+        }
+        Some(Value::Null) => {
+            out.insert("last_exit".into(), Value::Null);
+        }
+        _ => {}
+    }
+    match source.get("last_exit_at") {
+        // An RFC 3339 time, so only its digits and separators.
+        Some(Value::String(at))
+            if !at.is_empty()
+                && at.len() <= 40
+                && at
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || b"TZ:.+-".contains(&b)) =>
+        {
+            out.insert("last_exit_at".into(), Value::String(at.clone()));
+        }
+        Some(Value::Null) => {
+            out.insert("last_exit_at".into(), Value::Null);
+        }
+        _ => {}
+    }
+    Some(Value::Object(out))
 }
 /// The coordinator's dispatch health for this node, from its last heartbeat
 /// reply: offers it missed in a row and, while the coordinator sends it fewer
@@ -834,10 +932,19 @@ impl Node {
             web_running: AtomicBool::new(false),
             web_concurrency: std::sync::atomic::AtomicU8::new(0),
             web_browser_concurrency: std::sync::atomic::AtomicU8::new(0),
+            web_proxy: std::sync::Mutex::new(None),
+            web_proxy_running: std::sync::Mutex::new(None),
+            web_proxy_generation: std::sync::atomic::AtomicU64::new(0),
+            keychain: std::sync::Arc::new(crate::web_proxy::Keychain::native()),
             web_browser: None,
             log_dir: None,
             log_bound: std::sync::Mutex::new(None),
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn with_keychain(mut self, keychain: crate::web_proxy::Keychain) -> Self {
+        self.keychain = std::sync::Arc::new(keychain);
+        self
     }
     pub fn with_log_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.log_dir = dir;
@@ -904,6 +1011,94 @@ impl Node {
         self.web_browser_concurrency
             .store(concurrency, Ordering::SeqCst);
         Ok(())
+    }
+    /// The web proxy for the next child process with web: None is off. A
+    /// running node keeps the egress it was started with.
+    pub fn set_web_proxy(&self, route: Option<crate::web_proxy::Route>) {
+        *self.web_proxy.lock().unwrap_or_else(|e| e.into_inner()) = route;
+    }
+    fn web_proxy_route(&self) -> Option<crate::web_proxy::Route> {
+        *self.web_proxy.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// The store holding the web proxy's username and password.
+    pub fn keychain(&self) -> std::sync::Arc<crate::web_proxy::Keychain> {
+        self.keychain.clone()
+    }
+    /// The saved web proxy credentials, read off the async runtime: the OS
+    /// store can wait on the operator to allow access.
+    pub async fn web_proxy_credentials(&self) -> Result<Option<crate::web_proxy::Credentials>> {
+        let keychain = self.keychain();
+        tokio::task::spawn_blocking(move || keychain.load())
+            .await
+            .map_err(|_| Error::KeychainUnavailable)?
+    }
+    /// Saves the web proxy credentials, replacing any saved ones. A node
+    /// running with the proxy keeps the old ones until it next starts.
+    pub async fn save_web_proxy_credentials(
+        &self,
+        credentials: &crate::web_proxy::Credentials,
+    ) -> Result<()> {
+        let keychain = self.keychain();
+        let credentials = credentials.clone();
+        let saved = tokio::task::spawn_blocking(move || keychain.save(&credentials)).await;
+        // Counted after the write, failed or not: a start that read the
+        // store before this count then shows a restart pending.
+        self.web_proxy_generation.fetch_add(1, Ordering::SeqCst);
+        saved.map_err(|_| Error::KeychainUnavailable)?
+    }
+    /// Deletes the saved web proxy credentials; deleting none succeeds.
+    pub async fn delete_web_proxy_credentials(&self) -> Result<()> {
+        let keychain = self.keychain();
+        let deleted = tokio::task::spawn_blocking(move || keychain.delete()).await;
+        self.web_proxy_generation.fetch_add(1, Ordering::SeqCst);
+        deleted.map_err(|_| Error::KeychainUnavailable)?
+    }
+    /// One `desktop proxy-test`: the bundled node runs one exit probe through
+    /// a fresh session with these credentials and port. The credentials go
+    /// only on its stdin, and only its fixed reply comes back. A probe that
+    /// does not finish or replies with anything else is ProxyTestUnavailable,
+    /// apart from the app's own failures.
+    pub async fn test_web_proxy(
+        &self,
+        credentials: &crate::web_proxy::Credentials,
+        route: crate::web_proxy::Route,
+    ) -> Result<crate::web_proxy::TestResult> {
+        let input = crate::web_proxy::test_input(credentials, route)?;
+        match self.proxy_test(&input).await {
+            Err(Error::CommandFailed | Error::CommandTimeout) => Err(Error::ProxyTestUnavailable),
+            result => result,
+        }
+    }
+    async fn proxy_test(&self, input: &[u8]) -> Result<crate::web_proxy::TestResult> {
+        let mut child = self
+            .command(&["desktop", "proxy-test"])?
+            .spawn()
+            .map_err(|_| Error::RuntimeUnavailable)?;
+        let stdout = child.stdout.take().ok_or(Error::CommandFailed)?;
+        tokio::time::timeout(PROXY_TEST_TIMEOUT, async {
+            let mut pipe = child.stdin.take().ok_or(Error::CommandFailed)?;
+            pipe.write_all(input)
+                .await
+                .map_err(|_| Error::CommandFailed)?;
+            pipe.shutdown().await.map_err(|_| Error::CommandFailed)?;
+            drop(pipe);
+            let mut output = Vec::new();
+            stdout
+                .take(PROXY_TEST_OUTPUT_LIMIT as u64 + 1)
+                .read_to_end(&mut output)
+                .await
+                .map_err(|_| Error::CommandFailed)?;
+            if output.len() > PROXY_TEST_OUTPUT_LIMIT {
+                return Err(Error::CommandFailed);
+            }
+            // A failed probe is a result, whatever the exit status; only the
+            // fixed reply is read, and anything else is a failed command.
+            child.wait().await.map_err(|_| Error::CommandFailed)?;
+            crate::web_proxy::test_projection(&output)
+        })
+        .await
+        .map_err(|_| Error::CommandTimeout)?
+        // kill_on_drop ends a probe that outlives the timeout.
     }
     pub fn network_url(&self, destination: &str) -> Result<String> {
         let path = match destination {
@@ -1460,6 +1655,23 @@ impl Node {
             return Err(Error::AccountsUnavailable);
         }
         let mut cmd = self.command_with_web(&["desktop", "run"], web)?;
+        // The start line carries the web proxy, read from the keychain now.
+        // With the proxy on and nothing saved the node does not start: it
+        // never falls back to this network. The generation is read first, so
+        // credentials saved while this start reads them show a restart
+        // pending.
+        let route = if web { self.web_proxy_route() } else { None };
+        let generation = self.web_proxy_generation.load(Ordering::SeqCst);
+        let credentials = match route {
+            Some(_) => Some(
+                self.web_proxy_credentials()
+                    .await?
+                    .ok_or(Error::WebProxyNotSaved)?,
+            ),
+            None => None,
+        };
+        let line = crate::web_proxy::start_line(credentials.as_ref().zip(route))?;
+        drop(credentials);
         // The node's stderr goes to its private local log; a log that cannot
         // be opened never stops the node from starting.
         let log = self
@@ -1474,16 +1686,52 @@ impl Node {
         {
             cmd.process_group(0);
         }
-        let mut child = cmd.spawn().map_err(|_| Error::RuntimeUnavailable)?;
-        *self.owner.lock().await = child.stdin.take();
-        *running = Some(child);
-        self.web_running.store(web, Ordering::SeqCst);
+        let child = cmd.spawn().map_err(|_| Error::RuntimeUnavailable)?;
+        let proxy = route.map(|route| (route, generation));
+        self.supervise(&mut running, child, line, web, proxy)
+            .await?;
         let bound = self
             .log_dir
             .clone()
             .filter(|_| logging)
             .map(|dir| tokio::spawn(crate::node_log::keep_bounded(dir)));
         self.stop_log_bound(bound);
+        Ok(())
+    }
+    /// Sends `desktop run` its start line, which it reads exactly before its
+    /// config, then supervises it: owner commands follow on the same pipe. A
+    /// child that does not take the line is killed, and no owner pipe is kept
+    /// for it.
+    async fn supervise(
+        &self,
+        running: &mut Option<Child>,
+        mut child: Child,
+        line: crate::web_proxy::Secret,
+        web: bool,
+        proxy: Option<(crate::web_proxy::Route, u64)>,
+    ) -> Result<()> {
+        let mut owner = child.stdin.take();
+        let sent = tokio::time::timeout(START_LINE_TIMEOUT, async {
+            let pipe = owner.as_mut()?;
+            pipe.write_all(&line).await.ok()?;
+            pipe.flush().await.ok()
+        })
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+        drop(line);
+        if !sent {
+            let _ = child.kill().await;
+            return Err(Error::CommandFailed);
+        }
+        *self.owner.lock().await = owner;
+        *running = Some(child);
+        self.web_running.store(web, Ordering::SeqCst);
+        *self
+            .web_proxy_running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = proxy;
         Ok(())
     }
     /// Ends the previous node's log rotation, starting `next` in its place.
@@ -1769,6 +2017,18 @@ impl Node {
         }
         s.web_restart_pending =
             s.supervised && self.web_running.load(Ordering::SeqCst) != s.web_enabled;
+        s.web_proxy = self.web_proxy_route();
+        // Only a node serving web uses a proxy, so compare what each node
+        // with web would use: the route and the credentials it reads.
+        let next = s
+            .web_proxy
+            .filter(|_| s.web_enabled)
+            .map(|route| (route, self.web_proxy_generation.load(Ordering::SeqCst)));
+        let started = *self
+            .web_proxy_running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        s.web_proxy_restart_pending = s.supervised && started != next;
         s.login_pending = self.login.lock().await.is_some();
         s.login_error = self.login_error.lock().await.clone();
         s
@@ -2516,6 +2776,54 @@ esac
         );
     }
     #[test]
+    fn projection_keeps_only_the_closed_local_web_egress_fields() {
+        let status = observation_projection(br#"{"state":"running","web_egress":{"via":"both","provider":"webshare","country":"us","last_exit":"45.86.200.17","last_exit_at":"2026-10-26T10:00:00Z","rest_reason":"proxy_auth","username":"SECRET","session":"SECRET"}}"#).unwrap();
+        assert!(!status.to_string().contains("SECRET"));
+        assert_eq!(
+            status["web_egress"],
+            json!({"via":"both","provider":"webshare","country":"us","last_exit":"45.86.200.17","last_exit_at":"2026-10-26T10:00:00Z","rest_reason":"proxy_auth"})
+        );
+        // Nulls pass; anything outside each field's closed set is dropped
+        // one field at a time, and an exit must be a public IPv4 address.
+        let status = observation_projection(br#"{"state":"running","web_egress":{"via":"direct","provider":null,"country":null,"last_exit":null,"last_exit_at":null,"rest_reason":null}}"#).unwrap();
+        assert_eq!(
+            status["web_egress"],
+            json!({"via":"direct","provider":null,"country":null,"last_exit":null,"last_exit_at":null,"rest_reason":null})
+        );
+        let status = observation_projection(br#"{"state":"running","web_egress":{"via":"SECRET","provider":"SECRET","country":"SECRET","last_exit":"SECRET@45.86.200.17","last_exit_at":"2026-10-26\nSECRET","rest_reason":"SECRET"}}"#).unwrap();
+        assert_eq!(status["web_egress"], json!({}));
+        let status = observation_projection(
+            br#"{"state":"running","web_egress":{"via":"both","last_exit_at":"synthuser"}}"#,
+        )
+        .unwrap();
+        assert_eq!(status["web_egress"], json!({"via":"both"}));
+        for exit in [
+            "10.0.0.1",
+            "192.168.1.20",
+            "100.64.0.1",
+            "::1",
+            "045.86.200.17",
+        ] {
+            let raw = serde_json::to_vec(
+                &json!({"state":"running","web_egress":{"via":"proxy","last_exit":exit}}),
+            )
+            .unwrap();
+            assert_eq!(
+                observation_projection(&raw).unwrap()["web_egress"],
+                json!({"via":"proxy"})
+            );
+        }
+        for egress in [json!("SECRET"), json!(["SECRET"]), json!(null)] {
+            let raw = serde_json::to_vec(&json!({"state":"running","web_egress":egress})).unwrap();
+            assert!(
+                observation_projection(&raw)
+                    .unwrap()
+                    .get("web_egress")
+                    .is_none()
+            );
+        }
+    }
+    #[test]
     fn projection_keeps_the_last_answered_heartbeat_and_dispatch_health() {
         let status = observation_projection(br#"{"state":"running","last_heartbeat_at":"2026-10-11T10:00:01Z","last_heartbeat_ok_at":"2026-10-11T10:00:00.123456789Z","heartbeat_error_class":"timeout","dispatch_health":{"missed_streak":3,"suspect_until":"2026-10-11T10:04:00Z","node_id":"SECRET"}}"#).unwrap();
         assert!(!status.to_string().contains("SECRET"));
@@ -3089,7 +3397,23 @@ esac
             Some("codex,x_read,web")
         );
         assert_eq!(web["SCARLETT_WEB_CONCURRENCY"].as_deref(), Some("auto"));
-        assert!(!web.contains_key("SCARLETT_WEB_EGRESS_PROXY"));
+        // The web proxy never reaches the node through its environment,
+        // whether it is off or on: only the start line on stdin carries it.
+        for proxy in [
+            None,
+            Some(crate::web_proxy::Route::new("all", 1080).unwrap()),
+        ] {
+            node.set_web_proxy(proxy);
+            let env = env(&node);
+            for name in [
+                "SCARLETT_WEB_EGRESS_PROXY",
+                "SCARLETT_WEB_EGRESS_PROXY_FILE",
+            ] {
+                assert!(!env.contains_key(name), "{name}");
+            }
+            assert!(!env.keys().any(|k| k.contains("PROXY")), "{env:?}");
+        }
+        node.set_web_proxy(None);
         // Web pages at once: Auto passes `auto`, a fixed number passes
         // through, and anything above the desktop ceiling is refused without
         // changing the saved value.
@@ -3246,6 +3570,204 @@ esac
         assert!(!snapshot.supervised && !snapshot.web_restart_pending);
         assert_eq!(node.start().await, Err(Error::AccountsUnavailable));
     }
+    /// A fake node recording what `desktop run` got: its start line, then its
+    /// arguments and environment, before it waits on the owner pipe.
+    #[cfg(unix)]
+    fn start_line_fixture(temp: &tempfile::TempDir) -> Node {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = temp.path().join("node");
+        let helper = temp.path().join("helper");
+        std::fs::write(&binary, "#!/bin/sh\ncase \"$1 $2\" in\n'accounts list') printf '[{\"id\":\"work\",\"service\":\"codex\",\"concurrency\":1}]';;\n'desktop run') IFS= read -r line; printf '%s\\n' \"$line\" >> \"$SCARLETT_STATE_DIR/start-lines\"; printf '%s\\n' \"$*\" >> \"$SCARLETT_STATE_DIR/args\"; env >> \"$SCARLETT_STATE_DIR/env\"; cat >/dev/null;;\n'drain ') ;;\n*) exit 1;;\nesac\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&helper, "synthetic helper fixture").unwrap();
+        let node = Node::new(temp.path().join("state"), binary, helper)
+            .with_keychain(crate::web_proxy::Keychain::mock());
+        node.prepare().unwrap();
+        std::fs::write(node.state.join("identity.json"), "{}").unwrap();
+        node
+    }
+    /// The app writes one start line to `desktop run` before any owner
+    /// command: `{}`, or the web proxy from the keychain when web and the
+    /// proxy are on. The credentials appear nowhere else, and with the proxy
+    /// on and nothing saved the node does not start rather than run direct.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_line_carries_the_web_proxy_only_on_stdin() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = start_line_fixture(&temp);
+        let read = |name: &str| std::fs::read_to_string(node.state.join(name)).unwrap_or_default();
+        let lines = || read("start-lines");
+        let run = |want: usize| async move {
+            let began = Instant::now();
+            while lines().lines().count() < want {
+                assert!(began.elapsed() < Duration::from_secs(5), "{:?}", lines());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        // Proxy off: the line is `{}`.
+        node.start().await.unwrap();
+        run(1).await;
+        assert!(!node.snapshot().await.web_proxy_restart_pending);
+        node.stop().await.unwrap();
+        assert_eq!(lines(), "{}\n");
+        // Proxy on with nothing saved: no node runs, and the line is unchanged.
+        let route = crate::web_proxy::Route::new("limited_sites", 3128).unwrap();
+        node.set_web_proxy(Some(route));
+        assert_eq!(node.start().await, Err(Error::WebProxyNotSaved));
+        assert!(!node.snapshot().await.supervised);
+        assert_eq!(read("args").lines().count(), 1);
+        // Saved: the proxy goes on the start line, and only there.
+        let credentials =
+            crate::web_proxy::Credentials::new("synthuser".into(), "synthetic-pass".into())
+                .unwrap();
+        node.save_web_proxy_credentials(&credentials).await.unwrap();
+        node.start().await.unwrap();
+        run(2).await;
+        assert_eq!(
+            lines().lines().nth(1).unwrap(),
+            r#"{"web_egress_proxy":{"provider":"webshare","username":"synthuser","password":"synthetic-pass","country":"us","port":3128,"use":"limited_sites"}}"#
+        );
+        for name in ["args", "env"] {
+            let seen = read(name);
+            assert!(!seen.is_empty());
+            assert!(
+                !seen.contains("synthuser") && !seen.contains("synthetic-pass"),
+                "{name}"
+            );
+            assert!(!seen.contains("PROXY"), "{name}");
+        }
+        let snapshot = node.snapshot().await;
+        assert_eq!(snapshot.web_proxy, Some(route));
+        assert!(!snapshot.web_proxy_restart_pending);
+        let shown = serde_json::to_string(&snapshot).unwrap();
+        assert!(!shown.contains("synthuser") && !shown.contains("synthetic-pass"));
+        // A change while it runs waits for the next start: the route, or new
+        // credentials on the same route (a rotated proxy password).
+        node.set_web_proxy(None);
+        assert!(node.snapshot().await.web_proxy_restart_pending);
+        node.set_web_proxy(Some(route));
+        assert!(!node.snapshot().await.web_proxy_restart_pending);
+        let rotated =
+            crate::web_proxy::Credentials::new("synthuser".into(), "rotated-pass".into()).unwrap();
+        node.save_web_proxy_credentials(&rotated).await.unwrap();
+        assert!(node.snapshot().await.web_proxy_restart_pending);
+        node.stop().await.unwrap();
+        node.start().await.unwrap();
+        run(3).await;
+        assert!(
+            lines()
+                .lines()
+                .nth(2)
+                .unwrap()
+                .contains(r#""password":"rotated-pass""#)
+        );
+        assert!(!node.snapshot().await.web_proxy_restart_pending);
+        // Deleting them is a change too.
+        node.delete_web_proxy_credentials().await.unwrap();
+        assert!(node.snapshot().await.web_proxy_restart_pending);
+        node.stop().await.unwrap();
+        // Without web the node gets `{}` and never reads the keychain: the
+        // store's error still waits for the next call. A save while it runs,
+        // even one that fails, does not concern it.
+        node.set_web(false);
+        node.keychain().fail_next();
+        node.start().await.unwrap();
+        run(4).await;
+        assert_eq!(
+            node.save_web_proxy_credentials(&credentials).await,
+            Err(Error::KeychainUnavailable)
+        );
+        assert!(!node.snapshot().await.web_proxy_restart_pending);
+        node.stop().await.unwrap();
+        assert_eq!(lines().lines().nth(3).unwrap(), "{}");
+        // A keychain that refuses access stops the start too.
+        node.set_web(true);
+        node.keychain().fail_next();
+        assert_eq!(node.start().await, Err(Error::KeychainUnavailable));
+        assert!(!node.snapshot().await.supervised);
+        assert_eq!(lines().lines().count(), 4);
+    }
+    /// A child that cannot take its start line is killed and not supervised:
+    /// no owner pipe, no running child, and the start fails. The child closes
+    /// its stdin and says so before the line is sent, so the write fails
+    /// every time.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_that_refuses_its_start_line_is_killed_and_not_supervised() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = start_line_fixture(&temp);
+        let marker = temp.path().join("stdin-closed");
+        let child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                r#"exec 0<&-; echo $$ > "$1.tmp"; mv "$1.tmp" "$1"; exec sleep 30"#,
+                "sh",
+            ])
+            .arg(&marker)
+            .stdin(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let began = Instant::now();
+        while !marker.exists() {
+            assert!(began.elapsed() < Duration::from_secs(5));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let pid: libc::pid_t = std::fs::read_to_string(&marker)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let credentials =
+            crate::web_proxy::Credentials::new("synthuser".into(), "synthetic-pass".into())
+                .unwrap();
+        let route = crate::web_proxy::Route::new("all", 80).unwrap();
+        let line = crate::web_proxy::start_line(Some((&credentials, route))).unwrap();
+        let mut running = node.running.lock().await;
+        assert_eq!(
+            node.supervise(&mut running, child, line, true, Some((route, 0)))
+                .await,
+            Err(Error::CommandFailed)
+        );
+        assert!(running.is_none());
+        drop(running);
+        assert!(node.owner.lock().await.is_none());
+        // The child was killed and reaped, not left behind.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        let snapshot = node.snapshot().await;
+        assert!(!snapshot.supervised && !snapshot.web_proxy_restart_pending);
+        assert!(node.web_proxy_running.lock().unwrap().is_none());
+    }
+    /// A node that exits before reading its start line does not run: the app
+    /// does not keep an owner pipe for it, whether the write failed or the
+    /// pipe took the line first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_node_that_exits_before_its_start_line_is_not_supervised() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let node = start_line_fixture(&temp);
+        std::fs::write(&node.binary, "#!/bin/sh\ncase \"$1 $2\" in\n'accounts list') printf '[{\"id\":\"work\",\"service\":\"codex\",\"concurrency\":1}]';;\n'desktop run') exec 0<&-; exit 1;;\n*) exit 1;;\nesac\n").unwrap();
+        std::fs::set_permissions(&node.binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let credentials =
+            crate::web_proxy::Credentials::new("synthuser".into(), "p".repeat(128)).unwrap();
+        node.save_web_proxy_credentials(&credentials).await.unwrap();
+        node.set_web_proxy(Some(crate::web_proxy::Route::new("all", 80).unwrap()));
+        // The pipe may still take the line before the exit is seen; either
+        // way no owner pipe outlives the child.
+        match node.start().await {
+            Err(Error::CommandFailed) => assert!(node.owner.lock().await.is_none()),
+            Ok(()) => {
+                let began = Instant::now();
+                while node.snapshot().await.supervised {
+                    assert!(began.elapsed() < Duration::from_secs(5));
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert!(node.owner.lock().await.is_none());
+            }
+            Err(other) => panic!("{other:?}"),
+        }
+    }
     /// The saved setting reaches the node helper and back, through the real
     /// helper when one is supplied (desktop-complete builds it).
     #[tokio::test]
@@ -3271,6 +3793,22 @@ esac
             .unwrap();
         assert_eq!(reopened, off);
         assert!(state.join("web-preferences-v1.json").is_file());
+        // The web proxy's settings take the same path into their own file.
+        assert!(!saved.web_proxy && saved.web_proxy_route().is_none());
+        let mut proxy = off.clone();
+        proxy.web_proxy = true;
+        proxy.web_proxy_use = "all".into();
+        proxy.web_proxy_port = 1080;
+        node.save_preferences(&proxy).await.unwrap();
+        let reopened = crate::preferences::Preferences::load(&state, &helper)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        assert_eq!(reopened, proxy);
+        assert_eq!(
+            std::fs::read_to_string(state.join("web-proxy-preferences-v1.json")).unwrap(),
+            r#"{"schema":1,"web_proxy":true,"web_proxy_use":"all","web_proxy_port":1080}"#
+        );
     }
     #[cfg(unix)]
     #[tokio::test]

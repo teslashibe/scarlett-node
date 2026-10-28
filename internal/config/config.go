@@ -1,10 +1,10 @@
 package config
 
 import (
-	"encoding/base64"
 	"errors"
 	"github.com/teslashibe/scarlett-node/internal/attempts"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -87,9 +87,14 @@ type Config struct {
 	// WebObserver, set by the service pool on a web lease while the limit is
 	// adaptive, receives that page's relay outcomes. nil otherwise.
 	WebObserver WebObserver
-	// WebEgressProxy, when set, is the local HTTP CONNECT proxy every web
-	// target is dialled through (SCARLETT_WEB_EGRESS_PROXY), such as a
-	// residential proxy in front of a cloud server. It never leaves this node.
+	// WebEgressObserver, set by the service pool on a web lease, receives
+	// how that page left this node once it ends. nil otherwise.
+	WebEgressObserver func(WebEgressOutcome)
+	// WebEgressProxy, when set, is the operator's HTTP CONNECT proxy for web
+	// targets (SCARLETT_WEB_EGRESS_PROXY_FILE, or the desktop app's start
+	// line): their own Webshare account, or a proxy in front of a cloud
+	// server. Its Use decides whether every page goes through it or only
+	// those whose lease asks. It never leaves this node.
 	WebEgressProxy *WebProxy
 	// WebBrowser turns on the browser tier for web jobs in browser mode
 	// (SCARLETT_WEB_BROWSER on|off). It is on by default with web on macOS
@@ -131,6 +136,17 @@ type WebObserver interface {
 	Done(code string, timedOut bool)
 }
 
+// WebEgressOutcome is how one web page left this node, for the service pool
+// and local status only: Via "direct" or "proxy", the proxy exit its probe
+// found (invalid when none), and for a page that failed web_proxy_failed the
+// proxy class (proxy_unreachable, proxy_auth, proxy_quota or proxy_busy),
+// which decides how long web rests.
+type WebEgressOutcome struct {
+	Via        string
+	Exit       netip.Addr
+	ProxyClass string
+}
+
 var (
 	fixtureHost    = map[string]bool{"agent1-gateway": true, "agent2-gateway": true, "agent3-gateway": true, "agent4-gateway": true}
 	fixtureGateway = map[string]bool{
@@ -148,6 +164,11 @@ func Load() (Config, error) {
 	}
 	c := Config{Coordinator: os.Getenv("SCARLETT_COORDINATOR"), CoordinatorCA: os.Getenv("SCARLETT_COORDINATOR_CA_FILE"), Executor: os.Getenv("SCARLETT_EXECUTOR"), Verifier: os.Getenv("SCARLETT_VERIFIER"), VerifierCA: os.Getenv("SCARLETT_VERIFIER_CA_FILE"), VerifierPlaintextFixture: os.Getenv("SCARLETT_VERIFIER_PLAINTEXT_FIXTURE") == "1", Prover: os.Getenv("SCARLETT_PROVER"), Gateway: os.Getenv("SCARLETT_GATEWAY"), Profile: os.Getenv("SCARLETT_PROFILE"), StateDir: os.Getenv("SCARLETT_STATE_DIR"), GatewayKey: os.Getenv("SCARLETT_GATEWAY_KEY"), Credential: os.Getenv("SCARLETT_CREDENTIAL"), NodeID: os.Getenv("SCARLETT_NODE_ID"), CodexManagedRoot: os.Getenv("SCARLETT_CODEX_MANAGED_ROOT"), CodexHome: os.Getenv("SCARLETT_CODEX_HOME"), CodexProfile: os.Getenv("SCARLETT_CODEX_PROFILE"), CodexScaffold: os.Getenv("SCARLETT_CODEX_SCAFFOLD"), Bid: 100, LocalFixture: os.Getenv("SCARLETT_LOCAL_FIXTURE") == "1", InferenceTimeout: 45 * time.Second, MaxInputBytes: 32768, MaxOutputTokens: 2048}
 	c.JournalLimits = attempts.DefaultLimits()
+	// The proxy URL with its password in the environment is gone; a node that
+	// still names it would otherwise send every page from its own network.
+	if os.Getenv("SCARLETT_WEB_EGRESS_PROXY") != "" {
+		return c, errors.New("SCARLETT_WEB_EGRESS_PROXY is no longer read; name a 0600 proxy file in SCARLETT_WEB_EGRESS_PROXY_FILE")
+	}
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("SCARLETT_DIAGNOSTICS"))) {
 	case "", "1", "true", "on":
 	case "0", "false", "off":
@@ -234,8 +255,8 @@ func Load() (Config, error) {
 		}
 		c.Services = strings.Split(os.Getenv("SCARLETT_SERVICES"), ",")
 		c.CodexConcurrency, c.XConcurrency, c.XAccountConcurrency, c.WebConcurrency = 1, 1, 32, 4
-		if raw := os.Getenv("SCARLETT_WEB_EGRESS_PROXY"); raw != "" {
-			proxy, err := ParseWebProxy(raw)
+		if path := os.Getenv("SCARLETT_WEB_EGRESS_PROXY_FILE"); path != "" {
+			proxy, err := ReadWebProxyFile(path)
 			if err != nil {
 				return c, err
 			}
@@ -264,8 +285,8 @@ func Load() (Config, error) {
 		}
 	} else if os.Getenv("SCARLETT_SERVICES") != "" {
 		return c, errors.New("SCARLETT_SERVICES requires services executor")
-	} else if os.Getenv("SCARLETT_WEB_EGRESS_PROXY") != "" {
-		return c, errors.New("SCARLETT_WEB_EGRESS_PROXY requires services executor")
+	} else if os.Getenv("SCARLETT_WEB_EGRESS_PROXY_FILE") != "" {
+		return c, errors.New("SCARLETT_WEB_EGRESS_PROXY_FILE requires services executor")
 	} else if os.Getenv("SCARLETT_WEB_BROWSER") != "" || os.Getenv("SCARLETT_WEB_BROWSER_CONCURRENCY") != "" || os.Getenv("SCARLETT_WEB_BROWSER_IDLE_SECONDS") != "" {
 		return c, errors.New("SCARLETT_WEB_BROWSER settings require services executor")
 	} else if anySolverSetting() {
@@ -390,7 +411,7 @@ func (c Config) Validate() error {
 			return errors.New("invalid independent service configuration")
 		}
 		if c.WebEgressProxy != nil && !c.WebEgressProxy.valid() {
-			return errors.New("invalid SCARLETT_WEB_EGRESS_PROXY")
+			return errors.New("invalid web egress proxy")
 		}
 		if c.WebBrowserConcurrency < 0 || c.WebBrowserConcurrency > 4 || c.WebBrowser && c.WebBrowserConcurrency > c.WebConcurrency || c.WebBrowserIdle != 0 && (c.WebBrowserIdle < 30*time.Second || c.WebBrowserIdle > time.Hour) {
 			return errors.New("invalid web browser configuration")
@@ -487,70 +508,18 @@ func (c *Config) loadWebBrowser(goos string) error {
 	return nil
 }
 
-// WebProxy is a local HTTP CONNECT proxy for web egress. Only
-// non-intercepting CONNECT tunnels work: TLS runs end to end between the
-// target and the verifier, so the proxy sees only ciphertext.
-type WebProxy struct {
-	Host string
-	Port int
-	// Authorization is the exact Proxy-Authorization value, or empty.
-	Authorization string
-}
-
-// String and GoString keep the proxy and its credentials out of any log line
-// or formatted error that prints a configuration.
-func (WebProxy) String() string   { return "web egress proxy" }
-func (WebProxy) GoString() string { return "config.WebProxy{}" }
-
-// ParseWebProxy reads SCARLETT_WEB_EGRESS_PROXY: http://[user:pass@]host:port,
-// with the port required and no path, query or fragment. Errors never repeat
-// the value, which may hold credentials.
-func ParseWebProxy(raw string) (*WebProxy, error) {
-	invalid := errors.New("invalid SCARLETT_WEB_EGRESS_PROXY; use http://[user:pass@]host:port")
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "http" || u.Opaque != "" || u.Host == "" || u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawFragment != "" {
-		return nil, invalid
-	}
-	port, err := strconv.Atoi(u.Port())
-	if err != nil || strconv.Itoa(port) != u.Port() {
-		return nil, invalid
-	}
-	p := &WebProxy{Host: u.Hostname(), Port: port}
-	if u.User != nil {
-		password, _ := u.User.Password()
-		if u.User.Username() == "" {
-			return nil, invalid
-		}
-		p.Authorization = "Basic " + base64.StdEncoding.EncodeToString([]byte(u.User.Username()+":"+password))
-	}
-	if !p.valid() {
-		return nil, invalid
-	}
-	return p, nil
-}
-
-func (p WebProxy) valid() bool {
-	if p.Port < 1 || p.Port > 65535 || p.Host == "" || len(p.Host) > 253 || len(p.Authorization) > 4096 || strings.ContainsAny(p.Authorization, "\r\n\x00") {
-		return false
-	}
-	if ip := net.ParseIP(p.Host); ip != nil {
-		return true
-	}
-	for _, r := range p.Host {
-		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '.') {
-			return false
-		}
-	}
-	return true
-}
-
-// WebEgress is how this node reaches web targets: "proxy" through
-// WebEgressProxy, otherwise "direct". It is reported, never verified.
+// WebEgress is how this node reaches web targets, as its heartbeat says:
+// "direct" from its own network; "both", its own network and the proxy for
+// the leases that ask for it (web_egress "proxy"); or "proxy", every page
+// through WebEgressProxy. It is reported, never verified.
 func (c Config) WebEgress() string {
-	if c.WebEgressProxy != nil {
+	switch {
+	case c.WebEgressProxy == nil:
+		return "direct"
+	case c.WebEgressProxy.Use == ProxyUseAll:
 		return "proxy"
 	}
-	return "direct"
+	return "both"
 }
 
 func (c Config) Enabled(kind string) bool {

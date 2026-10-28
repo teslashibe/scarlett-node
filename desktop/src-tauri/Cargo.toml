@@ -1,6 +1,6 @@
 [package]
 name = "scarlett-node-desktop"
-version = "0.1.20"
+version = "0.1.21"
 edition = "2024"
 rust-version = "1.95"
 publish = false
@@ -19,6 +19,12 @@ serde_json = "=1.0.151"
 tokio = { version = "=1.53.1", features = ["process", "io-util", "time", "sync", "macros", "rt", "net"] }
 getrandom = "=0.4.3"
 sha2 = "=0.10.9"
+# The web proxy's username and password (src/web_proxy.rs). keyring's v1
+# feature picks the native store: macOS Keychain, Windows Credential Manager
+# or the Linux Secret Service. keyring-core is the store-neutral entry API the
+# app uses with it, and its mock store backs the tests.
+keyring = { version = "=4.2.0", default-features = false, features = ["v1"] }
+keyring-core = "=1.0.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.190"

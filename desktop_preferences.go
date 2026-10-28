@@ -36,6 +36,14 @@ type desktopPreferences struct {
 	// which the app keeps within Web pages at once. It applies when the node
 	// next starts.
 	WebBrowserConcurrency int `json:"web_browser_concurrency"`
+	// WebProxy sends web pages through the operator's own Webshare proxy;
+	// off by default. WebProxyUse is "limited_sites" (the default: only sites
+	// that limit this network) or "all", and WebProxyPort is 80, 1080 or 3128.
+	// The proxy username and password live in the OS keychain, never here.
+	// They apply when the node next starts.
+	WebProxy     bool   `json:"web_proxy"`
+	WebProxyUse  string `json:"web_proxy_use"`
+	WebProxyPort int    `json:"web_proxy_port"`
 }
 
 // desktopWebConcurrencyMax bounds the desktop setting below the node's own
@@ -55,8 +63,18 @@ func validDesktopWebBrowserConcurrency(n int) bool {
 	return n >= 0 && n <= desktopWebBrowserConcurrencyMax
 }
 
+func validDesktopWebProxyUse(use string) bool {
+	return use == "limited_sites" || use == "all"
+}
+
+// validDesktopWebProxyPort accepts the Webshare ports documented for
+// username and password authentication.
+func validDesktopWebProxyPort(port int) bool {
+	return port == 80 || port == 1080 || port == 3128
+}
+
 func (p desktopPreferences) valid() bool {
-	return p.Schema == 1 && p.LocalAPIPort >= 1024 && p.LocalAPIPort <= 65535 && p.XConcurrency >= 1 && p.XConcurrency <= 8 && (p.Updates == "notify" || p.Updates == "automatic") && validDesktopWebConcurrency(p.WebConcurrency) && validDesktopWebBrowserConcurrency(p.WebBrowserConcurrency)
+	return p.Schema == 1 && p.LocalAPIPort >= 1024 && p.LocalAPIPort <= 65535 && p.XConcurrency >= 1 && p.XConcurrency <= 8 && (p.Updates == "notify" || p.Updates == "automatic") && validDesktopWebConcurrency(p.WebConcurrency) && validDesktopWebBrowserConcurrency(p.WebBrowserConcurrency) && validDesktopWebProxyUse(p.WebProxyUse) && validDesktopWebProxyPort(p.WebProxyPort)
 }
 
 func desktopPreferencesCommand(action, path string, input io.Reader, out io.Writer) error {
@@ -69,7 +87,7 @@ func desktopPreferencesCommand(action, path string, input io.Reader, out io.Writ
 		return fail
 	}
 	defer lock.Close()
-	p := desktopPreferences{Schema: 1, LocalAPIPort: 8088, XConcurrency: 2, Updates: "notify", ServeWeb: true}
+	p := desktopPreferences{Schema: 1, LocalAPIPort: 8088, XConcurrency: 2, Updates: "notify", ServeWeb: true, WebProxyUse: "limited_sites", WebProxyPort: 80}
 	throughputPath := filepath.Join(filepath.Dir(path), "throughput-preferences-v1.json")
 	throughput, err := readDesktopThroughputPreferences(throughputPath)
 	if err != nil {
@@ -95,9 +113,15 @@ func desktopPreferencesCommand(action, path string, input io.Reader, out io.Writ
 	if err != nil {
 		return fail
 	}
+	webProxyPath := filepath.Join(filepath.Dir(path), "web-proxy-preferences-v1.json")
+	webProxy, err := readDesktopWebProxyPreferences(webProxyPath)
+	if err != nil {
+		return fail
+	}
 	p.XConcurrency = throughput.XConcurrency
 	p.Updates, p.ResumeServing = lifecycle.Updates, lifecycle.ResumeServing
 	p.ServeWeb, p.WebConcurrency, p.WebBrowserConcurrency = serveWeb, webConcurrency, browserConcurrency
+	p.WebProxy, p.WebProxyUse, p.WebProxyPort = *webProxy.WebProxy, *webProxy.WebProxyUse, *webProxy.WebProxyPort
 	switch action {
 	case "preferences-get":
 		f, err := localfs.OpenPrivate(path)
@@ -109,6 +133,7 @@ func desktopPreferencesCommand(action, path string, input io.Reader, out io.Writ
 			p.XConcurrency = throughput.XConcurrency
 			p.Updates, p.ResumeServing = lifecycle.Updates, lifecycle.ResumeServing
 			p.ServeWeb, p.WebConcurrency, p.WebBrowserConcurrency = serveWeb, webConcurrency, browserConcurrency
+			p.WebProxy, p.WebProxyUse, p.WebProxyPort = *webProxy.WebProxy, *webProxy.WebProxyUse, *webProxy.WebProxyPort
 		} else if !os.IsNotExist(err) {
 			return fail
 		}
@@ -128,10 +153,11 @@ func desktopPreferencesCommand(action, path string, input io.Reader, out io.Writ
 		webRaw, webErr := json.Marshal(desktopWebPreferences{Schema: 1, ServeWeb: &p.ServeWeb})
 		webCapacityRaw, webCapacityErr := json.Marshal(desktopWebCapacityPreferences{Schema: 1, WebConcurrency: &p.WebConcurrency})
 		browserCapacityRaw, browserCapacityErr := json.Marshal(desktopBrowserCapacityPreferences{Schema: 1, WebBrowserConcurrency: &p.WebBrowserConcurrency})
-		if err != nil || extensionErr != nil || lifecycleErr != nil || webErr != nil || webCapacityErr != nil || browserCapacityErr != nil || localfs.WriteAtomic(throughputPath, extension, true) != nil ||
+		webProxyRaw, webProxyErr := json.Marshal(desktopWebProxyPreferences{Schema: 1, WebProxy: &p.WebProxy, WebProxyUse: &p.WebProxyUse, WebProxyPort: &p.WebProxyPort})
+		if err != nil || extensionErr != nil || lifecycleErr != nil || webErr != nil || webCapacityErr != nil || browserCapacityErr != nil || webProxyErr != nil || localfs.WriteAtomic(throughputPath, extension, true) != nil ||
 			localfs.WriteAtomic(lifecyclePath, lifecycleRaw, true) != nil || localfs.WriteAtomic(webPath, webRaw, true) != nil ||
 			localfs.WriteAtomic(webCapacityPath, webCapacityRaw, true) != nil || localfs.WriteAtomic(browserCapacityPath, browserCapacityRaw, true) != nil ||
-			localfs.WriteAtomic(path, raw, true) != nil {
+			localfs.WriteAtomic(webProxyPath, webProxyRaw, true) != nil || localfs.WriteAtomic(path, raw, true) != nil {
 			return fail
 		}
 	default:
@@ -147,8 +173,9 @@ func decodeDesktopPreferences(input io.Reader, p *desktopPreferences) bool {
 	}
 	// Existing schema-1 files have no X concurrency, lifecycle or web settings.
 	// Normalize the defaults on reads without writing or changing any account.
-	// Web pages at once and Browser pages at once default to Auto (zero).
-	*p = desktopPreferences{XConcurrency: 2, Updates: "notify", ServeWeb: true}
+	// Web pages at once and Browser pages at once default to Auto (zero), and
+	// the web proxy to off, for limited sites on port 80.
+	*p = desktopPreferences{XConcurrency: 2, Updates: "notify", ServeWeb: true, WebProxyUse: "limited_sites", WebProxyPort: 80}
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.DisallowUnknownFields()
 	return d.Decode(p) == nil && p.valid() && d.Decode(&struct{}{}) == io.EOF
@@ -304,4 +331,41 @@ func readDesktopWebBrowserConcurrency(path string) (int, error) {
 		return 0, errors.New("invalid browser capacity preferences")
 	}
 	return *p.WebBrowserConcurrency, nil
+}
+
+// The web proxy's non-secret settings, in their own extension file for the
+// same reason: 0.1.19 and earlier decode their files strictly and never open
+// this one, so a rollback still starts. Absent, the proxy is off, for limited
+// sites on port 80. Credentials never appear here; the app keeps them in the
+// OS keychain.
+type desktopWebProxyPreferences struct {
+	Schema       int     `json:"schema"`
+	WebProxy     *bool   `json:"web_proxy"`
+	WebProxyUse  *string `json:"web_proxy_use"`
+	WebProxyPort *int    `json:"web_proxy_port"`
+}
+
+func readDesktopWebProxyPreferences(path string) (desktopWebProxyPreferences, error) {
+	off, use, port := false, "limited_sites", 80
+	p := desktopWebProxyPreferences{Schema: 1, WebProxy: &off, WebProxyUse: &use, WebProxyPort: &port}
+	f, err := localfs.OpenPrivate(path)
+	if os.IsNotExist(err) {
+		return p, nil
+	}
+	if err != nil {
+		return p, err
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, 1025))
+	if err != nil || len(raw) > 1024 {
+		return p, errors.New("invalid web proxy preferences")
+	}
+	p = desktopWebProxyPreferences{}
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.DisallowUnknownFields()
+	if d.Decode(&p) != nil || d.Decode(&struct{}{}) != io.EOF || p.Schema != 1 || p.WebProxy == nil || p.WebProxyUse == nil || p.WebProxyPort == nil ||
+		!validDesktopWebProxyUse(*p.WebProxyUse) || !validDesktopWebProxyPort(*p.WebProxyPort) {
+		return p, errors.New("invalid web proxy preferences")
+	}
+	return p, nil
 }

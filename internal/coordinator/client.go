@@ -65,6 +65,11 @@ type Lease struct {
 	// and the coordinator may escalate. Relay web offers only; it is outside
 	// web_request, so it never changes the job or its digests.
 	WebPrewarmBrowser bool `json:"web_prewarm_browser,omitempty"`
+	// WebEgress "proxy" sends a web job through the node's proxy, because the
+	// page's domain recently limited a node's own network. Only a node whose
+	// heartbeat egress is "both" or "proxy" is sent it, and like the pre-warm
+	// hint it is outside web_request, never part of the job or its digests.
+	WebEgress string `json:"web_egress,omitempty"`
 	// Community offers grant no provider permission before funded acceptance.
 	AcceptanceRequired bool   `json:"acceptance_required,omitempty"`
 	RequestSHA256      string `json:"request_sha256,omitempty"`
@@ -146,8 +151,10 @@ type ServiceHealth struct {
 	// Proof modes this node serves for the kind beyond the default. Absent
 	// means MPC-TLS only, which is what every node before this field serves.
 	ProofModes []string `json:"proof_modes,omitempty"`
-	// Egress is how an enabled web service reaches targets: "direct" or
-	// "proxy" (a local HTTP CONNECT proxy). Node-reported, not verified.
+	// Egress is how an enabled web service reaches targets: "direct" (its
+	// own network), "both" (its own network, and the operator's proxy for
+	// leases with web_egress "proxy") or "proxy" (every page through the
+	// proxy). Node-reported, not verified.
 	Egress string `json:"egress,omitempty"`
 	// Browser is the browser tier inside an enabled web entry, and absent
 	// everywhere else. Its capacity is part of the web capacity, never added.
@@ -185,6 +192,18 @@ type Proven struct {
 	Version string `json:"version"`
 	Attempt string `json:"attempt"`
 	Fence   string `json:"fence"`
+	// Egress is required in a web job's report and absent from any other.
+	Egress *WebEgress `json:"egress,omitempty"`
+}
+
+// WebEgress is how a web job left the node: Via "direct" (its own network)
+// or "proxy", and for a proxied job the proxy's public IPv4 exit when the
+// node's probe through the job's session found it. The coordinator keys
+// cooldowns by it. Node-reported, not verified; a direct job never names an
+// address.
+type WebEgress struct {
+	Via  string `json:"via"`
+	Exit string `json:"exit,omitempty"`
 }
 type Result struct {
 	Version         string `json:"version"`
@@ -213,6 +232,8 @@ type Failure struct {
 	// exactly when Code is page_too_large.
 	Stage         string `json:"stage,omitempty"`
 	ObservedBytes int64  `json:"observed_bytes,omitempty"`
+	// Egress is required in a web job's report and absent from any other.
+	Egress *WebEgress `json:"egress,omitempty"`
 }
 type Heartbeat struct {
 	Version  string          `json:"version"`

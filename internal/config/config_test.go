@@ -333,41 +333,32 @@ func TestWebServiceConfiguration(t *testing.T) {
 		}
 	}
 	os.Unsetenv("SCARLETT_WEB_CONCURRENCY")
-	for _, tc := range []struct {
-		raw, host, auth string
-		port            int
-	}{
-		{"http://proxy.example:8080", "proxy.example", "", 8080},
-		{"http://proxy.example:8080/", "proxy.example", "", 8080},
-		{"http://127.0.0.1:3128", "127.0.0.1", "", 3128},
-		{"http://[::1]:3128", "::1", "", 3128},
-		{"http://user:p%40ss@proxy.example:8080", "proxy.example", "Basic dXNlcjpwQHNz", 8080},
-		{"http://user@proxy.example:8080", "proxy.example", "Basic dXNlcjo=", 8080},
-	} {
-		t.Setenv("SCARLETT_WEB_EGRESS_PROXY", tc.raw)
-		c, err := Load()
-		if err != nil || c.WebEgressProxy == nil || c.WebEgressProxy.Host != tc.host || c.WebEgressProxy.Port != tc.port || c.WebEgressProxy.Authorization != tc.auth || c.WebEgress() != "proxy" {
-			t.Errorf("%q: %v %+v", tc.raw, err, c.WebEgressProxy)
+	// The proxy file sets the heartbeat egress from its use.
+	if runtime.GOOS != "windows" {
+		dir := t.TempDir()
+		for use, egress := range map[string]string{"limited_sites": "both", "all": "proxy"} {
+			path := writeKey(t, dir, use+".json", `{"provider":"webshare","username":"synthetic","password":"synthetic-secret","country":"us","port":80,"use":"`+use+`"}`, 0o600)
+			t.Setenv("SCARLETT_WEB_EGRESS_PROXY_FILE", path)
+			c, err := Load()
+			if err != nil || c.WebEgressProxy == nil || c.WebEgressProxy.Host != WebshareHost || c.WebEgress() != egress {
+				t.Errorf("use %s: %v %v", use, err, c.WebEgress())
+			}
+		}
+		// The proxy belongs to the services executor only.
+		t.Setenv("SCARLETT_EXECUTOR", ExecutorGateway)
+		t.Setenv("SCARLETT_GATEWAY", "http://127.0.0.1:8080")
+		os.Unsetenv("SCARLETT_SERVICES")
+		if _, err := Load(); err == nil {
+			t.Fatal("egress proxy accepted outside services mode")
 		}
 	}
-	for _, bad := range []string{"https://proxy.example:8080", "socks5://proxy.example:1080", "http://proxy.example", "http://proxy.example:0", "http://proxy.example:65536", "http://proxy.example:80a", "http://proxy.example:8080/path", "http://proxy.example:8080?x=1", "http://proxy.example:8080#f", "http://:secret@proxy.example:8080", "proxy.example:8080", "http://pro_xy.example:8080", "http://user:secret@:8080"} {
-		t.Setenv("SCARLETT_WEB_EGRESS_PROXY", bad)
-		_, err := Load()
-		if err == nil {
-			t.Errorf("%q accepted", bad)
-			continue
-		}
-		if strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "proxy.example") {
-			t.Errorf("error repeats the value: %v", err)
-		}
-	}
-	// The proxy belongs to the services executor only.
-	t.Setenv("SCARLETT_WEB_EGRESS_PROXY", "http://proxy.example:8080")
-	t.Setenv("SCARLETT_EXECUTOR", ExecutorGateway)
-	t.Setenv("SCARLETT_GATEWAY", "http://127.0.0.1:8080")
-	os.Unsetenv("SCARLETT_SERVICES")
-	if _, err := Load(); err == nil {
-		t.Fatal("egress proxy accepted outside services mode")
+	// The retired URL variable is refused, never quietly ignored.
+	os.Unsetenv("SCARLETT_WEB_EGRESS_PROXY_FILE")
+	t.Setenv("SCARLETT_EXECUTOR", ExecutorServices)
+	t.Setenv("SCARLETT_SERVICES", "web")
+	t.Setenv("SCARLETT_WEB_EGRESS_PROXY", "http://user:synthetic-secret@proxy.example:8080")
+	if _, err := Load(); err == nil || strings.Contains(err.Error(), "synthetic-secret") || !strings.Contains(err.Error(), "SCARLETT_WEB_EGRESS_PROXY_FILE") {
+		t.Fatal("retired proxy variable", err)
 	}
 }
 

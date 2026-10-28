@@ -18,7 +18,7 @@ use std::{
     ops::Range,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -263,7 +263,7 @@ pub struct WebSummary {
 }
 
 /// A failed hop: `class` is what the node maps to a failure code
-/// (`connect_failed`, `proxy_failed`, `fetch_failed`, `page_too_large`, or
+/// (`connect_failed`, a `proxy_class`, `fetch_failed`, `page_too_large`, or
 /// `verifier_busy`, which the node repeats within its hop budget).
 pub struct WebError {
     pub class: &'static str,
@@ -623,22 +623,48 @@ const CONNECT_ATTEMPTS: [Duration; 3] = if cfg!(test) {
     [Duration::from_secs(5), Duration::from_secs(10), Duration::from_secs(10)]
 };
 
-/// The hop's TCP connection to its target, which comes before its token.
+/// The class of a proxy that would not open the tunnel, from the status of
+/// its CONNECT reply (`None`: unreachable, or no HTTP reply). The node maps
+/// each class to a failure code and to how long its web service rests:
+/// `proxy_unreachable`, `proxy_auth` (407), `proxy_quota` (402) and
+/// `proxy_busy` (429) are the proxy itself failing; `proxy_refused` (403) is
+/// the proxy refusing this target; `proxy_exit` (502 or any other status) is
+/// the exit failing, which the node may retry once on a fresh session.
+pub fn proxy_class(status: Option<u16>) -> &'static str {
+    match status {
+        None => "proxy_unreachable",
+        Some(407) => "proxy_auth",
+        Some(402) => "proxy_quota",
+        Some(429) => "proxy_busy",
+        Some(403) => "proxy_refused",
+        Some(_) => "proxy_exit",
+    }
+}
+
+/// The hop's TCP connection to its target, which comes before its token. A
+/// proxied connection whose time ran out failed at the proxy when its TCP
+/// never came up, else at the exit, which never answered the CONNECT.
 async fn connect_target(hop: &Hop, trace: &Trace) -> Result<TcpStream, WebError> {
     let request = &hop.request;
-    let class = if request.proxy.is_some() { "proxy_failed" } else { "connect_failed" };
+    let reached = AtomicBool::new(false);
     trace
         .measure(Phase::XTcpConnect, async {
             for (attempt, limit) in CONNECT_ATTEMPTS.into_iter().enumerate() {
                 let until = (tokio::time::Instant::now() + limit).min(hop.deadline);
-                match tokio::time::timeout_at(until, dial::target(hop.ip, request.port, request.proxy.as_ref())).await {
+                reached.store(false, Ordering::Relaxed);
+                match tokio::time::timeout_at(until, dial::target(hop.ip, request.port, request.proxy.as_ref(), &reached)).await {
                     Ok(Ok(server)) => return Ok(server),
                     Ok(Err(dial::Error::Connect(error))) => return Err(WebError { class: "connect_failed", error }),
-                    Ok(Err(dial::Error::Proxy(error))) => return Err(WebError { class: "proxy_failed", error }),
+                    Ok(Err(dial::Error::Proxy(status, error))) => return Err(WebError { class: proxy_class(status), error }),
                     Err(_) if tokio::time::Instant::now() >= hop.deadline => break,
                     Err(_) => hop.detail(format_args!("target connection attempt {} had no answer in {} ms", attempt + 1, limit.as_millis())),
                 }
             }
+            let class = match request.proxy {
+                None => "connect_failed",
+                Some(_) if reached.load(Ordering::Relaxed) => "proxy_exit",
+                Some(_) => "proxy_unreachable",
+            };
             Err(WebError { class, error: anyhow::anyhow!("target connection timed out") })
         })
         .await
@@ -1494,13 +1520,13 @@ mod tests {
         let mut longest = web_input();
         longest["timeout_ms"] = 280_000.into();
         longest["proxy"] = serde_json::json!({"host":"127.0.0.1","port":1});
-        assert_eq!(web_class(&longest).await.0, "proxy_failed");
+        assert_eq!(web_class(&longest).await.0, "proxy_unreachable");
         // A later hop may fetch any canonical URL the verifier authorized.
         let mut later = web_input();
         later["hop"] = 1.into();
         later["url"] = "https://www.example.com/".into();
         later["proxy"] = serde_json::json!({"host":"127.0.0.1","port":1});
-        assert_eq!(web_class(&later).await.0, "proxy_failed");
+        assert_eq!(web_class(&later).await.0, "proxy_unreachable");
     }
 
     #[tokio::test]
@@ -1515,10 +1541,10 @@ mod tests {
             input["proxy"] = serde_json::json!({"host":"127.0.0.1","port":closed});
             input
         };
-        assert_eq!(web_class(&browser()).await.0, "proxy_failed");
+        assert_eq!(web_class(&browser()).await.0, "proxy_unreachable");
         let mut no_cookie = browser();
         no_cookie["node_headers"].as_object_mut().unwrap().remove("cookie");
-        assert_eq!(web_class(&no_cookie).await.0, "proxy_failed");
+        assert_eq!(web_class(&no_cookie).await.0, "proxy_unreachable");
         let cases: Vec<(&str, Box<dyn Fn(&mut serde_json::Value)>)> = vec![
             ("missing", Box::new(|v| drop(v.as_object_mut().unwrap().remove("node_headers")))),
             ("null", Box::new(|v| v["node_headers"] = serde_json::Value::Null)),
@@ -1554,7 +1580,7 @@ mod tests {
         let mut input = web_input();
         input["proxy"] = serde_json::json!({"host":"127.0.0.1","port":closed,"authorization":"Basic c2VjcmV0"});
         let (class, error) = web_class(&input).await;
-        assert_eq!(class, "proxy_failed");
+        assert_eq!(class, "proxy_unreachable");
         assert!(!error.contains("c2VjcmV0") && !error.contains("127.0.0.1"), "{error}");
         // A documentation address goes nowhere: the dial fails or times out.
         let mut input = web_input();

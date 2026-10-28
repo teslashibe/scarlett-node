@@ -1,15 +1,20 @@
 //! The supplier's TCP connection to a web target. The node resolves the
 //! name and checks the address before the prover runs, so the prover only
-//! ever dials that literal address: straight from this host, or through a
-//! local HTTP CONNECT proxy that tunnels it. TLS stays end to end between
-//! the verifier and the target, so only a non-intercepting tunnel works.
+//! ever dials that literal address: straight from this host, or through an
+//! HTTP CONNECT proxy that tunnels it. The node resolves and checks the
+//! proxy's own name too and hands over its address, so nothing here asks
+//! DNS. TLS stays end to end between the verifier and the target, so only a
+//! non-intercepting tunnel works.
 //!
 //! Proxy settings are local configuration. Nothing here prints the proxy's
 //! address or credentials.
 
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::atomic::{AtomicBool, Ordering},
+};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -22,9 +27,11 @@ const MAX_REPLY: usize = 8 << 10;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Proxy {
+    /// The proxy's address as an IP literal, which the node checked.
     pub host: String,
     pub port: u16,
-    /// The exact `Proxy-Authorization` value, when the proxy needs one.
+    /// The exact `Proxy-Authorization` value, when the proxy needs one: for a
+    /// Webshare proxy, the job's own session.
     pub authorization: Option<String>,
 }
 
@@ -32,14 +39,22 @@ pub struct Proxy {
 pub enum Error {
     /// The direct TCP connection failed.
     Connect(anyhow::Error),
-    /// The proxy could not be reached or would not open the tunnel.
-    Proxy(anyhow::Error),
+    /// The proxy could not be reached or would not open the tunnel: with the
+    /// status of its CONNECT reply when it answered one other than 200, and
+    /// `None` when it was unreachable or did not answer as HTTP.
+    Proxy(Option<u16>, anyhow::Error),
 }
 
 impl Proxy {
-    fn validate(&self) -> Result<()> {
-        let printable = |s: &str| s.bytes().all(|b| (0x21..=0x7e).contains(&b));
-        if self.host.is_empty() || self.host.len() > 253 || !printable(&self.host) || self.port == 0 {
+    /// The checked socket address to dial. A link-local, unspecified or
+    /// multicast address is never a proxy, whatever the node sent.
+    fn address(&self) -> Result<SocketAddr> {
+        let ip: IpAddr = self.host.parse().ok().context("egress proxy host must be an IP address literal")?;
+        let unusable = match ip.to_canonical() {
+            IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast(),
+            IpAddr::V6(v6) => v6.is_unicast_link_local() || v6.is_unspecified() || v6.is_multicast(),
+        };
+        if unusable || self.port == 0 {
             bail!("invalid egress proxy address");
         }
         if let Some(value) = &self.authorization
@@ -47,23 +62,28 @@ impl Proxy {
         {
             bail!("invalid egress proxy authorization");
         }
-        Ok(())
+        Ok(SocketAddr::new(ip, self.port))
     }
 }
 
-/// Opens a TCP connection to `ip:port`, through `proxy` when one is configured.
-pub async fn target(ip: IpAddr, port: u16, proxy: Option<&Proxy>) -> Result<TcpStream, Error> {
+/// Opens a TCP connection to `ip:port`, through `proxy` when one is
+/// configured. `reached` is set once the proxy's own TCP connection is up, so
+/// that a caller whose time ran out can tell a proxy it never reached from a
+/// tunnel the proxy never opened.
+pub async fn target(ip: IpAddr, port: u16, proxy: Option<&Proxy>, reached: &AtomicBool) -> Result<TcpStream, Error> {
     let stream = match proxy {
         None => TcpStream::connect(SocketAddr::new(ip, port)).await.context("target unreachable").map_err(Error::Connect)?,
-        Some(proxy) => tunnel(proxy, SocketAddr::new(ip, port)).await.map_err(Error::Proxy)?,
+        Some(proxy) => tunnel(proxy, SocketAddr::new(ip, port), reached).await?,
     };
     stream.set_nodelay(true).map_err(|e| Error::Connect(e.into()))?;
     Ok(stream)
 }
 
-async fn tunnel(proxy: &Proxy, target: SocketAddr) -> Result<TcpStream> {
-    proxy.validate()?;
-    let mut stream = TcpStream::connect((proxy.host.as_str(), proxy.port)).await.context("egress proxy unreachable")?;
+async fn tunnel(proxy: &Proxy, target: SocketAddr, reached: &AtomicBool) -> Result<TcpStream, Error> {
+    let unreachable = |error| Error::Proxy(None, error);
+    let address = proxy.address().map_err(unreachable)?;
+    let mut stream = TcpStream::connect(address).await.context("egress proxy unreachable").map_err(unreachable)?;
+    reached.store(true, Ordering::Relaxed);
     // SocketAddr brackets an IPv6 address, as the authority form requires.
     let mut request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
     if let Some(value) = &proxy.authorization {
@@ -72,7 +92,16 @@ async fn tunnel(proxy: &Proxy, target: SocketAddr) -> Result<TcpStream> {
         request.push_str("\r\n");
     }
     request.push_str("\r\n");
-    stream.write_all(request.as_bytes()).await.context("egress proxy write failed")?;
+    stream.write_all(request.as_bytes()).await.context("egress proxy write failed").map_err(unreachable)?;
+    let status = reply_status(&mut stream).await.map_err(unreachable)?;
+    if status != 200 {
+        return Err(Error::Proxy(Some(status), anyhow!("egress proxy refused the tunnel with HTTP {status}")));
+    }
+    Ok(stream)
+}
+
+/// Reads the proxy's CONNECT reply head and returns its status.
+async fn reply_status(stream: &mut TcpStream) -> Result<u16> {
     let mut reply = Vec::new();
     let mut chunk = [0u8; 2048];
     loop {
@@ -98,10 +127,7 @@ async fn tunnel(proxy: &Proxy, target: SocketAddr) -> Result<TcpStream> {
     if !status.iter().all(u8::is_ascii_digit) || !matches!(reply.get(12), Some(b' ' | b'\r')) {
         bail!("egress proxy reply is not HTTP");
     }
-    if status != b"200" {
-        bail!("egress proxy refused the tunnel with HTTP {}", String::from_utf8_lossy(status));
-    }
-    Ok(stream)
+    Ok(status.iter().fold(0, |n, d| n * 10 + u16::from(d - b'0')))
 }
 
 #[cfg(test)]
@@ -138,17 +164,26 @@ mod tests {
         (Proxy { host: "127.0.0.1".into(), port, authorization: Some(SECRET.into()) }, seen)
     }
 
-    fn message(error: Error) -> (bool, String) {
+    async fn dial(proxy: Option<&Proxy>) -> (Result<TcpStream, Error>, bool) {
+        let reached = AtomicBool::new(false);
+        let result = target("93.184.215.14".parse().unwrap(), 443, proxy, &reached).await;
+        (result, reached.load(Ordering::Relaxed))
+    }
+
+    /// A proxy failure's status and message.
+    fn message(error: Error) -> (Option<Option<u16>>, String) {
         match error {
-            Error::Proxy(e) => (true, format!("{e:#}")),
-            Error::Connect(e) => (false, format!("{e:#}")),
+            Error::Proxy(status, e) => (Some(status), format!("{e:#}")),
+            Error::Connect(e) => (None, format!("{e:#}")),
         }
     }
 
     #[tokio::test]
     async fn a_proxy_tunnel_carries_the_checked_address_and_credentials() {
         let (config, seen) = proxy(b"HTTP/1.1 200 Connection established\r\n\r\n").await;
-        let mut stream = target("93.184.215.14".parse().unwrap(), 443, Some(&config)).await.ok().unwrap();
+        let (result, reached) = dial(Some(&config)).await;
+        let mut stream = result.ok().unwrap();
+        assert!(reached);
         assert_eq!(*seen.lock().unwrap(), format!("CONNECT 93.184.215.14:443 HTTP/1.1\r\nHost: 93.184.215.14:443\r\nProxy-Authorization: {SECRET}\r\n\r\n").into_bytes());
         stream.write_all(b"ping").await.unwrap();
         let mut echo = [0u8; 4];
@@ -157,22 +192,35 @@ mod tests {
 
         let (mut config, seen) = proxy(b"HTTP/1.0 200 OK\r\nVia: test\r\n\r\n").await;
         config.authorization = None;
-        assert!(target("2606:2800:220:1::1".parse().unwrap(), 443, Some(&config)).await.is_ok());
+        assert!(target("2606:2800:220:1::1".parse().unwrap(), 443, Some(&config), &AtomicBool::new(false)).await.is_ok());
         assert_eq!(*seen.lock().unwrap(), b"CONNECT [2606:2800:220:1::1]:443 HTTP/1.1\r\nHost: [2606:2800:220:1::1]:443\r\n\r\n");
     }
 
+    /// The CONNECT status reaches the caller, which the node maps to a class.
     #[tokio::test]
-    async fn refusals_extra_bytes_and_bad_replies_are_proxy_failures_without_credentials() {
-        for reply in [
-            &b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\n\r\n"[..],
-            b"HTTP/1.1 403 Forbidden\r\n\r\n",
-            b"HTTP/1.1 200 OK\r\n\r\nunexpected",
-            b"SSH-2.0-OpenSSH\r\n\r\n",
-            b"HTTP/1.1 2000 OK\r\n\r\n",
+    async fn a_refused_tunnel_carries_its_status() {
+        for (reply, status) in [
+            (&b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic\r\n\r\n"[..], 407),
+            (b"HTTP/1.1 402 Payment Required\r\n\r\n", 402),
+            (b"HTTP/1.1 403 Forbidden\r\n\r\n", 403),
+            (b"HTTP/1.1 429 Too Many Requests\r\n\r\n", 429),
+            (b"HTTP/1.1 502 Bad Gateway\r\n\r\n", 502),
+            (b"HTTP/1.0 504\r\n\r\n", 504),
         ] {
             let (config, _) = proxy(reply).await;
-            let (is_proxy, text) = message(target("93.184.215.14".parse().unwrap(), 443, Some(&config)).await.err().unwrap());
-            assert!(is_proxy, "{text}");
+            let (result, reached) = dial(Some(&config)).await;
+            let (got, text) = message(result.err().unwrap());
+            assert_eq!(got, Some(Some(status)), "{text}");
+            assert!(reached && !text.contains("c3ludGhldGlj") && !text.contains("127.0.0.1"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn extra_bytes_and_bad_replies_are_proxy_failures_without_a_status_or_credentials() {
+        for reply in [&b"HTTP/1.1 200 OK\r\n\r\nunexpected"[..], b"SSH-2.0-OpenSSH\r\n\r\n", b"HTTP/1.1 2000 OK\r\n\r\n", b"HTTP/1.1 20x OK\r\n\r\n"] {
+            let (config, _) = proxy(reply).await;
+            let (got, text) = message(dial(Some(&config)).await.0.err().unwrap());
+            assert_eq!(got, Some(None), "{text}");
             assert!(!text.contains("c3ludGhldGlj") && !text.contains("127.0.0.1"), "{text}");
         }
         // A proxy that never stops sending a head.
@@ -183,12 +231,14 @@ mod tests {
             let _ = tcp.write_all(&vec![b'a'; 3 * MAX_REPLY]).await;
         });
         let config = Proxy { host: "127.0.0.1".into(), port, authorization: None };
-        assert!(matches!(target("93.184.215.14".parse().unwrap(), 443, Some(&config)).await, Err(Error::Proxy(_))));
-        // Invalid local settings fail before any connection.
-        for (host, auth) in [("", None), ("bad host", None), ("127.0.0.1", Some("a\r\nX-Injected: 1"))] {
+        assert!(matches!(dial(Some(&config)).await.0, Err(Error::Proxy(None, _))));
+        // Invalid local settings fail before any connection: the proxy is a
+        // checked IP literal, never a name, link-local or unspecified.
+        for (host, auth) in [("", None), ("bad host", None), ("localhost", None), ("p.webshare.io", None), ("169.254.169.254", None), ("fe80::1", None), ("0.0.0.0", None), ("224.0.0.1", None), ("127.0.0.1", Some("a\r\nX-Injected: 1"))] {
             let config = Proxy { host: host.into(), port: 1, authorization: auth.map(Into::into) };
-            let (is_proxy, text) = message(target("93.184.215.14".parse().unwrap(), 443, Some(&config)).await.err().unwrap());
-            assert!(is_proxy && !text.contains("Injected"), "{text}");
+            let (result, reached) = dial(Some(&config)).await;
+            let (got, text) = message(result.err().unwrap());
+            assert!(got == Some(None) && !reached && !text.contains("Injected"), "{host}: {text}");
         }
     }
 
@@ -196,9 +246,10 @@ mod tests {
     async fn an_unreachable_proxy_or_target_is_classified() {
         let closed = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
         let config = Proxy { host: "127.0.0.1".into(), port: closed, authorization: None };
-        assert!(matches!(target("93.184.215.14".parse().unwrap(), 443, Some(&config)).await, Err(Error::Proxy(_))));
-        assert!(matches!(target("127.0.0.1".parse().unwrap(), closed, None).await, Err(Error::Connect(_))));
+        let (result, reached) = dial(Some(&config)).await;
+        assert!(matches!(result, Err(Error::Proxy(None, _))) && !reached);
+        assert!(matches!(target("127.0.0.1".parse().unwrap(), closed, None, &AtomicBool::new(false)).await, Err(Error::Connect(_))));
         let open = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        assert!(target("127.0.0.1".parse().unwrap(), open.local_addr().unwrap().port(), None).await.is_ok());
+        assert!(target("127.0.0.1".parse().unwrap(), open.local_addr().unwrap().port(), None, &AtomicBool::new(false)).await.is_ok());
     }
 }

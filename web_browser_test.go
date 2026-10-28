@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/teslashibe/scarlett-node/internal/config"
 	"github.com/teslashibe/scarlett-node/internal/coordinator"
+	"github.com/teslashibe/scarlett-node/internal/webruntime"
 	"github.com/teslashibe/scarlett-node/internal/worker"
 )
 
@@ -104,21 +106,18 @@ func TestRuntimeBrowserWithoutArchive(t *testing.T) {
 }
 
 func TestBrowserRuntimeInputs(t *testing.T) {
-	if upstreamProxyURL(nil) != nil {
-		t.Fatal("proxy without configuration")
+	// A proxied page's upstream reaches the runtime, which checks it as the
+	// prover checks a proxy: a link-local one is a refused request, a good
+	// one waits for a ready tier like any page.
+	tier := runtimeBrowser{webruntime.New(webruntime.Config{StateDir: t.TempDir(), Guard: worker.DefaultWebEgress()})}
+	page := worker.BrowserFetchRequest{URL: "https://example.com/", Wait: "load", TimeoutMS: 5000}
+	page.Upstream = &worker.ProxyUpstream{Addr: netip.MustParseAddrPort("169.254.169.254:1080"), Authorization: "Basic c3ludGhldGlj"}
+	if _, err := tier.Fetch(context.Background(), page); err == nil || errors.Is(err, worker.ErrBrowserUnavailable) {
+		t.Fatal("link-local upstream", err)
 	}
-	proxy, err := config.ParseWebProxy("http://synthetic-user:synthetic-pass@proxy.synthetic.invalid:3128")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The address only; the credentials travel as the configured
-	// Proxy-Authorization value.
-	if u := upstreamProxyURL(proxy); u.String() != "http://proxy.synthetic.invalid:3128" || u.User != nil || proxy.Authorization == "" {
-		t.Fatal("proxy URL", u.Redacted())
-	}
-	plain, _ := config.ParseWebProxy("http://[2001:db8::1]:8080")
-	if u := upstreamProxyURL(plain); u.Host != "[2001:db8::1]:8080" || u.User != nil {
-		t.Fatal("plain proxy URL", u.String())
+	page.Upstream = &worker.ProxyUpstream{Addr: netip.MustParseAddrPort("104.16.0.10:1080"), Authorization: "Basic c3ludGhldGlj"}
+	if _, err := tier.Fetch(context.Background(), page); !errors.Is(err, worker.ErrBrowserUnavailable) {
+		t.Fatal("proxied page before the tier is ready", err)
 	}
 	if !strings.HasSuffix(xLoginNode("/r"), filepath.Join("x-login-runtime", "node")) && !strings.HasSuffix(xLoginNode("/r"), "node.exe") {
 		t.Fatal("x-login node path", xLoginNode("/r"))

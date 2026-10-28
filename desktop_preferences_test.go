@@ -22,13 +22,13 @@ func TestDesktopPreferencesPersistPrivatelyWithoutChangingDefaultsOnReads(t *tes
 	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil {
 		t.Fatal(err)
 	}
-	if out.String() != "{\"schema\":1,\"local_api_port\":8088,\"background\":false,\"x_concurrency\":2,\"updates\":\"notify\",\"resume_serving\":false,\"serve_web\":true,\"web_concurrency\":0,\"web_browser_concurrency\":0}\n" {
+	if out.String() != "{\"schema\":1,\"local_api_port\":8088,\"background\":false,\"x_concurrency\":2,\"updates\":\"notify\",\"resume_serving\":false,\"serve_web\":true,\"web_concurrency\":0,\"web_browser_concurrency\":0,\"web_proxy\":false,\"web_proxy_use\":\"limited_sites\",\"web_proxy_port\":80}\n" {
 		t.Fatal("unexpected defaults")
 	}
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
 		t.Fatal("read wrote preferences")
 	}
-	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":3,"updates":"automatic","resume_serving":true,"serve_web":false,"web_concurrency":0,"web_browser_concurrency":0}`
+	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":3,"updates":"automatic","resume_serving":true,"serve_web":false,"web_concurrency":0,"web_browser_concurrency":0,"web_proxy":false,"web_proxy_use":"limited_sites","web_proxy_port":80}`
 	out.Reset()
 	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(value), &out); err != nil {
 		t.Fatal(err)
@@ -95,7 +95,7 @@ func TestDesktopPreferencesMigrateExistingSettingsAndBoundXConcurrency(t *testin
 	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(out.String()) != `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":2,"updates":"notify","resume_serving":false,"serve_web":true,"web_concurrency":0,"web_browser_concurrency":0}` {
+	if strings.TrimSpace(out.String()) != `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":2,"updates":"notify","resume_serving":false,"serve_web":true,"web_concurrency":0,"web_browser_concurrency":0,"web_proxy":false,"web_proxy_use":"limited_sites","web_proxy_port":80}` {
 		t.Fatal("old preferences did not retain values with default concurrency")
 	}
 	stored, err := os.ReadFile(path)
@@ -120,7 +120,7 @@ func TestSavedThroughputPreferencesRetainDesktop013RollbackRepresentation(t *tes
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "preferences.json")
-	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":4,"updates":"notify","resume_serving":false,"serve_web":true,"web_concurrency":0,"web_browser_concurrency":0}`
+	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":4,"updates":"notify","resume_serving":false,"serve_web":true,"web_concurrency":0,"web_browser_concurrency":0,"web_proxy":false,"web_proxy_use":"limited_sites","web_proxy_port":80}`
 	var out bytes.Buffer
 	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(value), &out); err != nil {
 		t.Fatal(err)
@@ -155,7 +155,7 @@ func TestLifecyclePreferencesDefaultToNotifyAndRoundTrip(t *testing.T) {
 	}
 	path := filepath.Join(dir, "preferences.json")
 	var out bytes.Buffer
-	value := `{"schema":1,"local_api_port":8088,"background":false,"x_concurrency":2,"updates":"automatic","resume_serving":true,"serve_web":true,"web_concurrency":0,"web_browser_concurrency":0}`
+	value := `{"schema":1,"local_api_port":8088,"background":false,"x_concurrency":2,"updates":"automatic","resume_serving":true,"serve_web":true,"web_concurrency":0,"web_browser_concurrency":0,"web_proxy":false,"web_proxy_use":"limited_sites","web_proxy_port":80}`
 	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(value), &out); err != nil {
 		t.Fatal(err)
 	}
@@ -208,13 +208,13 @@ func TestWebPreferenceDefaultsOnPersistsOffAndKeepsDesktop013FilesReadable(t *te
 	}
 	var out bytes.Buffer
 	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil ||
-		strings.TrimSpace(out.String()) != `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":3,"updates":"automatic","resume_serving":true,"serve_web":true,"web_concurrency":0,"web_browser_concurrency":0}` {
+		strings.TrimSpace(out.String()) != `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":3,"updates":"automatic","resume_serving":true,"serve_web":true,"web_concurrency":0,"web_browser_concurrency":0,"web_proxy":false,"web_proxy_use":"limited_sites","web_proxy_port":80}` {
 		t.Fatalf("0.1.13 settings did not read with web on: %v %q", err, out.String())
 	}
 	if _, err := os.Lstat(webPath); !os.IsNotExist(err) {
 		t.Fatal("read wrote the web extension")
 	}
-	off := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":3,"updates":"automatic","resume_serving":true,"serve_web":false,"web_concurrency":0,"web_browser_concurrency":0}`
+	off := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":3,"updates":"automatic","resume_serving":true,"serve_web":false,"web_concurrency":0,"web_browser_concurrency":0,"web_proxy":false,"web_proxy_use":"limited_sites","web_proxy_port":80}`
 	out.Reset()
 	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(off), &out); err != nil {
 		t.Fatal(err)
@@ -304,7 +304,7 @@ func TestDesktopPreferencesKeepWebPagesAtOnceInItsOwnExtension(t *testing.T) {
 	if _, err := os.Lstat(capacityPath); !os.IsNotExist(err) {
 		t.Fatal("read wrote the web capacity extension")
 	}
-	value := `{"schema":1,"local_api_port":8088,"background":false,"x_concurrency":2,"updates":"notify","resume_serving":false,"serve_web":true,"web_concurrency":12,"web_browser_concurrency":0}`
+	value := `{"schema":1,"local_api_port":8088,"background":false,"x_concurrency":2,"updates":"notify","resume_serving":false,"serve_web":true,"web_concurrency":12,"web_browser_concurrency":0,"web_proxy":false,"web_proxy_use":"limited_sites","web_proxy_port":80}`
 	out.Reset()
 	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(value), &out); err != nil {
 		t.Fatal(err)
@@ -386,13 +386,13 @@ func TestDesktopPreferencesKeepBrowserPagesAtOnceInItsOwnExtension(t *testing.T)
 	}
 	var out bytes.Buffer
 	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil ||
-		strings.TrimSpace(out.String()) != `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":6,"updates":"automatic","resume_serving":true,"serve_web":true,"web_concurrency":16,"web_browser_concurrency":0}` {
+		strings.TrimSpace(out.String()) != `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":6,"updates":"automatic","resume_serving":true,"serve_web":true,"web_concurrency":16,"web_browser_concurrency":0,"web_proxy":false,"web_proxy_use":"limited_sites","web_proxy_port":80}` {
 		t.Fatalf("0.1.17 settings did not read with Browser pages at once on Auto: %v %q", err, out.String())
 	}
 	if _, err := os.Lstat(browserPath); !os.IsNotExist(err) {
 		t.Fatal("read wrote the browser capacity extension")
 	}
-	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":6,"updates":"automatic","resume_serving":true,"serve_web":true,"web_concurrency":16,"web_browser_concurrency":4}`
+	value := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":6,"updates":"automatic","resume_serving":true,"serve_web":true,"web_concurrency":16,"web_browser_concurrency":4,"web_proxy":false,"web_proxy_use":"limited_sites","web_proxy_port":80}`
 	out.Reset()
 	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(value), &out); err != nil {
 		t.Fatal(err)
@@ -455,6 +455,109 @@ func TestDesktopPreferencesKeepBrowserPagesAtOnceInItsOwnExtension(t *testing.T)
 		}
 		if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err == nil {
 			t.Fatalf("corrupt browser capacity extension accepted: %s", corrupt)
+		}
+	}
+}
+
+// The web proxy's non-secret settings live in their own extension: a device
+// that never chose reads the proxy off, for limited sites on port 80, every
+// file 0.1.19 decodes strictly keeps its representation so a rollback still
+// starts, and neither the input nor the file can carry proxy credentials.
+func TestDesktopPreferencesKeepTheWebProxyInItsOwnExtension(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "private")
+	if err := localfs.EnsureDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "preferences.json")
+	proxyPath := filepath.Join(dir, "web-proxy-preferences-v1.json")
+	// A device updating from 0.1.19 has every earlier file but this one.
+	earlier := map[string]string{
+		"preferences.json":                     `{"schema":1,"local_api_port":18088,"background":true}`,
+		"throughput-preferences-v1.json":       `{"schema":1,"x_concurrency":6}`,
+		"lifecycle-preferences-v1.json":        `{"schema":1,"updates":"automatic","resume_serving":true}`,
+		"web-preferences-v1.json":              `{"schema":1,"serve_web":true}`,
+		"web-capacity-preferences-v1.json":     `{"schema":1,"web_concurrency":16}`,
+		"browser-capacity-preferences-v1.json": `{"schema":1,"web_browser_concurrency":2}`,
+	}
+	for name, raw := range earlier {
+		if err := localfs.WriteAtomic(filepath.Join(dir, name), []byte(raw), true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var out bytes.Buffer
+	prefix := `{"schema":1,"local_api_port":18088,"background":true,"x_concurrency":6,"updates":"automatic","resume_serving":true,"serve_web":true,"web_concurrency":16,"web_browser_concurrency":2,`
+	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil ||
+		strings.TrimSpace(out.String()) != prefix+`"web_proxy":false,"web_proxy_use":"limited_sites","web_proxy_port":80}` {
+		t.Fatalf("0.1.19 settings did not read with the proxy off: %v %q", err, out.String())
+	}
+	if _, err := os.Lstat(proxyPath); !os.IsNotExist(err) {
+		t.Fatal("read wrote the web proxy extension")
+	}
+	value := prefix + `"web_proxy":true,"web_proxy_use":"all","web_proxy_port":1080}`
+	out.Reset()
+	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(value), &out); err != nil || strings.TrimSpace(out.String()) != value {
+		t.Fatalf("web proxy settings not saved: %v %q", err, out.String())
+	}
+	out.Reset()
+	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil || strings.TrimSpace(out.String()) != value {
+		t.Fatalf("web proxy settings did not survive reopen: %v %q", err, out.String())
+	}
+	if raw, err := os.ReadFile(proxyPath); err != nil || string(raw) != `{"schema":1,"web_proxy":true,"web_proxy_use":"all","web_proxy_port":1080}` {
+		t.Fatalf("unexpected web proxy extension %q", raw)
+	}
+	f, err := localfs.OpenPrivate(proxyPath)
+	if err != nil {
+		t.Fatal("web proxy extension not private", err)
+	}
+	f.Close()
+	// Every file an earlier release reads keeps its representation.
+	for name, want := range earlier {
+		if raw, err := os.ReadFile(filepath.Join(dir, name)); err != nil || string(raw) != want {
+			t.Fatalf("%s changed representation: %q", name, raw)
+		}
+	}
+	for _, invalid := range []string{
+		strings.Replace(value, `"web_proxy_use":"all"`, `"web_proxy_use":"every"`, 1),
+		strings.Replace(value, `"web_proxy_use":"all"`, `"web_proxy_use":""`, 1),
+		strings.Replace(value, `"web_proxy_port":1080`, `"web_proxy_port":8080`, 1),
+		strings.Replace(value, `"web_proxy_port":1080`, `"web_proxy_port":0`, 1),
+		strings.Replace(value, `"web_proxy_port":1080`, `"web_proxy_port":"80"`, 1),
+		strings.Replace(value, `"web_proxy":true`, `"web_proxy":"on"`, 1),
+		strings.Replace(value, `}`, `,"username":"synthetic"}`, 1),
+		strings.Replace(value, `}`, `,"password":"synthetic"}`, 1),
+	} {
+		if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(invalid), &out); err == nil {
+			t.Fatalf("invalid web proxy setting accepted: %s", invalid)
+		}
+	}
+	out.Reset()
+	if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err != nil || strings.TrimSpace(out.String()) != value {
+		t.Fatal("an invalid write changed the web proxy settings")
+	}
+	// Off is saved explicitly, and a corrupt extension is reported, not reset.
+	off := prefix + `"web_proxy":false,"web_proxy_use":"limited_sites","web_proxy_port":3128}`
+	if err := desktopCommand([]string{"preferences-set", path}, strings.NewReader(off), &out); err != nil {
+		t.Fatal(err)
+	}
+	if raw, err := os.ReadFile(proxyPath); err != nil || string(raw) != `{"schema":1,"web_proxy":false,"web_proxy_use":"limited_sites","web_proxy_port":3128}` {
+		t.Fatalf("proxy off not saved: %q", raw)
+	}
+	for _, corrupt := range []string{
+		`{"schema":1,"web_proxy":true,"web_proxy_use":"all"}`,
+		`{"schema":1,"web_proxy":true,"web_proxy_port":80}`,
+		`{"schema":1,"web_proxy_use":"all","web_proxy_port":80}`,
+		`{"schema":2,"web_proxy":true,"web_proxy_use":"all","web_proxy_port":80}`,
+		`{"schema":1,"web_proxy":true,"web_proxy_use":"some","web_proxy_port":80}`,
+		`{"schema":1,"web_proxy":true,"web_proxy_use":"all","web_proxy_port":443}`,
+		`{"schema":1,"web_proxy":true,"web_proxy_use":"all","web_proxy_port":80,"password":"synthetic"}`,
+		`{"schema":1,"web_proxy":true,"web_proxy_use":"all","web_proxy_port":80}{}`,
+		"corrupted",
+	} {
+		if err := localfs.WriteAtomic(proxyPath, []byte(corrupt), true); err != nil {
+			t.Fatal(err)
+		}
+		if err := desktopCommand([]string{"preferences-get", path}, nil, &out); err == nil {
+			t.Fatalf("corrupt web proxy extension accepted: %s", corrupt)
 		}
 	}
 }

@@ -9,11 +9,9 @@ import (
 	"io"
 	"net"
 	"net/netip"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"time"
 
 	"github.com/teslashibe/scarlett-node/internal/config"
@@ -101,16 +99,6 @@ func xLoginNode(resources string) string {
 // lookupWebHost is the resolver the browser's egress proxy uses.
 func lookupWebHost(ctx context.Context, host string) ([]netip.Addr, error) {
 	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
-}
-
-// upstreamProxyURL is SCARLETT_WEB_EGRESS_PROXY's address for the browser's
-// egress proxy, which then sends CONNECT <checked-ip>:<port> through it as
-// the relay does. Its Proxy-Authorization travels apart, exactly as configured.
-func upstreamProxyURL(p *config.WebProxy) *url.URL {
-	if p == nil {
-		return nil
-	}
-	return &url.URL{Scheme: "http", Host: net.JoinHostPort(p.Host, strconv.Itoa(p.Port))}
 }
 
 // webRuntimeCommand is `scarlett-node web-runtime check [--resources DIR]

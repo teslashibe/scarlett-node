@@ -1,10 +1,37 @@
-export type Preferences = { schema: 1; local_api_port: number; background: boolean; x_concurrency: number; updates: "notify" | "automatic"; resume_serving: boolean; serve_web: boolean; web_concurrency: number; web_browser_concurrency: number };
+export type Preferences = { schema: 1; local_api_port: number; background: boolean; x_concurrency: number; updates: "notify" | "automatic"; resume_serving: boolean; serve_web: boolean; web_concurrency: number; web_browser_concurrency: number; web_proxy: boolean; web_proxy_use: WebProxyUse; web_proxy_port: number };
 /** Web pages at once: 0 is Auto (SCARLETT_WEB_CONCURRENCY=auto, the node's adaptive limit). */
 export const WEB_CONCURRENCY_CHOICES = [0, 2, 4, 8, 12, 16] as const;
 export function validWebConcurrency(n: number): boolean { return (WEB_CONCURRENCY_CHOICES as readonly number[]).includes(n); }
 /** Browser pages at once: 0 is Auto (the node picks 1 or 2 from its memory); 1-4 is SCARLETT_WEB_BROWSER_CONCURRENCY, never above Web pages at once. */
 export const WEB_BROWSER_CONCURRENCY_CHOICES = [0, 1, 2, 3, 4] as const;
 export function validWebBrowserConcurrency(n: number): boolean { return (WEB_BROWSER_CONCURRENCY_CHOICES as readonly number[]).includes(n); }
+/** "Use it for": sites that limit this network (the node's `both` egress) or every web page (`proxy`). */
+export type WebProxyUse = "limited_sites" | "all";
+/** The Webshare ports documented for username and password sign-in. */
+export const WEB_PROXY_PORTS = [80, 1080, 3128] as const;
+export function validWebProxyPort(n: number): boolean { return (WEB_PROXY_PORTS as readonly number[]).includes(n); }
+export function validWebProxyUse(value: string): value is WebProxyUse { return value === "limited_sites" || value === "all"; }
+/** Webshare's base username; the node adds the country and a session per job. */
+export function validWebProxyUsername(value: string): boolean { return /^[A-Za-z0-9]{1,32}$/.test(value); }
+/** Printable ASCII without spaces, as the app saves it. */
+export function validWebProxyPassword(value: string): boolean { return /^[\x21-\x7e]{1,128}$/.test(value); }
+// What the app tells the page about the saved proxy: whether one is saved, a
+// masked username and the OS store's name. Never the password.
+export type WebProxySaved = { saved: boolean; username?: string | null; store: string };
+// `desktop proxy-test`: the exit IP on success, else a failure class.
+export type WebProxyTest = { ok: boolean; exit?: string; class?: string };
+// Save keeps the credentials, runs Test first with the switch on, and turns
+// the proxy on only when it passes.
+export type WebProxySaveResult = WebProxySaved & { enabled: boolean; test?: WebProxyTest | null };
+// The node's local-only web egress, from its status (never its heartbeat).
+export type WebEgress = {
+  via?: "direct" | "both" | "proxy";
+  provider?: string | null; // "webshare" or "http"
+  country?: string | null; // "us"
+  last_exit?: string | null; // the exit IPv4 the last proxied job reported
+  last_exit_at?: string | null;
+  rest_reason?: string | null; // why the proxy is resting, see PROXY_REST
+};
 export type Account = {
   id: string;
   service: "codex" | "x_read";
@@ -29,7 +56,8 @@ export type ServiceHealth = {
   last_error_code?: string;
   // Absent means MPC-TLS only, as for every node before the field existed.
   proof_modes?: string[];
-  // web only: "direct" or "proxy" (a local CONNECT proxy).
+  // web only: "direct", "both" (the proxy for sites that limit this
+  // network) or "proxy" (every page).
   egress?: string;
   // web only: the hidden browser tier inside web capacity.
   browser?: BrowserHealth;
@@ -69,6 +97,10 @@ export type Snapshot = {
   // Whether a node this app starts with web runs the hidden browser:
   // SCARLETT_WEB_BROWSER, else the node's platform default (off on Windows).
   web_browser?: boolean;
+  // The saved web proxy for the next node with web; absent or null when off.
+  web_proxy?: { use: WebProxyUse; port: number } | null;
+  // The running node was started with another web proxy setting.
+  web_proxy_restart_pending?: boolean;
   observation?: {
     state?: string;
     updated_at?: string;
@@ -94,6 +126,7 @@ export type Snapshot = {
     latest_release?: string;
     update_available?: boolean;
     update_required?: boolean;
+    web_egress?: WebEgress;
   } | null;
 };
 // The node accepts at most eight accounts per provider (node.rs MAX_CODEX_ACCOUNTS).
@@ -133,6 +166,9 @@ export const errorMessage = (code: unknown): string =>
     browser_no_x_session: "No complete X session was found in that profile. Sign in to X there or use cookie paste",
     browser_ambiguous: "This profile contains multiple X sessions. Paste the two cookies for the account you want",
     browser_unsupported: "This browser format is not supported on this device. Use cookie paste",
+    keychain_unavailable: "Scarlett could not use the system keychain. Allow access when asked, or remove the proxy and save it again",
+    web_proxy_not_saved: "Enter your proxy username and password first",
+    proxy_test_unavailable: "The proxy test could not run. The proxy stays off until a test passes",
     windows_pending:
       "Native Windows runtime support is not available in this build",
   })[String(code)] ?? "Scarlett could not complete that action";
@@ -194,6 +230,15 @@ const WEB_PAUSED: Record<string, string> = {
   web_proxy_failed: "Proxy failed · retrying in a minute",
   prover_error: "Proof helper missing",
 };
+// Why the node rests its proxy, and for how long (its proxy class table).
+// Refused sites and failed exits do not rest the proxy.
+export const PROXY_REST: Record<string, { reason: string; note: string }> = {
+  proxy_unreachable: { reason: "proxy unreachable", note: "Proxy unreachable · retrying in a minute" },
+  proxy_auth: { reason: "sign-in failed", note: "Proxy sign-in failed · retrying in 10 min" },
+  proxy_quota: { reason: "plan out of bandwidth", note: "Proxy plan out of bandwidth · retrying in 30 min" },
+  proxy_busy: { reason: "proxy busy", note: "Proxy busy · retrying in a minute" },
+};
+const proxyRest = (s: Snapshot) => PROXY_REST[s.observation?.web_egress?.rest_reason ?? ""];
 export function webServing(s: Snapshot): Metric {
   const on = webOn(s);
   if (on === undefined) return { value: "Unknown", note: "Waiting for node status" };
@@ -207,9 +252,83 @@ export function webServing(s: Snapshot): Metric {
   if (s.observation?.drain_requested || s.observation?.state === "draining")
     return { value: "Paused", note: "Finishing accepted work" };
   if (s.observation?.journal_full === true) return { value: "Paused", note: "Receipt journal full" };
-  if (web.state !== "configured" && web.state !== "ready" && web.state !== "exhausted")
-    return { value: "Paused", note: WEB_PAUSED[web.last_error_code ?? ""] ?? "Not taking new pages" };
+  if (web.state !== "configured" && web.state !== "ready" && web.state !== "exhausted") {
+    const rest = web.last_error_code === "web_proxy_failed" ? proxyRest(s) : undefined;
+    return { value: "Paused", note: rest?.note ?? WEB_PAUSED[web.last_error_code ?? ""] ?? "Not taking new pages" };
+  }
   return { value: "On", note: s.web_restart_pending ? "Stop and start the node to turn off" : "Serving on this device" };
+}
+const PROXY_ROUTE: Record<string, string> = {
+  both: "Proxy for limited sites · Webshare US",
+  proxy: "Proxy for every page · Webshare US",
+};
+// How web pages leave this device, for the status card: direct, through the
+// proxy for limited sites or every page, the last exit a proxied job reported,
+// or the proxy resting and why. Empty while web pages are off or unknown.
+export function webEgress(s: Snapshot): string {
+  if (webOn(s) !== true) return "";
+  if (!nodeLive(s)) {
+    const proxy = s.web_proxy;
+    return `Web traffic · ${!proxy ? "Direct" : PROXY_ROUTE[proxy.use === "all" ? "proxy" : "both"]}`;
+  }
+  const local = s.observation?.web_egress;
+  const via = local?.via ?? webEntry(s)?.egress;
+  if (via !== "direct" && via !== "both" && via !== "proxy") return "";
+  const rest = proxyRest(s);
+  if (via !== "direct" && rest) return `Web traffic · Proxy resting · ${rest.reason}`;
+  if (via === "direct") return "Web traffic · Direct";
+  if (local?.last_exit && /^\d{1,3}(\.\d{1,3}){3}$/.test(local.last_exit)) return `Web traffic · Proxy · last exit ${local.last_exit}`;
+  return `Web traffic · ${PROXY_ROUTE[via]}`;
+}
+// What the proxy test found, for the settings page.
+const PROXY_FAILURE: Record<string, string> = {
+  proxy_unreachable: "Could not reach the proxy. Check this device's connection and the port",
+  proxy_auth: "Proxy sign-in failed. Check the proxy username and password from your Webshare dashboard",
+  proxy_quota: "Your Webshare plan is out of bandwidth",
+  proxy_busy: "The proxy is busy. Try again in a minute",
+  proxy_refused: "The proxy refused the test page",
+  proxy_exit: "The proxy's exit did not answer. Try again",
+  invalid: "Check the proxy username, password and port",
+};
+export function webProxyTestText(result: WebProxyTest): string {
+  if (result.ok) return `Proxy works · exit IP ${result.exit ?? "unknown"}`;
+  return PROXY_FAILURE[result.class ?? ""] ?? "The proxy test did not pass";
+}
+// After Save: on, saved but off, or saved but left off because its test
+// failed; off with nothing saved when the keychain item was already gone. A
+// running node keeps its egress until it next starts.
+export function webProxySaved(result: WebProxySaveResult, running: boolean): { text: string; error: boolean } {
+  const apply = running ? ". Stop and start the node to apply it" : "";
+  if (!result.saved) return { text: `Proxy off${apply}`, error: false };
+  if (result.enabled) return { text: `Proxy saved and on${running ? apply : ". The node uses it when it starts"}`, error: false };
+  if (result.test && !result.test.ok) return { text: `Proxy saved but left off. ${webProxyTestText(result.test)}`, error: true };
+  return { text: `Proxy saved and off${apply}`, error: false };
+}
+// The credential fields never get the saved values back: placeholders say
+// what is saved, with the username masked.
+export function webProxyPlaceholders(saved: WebProxySaved | undefined): { username: string; password: string } {
+  if (!saved?.saved) return { username: "", password: "" };
+  return { username: saved.username ?? "", password: `Saved in ${saved.store}` };
+}
+// What is wrong with the typed proxy username and password, if anything.
+// Both empty keep the saved ones; Test and switching on need some saved, but
+// switching off never does, so a proxy whose keychain item is gone can still
+// be turned off.
+export function webProxyCredentialsError(username: string, password: string, saved: boolean, needed: boolean): string | undefined {
+  if (!username && !password) return needed && !saved ? errorMessage("web_proxy_not_saved") : undefined;
+  if (!validWebProxyUsername(username) || !validWebProxyPassword(password))
+    return "Enter the proxy username (letters and digits) and its password from your Webshare dashboard";
+  return undefined;
+}
+// Remove clears a saved item, one the keychain will not hand over, or a
+// proxy left on with nothing saved.
+export function webProxyRemovable(saved: WebProxySaved | undefined, unreadable: boolean, preferences: Preferences | undefined): boolean {
+  return !!saved?.saved || unreadable || preferences?.web_proxy === true;
+}
+export function webProxyNote(s: Snapshot): string {
+  return s.web_proxy_restart_pending
+    ? "Saved · stop and start the node to apply the proxy change. Accepted jobs finish before it stops"
+    : "";
 }
 // Free web slots on the running node, like availableXSlots: none while it is
 // stopped, paused or the web service is not ready, and unknown without data.

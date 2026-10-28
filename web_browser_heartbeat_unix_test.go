@@ -224,7 +224,7 @@ func TestRunLoopServesWebBrowserLease(t *testing.T) {
 			case <-time.After(10 * time.Second):
 				t.Fatal("no proven report")
 			}
-			want, _ := json.Marshal(coordinator.Proven{Version: coordinator.Version, Attempt: offer.Attempt, Fence: offer.Fence})
+			want, _ := json.Marshal(coordinator.Proven{Version: coordinator.Version, Attempt: offer.Attempt, Fence: offer.Fence, Egress: &coordinator.WebEgress{Via: "direct"}})
 			if !bytes.Equal(body, want) {
 				t.Fatalf("proven body %s", body)
 			}
