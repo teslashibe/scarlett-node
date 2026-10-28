@@ -25,6 +25,8 @@
 //! it could read the hidden values outright. Nothing short of proving the
 //! sealing to the supplier prevents the first of these; the supplier only
 //! detects it afterwards, when the verifier opens the record (`node::MISUSE`).
+//! A session that ends before the verifier opens the record proves nothing
+//! either way (`node::UNOPENED`).
 //!
 //! Hidden bytes are not checked for content, as under MPC-TLS: the verifier
 //! cannot see them, so a supplier can put any bytes there, line breaks

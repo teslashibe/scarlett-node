@@ -1046,7 +1046,7 @@ where
         match event {
             Event::Failed(e) => {
                 if record_sent && !checked {
-                    return Err(e.context(format!("{MISUSE}: the session ended before it opened the request record")));
+                    return Err(e.context(format!("{UNOPENED}: the verifier connection ended first")));
                 }
                 return Err(e);
             }
@@ -1143,7 +1143,7 @@ where
             Event::Frame(wire::FAILED, payload) if web => {
                 // A verifier opens a sealed record before it says why the hop failed.
                 if record_sent && !checked {
-                    bail!("{MISUSE}: it ended the session before it opened the request record");
+                    bail!("{UNOPENED}: it ended the hop first ({})", Refused::parse(&payload).0);
                 }
                 return Err(Refused::parse(&payload).into());
             }
@@ -1169,7 +1169,7 @@ where
                 }
                 // No result is reported for a record the supplier could not check.
                 if !checked {
-                    bail!("{MISUSE}: it did not open the request record");
+                    bail!("{UNOPENED}: it finished the session without opening it");
                 }
                 if web && outcome.is_none() {
                     bail!("verifier finished without reporting the hop");
@@ -1183,11 +1183,21 @@ where
     }
 }
 
-/// Start of the error a supplier reports when the verifier made it send
-/// something other than its own request, or would not show that it had not.
-/// Only the verifier holds the key, so it decides what is sealed; this check
-/// comes after the fact and cannot undo the request, but it is certain.
-pub const MISUSE: &str = "verifier misused this node's X session";
+/// Start of the error a supplier reports when the verifier opened the record
+/// and showed that it made the supplier send something other than its own
+/// request. Only the verifier holds the key, so it decides what is sealed;
+/// this check comes after the fact and cannot undo the request, but it is
+/// certain. Through release 0.1.19 this text was "verifier misused this
+/// node's X session" and also covered `UNOPENED`.
+pub const MISUSE: &str = "verifier sealed a request this node did not authorize";
+
+/// Start of the error a supplier reports when a session ends after its
+/// request record went out but before the verifier opened it. The supplier
+/// cannot tell what was sealed, but this proves nothing: a verifier that timed
+/// the session out, a dropped connection or a machine that slept ends a
+/// session the same way. The node rests relay after several of these and
+/// resumes on its own; only `MISUSE` halts it.
+pub const UNOPENED: &str = "verifier did not open this node's request record";
 
 /// Checks, with the key the verifier revealed, that the record this supplier
 /// sent to X was exactly `raw`. A key that authenticates the record cannot

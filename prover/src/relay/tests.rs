@@ -416,8 +416,10 @@ async fn altered_dropped_or_truncated_server_records_are_rejected() {
         assert!(outcome.is_err(), "{attack}: verifier accepted a tampered response");
         let error = response_at_node.expect_err(attack);
         // The verifier failed honestly after the record went out; it still
-        // opened the record, so the supplier does not report misuse.
+        // opened the record, so the supplier reports neither misuse nor an
+        // unopened record.
         assert!(!format!("{error:#}").contains(node::MISUSE), "{attack}: honest failure reported as misuse: {error:#}");
+        assert!(!format!("{error:#}").contains(node::UNOPENED), "{attack}: honest failure reported unopened: {error:#}");
     }
 }
 
@@ -688,16 +690,21 @@ async fn a_supplier_reports_no_result_unless_the_verifier_opens_its_record_corre
         let (response_at_node, outcome) = run(server.roots.clone(), node_end, verifier_end, tcp).await;
         // The verifier itself was honest here; only what reached the supplier was changed.
         assert!(outcome.is_ok(), "{attack}");
-        let error = response_at_node.expect_err(attack);
-        assert!(format!("{error:#}").starts_with(node::MISUSE), "{attack}: {error:#}");
+        let error = format!("{:#}", response_at_node.expect_err(attack));
+        // A withheld opening proves nothing about what was sealed; a wrong one does.
+        let expected = if attack == "withheld" { node::UNOPENED } else { node::MISUSE };
+        assert!(error.starts_with(expected), "{attack}: {error}");
+        assert!(attack != "withheld" || !error.contains(node::MISUSE), "{attack}: {error}");
     }
 }
 
 #[tokio::test]
-async fn a_verifier_that_seals_and_then_vanishes_is_reported_as_misuse() {
+async fn a_verifier_that_seals_and_then_vanishes_is_reported_unopened_not_as_misuse() {
     // The verifier had the node send a record with its session values and
     // then dropped the connection without ever opening the record. The node
-    // cannot tell that from a hidden request, so it must not pass quietly.
+    // cannot tell that from a hidden request, so it must not pass quietly,
+    // but a machine that slept or a dropped connection ends a session the
+    // same way: it is not proof of misuse.
     let server = server(response(), |_| {}).await;
     let (node_end, verifier_end) = link(|from_node, kind, payload| {
         if !from_node && kind == wire::MATERIAL {
@@ -707,8 +714,8 @@ async fn a_verifier_that_seals_and_then_vanishes_is_reported_as_misuse() {
     });
     let tcp = TcpStream::connect(server.addr).await.unwrap();
     let (response_at_node, _) = run(server.roots.clone(), node_end, verifier_end, tcp).await;
-    let error = response_at_node.expect_err("record sent, verifier gone");
-    assert!(format!("{error:#}").contains(node::MISUSE), "{error:#}");
+    let error = format!("{:#}", response_at_node.expect_err("record sent, verifier gone"));
+    assert!(error.contains(node::UNOPENED) && !error.contains(node::MISUSE), "{error}");
 }
 
 #[tokio::test]
@@ -1020,6 +1027,24 @@ async fn a_web_hop_reaches_the_verifier_and_only_its_outcome_reaches_the_supplie
 }
 
 #[tokio::test]
+async fn a_web_hop_the_verifier_fails_before_opening_its_record_is_unopened_not_misuse() {
+    // The verifier ended the hop after the request went out without opening
+    // it first, as one does whose session timed out while the node slept.
+    let origin = web_origin(page(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", End::Wait), false).await;
+    let (node_end, verifier_end) = link(|from_node, kind, _| {
+        if !from_node && kind == wire::MATERIAL {
+            return Verdict::Also(vec![(wire::FAILED, br#"{"reason":"session_timeout"}"#.to_vec())]);
+        }
+        Verdict::Pass
+    });
+    let url = "https://example.com/";
+    let tcp = TcpStream::connect(origin.addr).await.unwrap();
+    let (node_result, _) = web_hop(origin.roots.clone(), node_end, verifier_end, tcp, url, crate::webpolicy::request(url, &web_headers()), "example.com", 1 << 20).await;
+    let error = format!("{:#}", node_result.err().unwrap_or_else(|| panic!("the supplier reported a hop")));
+    assert!(error.starts_with(node::UNOPENED) && error.contains("session_timeout") && !error.contains(node::MISUSE), "{error}");
+}
+
+#[tokio::test]
 async fn a_web_supplier_refuses_plaintext_a_missing_or_wrong_outcome_and_another_host() {
     const PAGE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
     for attack in ["plain", "no_outcome", "outcome_hop", "outcome_url", "outcome_early", "two_outcomes", "other_host"] {
@@ -1092,7 +1117,8 @@ async fn a_web_verifier_authorizes_only_the_canonical_request_and_classifies_fai
             assert!(origin.seen.lock().unwrap().is_none(), "{case}: a request reached the origin");
         }
         // An honest verifier that fails after sealing still opens the record.
-        assert!(!format!("{:#}", node_result.err().unwrap()).contains(node::MISUSE), "{case}");
+        let node_error = format!("{:#}", node_result.err().unwrap());
+        assert!(!node_error.contains(node::MISUSE) && !node_error.contains(node::UNOPENED), "{case}: {node_error}");
     }
 }
 
