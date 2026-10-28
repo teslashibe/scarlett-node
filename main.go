@@ -258,7 +258,8 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 		return err
 	}
 	// A relay halt from an earlier run stays in force until the operator
-	// clears it; a restart alone must not re-arm relay.
+	// clears it; a restart alone must not re-arm relay. The one exception is
+	// a marker from 0.1.19 or earlier, which proved no misuse: it is cleared.
 	if err := worker.LoadRelayHalt(c.StateDir); err != nil {
 		return err
 	}
@@ -400,6 +401,9 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 	defer func() {
 		status.State = "draining"
 		status.InFlight = len(slots)
+		// A relay rest is held in memory and ends with this process. Leaving
+		// it out also keeps the file readable by 0.1.19 after a rollback.
+		status.RelayRestUntil = nil
 		if services != nil {
 			status.Services = services.health()
 			status.Accounts = services.accountStatus()
@@ -817,6 +821,11 @@ func runWithOwner(c config.Config, owner io.Reader) error {
 			status.UnresolvedAttempts = len(records)
 		}
 		status.RelayHalted = worker.RelayHalted()
+		status.RelayRestUntil = nil
+		if until := worker.RelayRestUntil(); !until.IsZero() {
+			until = until.UTC()
+			status.RelayRestUntil = &until
+		}
 		status.observeRelease(client.Release())
 		status.HeartbeatDiagnostics = counters.snapshot(client.Stats())
 		if err := saveRuntimeStatus(c.StateDir, status); err != nil {
@@ -916,13 +925,13 @@ type advertisement struct {
 }
 
 // servableDeclineReason is the rejection reason for an offer whose proof
-// mode the node will not serve. A keyed-relay halt or a browser tier that is
-// not ready is the node's own state, which changed after it advertised; only
-// an offer for a mode the node never advertised is invalid.
+// mode the node will not serve. A keyed-relay halt or rest, or a browser tier
+// that is not ready, is the node's own state, which changed after it
+// advertised; only an offer for a mode the node never advertised is invalid.
 func servableDeclineReason(c config.Config, l coordinator.Lease) string {
 	browser := currentBrowser()
 	switch {
-	case worker.RelayHalted():
+	case worker.RelayPaused():
 		return coordinator.RejectOther
 	case l.ServiceType == "web" && l.WebRequest != nil && l.WebRequest.Mode == "browser" && !(c.WebBrowser && browser != nil && browser.Status().Ready):
 		return coordinator.RejectNoSlot

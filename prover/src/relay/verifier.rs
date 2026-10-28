@@ -869,7 +869,8 @@ where
     // there is no second material for it. Hand it over, on success or
     // failure, so the supplier can check that the record it completed was
     // its own request and nothing else. Best effort on failure: the supplier
-    // treats a sealed record that is never opened as misuse.
+    // reports a sealed record that is never opened as unopened
+    // (node::UNOPENED), which counts toward resting its relay.
     if sent.is_some()
         && let Some((client, _)) = keys.as_ref()
     {

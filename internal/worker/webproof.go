@@ -166,7 +166,8 @@ func (r webHelperResult) summary() []byte {
 }
 
 // outcome classifies the result: caught verifier misuse halts relay
-// node-wide first, as for X.
+// node-wide first, and an unopened session counts toward a relay rest, as
+// for X.
 func (r webHelperResult) outcome(ctx, hopCtx context.Context, exchange, hop int, url string, maxRedirects int) webHopOutcome {
 	if r.fromDaemon {
 		if r.err != nil {
@@ -206,9 +207,8 @@ func runRelayWeb(hopCtx context.Context, prover string, input []byte) webHelperR
 // halts relay node-wide first, as for X: the request is already out, and the
 // node must not be used that way again.
 func webHelperFailure(ctx, hopCtx context.Context, err error, stderr string) string {
-	if strings.Contains(stderr, relayMisuseMarker) {
-		HaltRelay(relayMisuseMarker)
-		return "relay_misuse"
+	if code, ok := webRelayVerdict(stderr); ok {
+		return code
 	}
 	if ctx.Err() != nil {
 		return "expired"
@@ -221,12 +221,29 @@ func webHelperFailure(ctx, hopCtx context.Context, err error, stderr string) str
 	return webFailureCode(ctx, "", webErrorClass(stderr))
 }
 
-// webFailureCode maps a helper's failure class to the hop's code; a cause
-// carrying the relay misuse text halts relay first.
-func webFailureCode(ctx context.Context, cause, class string) string {
-	if strings.Contains(cause, relayMisuseMarker) {
+// webRelayVerdict reads what the helper said about the verifier's handling
+// of the request record. Misuse halts relay node-wide. A session that ended
+// before the verifier opened the record counts toward a relay rest and is
+// execution_uncertain: the coordinator builds the page from the verifier's
+// receipt when that holds it, and otherwise fails the job as the node's,
+// for the buyer to retry.
+func webRelayVerdict(cause string) (string, bool) {
+	switch misuse, unopened := relayVerdict(cause); {
+	case misuse:
 		HaltRelay(relayMisuseMarker)
-		return "relay_misuse"
+		return "relay_misuse", true
+	case unopened:
+		noteRelayUnopened()
+		return "execution_uncertain", true
+	}
+	return "", false
+}
+
+// webFailureCode maps a helper's failure class to the hop's code; a cause
+// carrying the relay misuse or unopened text is read first.
+func webFailureCode(ctx context.Context, cause, class string) string {
+	if code, ok := webRelayVerdict(cause); ok {
+		return code
 	}
 	if ctx.Err() != nil {
 		return "expired"
@@ -281,7 +298,7 @@ type webPredialKey struct{}
 // token.
 func (w Web) StartPredial(ctx context.Context, l coordinator.Lease) *WebPredial {
 	c := w.Config
-	if c.Executor != config.ExecutorServices || !c.Enabled("web") || l.ServiceType != "web" || !l.AcceptanceRequired || l.VerifierToken != "" || l.WebRequest == nil || l.WebRequest.Mode != "" || RelayHalted() {
+	if c.Executor != config.ExecutorServices || !c.Enabled("web") || l.ServiceType != "web" || !l.AcceptanceRequired || l.VerifierToken != "" || l.WebRequest == nil || l.WebRequest.Mode != "" || RelayPaused() {
 		return nil
 	}
 	plan, ok := decodeWebPlan(l.WebPayload)

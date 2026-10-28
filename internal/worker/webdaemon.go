@@ -401,6 +401,12 @@ func (d *webDaemon) read(stdout *os.File) {
 			daemonDetail("hop %s: %s %s (waited for: %v)", reply.ID, reply.Type, reply.Class, h != nil)
 			if h != nil {
 				h.final <- reply
+			} else if reply.Type == "error" {
+				// The node stopped waiting when the hop's job ended, and the
+				// daemon ran the session to its own deadline. What it found
+				// about the verifier still counts: misuse halts relay, and an
+				// unopened record counts toward a rest.
+				webRelayVerdict(reply.Error)
 			}
 		}
 	}

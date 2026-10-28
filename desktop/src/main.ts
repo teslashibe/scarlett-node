@@ -4,6 +4,7 @@ import { layout, revealControl } from "./layout.ts";
 import { api } from "./api.ts";
 import { scheduleXLoginExpiry } from "./x-login-expiry.ts";
 import { accountRemovalConfirmation } from "./account-removal.ts";
+import { relayResumeConfirmation } from "./relay-resume.ts";
 import { failureNotice, updatedBanner, updateSummary, updateToast, validVersion, type UpdateAction, type UpdateStatus } from "./update.ts";
 import { availableXSlots, diagnosticsNote, localCapacity, renderDiagnostics, webPagesServed, xDiagnostics, type Diagnostics } from "./diagnostics.ts";
 import {
@@ -56,6 +57,19 @@ const confirmRemoval = accountRemovalConfirmation({
   cancel: $<HTMLButtonElement>("remove-account-cancel"),
   confirm: $<HTMLButtonElement>("remove-account-confirm"),
   restoreFocus: restoreAccountFocus,
+});
+const relayResume = relayResumeConfirmation({
+  banner: $("relay-banner"),
+  resume: $("relay-resume"),
+  confirm: $("relay-confirm"),
+  cancel: $("relay-cancel"),
+  prompt: $("relay-confirm-detail"),
+  onConfirm: () => {
+    void act(() => api.resumeRelay(), "Relay resume saved").then(() => {
+      // The buttons are gone once the resume is saved; keep keyboard focus in the banner.
+      if ($("relay-resume").hidden && !$("relay-banner").hidden) $("relay-detail").focus();
+    });
+  },
 });
 let snapshot: Snapshot | undefined;
 let claudeStatus: ClaudeStatus | undefined;
@@ -161,12 +175,13 @@ function render(s: Snapshot) {
   setText(
     $("relay-detail"),
     relay === "halted"
-      ? "The node could not verify a relay request. This can happen if the connection ends before verification finishes. Check with the operator before resuming."
+      ? "The verifier sealed a request this node did not authorize, so the node stopped serving keyed relay. MPC-TLS work continues. Check with the operator before resuming."
       : "Resume saved. Waiting for the node to confirm relay is available again.",
   );
-  $("relay-resume").hidden = relay !== "halted";
+  relayResume.render(relay === "halted");
   renderUpdate(s);
   $("relay-resume").toggleAttribute("disabled", busy);
+  $("relay-confirm").toggleAttribute("disabled", busy);
   const proofs = xProofModes(s);
   $("x-proofs").hidden = !proofs;
   $("x-proofs").textContent = proofs ? `X proofs · ${proofs}` : "";
@@ -525,18 +540,6 @@ for (const action of ["start", "pause", "resume", "stop"] as const)
             : "Node starting",
     );
   });
-$("relay-resume").addEventListener("click", () => {
-  if (
-    !confirm(
-      "Resume keyed relay on this node?\n\nOnly continue after the operator confirms the verifier has been checked. The node keeps running and its current work continues. Relay resumes at the next status update.",
-    )
-  )
-    return;
-  void act(() => api.resumeRelay(), "Relay resume saved").then(() => {
-    // The button is gone once the resume is saved; keep keyboard focus in the banner.
-    if ($("relay-resume").hidden && !$("relay-banner").hidden) $("relay-detail").focus();
-  });
-});
 $("pair-form").addEventListener("submit", (event) => {
   event.preventDefault();
   const input = $<HTMLInputElement>("pair-code");

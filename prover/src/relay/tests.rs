@@ -4,7 +4,10 @@
 use std::{
     net::SocketAddr,
     ops::Range,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -416,8 +419,10 @@ async fn altered_dropped_or_truncated_server_records_are_rejected() {
         assert!(outcome.is_err(), "{attack}: verifier accepted a tampered response");
         let error = response_at_node.expect_err(attack);
         // The verifier failed honestly after the record went out; it still
-        // opened the record, so the supplier does not report misuse.
+        // opened the record, so the supplier reports neither misuse nor an
+        // unopened record.
         assert!(!format!("{error:#}").contains(node::MISUSE), "{attack}: honest failure reported as misuse: {error:#}");
+        assert!(!format!("{error:#}").contains(node::UNOPENED), "{attack}: honest failure reported unopened: {error:#}");
     }
 }
 
@@ -688,16 +693,21 @@ async fn a_supplier_reports_no_result_unless_the_verifier_opens_its_record_corre
         let (response_at_node, outcome) = run(server.roots.clone(), node_end, verifier_end, tcp).await;
         // The verifier itself was honest here; only what reached the supplier was changed.
         assert!(outcome.is_ok(), "{attack}");
-        let error = response_at_node.expect_err(attack);
-        assert!(format!("{error:#}").starts_with(node::MISUSE), "{attack}: {error:#}");
+        let error = format!("{:#}", response_at_node.expect_err(attack));
+        // A withheld opening proves nothing about what was sealed; a wrong one does.
+        let expected = if attack == "withheld" { node::UNOPENED } else { node::MISUSE };
+        assert!(error.starts_with(expected), "{attack}: {error}");
+        assert!(attack != "withheld" || !error.contains(node::MISUSE), "{attack}: {error}");
     }
 }
 
 #[tokio::test]
-async fn a_verifier_that_seals_and_then_vanishes_is_reported_as_misuse() {
+async fn a_verifier_that_seals_and_then_vanishes_is_reported_unopened_not_as_misuse() {
     // The verifier had the node send a record with its session values and
     // then dropped the connection without ever opening the record. The node
-    // cannot tell that from a hidden request, so it must not pass quietly.
+    // cannot tell that from a hidden request, so it must not pass quietly,
+    // but a machine that slept or a dropped connection ends a session the
+    // same way: it is not proof of misuse.
     let server = server(response(), |_| {}).await;
     let (node_end, verifier_end) = link(|from_node, kind, payload| {
         if !from_node && kind == wire::MATERIAL {
@@ -707,8 +717,88 @@ async fn a_verifier_that_seals_and_then_vanishes_is_reported_as_misuse() {
     });
     let tcp = TcpStream::connect(server.addr).await.unwrap();
     let (response_at_node, _) = run(server.roots.clone(), node_end, verifier_end, tcp).await;
-    let error = response_at_node.expect_err("record sent, verifier gone");
-    assert!(format!("{error:#}").contains(node::MISUSE), "{error:#}");
+    let error = format!("{:#}", response_at_node.expect_err("record sent, verifier gone"));
+    assert!(error.contains(node::UNOPENED) && !error.contains(node::MISUSE), "{error}");
+}
+
+#[tokio::test]
+async fn a_session_that_breaks_off_after_the_record_went_out_is_reported_unopened() {
+    // Once the node's record has gone to X, a verifier that sends anything
+    // out of turn instead of the opening leaves the node as unable to tell
+    // what was sealed as one that never opens it. None of these is proof of
+    // misuse, and none may pass as an ordinary failure of the read.
+    let stray: [(&str, u8, &[u8]); 5] = [
+        ("handshake after the record", wire::TO_SERVER, &[0x17, 3, 3, 0, 1, 0]),
+        ("second material", wire::MATERIAL, &[0; 8]),
+        ("base-OT choice", wire::CO_CHOOSE, &[0; 8]),
+        ("web failure", wire::FAILED, br#"{"reason":"session_timeout"}"#),
+        ("web outcome", wire::OUTCOME, b"{}"),
+    ];
+    for (case, kind, payload) in stray {
+        let server = server(response(), |_| {}).await;
+        let (node_end, verifier_end) = link(move |from_node, frame, _| {
+            if !from_node && frame == wire::MATERIAL {
+                return Verdict::Also(vec![(kind, payload.to_vec())]);
+            }
+            Verdict::Pass
+        });
+        let tcp = TcpStream::connect(server.addr).await.unwrap();
+        let (response_at_node, _) = run(server.roots.clone(), node_end, verifier_end, tcp).await;
+        let error = format!("{:#}", response_at_node.expect_err(case));
+        assert!(error.starts_with(node::UNOPENED) && !error.contains(node::MISUSE), "{case}: {error}");
+    }
+}
+
+#[tokio::test]
+async fn an_x_session_whose_verifier_keeps_the_opening_until_the_deadline_is_unopened() {
+    // The verifier keeps its connection open after the record went out and
+    // never sends the opening; the session's own deadline ends it. This link
+    // drops OPENING and DONE and never lets the node hear the verifier go.
+    // The deadline leaves a slow CI runner ample time for the honest exchange
+    // to reach the opening before it fires.
+    const DEADLINE: Duration = Duration::from_secs(10);
+    let server = server(response(), |_| {}).await;
+    let (node_end, node_far) = tokio::io::duplex(1 << 20);
+    let (verifier_end, verifier_far) = tokio::io::duplex(1 << 20);
+    let withheld = Arc::new(AtomicBool::new(false));
+    let saw = withheld.clone();
+    let held = tokio::spawn(async move {
+        let (mut from_node, mut to_node) = tokio::io::split(node_far);
+        let (mut from_verifier, mut to_verifier) = tokio::io::split(verifier_far);
+        let up = async {
+            while let Ok((kind, payload)) = wire::recv(&mut from_node).await {
+                let _ = wire::send(&mut to_verifier, kind, &payload).await;
+            }
+            // The node went: let the verifier see it, so it never waits on us.
+            let _ = to_verifier.shutdown().await;
+        };
+        let down = async {
+            while let Ok((kind, payload)) = wire::recv(&mut from_verifier).await {
+                if kind == wire::OPENING {
+                    saw.store(true, Ordering::SeqCst);
+                }
+                if kind != wire::OPENING && kind != wire::DONE {
+                    let _ = wire::send(&mut to_node, kind, &payload).await;
+                }
+            }
+            std::future::pending::<()>().await
+        };
+        tokio::join!(up, down);
+    });
+    let config = verifier::tls_config(server.roots.clone()).unwrap();
+    let verifier = tokio::spawn(async move { verifier::run(&mut verifier::Conn::new(verifier_end), config, xpolicy::HOST, verifier::authorize_x).await });
+    let tcp = TcpStream::connect(server.addr).await.unwrap();
+    let raw = request();
+    let started = std::time::Instant::now();
+    let result = within(node::x_session(&mut node::RelayConn::new(node_end), tcp, &raw, xpolicy::HOST, DEADLINE, &crate::diagnostics::Trace::new())).await;
+    // The verifier itself was honest, saw the whole response and sent the
+    // opening this link kept from the node.
+    assert!(within(verifier).await.unwrap().is_ok());
+    held.abort();
+    assert!(withheld.load(Ordering::SeqCst), "the verifier never sent its opening");
+    let error = format!("{:#}", result.expect_err("no opening, no response"));
+    assert!(started.elapsed() >= DEADLINE, "{error}");
+    assert!(error.starts_with(node::UNOPENED) && error.contains("timed out") && !error.contains(node::MISUSE), "{error}");
 }
 
 #[tokio::test]
@@ -1020,6 +1110,49 @@ async fn a_web_hop_reaches_the_verifier_and_only_its_outcome_reaches_the_supplie
 }
 
 #[tokio::test]
+async fn a_web_hop_the_verifier_fails_before_opening_its_record_is_unopened_not_misuse() {
+    // The verifier ended the hop after the request went out without opening
+    // it first, as one does whose session timed out while the node slept.
+    let origin = web_origin(page(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", End::Wait), false).await;
+    let (node_end, verifier_end) = link(|from_node, kind, _| {
+        if !from_node && kind == wire::MATERIAL {
+            return Verdict::Also(vec![(wire::FAILED, br#"{"reason":"session_timeout"}"#.to_vec())]);
+        }
+        Verdict::Pass
+    });
+    let url = "https://example.com/";
+    let tcp = TcpStream::connect(origin.addr).await.unwrap();
+    let (node_result, _) = web_hop(origin.roots.clone(), node_end, verifier_end, tcp, url, crate::webpolicy::request(url, &web_headers()), "example.com", 1 << 20).await;
+    let error = format!("{:#}", node_result.err().unwrap_or_else(|| panic!("the supplier reported a hop")));
+    assert!(error.starts_with(node::UNOPENED) && error.contains("session_timeout") && !error.contains(node::MISUSE), "{error}");
+}
+
+#[tokio::test]
+async fn a_web_hop_that_breaks_off_after_the_record_went_out_is_unopened() {
+    // As for X: a frame out of turn after the request went out, before the
+    // opening, is an unopened record, not an ordinary failed fetch.
+    let stray: [(&str, u8, &[u8]); 3] = [
+        ("page plaintext", wire::PLAIN, b"ok"),
+        ("outcome before the opening", wire::OUTCOME, br#"{"hop":0,"url":"https://example.com/","status_code":200,"final":true,"next_url":null}"#),
+        ("handshake after the record", wire::TO_SERVER, &[0x17, 3, 3, 0, 1, 0]),
+    ];
+    for (case, kind, payload) in stray {
+        let origin = web_origin(page(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok", End::Wait), false).await;
+        let (node_end, verifier_end) = link(move |from_node, frame, _| {
+            if !from_node && frame == wire::MATERIAL {
+                return Verdict::Also(vec![(kind, payload.to_vec())]);
+            }
+            Verdict::Pass
+        });
+        let url = "https://example.com/";
+        let tcp = TcpStream::connect(origin.addr).await.unwrap();
+        let (node_result, _) = web_hop(origin.roots.clone(), node_end, verifier_end, tcp, url, crate::webpolicy::request(url, &web_headers()), "example.com", 1 << 20).await;
+        let error = format!("{:#}", node_result.err().unwrap_or_else(|| panic!("{case}: the supplier reported a hop")));
+        assert!(error.starts_with(node::UNOPENED) && !error.contains(node::MISUSE), "{case}: {error}");
+    }
+}
+
+#[tokio::test]
 async fn a_web_supplier_refuses_plaintext_a_missing_or_wrong_outcome_and_another_host() {
     const PAGE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
     for attack in ["plain", "no_outcome", "outcome_hop", "outcome_url", "outcome_early", "two_outcomes", "other_host"] {
@@ -1092,7 +1225,8 @@ async fn a_web_verifier_authorizes_only_the_canonical_request_and_classifies_fai
             assert!(origin.seen.lock().unwrap().is_none(), "{case}: a request reached the origin");
         }
         // An honest verifier that fails after sealing still opens the record.
-        assert!(!format!("{:#}", node_result.err().unwrap()).contains(node::MISUSE), "{case}");
+        let node_error = format!("{:#}", node_result.err().unwrap());
+        assert!(!node_error.contains(node::MISUSE) && !node_error.contains(node::UNOPENED), "{case}: {node_error}");
     }
 }
 
@@ -1276,12 +1410,12 @@ async fn sessions_on_one_connection_share_no_state_and_a_failure_closes_it() {
     });
     let first = "https://example.com/";
     conn.present(&"1".repeat(64)).await.unwrap();
-    let (outcome, keep) = within(node::web_session_on(&mut conn, to_a, &crate::webpolicy::request(first, &web_headers()), "example.com", 0, first, &trace)).await.unwrap();
+    let (outcome, keep) = within(node::web_session_on(&mut conn, to_a, &crate::webpolicy::request(first, &web_headers()), "example.com", 0, first, &node::Sealing::default(), &trace)).await.unwrap();
     assert_eq!((outcome.status_code, outcome.is_final, keep), (200, true, true));
     // Session 2, another token and another origin, on the same connection.
     let second = "https://www.example.com/";
     conn.present(&"2".repeat(64)).await.unwrap();
-    let (outcome, keep) = within(node::web_session_on(&mut conn, TcpStream::connect(b.addr).await.unwrap(), &crate::webpolicy::request(second, &web_headers()), "www.example.com", 0, second, &trace)).await.unwrap();
+    let (outcome, keep) = within(node::web_session_on(&mut conn, TcpStream::connect(b.addr).await.unwrap(), &crate::webpolicy::request(second, &web_headers()), "www.example.com", 0, second, &node::Sealing::default(), &trace)).await.unwrap();
     assert_eq!((outcome.status_code, outcome.url.as_str(), keep), (200, second, true));
     // Session 3 is fed session 1's server flight: nothing of session 1's
     // handshake or keys carries over, so the replay fails as TLS.
@@ -1296,14 +1430,14 @@ async fn sessions_on_one_connection_share_no_state_and_a_failure_closes_it() {
         let mut rest = [0u8; 4096];
         while matches!(far.read(&mut rest).await, Ok(n) if n > 0) {}
     });
-    let error = within(node::web_session_on(&mut conn, replay, &crate::webpolicy::request(first, &web_headers()), "example.com", 0, first, &trace)).await.err().unwrap();
+    let error = within(node::web_session_on(&mut conn, replay, &crate::webpolicy::request(first, &web_headers()), "example.com", 0, first, &node::Sealing::default(), &trace)).await.err().unwrap();
     assert_eq!(error.downcast_ref::<node::Refused>(), Some(&node::Refused("tls_failed")), "{error:#}");
     assert!(!format!("{error:#}").contains(node::MISUSE));
     let served = within(verifier_side).await.unwrap();
     // FAILED closed the connection: the idle check sees it, and a fourth token goes nowhere.
     assert!(conn.check_idle().is_err());
     let _ = conn.present(&"4".repeat(64)).await;
-    let fourth = within(node::web_session_on(&mut conn, TcpStream::connect(a.addr).await.unwrap(), &crate::webpolicy::request(first, &web_headers()), "example.com", 0, first, &trace)).await;
+    let fourth = within(node::web_session_on(&mut conn, TcpStream::connect(a.addr).await.unwrap(), &crate::webpolicy::request(first, &web_headers()), "example.com", 0, first, &node::Sealing::default(), &trace)).await;
     assert!(fourth.is_err());
 
     assert_eq!(served.len(), 3);
@@ -1334,7 +1468,7 @@ async fn a_verifier_that_does_not_keep_the_connection_ends_it_after_done() {
     let mut conn = node::RelayConn::new(node_end);
     conn.present(&"a".repeat(64)).await.unwrap();
     let url = "https://example.com/";
-    let (_, keep) = within(node::web_session_on(&mut conn, TcpStream::connect(origin.addr).await.unwrap(), &crate::webpolicy::request(url, &web_headers()), "example.com", 0, url, &crate::diagnostics::Trace::new())).await.unwrap();
+    let (_, keep) = within(node::web_session_on(&mut conn, TcpStream::connect(origin.addr).await.unwrap(), &crate::webpolicy::request(url, &web_headers()), "example.com", 0, url, &node::Sealing::default(), &crate::diagnostics::Trace::new())).await.unwrap();
     assert!(!keep);
     assert_eq!(within(verifier_side).await.unwrap(), "a".repeat(64));
     // The verifier closed its side: the idle check sees the end.

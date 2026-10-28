@@ -2889,7 +2889,7 @@ dependencies = [
 
 [[package]]
 name = "scarlett-node-desktop"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "block2",
  "getrandom 0.4.3",
