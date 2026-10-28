@@ -22,7 +22,8 @@ const OUTPUT_LIMIT: usize = 32768;
 const X_ACCOUNT_WRITE_TIMEOUT: u64 = 45;
 /// The node's durable keyed-relay halt marker (worker.RelayHaltFile). It exists
 /// from the moment the node catches its verifier misusing an X session until
-/// `scarlett-node relay-resume` removes it.
+/// `scarlett-node relay-resume` removes it. A node from 0.1.20 on also removes
+/// one written by 0.1.19 or earlier when it starts: those never proved misuse.
 const RELAY_HALT_FILE: &str = "relay-halt";
 
 #[derive(Clone)]
@@ -645,6 +646,7 @@ fn observation_projection(raw: &[u8]) -> Result<Value> {
         "unresolved_attempts",
         "drain_requested",
         "relay_halted",
+        "relay_rest_until",
         "journal_full",
         "release",
         "latest_release",
@@ -2476,6 +2478,8 @@ esac
         );
         let unhalted = observation_projection(br#"{"state":"running","services":[]}"#).unwrap();
         assert!(unhalted.get("relay_halted").is_none());
+        let resting = observation_projection(br#"{"state":"running","relay_rest_until":"2026-10-28T18:00:00Z","services":[]}"#).unwrap();
+        assert_eq!(resting["relay_rest_until"], json!("2026-10-28T18:00:00Z"));
     }
     #[test]
     fn projection_keeps_only_known_browser_fields() {
@@ -2586,7 +2590,7 @@ esac
         let temp = tempfile::tempdir().unwrap();
         let node = relay_fixture(&temp);
         let marker = node.state.join(RELAY_HALT_FILE);
-        std::fs::write(&marker, "verifier misused this node's X session\n").unwrap();
+        std::fs::write(&marker, "verifier sealed a request this node did not authorize\n").unwrap();
         node.start().await.unwrap();
         let calls = node.state.join("calls");
         let began = Instant::now();
@@ -2626,7 +2630,7 @@ esac
                 .any(|call| call == "drain" || call.starts_with("desktop"))
         );
         // A marker the command did not remove is reported, not assumed gone.
-        std::fs::write(&marker, "verifier misused this node's X session\n").unwrap();
+        std::fs::write(&marker, "verifier sealed a request this node did not authorize\n").unwrap();
         std::fs::write(node.state.join("keep-halt"), "").unwrap();
         assert_eq!(node.resume_relay().await, Err(Error::CommandFailed));
         assert!(node.snapshot().await.relay_halt_marker);
@@ -2645,7 +2649,7 @@ esac
         );
         node.prepare().unwrap();
         let marker = node.state.join(RELAY_HALT_FILE);
-        std::fs::write(&marker, "verifier misused this node's X session\n").unwrap();
+        std::fs::write(&marker, "verifier sealed a request this node did not authorize\n").unwrap();
         assert!(node.snapshot().await.relay_halt_marker);
         node.resume_relay().await.unwrap();
         assert!(!marker.exists());
