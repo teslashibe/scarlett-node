@@ -10,11 +10,20 @@
 # app and sidecars inside the DMG, each with its pinned designated requirement.
 # The signer verified the app before packaging; this proves what was packaged.
 #
-# usage: smoke-macos-dmg.sh <absolute signed .dmg> <new absolute work directory>
+# --verify-only stops after those signature checks: it mounts the DMG and copies
+# the app into the work directory but never launches it, so it creates no app
+# state and may run on a developer Mac (local-release.sh uses it).
+#
+# usage: smoke-macos-dmg.sh [--verify-only] <absolute signed .dmg> <new absolute work directory>
 set -euo pipefail
 
+verify_only=false
+if [[ "${1:-}" == --verify-only ]]; then
+  verify_only=true
+  shift
+fi
 if [[ $# -ne 2 ]]; then
-  echo 'usage: smoke-macos-dmg.sh <absolute signed .dmg> <new absolute work directory>' >&2
+  echo 'usage: smoke-macos-dmg.sh [--verify-only] <absolute signed .dmg> <new absolute work directory>' >&2
   exit 2
 fi
 dmg=$1
@@ -23,7 +32,7 @@ if [[ "$(uname -s)" != Darwin || "$dmg" != /*.dmg || ! -f "$dmg" || "$work" != /
   echo 'Run on a Mac with an absolute DMG and a new absolute work directory' >&2
   exit 2
 fi
-if [[ "${GITHUB_ACTIONS:-}" != true ]]; then
+if [[ "$verify_only" != true && "${GITHUB_ACTIONS:-}" != true ]]; then
   echo 'The launch smoke creates app state; run it only on a disposable CI runner' >&2
   exit 2
 fi
@@ -50,7 +59,7 @@ PY
 fi
 pin="certificate leaf = H\"$sha1\""
 codesign --verify --strict "-R=identifier \"ai.scarlett.node.dmg\" and $pin" "$dmg"
-if pgrep -x scarlett-node-desktop > /dev/null; then
+if [[ "$verify_only" != true ]] && pgrep -x scarlett-node-desktop > /dev/null; then
   echo 'Another Scarlett Node desktop is already running' >&2
   exit 1
 fi
@@ -74,6 +83,10 @@ for name in scarlett-node scarlett-prover open-agent-api; do
   codesign --verify --strict "-R=identifier \"ai.scarlett.node.$name\" and $pin" "$app/Contents/MacOS/$name"
 done
 echo 'The disk image, app and sidecars carry the pinned self-signed signature'
+if [[ "$verify_only" == true ]]; then
+  echo 'Verified only: the app was not launched'
+  exit 0
+fi
 
 open -n "$app"
 sleep 20

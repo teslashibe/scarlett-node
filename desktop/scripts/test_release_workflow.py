@@ -226,6 +226,29 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('--channel stable', assemble)
         self.assertIn('--node-commit "$GITHUB_SHA"', assemble)
 
+    def test_local_release_repeats_the_mac_sign_job(self):
+        script = (ROOT / 'desktop/scripts/local-release.sh').read_text()
+        self.assertIn('set -euo pipefail', script)
+        # The release commit's own scripts, in the release job's order.
+        order = ['release-manifest.py check-version', 'desktop/scripts/build-complete-runtime.sh "$native"',
+                 'npm --prefix desktop ci --ignore-scripts',
+                 'npm run tauri build -- --bundles app --no-sign --config src-tauri/tauri.complete.generated.json',
+                 'desktop/scripts/import-macos-identity.sh', 'desktop/scripts/sign-macos-bundle.py',
+                 'security delete-keychain "$keychain"\nrm -rf "$signing"', 'smoke-macos-dmg.sh" --verify-only',
+                 'verify_platform(']
+        positions = [script.find(item) for item in order]
+        self.assertNotIn(-1, positions, order)
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn('SCARLETT_SIGNING_SCHEME=self-signed-stable SCARLETT_MAC_KEYCHAIN="$keychain"', script)
+        self.assertIn('unset SCARLETT_SIGNING_REHEARSAL SCARLETT_SIGNING_IDENTITIES', script)
+        self.assertIn('trap cleanup EXIT', script)
+        # The passphrase reaches the importer only through its environment variable.
+        self.assertIn('password=$(security find-generic-password -s "$service" -a "$account" -w)', script)
+        self.assertEqual(re.findall(r'\$password\b|\$\{password\}', script), ['$password'])
+        self.assertIn('SCARLETT_MAC_P12_PASSWORD=$password desktop/scripts/import-macos-identity.sh', script)
+        self.assertNotIn('set -x', script)
+        self.assertNotIn('GITHUB_ACTIONS', script)
+
     def test_pr_ci_rehearses_both_platforms_without_secrets(self):
         self.assertNotIn('secrets.', self.complete)
         self.assertNotIn('environment:', self.complete)
