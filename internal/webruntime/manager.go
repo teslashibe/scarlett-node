@@ -1225,7 +1225,8 @@ func readHelperPort(r *os.File, ports chan<- int) {
 			break
 		}
 		if buf[0] == '\n' {
-			if value, ok := strings.CutPrefix(string(line), helperPortPrefix); ok {
+			// Python's text-mode stdout ends the line with "\r\n" on Windows.
+			if value, ok := strings.CutPrefix(strings.TrimSuffix(string(line), "\r"), helperPortPrefix); ok {
 				if n, err := strconv.Atoi(value); err == nil && n > 0 && n < 65536 && strconv.Itoa(n) == value {
 					port = n
 				}
